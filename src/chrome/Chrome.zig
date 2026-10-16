@@ -70,6 +70,9 @@ pub const View = struct {
     /// The terminal's default background.
     terminal_bg: Color,
 
+    /// Frame stats, when built with `-Dstats`. Lines end with LF.
+    stats: []const u16 = &.{},
+
     pub const Session = struct {
         title: []const u16,
         /// Output arrived while it wasn't shown.
@@ -316,9 +319,12 @@ pub const Fonts = struct {
     section: *dwrite.ITextFormat,
     /// Key hints, centered.
     hint: *dwrite.ITextFormat,
+    /// Numbers that change in place, like the stats.
+    mono: *dwrite.ITextFormat,
 
     const L = std.unicode.utf8ToUtf16LeStringLiteral;
-    const families = [_][:0]const u16{ L("Segoe UI Variable Text"), L("Segoe UI") };
+    const ui_families = [_][:0]const u16{ L("Segoe UI Variable Text"), L("Segoe UI") };
+    const mono_families = [_][:0]const u16{ L("Cascadia Mono"), L("Consolas") };
 
     fn init(scale: f32) !Fonts {
         var factory: ?*dwrite.IFactory2 = null;
@@ -328,35 +334,38 @@ pub const Fonts = struct {
         );
         errdefer com.releaseOpt(&factory);
         const f = factory.?;
-        const family = findFamily(f);
+        const ui = findFamily(f, &ui_families);
+        const mono = findFamily(f, &mono_families);
 
         var self: Fonts = undefined;
         self.factory = f;
         const specs = .{
-            .{ "body", dwrite.FONT_WEIGHT.NORMAL, 13, dwrite.TEXT_ALIGNMENT_LEADING },
-            .{ "body_strong", dwrite.FONT_WEIGHT.SEMI_BOLD, 13, dwrite.TEXT_ALIGNMENT_LEADING },
-            .{ "title", dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_CENTER },
-            .{ "section", dwrite.FONT_WEIGHT.SEMI_BOLD, 11, dwrite.TEXT_ALIGNMENT_LEADING },
-            .{ "hint", dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_CENTER },
+            .{ "body", ui, dwrite.FONT_WEIGHT.NORMAL, 13, dwrite.TEXT_ALIGNMENT_LEADING },
+            .{ "body_strong", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 13, dwrite.TEXT_ALIGNMENT_LEADING },
+            .{ "title", ui, dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_CENTER },
+            .{ "section", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 11, dwrite.TEXT_ALIGNMENT_LEADING },
+            .{ "hint", ui, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_CENTER },
+            .{ "mono", mono, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_LEADING },
         };
         var made: usize = 0;
         errdefer inline for (specs, 0..) |spec, i| {
             if (i < made) com.release(@field(self, spec[0]));
         };
         inline for (specs) |spec| {
-            @field(self, spec[0]) = try createFormat(f, family, spec[1], spec[2] * scale, spec[3]);
+            @field(self, spec[0]) = try createFormat(f, spec[1], spec[2], spec[3] * scale, spec[4]);
             made += 1;
         }
         return self;
     }
 
     fn deinit(self: *Fonts) void {
-        inline for (.{ "body", "body_strong", "title", "section", "hint" }) |name| com.release(@field(self, name));
+        inline for (.{ "body", "body_strong", "title", "section", "hint", "mono" }) |name| com.release(@field(self, name));
         com.release(self.factory);
         self.* = undefined;
     }
 
-    fn findFamily(factory: *dwrite.IFactory2) [:0]const u16 {
+    /// The first installed of `families`, else the last.
+    fn findFamily(factory: *dwrite.IFactory2, families: []const [:0]const u16) [:0]const u16 {
         var collection: ?*dwrite.IFontCollection = null;
         if (factory.getSystemFontCollection(&collection) < 0) return families[families.len - 1];
         defer com.releaseOpt(&collection);

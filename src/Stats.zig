@@ -1,5 +1,5 @@
-//! Frame timing and output throughput, reported in the window title once
-//! a second. Enabled with `-Dstats` (default in Debug builds).
+//! Frame timing and output throughput, shown in the chrome once a
+//! second. Enabled with `-Dstats` (default in Debug builds).
 const Stats = @This();
 
 const std = @import("std");
@@ -32,7 +32,8 @@ pub fn lap(self: *Stats, phase: Phase, start: i64) i64 {
     return t;
 }
 
-/// Format the interval since the last call as a title suffix and reset.
+/// Format the interval since the last call, one counter per line, and
+/// reset.
 pub fn report(self: *Stats, buf: []u8) []const u8 {
     var freq: i64 = undefined;
     _ = win32.QueryPerformanceFrequency(&freq);
@@ -49,13 +50,13 @@ pub fn report(self: *Stats, buf: []u8) []const u8 {
 
     const text = std.fmt.bufPrint(
         buf,
-        "{d:.0} fps \u{b7} update {d:.2} \u{b7} build {d:.2} \u{b7} draw {d:.2} ms \u{b7} {d:.1} MB/s",
+        "{d:.0} fps\n{d:.1} MB/s\nupdate {d:.2} ms\nbuild {d:.2} ms\ndraw {d:.2} ms",
         .{
             @as(f64, @floatFromInt(self.frames)) / secs,
+            bytes / secs / (1024 * 1024),
             ms.get(.update),
             ms.get(.build),
             ms.get(.draw),
-            bytes / secs / (1024 * 1024),
         },
     ) catch buf[0..0];
 

@@ -38,7 +38,7 @@ pub const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
 /// Posted from a reader thread when the child writes the clipboard.
 pub const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
 
-/// Room for the stats report after the title, in UTF-16 units.
+/// Room for the stats report, in UTF-16 units.
 const max_stats_len = 160;
 
 const stats_timer_id = 1;
@@ -67,7 +67,7 @@ config: *const Config,
 /// What new sessions run, in CreateProcessW syntax. Outlives the window.
 command_line: []const u16,
 hwnd: ?win32.HWND = null,
-/// The last stats report, shown after the title.
+/// The last stats report, which the chrome shows.
 stats_text: [max_stats_len]u16 = undefined,
 stats_len: usize = 0,
 dpi: u32 = win32.USER_DEFAULT_SCREEN_DPI,
@@ -518,6 +518,7 @@ fn view(self: *Window) Chrome.View {
         .focused = self.focused,
         .maximized = win32.IsZoomed(self.hwnd.?) != 0,
         .terminal_bg = Painter.rgb(@as(u24, bg.r) << 16 | @as(u24, bg.g) << 8 | bg.b),
+        .stats = self.stats_text[0..self.stats_len],
     };
 }
 
@@ -771,26 +772,21 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     }
 }
 
-/// Show the last second's stats after the title.
+/// Take the last second's stats for the chrome to show.
 fn showStats(self: *Window) void {
-    var utf8: [160]u8 = undefined;
+    var utf8: [max_stats_len]u8 = undefined;
     const text = self.stats.report(&utf8);
     self.stats_len = std.unicode.utf8ToUtf16Le(&self.stats_text, text) catch 0;
-    self.showTitle();
+    self.dirty = true;
 }
 
 /// Set the window text, which the taskbar shows: the active session's
-/// title, then any stats.
+/// title.
 fn showTitle(self: *Window) void {
-    const sep = std.unicode.utf8ToUtf16LeStringLiteral("  \u{2014}  ");
-    var text: [Session.max_title_len + sep.len + max_stats_len + 1]u16 = undefined;
+    var text: [Session.max_title_len + 1]u16 = undefined;
     const title = self.activeSession().title();
-    const stats = self.stats_text[0..self.stats_len];
-    var len: usize = 0;
-    for ([_][]const u16{ title[0..@min(title.len, Session.max_title_len)], if (stats.len > 0) sep else &.{}, stats }) |part| {
-        @memcpy(text[len..][0..part.len], part);
-        len += part.len;
-    }
+    const len = @min(title.len, Session.max_title_len);
+    @memcpy(text[0..len], title[0..len]);
     text[len] = 0;
     _ = win32.SetWindowTextW(self.hwnd.?, text[0..len :0]);
 }

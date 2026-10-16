@@ -60,6 +60,23 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
         if (r.y >= l.list.bottom()) break;
         paintRow(c, p, r, i, session, i == view.active);
     }
+    paintStats(c, p, l, view.stats);
+}
+
+/// The frame stats at the bottom left, in line with the section headers.
+fn paintStats(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, stats: []const u16) void {
+    if (stats.len == 0) return;
+    const line_h = c.px(16);
+    const lines: f32 = @floatFromInt(std.mem.countScalar(u16, stats, '\n') + 1);
+    const x = l.list.x + c.px(pad_left) + c.px(2);
+    var r: Rect = .{
+        .x = x,
+        .y = l.list.bottom() - c.px(10) - lines * line_h,
+        .w = @max(0, l.list.right() - c.px(pad_right) - x),
+        .h = line_h,
+    };
+    var it = std.mem.splitScalar(u16, stats, '\n');
+    while (it.next()) |line| : (r.y += line_h) p.text(line, c.fonts.mono, r, c.theme.text_muted);
 }
 
 fn paintNewSession(c: *const Chrome, p: *Painter, r: Rect) void {
