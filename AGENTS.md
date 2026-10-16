@@ -28,4 +28,5 @@ zig build test
 - The reader thread must never call anything that waits on the UI thread
   (SendMessage, SetWindowTextW); use PostMessage.
 - Check `deferred.md` before building adjacent features; keep it current.
-- Commits: one-line conventional commits, only when asked.
+- Commits: one line, `module: description` (e.g. `renderer: ...`,
+  `input: ...`), only when asked.
