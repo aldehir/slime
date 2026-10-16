@@ -81,6 +81,8 @@ d2d_context: *d2d1.IDeviceContext,
 /// The back buffer as a Direct2D target. Released with `rtv`.
 d2d_target: ?*d2d1.IBitmap1 = null,
 brush: *d2d1.ISolidColorBrush,
+/// The app icon, for the title bar. Null where Direct2D can't draw SVG.
+icon: ?Painter.Icon = null,
 
 /// GPU copies of one terminal's kitty images (see `image.Images`), by
 /// kitty image ID. Each terminal needs its own: image IDs are per
@@ -220,6 +222,7 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
         .d2d_device = d2d.device,
         .d2d_context = d2d.context,
         .brush = d2d.brush,
+        .icon = Painter.Icon.init(d2d.context, @embedFile("slime-small.svg")),
     };
     try self.createRenderTarget();
     self.updateRefreshRate();
@@ -236,6 +239,7 @@ pub fn deinit(self: *D3D11) void {
     self.context.clearState();
     self.d2d_context.setTarget(null);
     com.releaseOpt(&self.d2d_target);
+    if (self.icon) |icon| icon.deinit();
     (D2d{ .factory = self.d2d_factory, .device = self.d2d_device, .context = self.d2d_context, .brush = self.brush }).deinit();
     com.release(self.image_placement);
     com.releaseOpt(&self.atlas_srv);
@@ -425,7 +429,7 @@ fn drawGrid(self: *D3D11, f: Frame) Error!void {
 fn paintUi(self: *D3D11, ui: anytype) Error!void {
     const d2d = self.d2d_context;
     d2d.beginDraw();
-    var painter: Painter = .{ .ctx = d2d, .factory = self.d2d_factory, .brush = self.brush };
+    var painter: Painter = .{ .ctx = d2d, .factory = self.d2d_factory, .brush = self.brush, .icon = self.icon };
     ui.paint(&painter);
     try com.check(d2d.endDraw(), "ID2D1DeviceContext::EndDraw");
 }

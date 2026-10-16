@@ -12,6 +12,33 @@ ctx: *d2d1.IDeviceContext,
 factory: *d2d1.IFactory1,
 /// One brush, recolored for each primitive.
 brush: *d2d1.ISolidColorBrush,
+icon: ?Icon = null,
+
+/// An SVG image parsed once, drawn at any size.
+pub const Icon = struct {
+    ctx: *d2d1.IDeviceContext5,
+    doc: *d2d1.ISvgDocument,
+    /// The SVG's width and height, which it's parsed at and scaled from.
+    size: f32,
+
+    /// Parse `svg`, whose root is 1024 x 1024. Null if Direct2D can't
+    /// draw SVG (before Windows 10 1703) or the SVG doesn't parse.
+    pub fn init(ctx: *d2d1.IDeviceContext, svg: []const u8) ?Icon {
+        const size = 1024;
+        const ctx5 = com.query(ctx, d2d1.IDeviceContext5) orelse return null;
+        var doc: ?*d2d1.ISvgDocument = null;
+        defer if (doc == null) com.release(ctx5);
+        const stream = win32.SHCreateMemStream(svg.ptr, @intCast(svg.len)) orelse return null;
+        defer com.release(stream);
+        com.check(ctx5.createSvgDocument(stream, .{ .width = size, .height = size }, &doc), "ID2D1DeviceContext5::CreateSvgDocument") catch return null;
+        return .{ .ctx = ctx5, .doc = doc.?, .size = size };
+    }
+
+    pub fn deinit(self: Icon) void {
+        com.release(self.doc);
+        com.release(self.ctx);
+    }
+};
 
 /// Straight (not premultiplied) RGBA.
 pub const Color = [4]f32;
@@ -116,6 +143,15 @@ pub fn cornerMask(self: *Painter, x: f32, y: f32, radius: f32, c: Color) void {
 pub fn text(self: *Painter, str: []const u16, format: *dwrite.ITextFormat, r: Rect, c: Color) void {
     if (str.len == 0 or r.w <= 0) return;
     self.ctx.drawText(str, format, &r.d2d(), self.color(c), d2d1.DRAW_TEXT_OPTIONS_CLIP);
+}
+
+/// Draw the app icon scaled to the square `r`, if there is one.
+pub fn appIcon(self: *Painter, r: Rect) void {
+    const icon = self.icon orelse return;
+    const s = r.w / icon.size;
+    icon.ctx.setTransform(&.{ s, 0, 0, s, r.x, r.y });
+    icon.ctx.drawSvgDocument(icon.doc);
+    icon.ctx.setTransform(&.{ 1, 0, 0, 1, 0, 0 });
 }
 
 pub fn pushClip(self: *Painter, r: Rect) void {

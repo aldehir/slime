@@ -468,6 +468,10 @@ pub extern "user32" fn SetClipboardData(u32, ?HANDLE) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn GetClipboardData(u32) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn IsClipboardFormatAvailable(u32) callconv(.winapi) BOOL;
 
+pub const IStream = extern struct { vtable: com.VTable };
+
+pub extern "shlwapi" fn SHCreateMemStream(?[*]const u8, u32) callconv(.winapi) ?*IStream;
+
 pub extern "dwmapi" fn DwmGetCompositionTimingInfo(?HWND, *DWM_TIMING_INFO) callconv(.winapi) HRESULT;
 pub extern "dwmapi" fn DwmSetWindowAttribute(HWND, u32, *const anyopaque, u32) callconv(.winapi) HRESULT;
 

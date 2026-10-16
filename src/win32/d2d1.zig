@@ -180,6 +180,35 @@ pub const IDeviceContext = extern struct {
     }
 };
 
+/// ID2D1DeviceContext5 (Windows 10 1703+), for SVG. Its slots are from
+/// the Windows SDK's d2d1_3.h; Zig's mingw headers stop at
+/// ID2D1DeviceContext3.
+pub const IDeviceContext5 = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0x7836d248,
+        .data2 = 0x68cc,
+        .data3 = 0x4df6,
+        .data4 = .{ 0xb9, 0xe8, 0xde, 0x99, 0x1b, 0xf6, 0x2e, 0xb7 },
+    };
+
+    /// A 3x2 matrix, row major: m11 m12 m21 m22 dx dy.
+    pub fn setTransform(self: *IDeviceContext5, m: *const [6]f32) void {
+        com.call(self, 30, fn (*const [6]f32) void, .{m});
+    }
+
+    pub fn createSvgDocument(self: *IDeviceContext5, stream: *win32.IStream, viewport: SIZE_F, out: *?*ISvgDocument) HRESULT {
+        return com.call(self, 115, fn (*win32.IStream, SIZE_F, *?*ISvgDocument) HRESULT, .{ stream, viewport, out });
+    }
+
+    pub fn drawSvgDocument(self: *IDeviceContext5, doc: *ISvgDocument) void {
+        com.call(self, 116, fn (*ISvgDocument) void, .{doc});
+    }
+};
+
+pub const ISvgDocument = extern struct { vtable: com.VTable };
+
 pub const IBitmap1 = extern struct { vtable: com.VTable };
 
 pub const ISolidColorBrush = extern struct {

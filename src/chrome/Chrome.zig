@@ -88,6 +88,9 @@ pub const View = struct {
 pub const Layout = struct {
     window: Rect,
     titlebar: Rect,
+    /// The app icon, at the far left. Part of the caption: it moves the
+    /// window.
+    icon: Rect,
     toggle: Rect,
     /// The title bar between the toggle and the caption buttons.
     title: Rect,
@@ -135,10 +138,13 @@ pub fn layout(self: *const Chrome, width: f32, height: f32) Layout {
     const close: Rect = .{ .x = width - button_w, .w = button_w, .h = bar_h };
     const maximize: Rect = .{ .x = close.x - button_w, .w = button_w, .h = bar_h };
     const minimize: Rect = .{ .x = maximize.x - button_w, .w = button_w, .h = bar_h };
-    const toggle: Rect = .{ .w = self.px(40), .h = bar_h };
+    const icon_size = self.px(18);
+    const icon: Rect = .{ .x = self.px(12), .y = @round((bar_h - icon_size) / 2), .w = icon_size, .h = icon_size };
+    const toggle: Rect = .{ .x = icon.right() + self.px(6), .w = self.px(40), .h = bar_h };
     var l: Layout = .{
         .window = .{ .w = width, .h = height },
         .titlebar = .{ .w = width, .h = bar_h },
+        .icon = icon,
         .toggle = toggle,
         .title = .{ .x = toggle.right(), .w = @max(0, minimize.x - toggle.right()), .h = bar_h },
         .minimize = minimize,
@@ -196,6 +202,7 @@ pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const Vi
         inline else => |m| Impl(m).paint(self, p, l, view),
     }
     if (l.corner > 0) p.cornerMask(l.terminal.x, l.terminal.y, l.corner, self.theme.ground);
+    p.appIcon(l.icon);
     self.paintToggle(p, l, view);
     self.paintCaptionButtons(p, l, view);
 }
@@ -421,7 +428,8 @@ test "layout and hit testing" {
     var l = chrome.layout(1000, 600);
     try std.testing.expectEqual(Hit.close, chrome.hitTest(&l, &view, 999, 5));
     try std.testing.expectEqual(Hit.caption, chrome.hitTest(&l, &view, 500, 5));
-    try std.testing.expectEqual(Hit.toggle_mode, chrome.hitTest(&l, &view, 5, 5));
+    try std.testing.expectEqual(Hit.toggle_mode, chrome.hitTest(&l, &view, l.toggle.x + 1, 5));
+    try std.testing.expectEqual(Hit.caption, chrome.hitTest(&l, &view, l.icon.x + 1, l.icon.y + 1));
     try std.testing.expectEqual(Hit.terminal, chrome.hitTest(&l, &view, l.terminal.x + 1, l.terminal.y + 1));
     try std.testing.expect(l.list.w > 0 and l.terminal.x == l.list.right());
 
