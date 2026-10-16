@@ -64,7 +64,7 @@ func knownHostsFile(t *testing.T, lines ...string) string {
 	return path
 }
 
-func newHarness(t *testing.T, srv *sshtest.Server, knownHosts string) *harness {
+func newHarness(t *testing.T, srv *sshtest.Server, knownHosts string, mods ...func(*Options)) *harness {
 	t.Helper()
 	h := &harness{
 		t:        t,
@@ -80,6 +80,9 @@ func newHarness(t *testing.T, srv *sshtest.Server, knownHosts string) *harness {
 		Dest:       Destination{User: "alde", Host: "127.0.0.1", Port: srv.Port()},
 		KnownHosts: []string{knownHosts},
 		OpenPipes:  h.openPipes,
+	}
+	for _, mod := range mods {
+		mod(&opts)
 	}
 	go func() {
 		h.serveErr <- Serve(opts, ctlInR, ctlOutW)

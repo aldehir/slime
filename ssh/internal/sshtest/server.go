@@ -4,6 +4,7 @@
 package sshtest
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
@@ -23,7 +24,8 @@ import (
 )
 
 type Options struct {
-	// Password is accepted by password auth, or by the first Duo round.
+	// Password is accepted by password auth, or by the first Duo round
+	// (which is skipped without one).
 	Password string
 	// Duo replaces password auth with keyboard-interactive shaped like
 	// pam_duo's: a password round, then a passcode-or-option menu that
@@ -31,6 +33,11 @@ type Options struct {
 	Duo bool
 	// PushDelay is how long a Duo push takes to be approved.
 	PushDelay time.Duration
+	// AuthorizedKeys log in by public key.
+	AuthorizedKeys []ssh.PublicKey
+	// KeyThenDuo requires an authorized key and then the Duo prompts,
+	// like sshd's AuthenticationMethods publickey,keyboard-interactive.
+	KeyThenDuo bool
 	// MaxSessions limits open session channels per server, like sshd's
 	// MaxSessions. Zero is unlimited.
 	MaxSessions int
@@ -75,10 +82,16 @@ func Start(opts Options) (*Server, error) {
 		conns:  map[net.Conn]struct{}{},
 	}
 	s.config = &ssh.ServerConfig{}
-	if opts.Duo {
+	switch {
+	case opts.KeyThenDuo:
+		s.config.PublicKeyCallback = s.keyThenDuo
+	case opts.Duo:
 		s.config.KeyboardInteractiveCallback = s.duo
-	} else {
+	default:
 		s.config.PasswordCallback = s.password
+	}
+	if len(opts.AuthorizedKeys) > 0 && !opts.KeyThenDuo {
+		s.config.PublicKeyCallback = s.publicKey
 	}
 	if opts.Banner != "" {
 		s.config.BannerCallback = func(ssh.ConnMetadata) string { return opts.Banner }
@@ -145,6 +158,24 @@ func (s *Server) password(_ ssh.ConnMetadata, pw []byte) (*ssh.Permissions, erro
 	return nil, nil
 }
 
+func (s *Server) publicKey(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	for _, k := range s.opts.AuthorizedKeys {
+		if bytes.Equal(k.Marshal(), key.Marshal()) {
+			return nil, nil
+		}
+	}
+	return nil, errors.New("unknown key")
+}
+
+func (s *Server) keyThenDuo(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	if _, err := s.publicKey(conn, key); err != nil {
+		return nil, err
+	}
+	return nil, &ssh.PartialSuccessError{
+		Next: ssh.ServerAuthCallbacks{KeyboardInteractiveCallback: s.duo},
+	}
+}
+
 const duoMenu = `Duo two-factor login for %s
 
 Enter a passcode or select one of the following options:
@@ -154,14 +185,16 @@ Enter a passcode or select one of the following options:
 Passcode or option (1-1): `
 
 func (s *Server) duo(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-	ans, err := client("", "", []string{"Password: "}, []bool{false})
-	if err != nil {
-		return nil, err
+	if s.opts.Password != "" {
+		ans, err := client("", "", []string{"Password: "}, []bool{false})
+		if err != nil {
+			return nil, err
+		}
+		if len(ans) != 1 || ans[0] != s.opts.Password {
+			return nil, errors.New("wrong password")
+		}
 	}
-	if len(ans) != 1 || ans[0] != s.opts.Password {
-		return nil, errors.New("wrong password")
-	}
-	ans, err = client("", "", []string{fmt.Sprintf(duoMenu, conn.User())}, []bool{true})
+	ans, err := client("", "", []string{fmt.Sprintf(duoMenu, conn.User())}, []bool{true})
 	if err != nil {
 		return nil, err
 	}

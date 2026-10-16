@@ -33,6 +33,7 @@ func newCommand() *cobra.Command {
 		port           int
 		login          string
 		knownHosts     []string
+		identities     []string
 		connectTimeout time.Duration
 	)
 	cmd := &cobra.Command{
@@ -64,23 +65,32 @@ func newCommand() *cobra.Command {
 					return err
 				}
 			}
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return err
+			}
+			sshDir := filepath.Join(home, ".ssh")
 			if len(knownHosts) == 0 {
-				home, err := os.UserHomeDir()
-				if err != nil {
-					return err
+				knownHosts = []string{filepath.Join(sshDir, "known_hosts")}
+			}
+			if len(identities) == 0 {
+				for _, name := range []string{"id_rsa", "id_ecdsa", "id_ed25519"} {
+					identities = append(identities, filepath.Join(sshDir, name))
 				}
-				knownHosts = []string{filepath.Join(home, ".ssh", "known_hosts")}
 			}
 			return helper.Serve(helper.Options{
 				Dest:           dest,
 				KnownHosts:     knownHosts,
 				ConnectTimeout: connectTimeout,
+				Identities:     identities,
+				DialAgent:      helper.DialAgent,
 			}, os.Stdin, os.Stdout)
 		},
 	}
 	f := cmd.Flags()
 	f.IntVarP(&port, "port", "p", 22, "port to connect to")
 	f.StringVarP(&login, "login", "l", "", "user to log in as")
+	f.StringArrayVarP(&identities, "identity", "i", nil, "private key file to offer after the agent's keys; repeatable (default ~/.ssh/id_rsa, id_ecdsa, id_ed25519)")
 	f.StringSliceVar(&knownHosts, "known-hosts", nil, "known_hosts files; new keys go to the first (default ~/.ssh/known_hosts)")
 	f.DurationVar(&connectTimeout, "connect-timeout", 0, "TCP connect timeout (default: the system's)")
 	// stdout is the control pipe, so help and version go to stderr.

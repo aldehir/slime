@@ -30,6 +30,11 @@ type Options struct {
 	KnownHosts []string
 	// ConnectTimeout bounds the TCP connect. Zero is the system's.
 	ConnectTimeout time.Duration
+	// Identities are private key files to offer, after the agent's
+	// keys. Missing files are skipped.
+	Identities []string
+	// DialAgent connects to an SSH agent. Nil means no agent.
+	DialAgent func() (io.ReadWriteCloser, error)
 	// OpenPipes turns the handle values in an Open into the channel's
 	// pipes: the user's input to read and the remote's output to
 	// write. Nil means they are Windows handles in this process.
@@ -316,7 +321,12 @@ func (s *Server) connect(ch *channel) {
 			s.finish(nil, "cancelled")
 			return
 		}
-		p.Print(fmt.Sprintf("slime-ssh: %v\n", err))
+		var denied *deniedError
+		if errors.As(err, &denied) {
+			p.Print(denied.Error() + "\n")
+		} else {
+			p.Print(fmt.Sprintf("slime-ssh: %v\n", err))
+		}
 		s.finish(fmt.Errorf("connecting to %s: %w", s.opts.Dest.Addr(), err), err.Error())
 		return
 	}
@@ -357,9 +367,12 @@ func (s *Server) dial(p *prompt.Prompter) (*ssh.Client, error) {
 		conn.Close()
 		return nil, err
 	}
+	signers, closeAgent := agentSigners(s.opts.DialAgent)
+	defer closeAgent()
+	auth := newAuthenticator(p, d, signers, loadKeys(s.opts.Identities, signers))
 	config := &ssh.ClientConfig{
 		User:              d.User,
-		Auth:              authMethods(p, d),
+		AuthCallback:      auth.callback,
 		HostKeyCallback:   check,
 		HostKeyAlgorithms: algos,
 		BannerCallback: func(msg string) error {
@@ -372,35 +385,6 @@ func (s *Server) dial(p *prompt.Prompter) (*ssh.Client, error) {
 		return nil, err
 	}
 	return ssh.NewClient(c, chans, reqs), nil
-}
-
-func authMethods(p *prompt.Prompter, d Destination) []ssh.AuthMethod {
-	interactive := func(name, instruction string, questions []string, echos []bool) ([]string, error) {
-		for _, text := range []string{name, instruction} {
-			if text != "" {
-				if !strings.HasSuffix(text, "\n") {
-					text += "\n"
-				}
-				p.Print(text)
-			}
-		}
-		answers := make([]string, len(questions))
-		for i, q := range questions {
-			a, err := p.ReadLine(q, echos[i])
-			if err != nil {
-				return nil, err
-			}
-			answers[i] = a
-		}
-		return answers, nil
-	}
-	password := func() (string, error) {
-		return p.ReadLine(fmt.Sprintf("%s@%s's password: ", d.User, d.Host), false)
-	}
-	return []ssh.AuthMethod{
-		ssh.RetryableAuthMethod(ssh.KeyboardInteractive(interactive), 3),
-		ssh.RetryableAuthMethod(ssh.PasswordCallback(password), 3),
-	}
 }
 
 // start opens ch's session channel with a pty and a shell, then copies
