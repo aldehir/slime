@@ -17,11 +17,18 @@ const RGB = ghostty_vt.color.RGB;
 /// Shader constants. Must match `Uniforms` in shaders.hlsl, including
 /// HLSL's 16-byte register packing.
 pub const Uniforms = extern struct {
-    screen_size: [2]f32,
+    default_bg: [4]f32,
+    viewport_origin: [2]f32,
+    viewport_size: [2]f32,
     cell_size: [2]f32,
     grid_size: [2]u32,
     grid_offset: [2]f32,
-    default_bg: [4]f32,
+    /// Constant buffers are a whole number of registers.
+    _pad: [2]f32 = .{ 0, 0 },
+
+    comptime {
+        std.debug.assert(@sizeOf(Uniforms) % 16 == 0);
+    }
 };
 
 /// One quad. Must match `Instance` in shaders.hlsl.
@@ -340,12 +347,15 @@ pub const Cells = struct {
         self.row_cache.clearRetainingCapacity();
     }
 
-    pub fn uniforms(self: *const Cells, m: font.Grid.Metrics, screen_width: u32, screen_height: u32, offset: [2]f32) Uniforms {
+    /// `viewport` is x, y, width, height in render target pixels, and
+    /// `offset` the grid's top-left within it.
+    pub fn uniforms(self: *const Cells, m: font.Grid.Metrics, viewport: [4]f32, offset: [2]f32) Uniforms {
         return .{
-            .screen_size = .{ @floatFromInt(screen_width), @floatFromInt(screen_height) },
+            .viewport_origin = .{ viewport[0], viewport[1] },
+            .viewport_size = .{ viewport[2], viewport[3] },
             .cell_size = .{ @floatFromInt(m.cell_width), @floatFromInt(m.cell_height) },
             .grid_size = .{ self.cols, self.rows },
-            .grid_offset = offset,
+            .grid_offset = .{ viewport[0] + offset[0], viewport[1] + offset[1] },
             .default_bg = toFloat(self.default_bg),
         };
     }

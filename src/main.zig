@@ -24,13 +24,7 @@ pub fn main(init: std.process.Init) !void {
     const command_line = try shellCommand(init.gpa, config.command);
     defer init.gpa.free(command_line);
 
-    const window = try Window.create(
-        init.gpa,
-        init.io,
-        &config,
-        std.unicode.utf8ToUtf16LeStringLiteral("slime"),
-        command_line,
-    );
+    const window = try Window.create(init.gpa, init.io, &config, command_line);
     defer window.destroy();
 
     // Handle every pending message (input first) before drawing, so a
@@ -152,6 +146,10 @@ test {
     _ = win32;
     _ = Window;
     _ = Config;
+    _ = @import("Session.zig");
+    _ = @import("chrome/Chrome.zig");
+    _ = @import("chrome/sidebar.zig");
+    _ = @import("renderer/Painter.zig");
     _ = @import("font/font.zig");
     _ = @import("input.zig");
 }

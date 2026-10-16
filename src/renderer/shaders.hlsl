@@ -8,14 +8,18 @@
 //      rectangles (cursor, underline, strikethrough), blended with
 //      premultiplied alpha.
 //
+// Everything is drawn into a viewport, the window's terminal area, which
+// clips it. Positions are in render target pixels, as SV_Position is.
+//
 // Layouts must match `Uniforms` and `Instance` in cells.zig.
 
 cbuffer Uniforms : register(b0) {
-    float2 screen_size;
+    float4 default_bg;
+    float2 viewport_origin;
+    float2 viewport_size;
     float2 cell_size;
     uint2 grid_size;
     float2 grid_offset;
-    float4 default_bg;
 };
 
 struct Instance {
@@ -37,11 +41,11 @@ float4 unpack(uint c) {
 }
 
 float4 to_ndc(float2 px) {
-    return float4(px / screen_size * float2(2, -2) + float2(-1, 1), 0, 1);
+    return float4((px - viewport_origin) / viewport_size * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 
 float4 bg_vs(uint id : SV_VertexID) : SV_Position {
-    // (0,0), (2,0), (0,2) in UV space covers the screen with one triangle.
+    // (0,0), (2,0), (0,2) in UV space covers the viewport with one triangle.
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }

@@ -1,5 +1,6 @@
 //! Direct3D 11 renderer: device, flip-model swap chain, and the terminal
-//! grid pipeline (see shaders.hlsl) for a single window.
+//! grid pipeline (see shaders.hlsl) for a single window. The window's
+//! chrome is drawn over the grid with Direct2D, on the same device.
 //!
 //! Frames are presented without vsync and gated twice (see `frameGate`):
 //! by a timer, so we draw at most once per display refresh, and by the
@@ -18,9 +19,11 @@ const com = win32.com;
 const d3d11 = win32.d3d11;
 const d3dcompiler = win32.d3dcompiler;
 const dxgi = win32.dxgi;
+const d2d1 = win32.d2d1;
 const font = @import("../font/font.zig");
 const cells = @import("cells.zig");
 const image = @import("image.zig");
+pub const Painter = @import("Painter.zig");
 
 const log = std.log.scoped(.d3d11);
 
@@ -71,8 +74,26 @@ atlas_generation: u64 = 0,
 
 /// The placement being drawn (see `drawImages`).
 image_placement: *d3d11.IBuffer,
-/// GPU copies of the images in `image.Images`, by kitty image ID.
-image_textures: std.AutoArrayHashMapUnmanaged(u32, ImageTexture) = .empty,
+
+d2d_factory: *d2d1.IFactory1,
+d2d_device: *d2d1.IDevice,
+d2d_context: *d2d1.IDeviceContext,
+/// The back buffer as a Direct2D target. Released with `rtv`.
+d2d_target: ?*d2d1.IBitmap1 = null,
+brush: *d2d1.ISolidColorBrush,
+
+/// GPU copies of one terminal's kitty images (see `image.Images`), by
+/// kitty image ID. Each terminal needs its own: image IDs are per
+/// terminal, and pixels are freed once uploaded, so these are the only
+/// copies.
+pub const ImageTextures = struct {
+    map: std.AutoArrayHashMapUnmanaged(u32, ImageTexture) = .empty,
+
+    pub fn deinit(self: *ImageTextures, alloc: std.mem.Allocator) void {
+        for (self.map.values()) |t| t.deinit();
+        self.map.deinit(alloc);
+    }
+};
 
 const ImageTexture = struct {
     texture: *d3d11.ITexture2D,
@@ -82,6 +103,19 @@ const ImageTexture = struct {
         com.release(self.srv);
         com.release(self.texture);
     }
+};
+
+/// What to draw of a terminal, and where.
+pub const Frame = struct {
+    cells: *const cells.Cells,
+    images: *image.Images,
+    textures: *ImageTextures,
+    atlas: *const font.Atlas,
+    metrics: font.Grid.Metrics,
+    /// The terminal's part of the window, which clips it.
+    viewport: Painter.Rect,
+    /// The grid's top-left in the viewport.
+    grid_offset: [2]f32,
 };
 
 pub const Error = com.Error;
@@ -166,6 +200,9 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
     }, &image_placement), "ID3D11Device::CreateBuffer(image placement)");
     errdefer com.releaseOpt(&image_placement);
 
+    const d2d = try createD2d(device.?);
+    errdefer d2d.deinit();
+
     var self: D3D11 = .{
         .device = device.?,
         .context = context.?,
@@ -179,6 +216,10 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
         .pipeline = pipeline,
         .uniforms = uniforms.?,
         .image_placement = image_placement.?,
+        .d2d_factory = d2d.factory,
+        .d2d_device = d2d.device,
+        .d2d_context = d2d.context,
+        .brush = d2d.brush,
     };
     try self.createRenderTarget();
     self.updateRefreshRate();
@@ -191,10 +232,11 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
     return self;
 }
 
-pub fn deinit(self: *D3D11, alloc: std.mem.Allocator) void {
+pub fn deinit(self: *D3D11) void {
     self.context.clearState();
-    for (self.image_textures.values()) |t| t.deinit();
-    self.image_textures.deinit(alloc);
+    self.d2d_context.setTarget(null);
+    com.releaseOpt(&self.d2d_target);
+    (D2d{ .factory = self.d2d_factory, .device = self.d2d_device, .context = self.d2d_context, .brush = self.brush }).deinit();
     com.release(self.image_placement);
     com.releaseOpt(&self.atlas_srv);
     com.releaseOpt(&self.atlas_texture);
@@ -297,6 +339,8 @@ pub fn resize(self: *D3D11, width: u32, height: u32) Error!void {
     // ResizeBuffers, including the ones bound to the pipeline.
     self.context.clearState();
     com.releaseOpt(&self.rtv);
+    self.d2d_context.setTarget(null);
+    com.releaseOpt(&self.d2d_target);
 
     try com.check(
         self.swap_chain.resizeBuffers(0, width, height, .UNKNOWN, self.swap_chain_flags),
@@ -307,62 +351,32 @@ pub fn resize(self: *D3D11, width: u32, height: u32) Error!void {
     try self.createRenderTarget();
 }
 
-/// Draw the grid and present. Waits for the swap chain first unless
+/// Draw the terminal, then `ui` over it, and present. `ui` has a
+/// `paint(*Painter)` method. Waits for the swap chain first unless
 /// `waitForFrame` or `frameAcquired` already did.
-pub fn draw(
-    self: *D3D11,
-    alloc: std.mem.Allocator,
-    frame: *const cells.Cells,
-    images: *image.Images,
-    atlas: *const font.Atlas,
-    metrics: font.Grid.Metrics,
-    grid_offset: [2]f32,
-) error{ DeviceLost, HResult }!void {
+pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error{ DeviceLost, HResult }!void {
     const rtv = self.rtv orelse return;
     const ctx = self.context;
     self.waitForFrame();
 
-    try self.uploadAtlas(atlas);
-    try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(frame.bg.items));
-    try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(frame.instances.items));
-    try self.uploadImages(alloc, images);
+    try self.uploadAtlas(f.atlas);
+    try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.bg.items));
+    try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.instances.items));
+    try self.uploadImages(alloc, f.images, f.textures);
 
-    const uniforms = frame.uniforms(metrics, self.width, self.height, grid_offset);
+    const v = f.viewport;
+    const uniforms = f.cells.uniforms(f.metrics, .{ v.x, v.y, v.w, v.h }, f.grid_offset);
     var mapped: d3d11.MAPPED_SUBRESOURCE = undefined;
     try com.check(ctx.map(self.uniforms.resource(), d3d11.MAP_WRITE_DISCARD, &mapped), "Map(uniforms)");
     @as(*cells.Uniforms, @ptrCast(@alignCast(mapped.pData.?))).* = uniforms;
     ctx.unmap(self.uniforms.resource());
 
+    // Direct2D shares the context and leaves its own state bound.
+    ctx.clearState();
     ctx.omSetRenderTargets(&.{rtv});
-    ctx.rsSetViewports(&.{.{
-        .Width = @floatFromInt(self.width),
-        .Height = @floatFromInt(self.height),
-    }});
     ctx.clearRenderTargetView(rtv, &uniforms.default_bg);
-    try self.drawImages(images, .below_bg);
-
-    if (frame.bg.items.len > 0) {
-        ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx.vsSetShader(self.pipeline.bg_vs);
-        ctx.psSetShader(self.pipeline.bg_ps);
-        ctx.psSetConstantBuffers(0, &.{self.uniforms});
-        ctx.psSetShaderResources(0, &.{self.bg_cells.srv});
-        ctx.omSetBlendState(self.pipeline.blend);
-        ctx.draw(3, 0);
-    }
-    try self.drawImages(images, .below_text);
-
-    if (frame.instances.items.len > 0) {
-        ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        ctx.vsSetShader(self.pipeline.text_vs);
-        ctx.vsSetConstantBuffers(0, &.{self.uniforms});
-        ctx.vsSetShaderResources(1, &.{self.instances.srv});
-        ctx.psSetShader(self.pipeline.text_ps);
-        ctx.psSetShaderResources(2, &.{self.atlas_srv});
-        ctx.omSetBlendState(self.pipeline.blend);
-        ctx.drawInstanced(4, @intCast(frame.instances.items.len), 0, 0);
-    }
-    try self.drawImages(images, .above_text);
+    if (v.w >= 1 and v.h >= 1) try self.drawGrid(f);
+    try self.paintUi(ui);
 
     self.frame_acquired = false;
     self.frame_started = false;
@@ -374,9 +388,51 @@ pub fn draw(
     try com.check(hr, "IDXGISwapChain::Present");
 }
 
+/// The grid's passes, with kitty images before, between, and after them,
+/// clipped to the viewport.
+fn drawGrid(self: *D3D11, f: Frame) Error!void {
+    const ctx = self.context;
+    const frame = f.cells;
+    const images = f.images;
+    const v = f.viewport;
+    ctx.rsSetViewports(&.{.{ .TopLeftX = v.x, .TopLeftY = v.y, .Width = v.w, .Height = v.h }});
+    try self.drawImages(images, f.textures, .below_bg);
+
+    if (frame.bg.items.len > 0) {
+        ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx.vsSetShader(self.pipeline.bg_vs);
+        ctx.psSetShader(self.pipeline.bg_ps);
+        ctx.psSetConstantBuffers(0, &.{self.uniforms});
+        ctx.psSetShaderResources(0, &.{self.bg_cells.srv});
+        ctx.omSetBlendState(self.pipeline.blend);
+        ctx.draw(3, 0);
+    }
+    try self.drawImages(images, f.textures, .below_text);
+
+    if (frame.instances.items.len > 0) {
+        ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        ctx.vsSetShader(self.pipeline.text_vs);
+        ctx.vsSetConstantBuffers(0, &.{self.uniforms});
+        ctx.vsSetShaderResources(1, &.{self.instances.srv});
+        ctx.psSetShader(self.pipeline.text_ps);
+        ctx.psSetShaderResources(2, &.{self.atlas_srv});
+        ctx.omSetBlendState(self.pipeline.blend);
+        ctx.drawInstanced(4, @intCast(frame.instances.items.len), 0, 0);
+    }
+    try self.drawImages(images, f.textures, .above_text);
+}
+
+fn paintUi(self: *D3D11, ui: anytype) Error!void {
+    const d2d = self.d2d_context;
+    d2d.beginDraw();
+    var painter: Painter = .{ .ctx = d2d, .factory = self.d2d_factory, .brush = self.brush };
+    ui.paint(&painter);
+    try com.check(d2d.endDraw(), "ID2D1DeviceContext::EndDraw");
+}
+
 /// Draw one layer of kitty images, each placement a quad with its image
 /// bound (see shaders.hlsl).
-fn drawImages(self: *D3D11, images: *const image.Images, layer: image.Layer) Error!void {
+fn drawImages(self: *D3D11, images: *const image.Images, textures: *const ImageTextures, layer: image.Layer) Error!void {
     const start, const end = images.layer(layer);
     if (start == end) return;
     const ctx = self.context;
@@ -387,7 +443,7 @@ fn drawImages(self: *D3D11, images: *const image.Images, layer: image.Layer) Err
     ctx.psSetSamplers(0, &.{self.pipeline.image_sampler});
     ctx.omSetBlendState(self.pipeline.blend);
     for (images.placements.items[start..end], images.placement_ids.items[start..end]) |p, id| {
-        const tex = self.image_textures.get(id) orelse continue;
+        const tex = textures.map.get(id) orelse continue;
         var mapped: d3d11.MAPPED_SUBRESOURCE = undefined;
         try com.check(ctx.map(self.image_placement.resource(), d3d11.MAP_WRITE_DISCARD, &mapped), "Map(image placement)");
         @as(*image.Placement, @ptrCast(@alignCast(mapped.pData.?))).* = p;
@@ -428,24 +484,24 @@ fn uploadAtlas(self: *D3D11, atlas: *const font.Atlas) Error!void {
 
 /// Mirror the snapshot's images on the GPU: upload new or changed images,
 /// freeing their pixels, and release textures of images no longer in it.
-fn uploadImages(self: *D3D11, alloc: std.mem.Allocator, images: *image.Images) Error!void {
+fn uploadImages(self: *D3D11, alloc: std.mem.Allocator, images: *image.Images, textures: *ImageTextures) Error!void {
     var i: usize = 0;
-    while (i < self.image_textures.count()) {
-        if (images.images.contains(self.image_textures.keys()[i])) {
+    while (i < textures.map.count()) {
+        if (images.images.contains(textures.map.keys()[i])) {
             i += 1;
             continue;
         }
-        self.image_textures.values()[i].deinit();
-        self.image_textures.swapRemoveAt(i);
+        textures.map.values()[i].deinit();
+        textures.map.swapRemoveAt(i);
     }
 
     var it = images.images.iterator();
     while (it.next()) |kv| {
         const img = kv.value_ptr;
         const rgba = img.rgba orelse continue;
-        const gop = self.image_textures.getOrPut(alloc, kv.key_ptr.*) catch return error.HResult;
+        const gop = textures.map.getOrPut(alloc, kv.key_ptr.*) catch return error.HResult;
         if (gop.found_existing) gop.value_ptr.deinit();
-        errdefer self.image_textures.swapRemoveAt(gop.index);
+        errdefer textures.map.swapRemoveAt(gop.index);
 
         var texture: ?*d3d11.ITexture2D = null;
         try com.check(self.device.createTexture2D(&.{
@@ -469,6 +525,8 @@ fn uploadImages(self: *D3D11, alloc: std.mem.Allocator, images: *image.Images) E
 }
 
 fn createRenderTarget(self: *D3D11) Error!void {
+    // With the flip model, buffer 0 is always the one being drawn, so
+    // both targets follow the swap chain as it flips.
     var back_buffer: ?*d3d11.ITexture2D = null;
     try com.check(
         self.swap_chain.getBuffer(0, &d3d11.ITexture2D.iid, @ptrCast(&back_buffer)),
@@ -480,6 +538,61 @@ fn createRenderTarget(self: *D3D11) Error!void {
         self.device.createRenderTargetView(back_buffer.?.resource(), &self.rtv),
         "ID3D11Device::CreateRenderTargetView",
     );
+
+    const surface = com.query(back_buffer.?, dxgi.ISurface) orelse {
+        log.err("back buffer has no IDXGISurface", .{});
+        return error.HResult;
+    };
+    defer com.release(surface);
+    try com.check(self.d2d_context.createBitmapFromDxgiSurface(surface, &.{
+        .pixelFormat = .{ .format = buffer_format, .alphaMode = d2d1.ALPHA_MODE_IGNORE },
+        .bitmapOptions = d2d1.BITMAP_OPTIONS_TARGET | d2d1.BITMAP_OPTIONS_CANNOT_DRAW,
+    }, &self.d2d_target), "ID2D1DeviceContext::CreateBitmapFromDxgiSurface");
+    self.d2d_context.setTarget(self.d2d_target);
+}
+
+const D2d = struct {
+    factory: *d2d1.IFactory1,
+    device: *d2d1.IDevice,
+    context: *d2d1.IDeviceContext,
+    brush: *d2d1.ISolidColorBrush,
+
+    fn deinit(self: D2d) void {
+        com.release(self.brush);
+        com.release(self.context);
+        com.release(self.device);
+        com.release(self.factory);
+    }
+};
+
+/// A Direct2D device context on our D3D device, which was created with
+/// BGRA support for this. Its DPI stays at 96, so it draws in pixels.
+fn createD2d(device: *d3d11.IDevice) Error!D2d {
+    var factory: ?*d2d1.IFactory1 = null;
+    try com.check(
+        d2d1.D2D1CreateFactory(d2d1.FACTORY_TYPE_SINGLE_THREADED, &d2d1.IFactory1.iid, null, @ptrCast(&factory)),
+        "D2D1CreateFactory",
+    );
+    errdefer com.releaseOpt(&factory);
+
+    const dxgi_device = com.query(device, dxgi.IDevice) orelse {
+        log.err("device has no IDXGIDevice", .{});
+        return error.HResult;
+    };
+    defer com.release(dxgi_device);
+    var d2d_device: ?*d2d1.IDevice = null;
+    try com.check(factory.?.createDevice(dxgi_device, &d2d_device), "ID2D1Factory1::CreateDevice");
+    errdefer com.releaseOpt(&d2d_device);
+
+    var context: ?*d2d1.IDeviceContext = null;
+    try com.check(d2d_device.?.createDeviceContext(0, &context), "ID2D1Device::CreateDeviceContext");
+    errdefer com.releaseOpt(&context);
+    context.?.setTextAntialiasMode(d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE);
+
+    var brush: ?*d2d1.ISolidColorBrush = null;
+    try com.check(context.?.createSolidColorBrush(&.{ 0, 0, 0, 1 }, &brush), "ID2D1DeviceContext::CreateSolidColorBrush");
+
+    return .{ .factory = factory.?, .device = d2d_device.?, .context = context.?, .brush = brush.? };
 }
 
 fn createDevice(device: *?*d3d11.IDevice, context: *?*d3d11.IDeviceContext) Error!void {

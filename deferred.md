@@ -3,11 +3,29 @@
 Features and fixes we've chosen to leave for later, and why. Move an
 item out when it's done.
 
+## Chrome
+
+The window draws its own title bar and session list (`src/chrome/`) with
+Direct2D over the terminal. The list has two layouts behind the title
+bar's toggle: a sidebar, which is done, and tabs, which isn't.
+
+- **Tabs in the title bar.** `chrome/tabs.zig` lays out the title bar
+  alone; the tabs (titles, close buttons, overflow) aren't drawn.
+- **Sidebar scrolling.** Rows past the bottom are clipped.
+- **Reordering, renaming,** and a context menu on rows.
+- **Closing a window with several sessions** doesn't ask.
+- **A session whose child exits** closes its row at once, whatever the
+  exit status. The mockups keep a failed one open with its status.
+- **Keyboard access** to the chrome (focusing the list, UI Automation),
+  a key for the toggle, and jumping to a session by number.
+- **The chrome's colors** are fixed and dark. They should follow the
+  theme or the system's light mode.
+- **Remembering the layout** (sidebar or tabs) and the sidebar width.
+
 ## Needs app chrome
 
-We have no UI beyond the terminal grid yet (no menus, dialogs, toasts, or
-settings). Rather than piecemeal it with MessageBox and the like, these
-wait until there is a proper design for it.
+These wait for UI on top of the chrome (menus, dialogs, banners) rather
+than being piecemealed with MessageBox and the like.
 
 - **Clipboard access prompts.** `clipboard-read` and `clipboard-write`
   accept `ask`, Ghostty's default for reads, but treat it as `deny`.

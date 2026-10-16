@@ -8,6 +8,7 @@ pub const dxgi = @import("dxgi.zig");
 pub const d3d11 = @import("d3d11.zig");
 pub const d3dcompiler = @import("d3dcompiler.zig");
 pub const dwrite = @import("dwrite.zig");
+pub const d2d1 = @import("d2d1.zig");
 pub const conpty = @import("conpty.zig");
 
 pub const BOOL = i32;
@@ -128,6 +129,18 @@ pub const DWM_TIMING_INFO = extern struct {
     }
 };
 
+pub const NCCALCSIZE_PARAMS = extern struct {
+    rgrc: [3]RECT,
+    lppos: ?*anyopaque,
+};
+
+pub const TRACKMOUSEEVENT = extern struct {
+    cbSize: u32 = @sizeOf(TRACKMOUSEEVENT),
+    dwFlags: u32,
+    hwndTrack: HWND,
+    dwHoverTime: u32 = 0,
+};
+
 pub const WAITORTIMERCALLBACK = *const fn (?*anyopaque, u8) callconv(.winapi) void;
 
 pub const WNDPROC = *const fn (HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
@@ -172,6 +185,14 @@ pub const WM_PAINT = 0x000F;
 pub const WM_CLOSE = 0x0010;
 pub const WM_ERASEBKGND = 0x0014;
 pub const WM_NCCREATE = 0x0081;
+pub const WM_NCCALCSIZE = 0x0083;
+pub const WM_NCHITTEST = 0x0084;
+pub const WM_NCMOUSEMOVE = 0x00A0;
+pub const WM_NCLBUTTONDOWN = 0x00A1;
+pub const WM_NCLBUTTONUP = 0x00A2;
+pub const WM_NCLBUTTONDBLCLK = 0x00A3;
+pub const WM_NCMOUSELEAVE = 0x02A2;
+pub const WM_MOUSELEAVE = 0x02A3;
 pub const WM_KEYDOWN = 0x0100;
 pub const WM_KEYUP = 0x0101;
 pub const WM_CHAR = 0x0102;
@@ -205,11 +226,22 @@ pub const WM_APP = 0x8000;
 pub const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 pub const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x00200000;
 pub const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
+pub const SW_MAXIMIZE = 3;
+pub const SW_MINIMIZE = 6;
+pub const SW_RESTORE = 9;
 pub const SW_SHOWDEFAULT = 10;
 pub const GWLP_USERDATA = -21;
 pub const SIZE_MINIMIZED = 1;
+pub const SWP_NOSIZE = 0x0001;
+pub const SWP_NOMOVE = 0x0002;
 pub const SWP_NOZORDER = 0x0004;
 pub const SWP_NOACTIVATE = 0x0010;
+pub const SWP_FRAMECHANGED = 0x0020;
+pub const SM_CXFRAME = 32;
+pub const SM_CYFRAME = 33;
+pub const SM_CXPADDEDBORDER = 92;
+pub const TME_LEAVE = 0x00000002;
+pub const TME_NONCLIENT = 0x00000010;
 // Cursor resource IDs (MAKEINTRESOURCE values, which aren't u16-aligned).
 pub const IDC_ARROW: usize = 32512;
 pub const IDC_IBEAM: usize = 32513;
@@ -224,7 +256,16 @@ pub const IDC_NO: usize = 32648;
 pub const IDC_HAND: usize = 32649;
 pub const IDC_APPSTARTING: usize = 32650;
 pub const IDC_HELP: usize = 32651;
+// WM_NCHITTEST results
+pub const HTNOWHERE = 0;
 pub const HTCLIENT = 1;
+pub const HTCAPTION = 2;
+pub const HTMINBUTTON = 8;
+pub const HTMAXBUTTON = 9;
+pub const HTTOP = 12;
+pub const HTTOPLEFT = 13;
+pub const HTTOPRIGHT = 14;
+pub const HTCLOSE = 20;
 pub const USER_DEFAULT_SCREEN_DPI = 96;
 
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
@@ -273,6 +314,9 @@ pub const VK_SHIFT = 0x10;
 pub const VK_CONTROL = 0x11;
 pub const VK_MENU = 0x12;
 pub const VK_CAPITAL = 0x14;
+pub const VK_TAB = 0x09;
+pub const VK_PRIOR = 0x21;
+pub const VK_NEXT = 0x22;
 pub const VK_INSERT = 0x2D;
 pub const VK_LWIN = 0x5B;
 pub const VK_RWIN = 0x5C;
@@ -319,6 +363,7 @@ pub extern "kernel32" fn GetModuleHandleW(?LPCWSTR) callconv(.winapi) ?HINSTANCE
 pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 pub extern "kernel32" fn QueryPerformanceCounter(*i64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn QueryPerformanceFrequency(*i64) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 pub extern "kernel32" fn CreateEventW(?*anyopaque, BOOL, BOOL, ?LPCWSTR) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn SetEvent(HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreateWaitableTimerExW(?*anyopaque, ?LPCWSTR, u32, u32) callconv(.winapi) ?HANDLE;
@@ -383,6 +428,9 @@ pub extern "user32" fn DestroyWindow(HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn DefWindowProcW(HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 pub extern "user32" fn ShowWindow(HWND, i32) callconv(.winapi) BOOL;
 pub extern "user32" fn SetWindowPos(HWND, ?HWND, i32, i32, i32, i32, u32) callconv(.winapi) BOOL;
+pub extern "user32" fn IsZoomed(HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn GetSystemMetricsForDpi(i32, u32) callconv(.winapi) i32;
+pub extern "user32" fn TrackMouseEvent(*TRACKMOUSEEVENT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn ValidateRect(HWND, ?*const RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn SetWindowLongPtrW(HWND, i32, isize) callconv(.winapi) isize;
@@ -407,6 +455,7 @@ pub extern "user32" fn ToUnicodeEx(u32, u32, *const [256]u8, [*]u16, i32, u32, ?
 pub extern "user32" fn SetCapture(HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetCursorPos(*POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn SetCursor(?HCURSOR) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn SystemParametersInfoW(u32, u32, ?*anyopaque, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn GetMessageTime() callconv(.winapi) i32;

@@ -1,10 +1,11 @@
-//! A top-level Win32 window showing one terminal. Heap allocated so that
-//! its address can be stored in the HWND's user data, and so the stream's
-//! pointer to `terminal` stays valid.
+//! A top-level Win32 window: our own title bar and session list (see
+//! `Chrome`) around the active session's terminal. Heap allocated so that
+//! its address can be stored in the HWND's user data.
 //!
-//! A reader thread feeds the child's output to the stream; the UI thread
-//! renders and handles input. `lock` guards `terminal` and `stream`
-//! between them.
+//! The window draws its own title bar. WM_NCCALCSIZE gives the caption's
+//! space to the client area, keeping the other borders, and WM_NCHITTEST
+//! tells Windows which parts of it move the window and which are caption
+//! buttons, so dragging, snapping, and Snap Layouts still work.
 const Window = @This();
 
 const std = @import("std");
@@ -13,14 +14,14 @@ const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const font = @import("font/font.zig");
 const input = @import("input.zig");
-const Pty = @import("Pty.zig");
 const clipboard = @import("clipboard.zig");
 const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
+const Session = @import("Session.zig");
+const Chrome = @import("chrome/Chrome.zig");
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
-const Cells = @import("renderer/cells.zig").Cells;
-const Images = @import("renderer/image.zig").Images;
+const Painter = Renderer.Painter;
 
 const log = std.log.scoped(.window);
 
@@ -29,31 +30,23 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("slime");
 /// The icon resource in src/slime.rc.
 const icon_id = 1;
 
-/// Posted from a thread pool wait when the child process exits.
-const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
-/// Posted from the reader thread when the child sets the title.
-const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
-/// Posted from the reader thread when the child writes the clipboard.
-const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
+/// Posted from a thread pool wait when a session's child exits. WPARAM
+/// is the session's ID, as for the messages below.
+pub const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
+/// Posted from a reader thread when the child sets the title.
+pub const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
+/// Posted from a reader thread when the child writes the clipboard.
+pub const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
 
-/// libghostty-vt's limit on a title, in bytes, which is at least as
-/// many UTF-16 units.
-const max_title_len = 1024;
 /// Room for the stats report after the title, in UTF-16 units.
 const max_stats_len = 160;
-
-const StreamHandler = @FieldType(ghostty_vt.TerminalStream, "handler");
-const MouseButton = ghostty_vt.input.MouseButton;
-const MouseAction = ghostty_vt.input.MouseAction;
-const MouseEvent = ghostty_vt.input.MouseEncodeEvent;
-const MouseEncodeOptions = ghostty_vt.input.MouseEncodeOptions;
 
 const stats_timer_id = 1;
 /// Draws pending output while DefWindowProc's modal move/size loop runs
 /// instead of ours.
 const sizemove_timer_id = 2;
 /// Scrolls the viewport while a selection drag is above or below it.
-const autoscroll_timer_id = 3;
+pub const autoscroll_timer_id = 3;
 /// Blinks the cursor while the window has focus.
 const blink_timer_id = 4;
 
@@ -63,52 +56,48 @@ const cursor_hold_ms = 4;
 /// How long synchronized output (mode 2026) can hold frames back before
 /// we reset it, Ghostty's `sync_reset_ms`.
 const sync_hold_ms = 1000;
+/// How long after a resize output from a background session isn't
+/// activity: ConPTY redraws on every resize.
+const resize_quiet_ms = 500;
 
 alloc: Allocator,
+io: std.Io,
 /// Outlives the window.
 config: *const Config,
+/// What new sessions run, in CreateProcessW syntax. Outlives the window.
+command_line: []const u16,
 hwnd: ?win32.HWND = null,
-/// Shown while the child hasn't set a title.
-app_title: [:0]const u16,
-/// The child's title (OSC 0/2). Empty for none.
-title_buf: [max_title_len]u16 = undefined,
-title_len: usize = 0,
-/// Set while a WM_APP_TITLE_CHANGED is queued, so a child that retitles
-/// rapidly posts one message rather than flooding the queue.
-title_pending: std.atomic.Value(bool) = .init(false),
-/// A clipboard write from the child (OSC 52) for the UI thread to make.
-/// Writing on the reader thread could deadlock: emptying the clipboard
-/// sends a message to its previous owner, which is often us. Empty
-/// clears the clipboard. Guarded by `lock`.
-clipboard_write: ?[]u8 = null,
 /// The last stats report, shown after the title.
 stats_text: [max_stats_len]u16 = undefined,
 stats_len: usize = 0,
 dpi: u32 = win32.USER_DEFAULT_SCREEN_DPI,
 
+/// Shared by every session: they all draw at the same size.
 grid: font.Grid,
-lock: win32.SRWLOCK = .{},
-terminal: ghostty_vt.Terminal,
-stream: ghostty_vt.TerminalStream,
-render_state: ghostty_vt.RenderState = .empty,
-cells: Cells = .{},
-images: Images = .{},
+chrome: Chrome,
+/// Where everything is, from the last `layout`.
+chrome_layout: Chrome.Layout = undefined,
 
 /// Set last during creation; messages sent during CreateWindowExW
 /// (WM_SIZE, etc.) arrive before everything else is ready.
 renderer: ?Renderer = null,
 
-pty: ?Pty = null,
-reader: ?std.Thread = null,
-exit_wait: ?win32.HANDLE = null,
+/// Never empty once created: closing the last session closes the window.
+sessions: std.ArrayList(*Session) = .empty,
+/// The session shown and given input.
+active: usize = 0,
+next_session_id: u32 = 1,
+/// Scratch for `view`, with room for every session.
+view_sessions: std.ArrayList(Chrome.View.Session) = .empty,
 
-/// Auto-reset event the reader thread sets after feeding output to the
-/// terminal. The message loop waits on it alongside messages and calls
-/// `outputArrived`. Not a posted message: those are retrieved before input
-/// and timers, so a steady stream of them starves the keyboard.
+/// Auto-reset event every session's reader thread sets after feeding
+/// output to its terminal. The message loop waits on it alongside
+/// messages and calls `outputArrived`. Not a posted message: those are
+/// retrieved before input and timers, so a steady stream of them starves
+/// the keyboard.
 output_event: win32.HANDLE,
 
-/// The terminal changed since the last frame. UI thread only.
+/// Something changed since the last frame. UI thread only.
 dirty: bool = false,
 
 /// Why frames are being held back, if they are. `hold_timer` fires when
@@ -125,37 +114,23 @@ focused: bool = false,
 /// The on phase of the cursor blink.
 blink_visible: bool = true,
 
-/// The first half of a surrogate pair from a lone WM_CHAR.
-high_surrogate: ?u16 = null,
-
-/// win32-input-mode (mode 9001): send keys as Win32 key events. Whoever
-/// is on the other end of the VT stream asks for it, which in practice
-/// is a ConPTY (ours, or a remote Windows host's), so it follows the
-/// stream rather than the transport. Guarded by `lock`.
-win32_input: bool = false,
-
-/// The cell the last mouse event was reported in, so motion within one
-/// cell is reported once.
-mouse_cell: ?ghostty_vt.Coordinate = null,
-
-/// Wheel rotation not yet turned into scrolling, vertical then
-/// horizontal, in 1/WHEEL_DELTA notches times the lines per notch.
-wheel_remainder: [2]i32 = .{ 0, 0 },
-
-/// Click, drag, and multi-click state for selecting text with the left
-/// button. Guarded by `lock`.
-selection: ghostty_vt.SelectionGesture = .init,
-
-/// A left button drag is selecting text rather than being reported.
-selecting: bool = false,
-
-/// Where the selection drag last was, in client coordinates, for
-/// autoscroll ticks.
-drag_pos: win32.POINT = .{ .x = 0, .y = 0 },
-
 /// The virtual key of the last key binding run, so its release isn't
 /// sent to the child either.
 bound_key: ?u32 = null,
+
+/// A mouse button went down over the terminal, which then gets the mouse
+/// until every button is up.
+mouse_in_terminal: bool = false,
+/// The session a middle click went down on, to close it on release.
+middle_pressed: ?usize = null,
+/// TrackMouseEvent is armed for the mouse leaving the client area, and
+/// for leaving the caption buttons.
+tracking_mouse: bool = false,
+tracking_nc_mouse: bool = false,
+
+/// Output from background sessions before this tick count isn't
+/// activity. See `resize_quiet_ms`.
+quiet_until: u64 = 0,
 
 /// Only used with `-Dstats`.
 stats: Stats = .{},
@@ -168,15 +143,9 @@ const Hold = enum {
     sync,
 };
 
-/// Create the window and run `command_line` (CreateProcessW syntax;
-/// modified in place) in it.
-pub fn create(
-    alloc: Allocator,
-    io: std.Io,
-    config: *const Config,
-    title: [:0]const u16,
-    command_line: win32.LPWSTR,
-) !*Window {
+/// Create the window with one session running `command_line`
+/// (CreateProcessW syntax).
+pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line: []const u16) !*Window {
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
 
@@ -195,13 +164,13 @@ pub fn create(
     errdefer _ = win32.CloseHandle(hold_timer);
     self.* = .{
         .alloc = alloc,
+        .io = io,
         .config = config,
-        .app_title = title,
+        .command_line = command_line,
         .output_event = output_event,
         .hold_timer = hold_timer,
         .grid = undefined,
-        .terminal = undefined,
-        .stream = undefined,
+        .chrome = undefined,
     };
 
     // WS_EX_NOREDIRECTIONBITMAP: we present through a flip-model swap
@@ -209,7 +178,7 @@ pub fn create(
     _ = win32.CreateWindowExW(
         win32.WS_EX_NOREDIRECTIONBITMAP,
         class_name,
-        title.ptr,
+        class_name,
         win32.WS_OVERLAPPEDWINDOW,
         win32.CW_USEDEFAULT,
         win32.CW_USEDEFAULT,
@@ -229,71 +198,23 @@ pub fn create(
     self.dpi = win32.GetDpiForWindow(hwnd);
     self.grid = try .init(alloc, io, config.@"font-family".items, config.@"font-size", self.dpi);
     errdefer self.grid.deinit();
+    self.chrome = try .init(self.dpi);
+    errdefer self.chrome.deinit();
 
     const size = self.clientSize();
-    const grid_size = self.gridSize(size.width, size.height);
-    self.terminal = try .init(io, alloc, .{
-        .cols = grid_size.cols,
-        .rows = grid_size.rows,
-        // Defaults that OSC 4/10/11/12 override and their resets return
-        // to. A cursor colored from its cell is resolved when drawing.
-        .colors = .{
-            .background = .init(config.background),
-            .foreground = .init(config.foreground),
-            .cursor = if (config.@"cursor-color") |c| switch (c) {
-                .color => |rgb| .init(rgb),
-                else => .unset,
-            } else .unset,
-            .palette = try .init(alloc, config.palette.colors),
-        },
-        // Mode 2027: cluster multi-codepoint graphemes (emoji sequences,
-        // combining marks) into one cell, as the Ghostty app does.
-        .default_modes = .{ .grapheme_cluster = true },
-        // Null blinks, as Ghostty does by default, including after a
-        // DECSCUSR 0, RIS, or DECSTR. Mode 12 and DECSCUSR change it.
-        .default_cursor_blink = null,
-    });
-    errdefer self.terminal.deinit(alloc);
-    // Init takes no pixel size, and kitty images and pixel size reports
-    // need one before the first resize.
-    try self.terminal.resize(alloc, .{
-        .cols = grid_size.cols,
-        .rows = grid_size.rows,
-        .cell_size_px = self.cellSizePx(),
-    });
-    // An arrow until the child asks for another shape with OSC 22. An
-    // I-beam (Ghostty's default) looks wrong over TUIs. An empty OSC 22
-    // still resets it to the I-beam.
-    self.terminal.mouse_shape = .default;
-    self.stream = self.terminal.vtStream();
-    errdefer self.stream.deinit();
-    self.stream.handler.effects.write_pty = &writePty;
-    self.stream.handler.effects.device_attributes = &deviceAttributes;
-    self.stream.handler.effects.title_changed = &titleChanged;
-    self.stream.handler.effects.clipboard_write = &clipboardWrite;
-    self.stream.handler.effects.clipboard_read = &clipboardRead;
-    self.stream.handler.unknown_sequence = &unknownSequence;
-
+    self.updateLayout(size);
     self.renderer = try Renderer.init(hwnd, size.width, size.height);
     errdefer {
-        self.renderer.?.deinit(self.alloc);
+        self.renderer.?.deinit();
         self.renderer = null;
     }
 
-    self.pty = try .spawn(command_line, grid_size.cols, grid_size.rows);
-    errdefer self.stopPty();
-    self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
+    try self.spawnSession();
+    errdefer self.destroySessions();
+    self.showTitle();
 
-    var wait: win32.HANDLE = undefined;
-    if (win32.RegisterWaitForSingleObject(
-        &wait,
-        self.pty.?.process,
-        onChildExited,
-        hwnd,
-        win32.INFINITE,
-        win32.WT_EXECUTEONLYONCE,
-    ) == 0) return win32.lastError("RegisterWaitForSingleObject");
-    self.exit_wait = wait;
+    // Have the frame recomputed now that WM_NCCALCSIZE can be answered.
+    _ = win32.SetWindowPos(hwnd, null, 0, 0, 0, 0, win32.SWP_FRAMECHANGED | win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
 
     if (build_options.stats) {
         self.stats = .init();
@@ -307,21 +228,108 @@ pub fn create(
 /// Free the window. The HWND must already be destroyed (the message
 /// loop has exited).
 pub fn destroy(self: *Window) void {
-    self.stopPty();
     if (self.renderer) |*r| {
-        r.deinit(self.alloc);
-        self.cells.deinit(self.alloc);
-        self.images.deinit(self.alloc);
-        self.render_state.deinit(self.alloc);
-        self.selection.deinit(&self.terminal);
-        self.stream.deinit();
-        self.terminal.deinit(self.alloc);
+        // Sessions hold GPU resources.
+        self.destroySessions();
+        r.deinit();
+        self.chrome.deinit();
         self.grid.deinit();
     }
-    if (self.clipboard_write) |text| self.alloc.free(text);
+    self.view_sessions.deinit(self.alloc);
     _ = win32.CloseHandle(self.output_event);
     _ = win32.CloseHandle(self.hold_timer);
     self.alloc.destroy(self);
+}
+
+fn destroySessions(self: *Window) void {
+    for (self.sessions.items) |s| s.destroy();
+    self.sessions.clearAndFree(self.alloc);
+}
+
+pub fn activeSession(self: *const Window) *Session {
+    return self.sessions.items[self.active];
+}
+
+fn sessionIndex(self: *const Window, id: u32) ?usize {
+    for (self.sessions.items, 0..) |s, i| {
+        if (s.id == id) return i;
+    }
+    return null;
+}
+
+/// Start a session running the window's command, and show it.
+fn spawnSession(self: *Window) !void {
+    try self.sessions.ensureUnusedCapacity(self.alloc, 1);
+    try self.view_sessions.ensureTotalCapacity(self.alloc, self.sessions.items.len + 1);
+    const grid_size = self.gridSize();
+    const s = try Session.create(self, self.next_session_id, self.command_line, grid_size.cols, grid_size.rows);
+    self.next_session_id +%= 1;
+    self.sessions.appendAssumeCapacity(s);
+    if (self.sessions.items.len > 1) self.activate(self.sessions.items.len - 1);
+}
+
+fn newSession(self: *Window) void {
+    self.spawnSession() catch |err| log.err("new session failed: {}", .{err});
+}
+
+/// Close session `i`, killing what runs in it. Closing the last one
+/// closes the window.
+fn closeSession(self: *Window, i: usize) void {
+    if (self.sessions.items.len <= 1) {
+        _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
+        return;
+    }
+    const was_active = i == self.active;
+    if (was_active) self.deactivate();
+    const s = self.sessions.orderedRemove(i);
+    s.destroy();
+    // Rows moved under the mouse.
+    _ = self.chrome.setHover(.none);
+    self.middle_pressed = null;
+    if (i < self.active) {
+        self.active -= 1;
+    } else if (was_active) {
+        self.active = @min(i, self.sessions.items.len - 1);
+        self.activated();
+    }
+    self.dirty = true;
+}
+
+/// Show session `i` and give it input.
+fn activate(self: *Window, i: usize) void {
+    if (i == self.active or i >= self.sessions.items.len) return;
+    self.deactivate();
+    self.active = i;
+    self.activated();
+}
+
+/// Let go of the active session before switching away from it.
+fn deactivate(self: *Window) void {
+    const s = self.activeSession();
+    if (self.mouse_in_terminal) _ = win32.ReleaseCapture();
+    self.mouse_in_terminal = false;
+    s.cancelSelection();
+    if (self.focused) s.reportFocus(false);
+}
+
+/// Take up the session that just became active.
+fn activated(self: *Window) void {
+    const s = self.activeSession();
+    s.activity = false;
+    s.unseen.store(false, .release);
+    if (self.focused) s.reportFocus(true);
+    // Holds were for the last session's updates.
+    self.hold = .none;
+    self.cursor_shown = false;
+    self.resetBlink();
+    self.showTitle();
+    self.dirty = true;
+}
+
+/// Show the next or previous session, wrapping around.
+fn cycle(self: *Window, forward: bool) void {
+    const n = self.sessions.items.len;
+    self.activate(if (forward) (self.active + 1) % n else (self.active + n - 1) % n);
 }
 
 /// The message loop's view of frame pacing: when `output_event` fires,
@@ -329,8 +337,17 @@ pub fn destroy(self: *Window) void {
 /// pass it to `frameGateFired` when it fires. Drawing then happens at most
 /// once per display refresh, and right away when the terminal was idle.
 pub fn outputArrived(self: *Window) void {
-    self.dirty = true;
-    self.updateHold();
+    const quiet = win32.GetTickCount64() < self.quiet_until;
+    for (self.sessions.items, 0..) |s, i| {
+        if (!s.unseen.swap(false, .acq_rel)) continue;
+        if (i == self.active) {
+            self.dirty = true;
+            self.updateHold();
+        } else if (!s.activity and !quiet) {
+            s.activity = true;
+            self.dirty = true;
+        }
+    }
 }
 
 pub fn needsFrame(self: *const Window) bool {
@@ -360,10 +377,11 @@ pub fn frameGateFired(self: *Window, gate: win32.HANDLE) void {
 /// arrive in separate reads; drawing between them flashes a frame
 /// without the cursor on every key.
 fn updateHold(self: *Window) void {
-    self.lockTerminal();
-    const sync = self.terminal.modes.get(.synchronized_output);
-    const cursor_hidden = !self.terminal.modes.get(.cursor_visible);
-    self.unlockTerminal();
+    const s = self.activeSession();
+    s.lockTerminal();
+    const sync = s.terminal.modes.get(.synchronized_output);
+    const cursor_hidden = !s.terminal.modes.get(.cursor_visible);
+    s.unlockTerminal();
 
     const hold: Hold = if (sync) .sync else if (cursor_hidden and self.cursor_shown) .cursor else .none;
     if (hold == self.hold) return;
@@ -389,225 +407,20 @@ fn holdExpired(self: *Window) void {
         // Ghostty resets the mode too, so a child that never ends its
         // update can't freeze the screen.
         .sync => {
-            self.lockTerminal();
-            self.terminal.modes.set(.synchronized_output, false);
-            self.unlockTerminal();
+            const s = self.activeSession();
+            s.lockTerminal();
+            s.terminal.modes.set(.synchronized_output, false);
+            s.unlockTerminal();
         },
     }
     self.hold = .none;
 }
 
-/// Close the pseudoconsole, wait for the reader to drain it, and kill
-/// whatever is left of the child's process tree.
-fn stopPty(self: *Window) void {
-    if (self.exit_wait) |wait| {
-        // INVALID_HANDLE_VALUE: wait for a running callback to finish.
-        _ = win32.UnregisterWaitEx(wait, win32.INVALID_HANDLE_VALUE);
-        self.exit_wait = null;
-    }
-    const pty = &(self.pty orelse return);
-    pty.close();
-    if (self.reader) |t| t.join();
-    self.reader = null;
-    pty.deinit();
-    self.pty = null;
-}
-
-fn lockTerminal(self: *Window) void {
-    win32.AcquireSRWLockExclusive(&self.lock);
-}
-
-fn unlockTerminal(self: *Window) void {
-    win32.ReleaseSRWLockExclusive(&self.lock);
-}
-
-/// Reader thread: feed child output to the terminal until EOF, which
-/// comes when the pseudoconsole is closed.
-fn readLoop(self: *Window) void {
-    var buf: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = self.pty.?.read(&buf) catch break;
-        if (n == 0) break;
-
-        self.lockTerminal();
-        self.stream.nextSlice(buf[0..n]);
-        self.unlockTerminal();
-        if (build_options.stats) _ = self.stats.bytes.fetchAdd(n, .monotonic);
-        _ = win32.SetEvent(self.output_event);
-    }
-}
-
-fn onChildExited(ctx: ?*anyopaque, _: u8) callconv(.winapi) void {
-    _ = win32.PostMessageW(@ptrCast(ctx), WM_APP_CHILD_EXITED, 0, 0);
-}
-
-/// Stream effect for query replies (DSR, DECRQM, ...). Runs on the
-/// reader thread with the terminal locked, so it must not wait on the
-/// UI thread.
-fn writePty(handler: *StreamHandler, data: []const u8) void {
-    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
-    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
-    if (self.pty) |*pty| pty.write(data);
-}
-
-/// Stream effect for OSC 0/2. Runs on the reader thread with the
-/// terminal locked, so it posts to the UI thread rather than calling
-/// SetWindowTextW, which waits on it.
-fn titleChanged(handler: *StreamHandler) void {
-    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
-    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
-    if (self.title_pending.swap(true, .acq_rel)) return;
-    _ = win32.PostMessageW(self.hwnd.?, WM_APP_TITLE_CHANGED, 0, 0);
-}
-
-/// Stream effect for OSC 52 and OSC 5522 writes. Runs on the reader
-/// thread with the terminal locked, so it hands the text to the UI
-/// thread. A write that arrives before the last one is made replaces it.
-fn clipboardWrite(handler: *StreamHandler, write: ghostty_vt.clipboard.Write) void {
-    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
-    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
-    const access = self.config.@"clipboard-write";
-    if (access != .allow) {
-        log.info("denied a clipboard write (clipboard-write = {t})", .{access});
-        return write.reply(.denied);
-    }
-    // Windows has one clipboard, so there's no selection or primary.
-    if (write.location != .standard) return write.reply(.unsupported);
-
-    // Text is the only representation we keep. No contents clears.
-    const text: []const u8 = if (write.contents.len == 0) "" else for (write.contents) |c| {
-        if (ghostty_vt.clipboard.isTextMime(c.mime)) break c.data;
-    } else return write.reply(.unsupported);
-
-    const copy = self.alloc.dupe(u8, text) catch return write.reply(.io_error);
-    if (self.clipboard_write) |pending| {
-        self.alloc.free(pending);
-    } else {
-        _ = win32.PostMessageW(self.hwnd.?, WM_APP_CLIPBOARD_WRITE, 0, 0);
-    }
-    self.clipboard_write = copy;
-    write.reply(.{ .success = .{} });
-}
-
-/// Make the child's pending clipboard write.
-fn clipboardWriteFlush(self: *Window) void {
-    self.lockTerminal();
-    const pending = self.clipboard_write;
-    self.clipboard_write = null;
-    self.unlockTerminal();
-
-    const text = pending orelse return;
-    defer self.alloc.free(text);
-    const result = if (text.len == 0) clipboard.clear(self.hwnd.?) else clipboard.set(self.hwnd.?, text);
-    result catch |err| log.warn("clipboard write failed: {}", .{err});
-}
-
-/// Stream effect for OSC 52 and OSC 5522 reads. Runs on the reader
-/// thread with the terminal locked, which is safe for reading: unlike
-/// writing, it sends our window no messages.
-fn clipboardRead(handler: *StreamHandler, read: ghostty_vt.clipboard.Read) void {
-    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
-    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
-    const access = self.config.@"clipboard-read";
-    if (access != .allow) {
-        log.info("denied a clipboard read (clipboard-read = {t})", .{access});
-        return read.reply(.denied);
-    }
-    if (read.location != .standard) return read.reply(.unsupported);
-
-    const text = clipboard.get(self.alloc, null) catch |err| {
-        log.warn("clipboard read failed: {}", .{err});
-        return read.reply(.busy);
-    };
-    defer if (text) |t| self.alloc.free(t);
-
-    // The text, under each text type asked for.
-    var contents: [8]ghostty_vt.clipboard.Content = undefined;
-    var n: usize = 0;
-    if (text) |t| for (read.mimes) |mime| {
-        if (n == contents.len) break;
-        if (!ghostty_vt.clipboard.isTextMime(mime)) continue;
-        contents[n] = .{ .mime = mime, .data = t };
-        n += 1;
-    };
-    read.reply(.{ .success = .{
-        .contents = contents[0..n],
-        .available = if (text != null) &.{"text/plain"} else &.{},
-    } });
-}
-
-/// ConPTY asks for DA1 at startup to learn what the terminal supports.
-fn deviceAttributes(_: *StreamHandler) ghostty_vt.device_attributes.Attributes {
-    return .{};
-}
-
-/// Encode a key message and send it to the child.
-/// Track the modes libghostty-vt leaves to us. Runs on the reader thread
-/// with the terminal locked.
-fn unknownSequence(handler: *StreamHandler, seq: StreamHandler.UnknownSequence) void {
-    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
-    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
-    switch (seq) {
-        .mode => |m| if (m.mode == 9001 and !m.ansi) {
-            self.win32_input = m.enabled;
-        },
-        else => {},
-    }
-}
-
-fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
-    // TranslateMessage already posted the WM_(SYS)CHAR / WM_(SYS)DEADCHAR
-    // messages this key produced. Take them so the key and its text are
-    // encoded together, as one event.
-    var utf16: [16]u16 = undefined;
-    var len: usize = 0;
-    var composing = false;
-    if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) {
-        var m: win32.MSG = undefined;
-        while (len < utf16.len) {
-            if (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) == 0 and
-                win32.PeekMessageW(&m, self.hwnd, win32.WM_SYSCHAR, win32.WM_SYSDEADCHAR, win32.PM_REMOVE) == 0) break;
-            if (m.message == win32.WM_DEADCHAR or m.message == win32.WM_SYSDEADCHAR) {
-                composing = true;
-            } else {
-                utf16[len] = @truncate(m.wParam);
-                len += 1;
-            }
-        }
-    }
-    self.lockTerminal();
-    const win32_input = self.win32_input;
-    const opts: ghostty_vt.input.KeyEncodeOptions = .fromTerminal(&self.terminal);
-    self.unlockTerminal();
-    if (win32_input) return self.win32KeyInput(msg, wparam, lparam, utf16[0..len]);
-
-    var utf8: [64]u8 = undefined;
-    const text_len = std.unicode.utf16LeToUtf8(&utf8, utf16[0..len]) catch 0;
-    const event = input.keyEvent(msg, wparam, lparam, utf8[0..text_len], composing);
-
-    var buf: [128]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    ghostty_vt.input.encodeKey(&w, event, opts) catch |err| {
-        log.warn("key encode failed: {}", .{err});
-        return;
-    };
-    // Following fixterms, the legacy encoder leaves ctrl+[, ctrl+i, and
-    // ctrl+m to CSI u, which it only emits with the key's plain text, so
-    // they encode to nothing. Send the C0 byte Windows produced (ESC,
-    // TAB, CR), as xterm and Windows Terminal do.
-    if (w.buffered().len == 0 and event.action != .release and
-        text_len == 1 and std.ascii.isControl(utf8[0]))
-    {
-        w.writeByte(utf8[0]) catch unreachable;
-    }
-    if (w.buffered().len == 0) return;
-    if (event.action != .release and !event.key.modifier()) self.typed();
-    if (self.pty) |*pty| pty.write(w.buffered());
-}
-
-/// Run the key binding a key press triggers, Ghostty's defaults: copy
-/// with ctrl+shift+c (when there is a selection) or ctrl+insert, paste
-/// with ctrl+shift+v (when the clipboard has text) or shift+insert.
+/// Run the key binding a key press triggers, Ghostty's defaults where it
+/// has them: copy with ctrl+shift+c (when there is a selection) or
+/// ctrl+insert, paste with ctrl+shift+v (when the clipboard has text) or
+/// shift+insert, a new session with ctrl+shift+t, close it with
+/// ctrl+shift+w, and switch with ctrl+(shift+)tab or ctrl+page up/down.
 /// Returns true if the key is consumed, which also holds for the release
 /// of a key that ran a binding.
 fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
@@ -620,15 +433,25 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
 
     const mods = input.currentMods();
     if (mods.alt or mods.super) return false;
-    if (mods.ctrl and mods.shift and vk == 'C') {
-        if (!self.copySelection()) return false;
+    const s = self.activeSession();
+    const ctrl_shift = mods.ctrl and mods.shift;
+    if (ctrl_shift and vk == 'C') {
+        if (!s.copySelection()) return false;
     } else if (mods.ctrl and !mods.shift and vk == win32.VK_INSERT) {
-        _ = self.copySelection();
-    } else if (mods.ctrl and mods.shift and vk == 'V') {
+        _ = s.copySelection();
+    } else if (ctrl_shift and vk == 'V') {
         if (!clipboard.hasText()) return false;
-        self.paste();
+        s.paste();
     } else if (!mods.ctrl and mods.shift and vk == win32.VK_INSERT) {
-        self.paste();
+        s.paste();
+    } else if (ctrl_shift and vk == 'T') {
+        self.newSession();
+    } else if (ctrl_shift and vk == 'W') {
+        self.closeSession(self.active);
+    } else if (mods.ctrl and vk == win32.VK_TAB) {
+        self.cycle(!mods.shift);
+    } else if (mods.ctrl and !mods.shift and (vk == win32.VK_NEXT or vk == win32.VK_PRIOR)) {
+        self.cycle(vk == win32.VK_NEXT);
     } else return false;
 
     // Drop the text TranslateMessage posted for the key (ctrl+shift+c
@@ -639,122 +462,8 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
     return true;
 }
 
-/// Copy the selected text to the clipboard. Returns false if nothing is
-/// selected.
-fn copySelection(self: *Window) bool {
-    self.lockTerminal();
-    const screen = self.terminal.screens.active;
-    const sel = screen.selection orelse {
-        self.unlockTerminal();
-        return false;
-    };
-    const text = screen.selectionString(self.alloc, .{ .sel = sel });
-    self.unlockTerminal();
-
-    const utf8 = text catch |err| {
-        log.err("selection to text failed: {}", .{err});
-        return true;
-    };
-    defer self.alloc.free(utf8);
-    clipboard.set(self.hwnd.?, utf8) catch |err| log.err("copy failed: {}", .{err});
-    return true;
-}
-
-/// Send the clipboard's text to the child: bracketed if it asked for
-/// that (mode 2004), else with newlines as CR, as the enter key sends.
-/// Either way, control bytes that could signal the child or end the
-/// paste early (ESC, ^C, ...) become spaces.
-fn paste(self: *Window) void {
-    const text = (clipboard.get(self.alloc, self.hwnd.?) catch |err| {
-        log.err("paste failed: {}", .{err});
-        return;
-    }) orelse return;
-    defer self.alloc.free(text);
-    if (text.len == 0) return;
-
-    self.lockTerminal();
-    const opts: ghostty_vt.input.PasteOptions = .fromTerminal(&self.terminal);
-    self.unlockTerminal();
-    self.typed();
-    const parts = ghostty_vt.input.encodePaste(text, opts);
-    if (self.pty) |*pty| for (parts) |part| pty.write(part);
-}
-
-/// Send text from a WM_CHAR that no key message claimed: IME commits,
-/// alt+numpad codes, and VK_PACKET input from SendInput.
-fn charInput(self: *Window, unit: u16) void {
-    self.lockTerminal();
-    const win32_input = self.win32_input;
-    self.unlockTerminal();
-    if (win32_input) {
-        // A press and release of no key, carrying the text. Surrogate
-        // halves go as they come; the console pairs them.
-        var buf: [64]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        for ([_]bool{ true, false }) |down| {
-            (input.Win32KeyEvent{ .char = unit, .down = down }).encode(&w) catch unreachable;
-        }
-        self.typed();
-        if (self.pty) |*pty| pty.write(w.buffered());
-        return;
-    }
-
-    var units: [2]u16 = undefined;
-    const pair: []const u16 = if (std.unicode.utf16IsHighSurrogate(unit)) {
-        self.high_surrogate = unit;
-        return;
-    } else if (std.unicode.utf16IsLowSurrogate(unit)) pair: {
-        units = .{ self.high_surrogate orelse return, unit };
-        break :pair &units;
-    } else pair: {
-        units[0] = unit;
-        break :pair units[0..1];
-    };
-    self.high_surrogate = null;
-
-    var utf8: [8]u8 = undefined;
-    const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
-    self.typed();
-    if (self.pty) |*pty| pty.write(utf8[0..len]);
-}
-
-/// Send a key in win32-input-mode: one event per UTF-16 unit of text it
-/// produced, or one with no text.
-fn win32KeyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM, text: []const u16) void {
-    var buf: [1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    if (text.len == 0) {
-        const up = msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP;
-        const char = if (up) input.releaseChar(wparam, lparam) else 0;
-        input.Win32KeyEvent.fromKey(msg, wparam, lparam, char).encode(&w) catch unreachable;
-    }
-    for (text) |unit| {
-        input.Win32KeyEvent.fromKey(msg, wparam, lparam, unit).encode(&w) catch unreachable;
-    }
-    if ((msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) and !input.isModifier(wparam, lparam)) self.typed();
-    if (self.pty) |*pty| pty.write(w.buffered());
-}
-
-/// Drop the selection, bring the viewport back from scrollback, and show
-/// the cursor, as typing does.
-fn typed(self: *Window) void {
-    self.resetBlink();
-    self.lockTerminal();
-    defer self.unlockTerminal();
-    const screen = self.terminal.screens.active;
-    if (screen.selection != null) {
-        screen.clearSelection();
-        self.dirty = true;
-    }
-    if (screen.pages.viewport == .active) return;
-    self.terminal.scrollViewport(.bottom);
-    self.dirty = true;
-}
-
 /// Track keyboard focus: the cursor blinks only while focused and is a
-/// hollow block otherwise, and the child hears about it if it asked for
-/// focus events (mode 1004). ConPTY always asks, and passes them on to
-/// console programs as FOCUS_EVENT records.
+/// hollow block otherwise, and the active session's child hears about it.
 fn setFocus(self: *Window, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
@@ -764,20 +473,12 @@ fn setFocus(self: *Window, focused: bool) void {
     } else {
         _ = win32.KillTimer(self.hwnd, blink_timer_id);
     }
-
-    self.lockTerminal();
-    const report = self.terminal.modes.get(.focus_event);
-    self.unlockTerminal();
-    if (!report) return;
-    var buf: [ghostty_vt.input.max_focus_encode_size]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    ghostty_vt.input.encodeFocus(&w, if (focused) .gained else .lost) catch unreachable;
-    if (self.pty) |*pty| pty.write(w.buffered());
+    self.activeSession().reportFocus(focused);
 }
 
 /// Start the blink over in its on phase. Blinking follows the system's
 /// caret blink rate, and is off when the user turned caret blinking off.
-fn resetBlink(self: *Window) void {
+pub fn resetBlink(self: *Window) void {
     if (!self.blink_visible) {
         self.blink_visible = true;
         self.dirty = true;
@@ -796,265 +497,172 @@ fn blinkTick(self: *Window) void {
     self.blink_visible = !self.blink_visible;
     // Only redraw if the last frame's cursor blinks. One that starts
     // blinking later picks up the phase from here.
-    const cursor = self.render_state.cursor;
+    const cursor = self.activeSession().render_state.cursor;
     if (cursor.visible and cursor.blinking) self.dirty = true;
 }
 
-/// Report a mouse button press or release, or motion, to the child if it
-/// asked for mouse events.
-fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
-    const button: ?MouseButton, const action: MouseAction = if (input.mouseButton(msg, wparam)) |b|
-        .{ b[0], if (b[1]) .press else .release }
-    else
-        .{ input.heldButton(wparam), .motion };
-
-    // Capture the mouse while a button is down, so a drag past the edge
-    // still reports and the release comes back to us.
-    const held = input.heldButton(wparam) != null;
-    if (action == .press) {
-        _ = win32.SetCapture(self.hwnd.?);
-    } else if (action == .release and !held) {
-        _ = win32.ReleaseCapture();
+/// The chrome's view of the window's state.
+fn view(self: *Window) Chrome.View {
+    // `spawnSession` keeps room for every session.
+    self.view_sessions.clearRetainingCapacity();
+    for (self.sessions.items) |s| {
+        self.view_sessions.appendAssumeCapacity(.{ .title = s.title(), .activity = s.activity });
     }
-
-    self.lockTerminal();
-    // Shift selects even when the child asks for mouse events.
-    if (!self.selecting and button == .left and action == .press) {
-        if (self.terminal.flags.mouse_event != .none and wparam & win32.MK_SHIFT == 0) {
-            self.selection.reset(&self.terminal);
-        } else {
-            self.selecting = true;
-        }
-    }
-    if (self.selecting) {
-        defer self.unlockTerminal();
-        return self.selectionInput(msg, wparam, lparam);
-    }
-    var opts: MouseEncodeOptions = .fromTerminal(&self.terminal, self.surfaceSize());
-    self.unlockTerminal();
-    opts.any_button_pressed = held;
-    opts.last_cell = &self.mouse_cell;
-    self.mouseReport(.{
-        .action = action,
-        .button = button,
-        .mods = input.mouseMods(wparam),
-        .pos = .{
-            .x = @floatFromInt(win32.xLparam(lparam)),
-            .y = @floatFromInt(win32.yLparam(lparam)),
-        },
-    }, opts);
+    const bg = self.activeSession().cells.default_bg;
+    return .{
+        .sessions = self.view_sessions.items,
+        .active = self.active,
+        .focused = self.focused,
+        .maximized = win32.IsZoomed(self.hwnd.?) != 0,
+        .terminal_bg = Painter.rgb(@as(u24, bg.r) << 16 | @as(u24, bg.g) << 8 | bg.b),
+    };
 }
 
-/// Start, extend, or finish a selection with the left button: a click
-/// clears it, a drag selects cells (a rectangle with ctrl+alt), and
-/// double and triple clicks select words and lines. Call with the
-/// terminal locked.
-fn selectionInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
-    const t = &self.terminal;
+/// What's under a client position.
+fn hitAt(self: *Window, pos: win32.POINT) Chrome.Hit {
+    const v = self.view();
+    return self.chrome.hitTest(&self.chrome_layout, &v, @floatFromInt(pos.x), @floatFromInt(pos.y));
+}
+
+/// A client position relative to the terminal area.
+fn toTerminal(self: *const Window, pos: win32.POINT) win32.POINT {
+    const t = self.chrome_layout.terminal;
+    return .{ .x = pos.x - @as(i32, @intFromFloat(t.x)), .y = pos.y - @as(i32, @intFromFloat(t.y)) };
+}
+
+fn setHover(self: *Window, hit: Chrome.Hit) void {
+    if (self.chrome.setHover(hit)) self.dirty = true;
+}
+
+fn setPressed(self: *Window, hit: Chrome.Hit) void {
+    if (self.chrome.setPressed(hit)) self.dirty = true;
+}
+
+/// Handle a client area mouse message: the terminal gets it if a button
+/// went down there (until all are up) or it's over the terminal, and the
+/// chrome otherwise.
+fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
     const pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
-    const pin = t.screens.active.pages.pin(.{ .viewport = self.cellAt(pos) }) orelse return;
-    const sel: ?ghostty_vt.Selection = switch (msg) {
-        win32.WM_LBUTTONDOWN => self.selection.press(t, .{
-            .time = messageTime(),
-            .pin = pin,
-            .xpos = @floatFromInt(pos.x),
-            .ypos = @floatFromInt(pos.y),
-            .max_distance = @floatFromInt(self.grid.metrics.cell_width),
-            .repeat_interval = @as(u64, win32.GetDoubleClickTime()) * std.time.ns_per_ms,
-            .word_boundary_codepoints = self.config.@"selection-word-chars".codepoints,
-        }) catch |err| {
-            log.err("selection failed: {}", .{err});
-            return;
-        },
-        win32.WM_MOUSEMOVE => sel: {
-            if (wparam & win32.MK_LBUTTON == 0) return;
-            self.drag_pos = pos;
-            const sel = self.selection.drag(t, .{
-                .pin = pin,
-                .xpos = @floatFromInt(pos.x),
-                .ypos = @floatFromInt(pos.y),
-                .rectangle = rectangleSelect(),
-                .word_boundary_codepoints = self.config.@"selection-word-chars".codepoints,
-                .geometry = self.dragGeometry(),
-            });
-            self.updateAutoscroll();
-            break :sel sel;
+    const s = self.activeSession();
+    const held = input.heldButton(wparam) != null;
+    const press = if (input.mouseButton(msg, wparam)) |b| b[1] else false;
+
+    if (msg == win32.WM_MOUSEMOVE and !self.tracking_mouse) {
+        var tme: win32.TRACKMOUSEEVENT = .{ .dwFlags = win32.TME_LEAVE, .hwndTrack = self.hwnd.? };
+        self.tracking_mouse = win32.TrackMouseEvent(&tme) != 0;
+    }
+
+    if (self.mouse_in_terminal) {
+        s.mouseInput(msg, wparam, self.toTerminal(pos));
+        if (!held) {
+            self.mouse_in_terminal = false;
+            // After the session's handled the release, so a selection
+            // ends where the button came up.
+            _ = win32.ReleaseCapture();
+        }
+        return;
+    }
+
+    const hit = self.hitAt(pos);
+    self.setHover(hit);
+    if (hit == .terminal) {
+        if (press) {
+            // Capture the mouse while a button is down, so a drag past
+            // the edge still reports and the release comes back to us.
+            self.mouse_in_terminal = true;
+            _ = win32.SetCapture(self.hwnd.?);
+        }
+        s.mouseInput(msg, wparam, self.toTerminal(pos));
+        return;
+    }
+
+    switch (msg) {
+        win32.WM_LBUTTONDOWN => {
+            self.setPressed(hit);
+            _ = win32.SetCapture(self.hwnd.?);
+            // Rows switch on press, as tabs do.
+            if (hit == .session) self.activate(hit.session);
         },
         win32.WM_LBUTTONUP => {
-            self.endSelection(pin);
-            return;
+            const pressed = self.chrome.pressed;
+            self.setPressed(.none);
+            _ = win32.ReleaseCapture();
+            if (pressed.eql(hit)) self.chromeClick(hit);
         },
-        else => return,
-    };
-    t.screens.active.select(sel) catch |err| log.err("selection failed: {}", .{err});
-    self.dirty = true;
-}
-
-/// Scroll the viewport one row toward a selection drag above or below
-/// it, and extend the selection there.
-fn autoscrollTick(self: *Window) void {
-    self.lockTerminal();
-    defer self.unlockTerminal();
-    const t = &self.terminal;
-    const sel = self.selection.autoscrollTick(t, .{
-        .viewport = self.cellAt(self.drag_pos),
-        .xpos = @floatFromInt(self.drag_pos.x),
-        .ypos = @floatFromInt(self.drag_pos.y),
-        .rectangle = rectangleSelect(),
-        .word_boundary_codepoints = self.config.@"selection-word-chars".codepoints,
-        .geometry = self.dragGeometry(),
-    });
-    self.updateAutoscroll();
-    // A reset gesture (the screen switched) leaves the selection alone.
-    if (self.selection.left_click_count == 0) return;
-    t.screens.active.select(sel) catch |err| log.err("selection failed: {}", .{err});
-    self.dirty = true;
-}
-
-/// Finish a selection drag, at `pin` if the button was released over a
-/// cell. Call with the terminal locked.
-fn endSelection(self: *Window, pin: ?ghostty_vt.Pin) void {
-    self.selection.release(&self.terminal, .{ .pin = pin });
-    self.selecting = false;
-    self.updateAutoscroll();
-}
-
-/// Run the autoscroll timer while the drag asks for it.
-fn updateAutoscroll(self: *Window) void {
-    if (self.selection.left_drag_autoscroll == .none) {
-        _ = win32.KillTimer(self.hwnd, autoscroll_timer_id);
-    } else {
-        _ = win32.SetTimer(self.hwnd, autoscroll_timer_id, 15, null);
+        win32.WM_MBUTTONDOWN => self.middle_pressed = switch (hit) {
+            .session, .close_session => |i| i,
+            else => null,
+        },
+        win32.WM_MBUTTONUP => {
+            const pressed = self.middle_pressed orelse return;
+            self.middle_pressed = null;
+            switch (hit) {
+                .session, .close_session => |i| if (i == pressed) self.closeSession(i),
+                else => {},
+            }
+        },
+        else => {},
     }
 }
 
-fn dragGeometry(self: *const Window) ghostty_vt.SelectionGesture.Drag.Geometry {
-    return .{
-        .columns = self.terminal.cols,
-        .cell_width = self.grid.metrics.cell_width,
-        .padding_left = self.paddingPx().left,
-        .screen_height = self.clientSize().height,
-    };
-}
-
-/// The viewport cell under a client position, clamped to the grid. Call
-/// with the terminal locked.
-fn cellAt(self: *const Window, pos: win32.POINT) ghostty_vt.Coordinate {
-    const m = self.grid.metrics;
-    const pad = self.paddingPx();
-    const x = @divFloor(pos.x - @as(i32, @intCast(pad.left)), @as(i32, @intCast(m.cell_width)));
-    const y = @divFloor(pos.y - @as(i32, @intCast(pad.top)), @as(i32, @intCast(m.cell_height)));
-    return .{
-        .x = @intCast(std.math.clamp(x, 0, @as(i32, self.terminal.cols) - 1)),
-        .y = @intCast(std.math.clamp(y, 0, @as(i32, self.terminal.rows) - 1)),
-    };
-}
-
-/// Ctrl+alt drags select a rectangle, as in Ghostty on Linux.
-fn rectangleSelect() bool {
-    const mods = input.currentMods();
-    return mods.ctrl and mods.alt;
-}
-
-/// When the message being handled was posted, for telling double clicks
-/// apart. GetMessageTime is milliseconds since boot, wrapping at 2^32.
-fn messageTime() std.Io.Timestamp {
-    const ms: u32 = @bitCast(win32.GetMessageTime());
-    return .{ .nanoseconds = @as(i96, ms) * std.time.ns_per_ms };
-}
-
-/// Scroll with the wheel: report wheel buttons if the child asked for
-/// mouse events, else send arrow keys on the alternate screen with
-/// alternate scroll (mode 1007) set, else move the viewport through
-/// scrollback.
-fn mouseWheel(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
-    const horizontal = msg == win32.WM_MOUSEHWHEEL;
-    const rotation: i16 = @bitCast(win32.hiword(wparam));
-
-    // Unlike other mouse messages, the position is in screen coordinates.
-    var pt: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
-    _ = win32.ScreenToClient(self.hwnd.?, &pt);
-
-    self.lockTerminal();
-    const t = &self.terminal;
-    const reporting = t.flags.mouse_event != .none;
-    const alternate_scroll = !reporting and
-        t.screens.active_key == .alternate and
-        t.modes.get(.mouse_alternate_scroll);
-    const cursor_keys = t.modes.get(.cursor_keys);
-    const opts: MouseEncodeOptions = .fromTerminal(t, self.surfaceSize());
-    const rows = t.rows;
-    self.unlockTerminal();
-
-    if (horizontal and !reporting) return;
-
-    // Reports are one per notch; programs pick how far that scrolls.
-    const lines: u32 = if (reporting) 1 else lines: {
-        var n: u32 = 3;
-        _ = win32.SystemParametersInfoW(win32.SPI_GETWHEELSCROLLLINES, 0, &n, 0);
-        break :lines if (n == win32.WHEEL_PAGESCROLL) rows else @min(n, rows);
-    };
-    const remainder = &self.wheel_remainder[@intFromBool(horizontal)];
-    remainder.* += @as(i32, rotation) * @as(i32, @intCast(lines));
-    const steps = @divTrunc(remainder.*, win32.WHEEL_DELTA);
-    remainder.* -= steps * win32.WHEEL_DELTA;
-    if (steps == 0) return;
-    // Positive rotation is away from the user, or to the right.
-    const up = steps > 0;
-    const count = @abs(steps);
-
-    if (reporting) {
-        const event: MouseEvent = .{
-            .button = if (horizontal)
-                (if (up) .seven else .six)
-            else
-                (if (up) .four else .five),
-            .mods = input.mouseMods(wparam),
-            .pos = .{ .x = @floatFromInt(pt.x), .y = @floatFromInt(pt.y) },
-        };
-        for (0..count) |_| self.mouseReport(event, opts);
-    } else if (alternate_scroll) {
-        const seq: []const u8 = if (cursor_keys)
-            (if (up) "\x1bOA" else "\x1bOB")
-        else
-            (if (up) "\x1b[A" else "\x1b[B");
-        if (self.pty) |*pty| for (0..count) |_| pty.write(seq);
-    } else {
-        const delta: isize = @intCast(count);
-        self.lockTerminal();
-        self.terminal.scrollViewport(.{ .delta = if (up) -delta else delta });
-        self.unlockTerminal();
-        self.dirty = true;
+fn chromeClick(self: *Window, hit: Chrome.Hit) void {
+    switch (hit) {
+        .toggle_mode => {
+            self.chrome.toggleMode();
+            self.layout();
+        },
+        .new_session => self.newSession(),
+        .close_session => |i| self.closeSession(i),
+        else => {},
     }
 }
 
-fn mouseReport(self: *Window, event: MouseEvent, opts: MouseEncodeOptions) void {
-    var buf: [64]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    ghostty_vt.input.encodeMouse(&w, event, opts) catch |err| {
-        log.warn("mouse encode failed: {}", .{err});
-        return;
+/// The caption buttons, which come as non-client messages.
+fn captionHit(ht: win32.WPARAM) Chrome.Hit {
+    return switch (ht) {
+        win32.HTMINBUTTON => .minimize,
+        win32.HTMAXBUTTON => .maximize,
+        win32.HTCLOSE => .close,
+        else => .none,
     };
-    if (w.buffered().len == 0) return;
-    if (self.pty) |*pty| pty.write(w.buffered());
 }
 
-/// The system cursor for a shape the child set with OSC 22.
-fn mouseCursor(shape: ghostty_vt.MouseShape) usize {
-    return switch (shape) {
-        .text, .vertical_text => win32.IDC_IBEAM,
-        .pointer, .alias, .copy, .grab, .grabbing => win32.IDC_HAND,
-        .help, .context_menu => win32.IDC_HELP,
-        .progress => win32.IDC_APPSTARTING,
-        .wait => win32.IDC_WAIT,
-        .cell, .crosshair => win32.IDC_CROSS,
-        .move, .all_scroll => win32.IDC_SIZEALL,
-        .no_drop, .not_allowed => win32.IDC_NO,
-        .col_resize, .e_resize, .w_resize, .ew_resize => win32.IDC_SIZEWE,
-        .row_resize, .n_resize, .s_resize, .ns_resize => win32.IDC_SIZENS,
-        .ne_resize, .sw_resize, .nesw_resize => win32.IDC_SIZENESW,
-        .nw_resize, .se_resize, .nwse_resize => win32.IDC_SIZENWSE,
-        .default, .zoom_in, .zoom_out => win32.IDC_ARROW,
+fn captionClick(self: *Window, hit: Chrome.Hit) void {
+    const hwnd = self.hwnd.?;
+    switch (hit) {
+        .minimize => _ = win32.ShowWindow(hwnd, win32.SW_MINIMIZE),
+        .maximize => _ = win32.ShowWindow(hwnd, if (win32.IsZoomed(hwnd) != 0) win32.SW_RESTORE else win32.SW_MAXIMIZE),
+        .close => _ = win32.PostMessageW(hwnd, win32.WM_CLOSE, 0, 0),
+        else => {},
+    }
+}
+
+/// The sizing border's thickness: what Windows puts above a maximized
+/// window's client area, off screen, and the top resize edge otherwise.
+fn frameThickness(hwnd: win32.HWND) i32 {
+    const dpi = win32.GetDpiForWindow(hwnd);
+    return win32.GetSystemMetricsForDpi(win32.SM_CYFRAME, dpi) + win32.GetSystemMetricsForDpi(win32.SM_CXPADDEDBORDER, dpi);
+}
+
+/// WM_NCHITTEST for the client area, which includes the title bar.
+fn hitTestFrame(self: *Window, lparam: win32.LPARAM) win32.LRESULT {
+    const hwnd = self.hwnd.?;
+    var pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+    _ = win32.ScreenToClient(hwnd, &pos);
+    // The top resize edge, which the caption took with it.
+    const frame = frameThickness(hwnd);
+    if (win32.IsZoomed(hwnd) == 0 and pos.y < frame) {
+        const width: i32 = @intCast(self.clientSize().width);
+        if (pos.x < 2 * frame) return win32.HTTOPLEFT;
+        if (pos.x >= width - 2 * frame) return win32.HTTOPRIGHT;
+        return win32.HTTOP;
+    }
+    return switch (self.hitAt(pos)) {
+        .caption => win32.HTCAPTION,
+        .minimize => win32.HTMINBUTTON,
+        .maximize => win32.HTMAXBUTTON,
+        .close => win32.HTCLOSE,
+        else => win32.HTCLIENT,
     };
 }
 
@@ -1069,28 +677,16 @@ fn clientSize(self: *const Window) ClientSize {
     };
 }
 
-/// The client area as the mouse encoder sees it, to map positions to
-/// cells. Call with the terminal locked.
-fn surfaceSize(self: *const Window) @FieldType(MouseEncodeOptions, "size") {
-    const size = self.clientSize();
-    const m = self.grid.metrics;
-    const pad = self.paddingPx();
-    return .{
-        .screen = .{ .width = size.width, .height = size.height },
-        .cell = .{ .width = m.cell_width, .height = m.cell_height },
-        .padding = .{
-            .top = pad.top,
-            .left = pad.left,
-            .right = size.width -| pad.left -| @as(u32, self.terminal.cols) * m.cell_width,
-            .bottom = size.height -| pad.top -| @as(u32, self.terminal.rows) * m.cell_height,
-        },
-    };
+/// The size of the terminal area, in pixels.
+pub fn terminalSize(self: *const Window) ClientSize {
+    const t = self.chrome_layout.terminal;
+    return .{ .width = @intFromFloat(t.w), .height = @intFromFloat(t.h) };
 }
 
-const PaddingPx = struct { left: u32, right: u32, top: u32, bottom: u32 };
+pub const PaddingPx = struct { left: u32, right: u32, top: u32, bottom: u32 };
 
 /// The configured padding, in points, as pixels at the current DPI.
-fn paddingPx(self: *const Window) PaddingPx {
+pub fn paddingPx(self: *const Window) PaddingPx {
     const x = self.config.@"window-padding-x";
     const y = self.config.@"window-padding-y";
     return .{
@@ -1101,14 +697,20 @@ fn paddingPx(self: *const Window) PaddingPx {
     };
 }
 
-/// The number of whole cells that fit in a client area.
-fn gridSize(self: *const Window, width: u32, height: u32) struct { cols: u16, rows: u16 } {
+/// The number of whole cells that fit in the terminal area.
+fn gridSize(self: *const Window) struct { cols: u16, rows: u16 } {
+    const size = self.terminalSize();
     const m = self.grid.metrics;
     const pad = self.paddingPx();
     return .{
-        .cols = @intCast(std.math.clamp((width -| pad.left -| pad.right) / m.cell_width, 1, std.math.maxInt(u16))),
-        .rows = @intCast(std.math.clamp((height -| pad.top -| pad.bottom) / m.cell_height, 1, std.math.maxInt(u16))),
+        .cols = @intCast(std.math.clamp((size.width -| pad.left -| pad.right) / m.cell_width, 1, std.math.maxInt(u16))),
+        .rows = @intCast(std.math.clamp((size.height -| pad.top -| pad.bottom) / m.cell_height, 1, std.math.maxInt(u16))),
     };
+}
+
+pub fn cellSizePx(self: *const Window) std.meta.Child(@FieldType(ghostty_vt.Terminal.Resize, "cell_size_px")) {
+    const m = self.grid.metrics;
+    return .{ .width = m.cell_width, .height = m.cell_height };
 }
 
 fn render(self: *Window) void {
@@ -1116,20 +718,31 @@ fn render(self: *Window) void {
     self.renderFallible(r) catch |err| log.err("render failed: {}", .{err});
 }
 
+/// The chrome, as the renderer draws it over the terminal.
+const Ui = struct {
+    window: *Window,
+    view: Chrome.View,
+
+    pub fn paint(self: Ui, p: *Painter) void {
+        self.window.chrome.paint(p, &self.window.chrome_layout, &self.view);
+    }
+};
+
 fn renderFallible(self: *Window, r: *Renderer) !void {
     r.waitForFrame();
     self.dirty = false;
+    const s = self.activeSession();
     const stats = build_options.stats;
     var t: i64 = if (stats) Stats.now() else 0;
     {
-        self.lockTerminal();
-        defer self.unlockTerminal();
-        try self.render_state.update(self.alloc, &self.terminal);
-        try self.images.update(self.alloc, &self.terminal);
+        s.lockTerminal();
+        defer s.unlockTerminal();
+        try s.render_state.update(self.alloc, &s.terminal);
+        try s.images.update(self.alloc, &s.terminal);
     }
     if (stats) t = self.stats.lap(.update, t);
-    self.cursor_shown = self.render_state.cursor.visible;
-    try self.cells.build(self.alloc, &self.render_state, &self.grid, .{
+    self.cursor_shown = s.render_state.cursor.visible;
+    try s.cells.build(self.alloc, &s.render_state, &self.grid, .{
         .focused = self.focused,
         .blink_visible = self.blink_visible,
     }, .{
@@ -1140,7 +753,15 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     });
     if (stats) t = self.stats.lap(.build, t);
     const pad = self.paddingPx();
-    try r.draw(self.alloc, &self.cells, &self.images, &self.grid.atlas, self.grid.metrics, .{ @floatFromInt(pad.left), @floatFromInt(pad.top) });
+    try r.draw(self.alloc, .{
+        .cells = &s.cells,
+        .images = &s.images,
+        .textures = &s.textures,
+        .atlas = &self.grid.atlas,
+        .metrics = self.grid.metrics,
+        .viewport = self.chrome_layout.terminal,
+        .grid_offset = .{ @floatFromInt(pad.left), @floatFromInt(pad.top) },
+    }, Ui{ .window = self, .view = self.view() });
     if (stats) {
         _ = self.stats.lap(.draw, t);
         self.stats.frames += 1;
@@ -1155,24 +776,15 @@ fn showStats(self: *Window) void {
     self.showTitle();
 }
 
-/// Take the child's new title. Clears the pending flag before reading,
-/// so a change made after the read posts again.
-fn titleUpdate(self: *Window) void {
-    self.title_pending.store(false, .release);
-    self.lockTerminal();
-    self.title_len = titleToUtf16(&self.title_buf, self.terminal.getTitle() orelse "");
-    self.unlockTerminal();
-    self.showTitle();
-}
-
-/// Set the window text: the child's title or ours, then any stats.
+/// Set the window text, which the taskbar shows: the active session's
+/// title, then any stats.
 fn showTitle(self: *Window) void {
     const sep = std.unicode.utf8ToUtf16LeStringLiteral("  \u{2014}  ");
-    var text: [max_title_len + sep.len + max_stats_len + 1]u16 = undefined;
-    const title = if (self.title_len > 0) self.title_buf[0..self.title_len] else self.app_title;
+    var text: [Session.max_title_len + sep.len + max_stats_len + 1]u16 = undefined;
+    const title = self.activeSession().title();
     const stats = self.stats_text[0..self.stats_len];
     var len: usize = 0;
-    for ([_][]const u16{ title, if (stats.len > 0) sep else &.{}, stats }) |part| {
+    for ([_][]const u16{ title[0..@min(title.len, Session.max_title_len)], if (stats.len > 0) sep else &.{}, stats }) |part| {
         @memcpy(text[len..][0..part.len], part);
         len += part.len;
     }
@@ -1180,33 +792,12 @@ fn showTitle(self: *Window) void {
     _ = win32.SetWindowTextW(self.hwnd.?, text[0..len :0]);
 }
 
-/// A title as UTF-16 in `out`, returning its length. libghostty-vt cuts
-/// long titles at a byte limit, so a codepoint split there is dropped.
-fn titleToUtf16(out: []u16, utf8: []const u8) usize {
-    const whole = utf8[0..@min(utf8.len, out.len)];
-    var end = whole.len;
-    while (end > 0 and whole.len - end < 4) : (end -= 1) {
-        if (std.unicode.utf8ToUtf16Le(out, whole[0..end])) |n| return n else |_| {}
-    }
-    return 0;
+fn updateLayout(self: *Window, size: ClientSize) void {
+    self.chrome_layout = self.chrome.layout(@floatFromInt(size.width), @floatFromInt(size.height));
 }
 
-test titleToUtf16 {
-    var out: [8]u16 = undefined;
-    try std.testing.expectEqual(0, titleToUtf16(&out, ""));
-    const n = titleToUtf16(&out, "h\u{e9}");
-    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("h\u{e9}"), out[0..n]);
-    // A codepoint cut off after its first byte.
-    const cut = "ab\u{1f600}"[0..3];
-    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("ab"), out[0..titleToUtf16(&out, cut)]);
-}
-
-fn cellSizePx(self: *const Window) std.meta.Child(@FieldType(ghostty_vt.Terminal.Resize, "cell_size_px")) {
-    const m = self.grid.metrics;
-    return .{ .width = m.cell_width, .height = m.cell_height };
-}
-
-/// Fit the swap chain and terminal grid to the client area and redraw.
+/// Fit the swap chain, the chrome, and every session's grid to the
+/// client area and redraw.
 fn layout(self: *Window) void {
     const r = &(self.renderer orelse return);
     const size = self.clientSize();
@@ -1216,25 +807,11 @@ fn layout(self: *Window) void {
         log.err("resize failed: {}", .{err});
         return;
     };
+    self.updateLayout(size);
 
-    const grid_size = self.gridSize(size.width, size.height);
-    self.lockTerminal();
-    const changed = grid_size.cols != self.terminal.cols or grid_size.rows != self.terminal.rows;
-    // A new font size (e.g. on a DPI change) can keep the grid size.
-    const cell = self.cellSizePx();
-    const px_changed = self.terminal.width_px != @as(u32, grid_size.cols) * cell.width or
-        self.terminal.height_px != @as(u32, grid_size.rows) * cell.height;
-    if (changed or px_changed) {
-        self.terminal.resize(self.alloc, .{
-            .cols = grid_size.cols,
-            .rows = grid_size.rows,
-            .cell_size_px = cell,
-        }) catch |err| log.err("terminal resize failed: {}", .{err});
-    }
-    self.unlockTerminal();
-
-    // After the terminal, so ConPTY's redraw lands on the new grid.
-    if (changed) if (self.pty) |*pty| pty.resize(grid_size.cols, grid_size.rows);
+    const grid_size = self.gridSize();
+    self.quiet_until = win32.GetTickCount64() + resize_quiet_ms;
+    for (self.sessions.items) |s| s.resize(grid_size.cols, grid_size.rows);
 
     // Render synchronously so live resize doesn't show stale frames.
     self.render();
@@ -1258,6 +835,25 @@ fn registerClass(instance: ?win32.HINSTANCE) !void {
     Static.registered = true;
 }
 
+/// The system cursor for a shape the child set with OSC 22.
+fn mouseCursor(shape: ghostty_vt.MouseShape) usize {
+    return switch (shape) {
+        .text, .vertical_text => win32.IDC_IBEAM,
+        .pointer, .alias, .copy, .grab, .grabbing => win32.IDC_HAND,
+        .help, .context_menu => win32.IDC_HELP,
+        .progress => win32.IDC_APPSTARTING,
+        .wait => win32.IDC_WAIT,
+        .cell, .crosshair => win32.IDC_CROSS,
+        .move, .all_scroll => win32.IDC_SIZEALL,
+        .no_drop, .not_allowed => win32.IDC_NO,
+        .col_resize, .e_resize, .w_resize, .ew_resize => win32.IDC_SIZEWE,
+        .row_resize, .n_resize, .s_resize, .ns_resize => win32.IDC_SIZENS,
+        .ne_resize, .sw_resize, .nesw_resize => win32.IDC_SIZENESW,
+        .nw_resize, .se_resize, .nwse_resize => win32.IDC_SIZENWSE,
+        .default, .zoom_in, .zoom_out => win32.IDC_ARROW,
+    };
+}
+
 fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
     if (msg == win32.WM_NCCREATE) {
         const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
@@ -1271,7 +867,71 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     if (ptr == 0) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     const self: *Window = @ptrFromInt(@as(usize, @bitCast(ptr)));
 
+    // Only the frame is ours to handle until the first session runs.
+    if (self.sessions.items.len == 0 and msg != win32.WM_NCCALCSIZE)
+        return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
     switch (msg) {
+        // Take the caption's space for the client area, keeping the
+        // other borders. A maximized window hangs its borders off
+        // screen, so its client area starts below the top one.
+        win32.WM_NCCALCSIZE => {
+            if (wparam == 0) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            const params: *win32.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const top = params.rgrc[0].top;
+            const result = win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (result != 0) return result;
+            params.rgrc[0].top = top;
+            if (win32.IsZoomed(hwnd) != 0) params.rgrc[0].top += frameThickness(hwnd);
+            return 0;
+        },
+
+        win32.WM_NCHITTEST => {
+            const hit = win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (hit != win32.HTCLIENT) return hit;
+            return self.hitTestFrame(lparam);
+        },
+
+        // The caption buttons are drawn and pressed by us; anything else
+        // in the non-client area (moving, sizing) is Windows'.
+        win32.WM_NCMOUSEMOVE => {
+            if (!self.tracking_nc_mouse) {
+                var tme: win32.TRACKMOUSEEVENT = .{ .dwFlags = win32.TME_LEAVE | win32.TME_NONCLIENT, .hwndTrack = hwnd };
+                self.tracking_nc_mouse = win32.TrackMouseEvent(&tme) != 0;
+            }
+            self.setHover(captionHit(wparam));
+            return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
+        win32.WM_NCMOUSELEAVE => {
+            self.tracking_nc_mouse = false;
+            switch (self.chrome.hover) {
+                .minimize, .maximize, .close => self.setHover(.none),
+                else => {},
+            }
+            switch (self.chrome.pressed) {
+                .minimize, .maximize, .close => self.setPressed(.none),
+                else => {},
+            }
+            return 0;
+        },
+
+        win32.WM_NCLBUTTONDOWN, win32.WM_NCLBUTTONDBLCLK => {
+            const hit = captionHit(wparam);
+            if (hit == .none) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            self.setPressed(hit);
+            return 0;
+        },
+
+        win32.WM_NCLBUTTONUP => {
+            const hit = captionHit(wparam);
+            const pressed = self.chrome.pressed;
+            self.setPressed(.none);
+            if (hit == .none) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (pressed.eql(hit)) self.captionClick(hit);
+            return 0;
+        },
+
         win32.WM_SIZE => {
             if (wparam != win32.SIZE_MINIMIZED) self.layout();
             return 0;
@@ -1306,10 +966,10 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         win32.WM_TIMER => {
             switch (wparam) {
                 stats_timer_id => if (build_options.stats) self.showStats(),
-                autoscroll_timer_id => self.autoscrollTick(),
+                autoscroll_timer_id => self.activeSession().autoscrollTick(),
                 blink_timer_id => self.blinkTick(),
                 sizemove_timer_id => {
-                    if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.dirty = true;
+                    if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.outputArrived();
                     if (self.dirty) self.render();
                 },
                 else => {},
@@ -1318,22 +978,26 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
-            if (self.renderer != null) self.setFocus(msg == win32.WM_SETFOCUS);
+            self.setFocus(msg == win32.WM_SETFOCUS);
             return 0;
         },
 
         WM_APP_CHILD_EXITED => {
-            _ = win32.DestroyWindow(hwnd);
+            if (self.sessionIndex(@intCast(wparam))) |i| self.closeSession(i);
             return 0;
         },
 
         WM_APP_TITLE_CHANGED => {
-            self.titleUpdate();
+            const i = self.sessionIndex(@intCast(wparam)) orelse return 0;
+            self.sessions.items[i].titleUpdate();
+            if (i == self.active) self.showTitle();
+            self.dirty = true;
             return 0;
         },
 
         WM_APP_CLIPBOARD_WRITE => {
-            self.clipboardWriteFlush();
+            const i = self.sessionIndex(@intCast(wparam)) orelse return 0;
+            self.sessions.items[i].clipboardWriteFlush();
             return 0;
         },
 
@@ -1345,8 +1009,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 // Keep alt+F4.
                 win32.VK_F4 => if (msg == win32.WM_SYSKEYDOWN and win32.GetKeyState(win32.VK_MENU) < 0) {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-                } else self.keyInput(msg, wparam, lparam),
-                else => self.keyInput(msg, wparam, lparam),
+                } else self.activeSession().keyInput(msg, wparam, lparam),
+                else => self.activeSession().keyInput(msg, wparam, lparam),
             }
             // Not passing WM_SYSKEYUP on also keeps a lone alt from
             // entering menu mode.
@@ -1354,7 +1018,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_CHAR, win32.WM_SYSCHAR => {
-            self.charInput(@truncate(wparam));
+            self.activeSession().charInput(@truncate(wparam));
             return 0;
         },
 
@@ -1378,35 +1042,58 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             return win32.TRUE;
         },
 
+        win32.WM_MOUSELEAVE => {
+            self.tracking_mouse = false;
+            self.setHover(.none);
+            return 0;
+        },
+
         // Losing the capture mid-drag (alt+tab, a modal window) ends it.
         win32.WM_CAPTURECHANGED => {
-            if (self.selecting and lparam != @as(isize, @bitCast(@intFromPtr(hwnd)))) {
-                self.lockTerminal();
-                defer self.unlockTerminal();
-                self.endSelection(null);
+            if (lparam != @as(isize, @bitCast(@intFromPtr(hwnd)))) {
+                if (self.mouse_in_terminal) {
+                    self.mouse_in_terminal = false;
+                    self.activeSession().cancelSelection();
+                }
+                self.setPressed(.none);
             }
             return 0;
         },
 
         win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {
-            self.mouseWheel(msg, wparam, lparam);
+            // Unlike other mouse messages, the position is in screen
+            // coordinates.
+            var pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+            _ = win32.ScreenToClient(hwnd, &pos);
+            if (self.mouse_in_terminal or self.hitAt(pos) == .terminal) {
+                self.activeSession().mouseWheel(msg, wparam, self.toTerminal(pos));
+            }
             return 0;
         },
 
         win32.WM_SETCURSOR => {
-            if (win32.loword(lparam) != win32.HTCLIENT or self.renderer == null)
+            if (win32.loword(lparam) != win32.HTCLIENT)
                 return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-            self.lockTerminal();
-            const shape = self.terminal.mouse_shape;
-            self.unlockTerminal();
-            _ = win32.SetCursor(win32.LoadCursorW(null, mouseCursor(shape)));
+            var pos: win32.POINT = undefined;
+            _ = win32.GetCursorPos(&pos);
+            _ = win32.ScreenToClient(hwnd, &pos);
+            var cursor = win32.IDC_ARROW;
+            if (self.mouse_in_terminal or self.hitAt(pos) == .terminal) {
+                const s = self.activeSession();
+                s.lockTerminal();
+                const shape = s.terminal.mouse_shape;
+                s.unlockTerminal();
+                cursor = mouseCursor(shape);
+            }
+            _ = win32.SetCursor(win32.LoadCursorW(null, cursor));
             return win32.TRUE;
         },
 
         win32.WM_DPICHANGED => {
             const rect: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             self.dpi = win32.hiword(wparam);
-            if (self.renderer != null) self.grid.setDpi(self.dpi);
+            self.grid.setDpi(self.dpi);
+            self.chrome.setDpi(self.dpi) catch |err| log.err("chrome DPI change failed: {}", .{err});
             _ = win32.SetWindowPos(
                 hwnd,
                 null,

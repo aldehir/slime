@@ -139,4 +139,28 @@ pub const ISwapChain1 = extern struct {
     }
 };
 
+/// Queried from the D3D11 device to create a Direct2D device on it.
+pub const IDevice = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0x54ec77fa,
+        .data2 = 0x1377,
+        .data3 = 0x44e6,
+        .data4 = .{ 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c },
+    };
+};
+
+/// A swap chain buffer as Direct2D takes it.
+pub const ISurface = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0xcafcb56c,
+        .data2 = 0x6ac3,
+        .data3 = 0x4889,
+        .data4 = .{ 0xbf, 0x47, 0x9e, 0x23, 0xbb, 0xd2, 0x60, 0xec },
+    };
+};
+
 pub extern "dxgi" fn CreateDXGIFactory2(flags: u32, riid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT;

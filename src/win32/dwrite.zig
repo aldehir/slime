@@ -1,5 +1,6 @@
 //! DirectWrite interfaces. Slot numbers are from dwrite.h / dwrite_2.h.
 
+const std = @import("std");
 const win32 = @import("win32.zig");
 const com = @import("com.zig");
 
@@ -15,8 +16,16 @@ pub const GRID_FIT_MODE_DEFAULT: u32 = 0;
 pub const TEXT_ANTIALIAS_MODE_GRAYSCALE: u32 = 1;
 pub const TEXTURE_ALIASED_1x1: u32 = 0;
 
+pub const TEXT_ALIGNMENT_LEADING: u32 = 0;
+pub const TEXT_ALIGNMENT_TRAILING: u32 = 1;
+pub const TEXT_ALIGNMENT_CENTER: u32 = 2;
+pub const PARAGRAPH_ALIGNMENT_CENTER: u32 = 2;
+pub const WORD_WRAPPING_NO_WRAP: u32 = 1;
+pub const TRIMMING_GRANULARITY_CHARACTER: u32 = 1;
+
 pub const FONT_WEIGHT = enum(u32) {
     NORMAL = 400,
+    SEMI_BOLD = 600,
     BOLD = 700,
     _,
 };
@@ -80,6 +89,35 @@ pub const IFactory2 = extern struct {
         return com.call(self, 3, fn (*?*IFontCollection, BOOL) HRESULT, .{ out, win32.FALSE });
     }
 
+    pub fn createTextFormat(
+        self: *IFactory2,
+        family: win32.LPCWSTR,
+        weight: FONT_WEIGHT,
+        size: f32,
+        out: *?*ITextFormat,
+    ) HRESULT {
+        return com.call(self, 15, fn (win32.LPCWSTR, ?*IFontCollection, FONT_WEIGHT, FONT_STYLE, u32, f32, win32.LPCWSTR, *?*ITextFormat) HRESULT, .{
+            family,
+            null,
+            weight,
+            .NORMAL,
+            FONT_STRETCH_NORMAL,
+            size,
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            out,
+        });
+    }
+
+    pub fn createTextLayout(self: *IFactory2, text: []const u16, format: *ITextFormat, max_width: f32, max_height: f32, out: *?*ITextLayout) HRESULT {
+        return com.call(self, 18, fn ([*]const u16, u32, *ITextFormat, f32, f32, *?*ITextLayout) HRESULT, .{
+            text.ptr, @as(u32, @intCast(text.len)), format, max_width, max_height, out,
+        });
+    }
+
+    pub fn createEllipsisTrimmingSign(self: *IFactory2, format: *ITextFormat, out: *?*IInlineObject) HRESULT {
+        return com.call(self, 20, fn (*ITextFormat, *?*IInlineObject) HRESULT, .{ format, out });
+    }
+
     pub fn createTextAnalyzer(self: *IFactory2, out: *?*ITextAnalyzer) HRESULT {
         return com.call(self, 21, fn (*?*ITextAnalyzer) HRESULT, .{out});
     }
@@ -124,6 +162,54 @@ pub const IFactory2 = extern struct {
         });
     }
 };
+
+pub const TRIMMING = extern struct {
+    granularity: u32,
+    delimiter: u32 = 0,
+    delimiterCount: u32 = 0,
+};
+
+pub const TEXT_METRICS = extern struct {
+    left: f32,
+    top: f32,
+    width: f32,
+    widthIncludingTrailingWhitespace: f32,
+    height: f32,
+    layoutWidth: f32,
+    layoutHeight: f32,
+    maxBidiReorderingDepth: u32,
+    lineCount: u32,
+};
+
+pub const ITextFormat = extern struct {
+    vtable: com.VTable,
+
+    pub fn setTextAlignment(self: *ITextFormat, alignment: u32) HRESULT {
+        return com.call(self, 3, fn (u32) HRESULT, .{alignment});
+    }
+
+    pub fn setParagraphAlignment(self: *ITextFormat, alignment: u32) HRESULT {
+        return com.call(self, 4, fn (u32) HRESULT, .{alignment});
+    }
+
+    pub fn setWordWrapping(self: *ITextFormat, wrapping: u32) HRESULT {
+        return com.call(self, 5, fn (u32) HRESULT, .{wrapping});
+    }
+
+    pub fn setTrimming(self: *ITextFormat, trimming: *const TRIMMING, sign: ?*IInlineObject) HRESULT {
+        return com.call(self, 9, fn (*const TRIMMING, ?*IInlineObject) HRESULT, .{ trimming, sign });
+    }
+};
+
+pub const ITextLayout = extern struct {
+    vtable: com.VTable,
+
+    pub fn getMetrics(self: *ITextLayout, out: *TEXT_METRICS) HRESULT {
+        return com.call(self, 60, fn (*TEXT_METRICS) HRESULT, .{out});
+    }
+};
+
+pub const IInlineObject = extern struct { vtable: com.VTable };
 
 pub const IFontCollection = extern struct {
     vtable: com.VTable,

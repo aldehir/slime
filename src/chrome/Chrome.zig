@@ -1,0 +1,428 @@
+//! The window's own UI around the terminal, drawn with Direct2D over each
+//! frame: a title bar with caption buttons, and the list of sessions.
+//!
+//! The session list has two layouts (`Mode`), each a module with the same
+//! three functions: `layout` places the list and the terminal, `hitTest`
+//! finds what's under a point in the list, and `paint` draws it. The
+//! title bar's toggle switches between them. What's drawn is a function
+//! of a `View` of the window's state; the chrome itself only tracks the
+//! mouse.
+const Chrome = @This();
+
+const std = @import("std");
+const win32 = @import("../win32/win32.zig");
+const com = win32.com;
+const dwrite = win32.dwrite;
+const Painter = @import("../renderer/Painter.zig");
+const theme = @import("theme.zig");
+
+pub const Rect = Painter.Rect;
+pub const Color = Painter.Color;
+
+pub const Mode = enum {
+    /// Sessions listed in a sidebar, grouped by where they run.
+    sidebar,
+    /// Sessions as tabs in the title bar.
+    tabs,
+};
+
+fn Impl(comptime mode: Mode) type {
+    return switch (mode) {
+        .sidebar => @import("sidebar.zig"),
+        .tabs => @import("tabs.zig"),
+    };
+}
+
+mode: Mode = .sidebar,
+/// Pixels per DIP.
+scale: f32,
+fonts: Fonts,
+/// What the mouse is over, and what a button went down on.
+hover: Hit = .none,
+pressed: Hit = .none,
+
+pub const Hit = union(enum) {
+    none,
+    /// The title bar's empty space, which moves the window.
+    caption,
+    minimize,
+    maximize,
+    close,
+    toggle_mode,
+    new_session,
+    session: usize,
+    close_session: usize,
+    terminal,
+
+    pub fn eql(a: Hit, b: Hit) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
+/// The window's state, as the chrome shows it.
+pub const View = struct {
+    sessions: []const Session,
+    active: usize,
+    /// The window has keyboard focus.
+    focused: bool,
+    maximized: bool,
+    /// The terminal's default background.
+    terminal_bg: Color,
+
+    pub const Session = struct {
+        title: []const u16,
+        /// Output arrived while it wasn't shown.
+        activity: bool,
+    };
+
+    pub fn title(self: *const View) []const u16 {
+        return if (self.active < self.sessions.len) self.sessions[self.active].title else &.{};
+    }
+};
+
+/// Where everything goes, in client pixels.
+pub const Layout = struct {
+    window: Rect,
+    titlebar: Rect,
+    toggle: Rect,
+    /// The title bar between the toggle and the caption buttons.
+    title: Rect,
+    minimize: Rect,
+    maximize: Rect,
+    close: Rect,
+    /// The session list's own area. Empty when it's in the title bar.
+    list: Rect = .{},
+    terminal: Rect = .{},
+    /// The radius of the terminal area's top-left corner.
+    corner: f32 = 0,
+};
+
+pub fn init(dpi: u32) !Chrome {
+    const scale = scaleFor(dpi);
+    return .{ .scale = scale, .fonts = try .init(scale) };
+}
+
+pub fn deinit(self: *Chrome) void {
+    self.fonts.deinit();
+}
+
+pub fn setDpi(self: *Chrome, dpi: u32) !void {
+    const scale = scaleFor(dpi);
+    const fonts: Fonts = try .init(scale);
+    self.fonts.deinit();
+    self.fonts = fonts;
+    self.scale = scale;
+}
+
+fn scaleFor(dpi: u32) f32 {
+    return @as(f32, @floatFromInt(dpi)) / 96.0;
+}
+
+/// `dip` device independent pixels as whole pixels.
+pub fn px(self: *const Chrome, dip: f32) f32 {
+    return @round(dip * self.scale);
+}
+
+pub fn layout(self: *const Chrome, width: f32, height: f32) Layout {
+    const bar_h = switch (self.mode) {
+        inline else => |m| self.px(Impl(m).titlebar_height),
+    };
+    const button_w = self.px(46);
+    const close: Rect = .{ .x = width - button_w, .w = button_w, .h = bar_h };
+    const maximize: Rect = .{ .x = close.x - button_w, .w = button_w, .h = bar_h };
+    const minimize: Rect = .{ .x = maximize.x - button_w, .w = button_w, .h = bar_h };
+    const toggle: Rect = .{ .w = self.px(40), .h = bar_h };
+    var l: Layout = .{
+        .window = .{ .w = width, .h = height },
+        .titlebar = .{ .w = width, .h = bar_h },
+        .toggle = toggle,
+        .title = .{ .x = toggle.right(), .w = @max(0, minimize.x - toggle.right()), .h = bar_h },
+        .minimize = minimize,
+        .maximize = maximize,
+        .close = close,
+    };
+    switch (self.mode) {
+        inline else => |m| Impl(m).layout(self, &l),
+    }
+    return l;
+}
+
+pub fn hitTest(self: *const Chrome, l: *const Layout, view: *const View, x: f32, y: f32) Hit {
+    if (l.terminal.contains(x, y)) return .terminal;
+    if (l.close.contains(x, y)) return .close;
+    if (l.maximize.contains(x, y)) return .maximize;
+    if (l.minimize.contains(x, y)) return .minimize;
+    if (l.toggle.contains(x, y)) return .toggle_mode;
+    const hit = switch (self.mode) {
+        inline else => |m| Impl(m).hitTest(self, l, view, x, y),
+    };
+    if (hit) |h| return h;
+    if (l.titlebar.contains(x, y)) return .caption;
+    return .none;
+}
+
+/// Track what the mouse is over. Returns true if that changed what's
+/// drawn.
+pub fn setHover(self: *Chrome, hit: Hit) bool {
+    // The terminal draws nothing for hover.
+    const h: Hit = if (hit == .terminal or hit == .caption) .none else hit;
+    if (self.hover.eql(h)) return false;
+    self.hover = h;
+    return true;
+}
+
+pub fn setPressed(self: *Chrome, hit: Hit) bool {
+    if (self.pressed.eql(hit)) return false;
+    self.pressed = hit;
+    return true;
+}
+
+pub fn toggleMode(self: *Chrome) void {
+    self.mode = switch (self.mode) {
+        .sidebar => .tabs,
+        .tabs => .sidebar,
+    };
+    self.hover = .none;
+    self.pressed = .none;
+}
+
+pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
+    p.fill(l.titlebar, theme.ground);
+    switch (self.mode) {
+        inline else => |m| Impl(m).paint(self, p, l, view),
+    }
+    if (l.corner > 0) p.cornerMask(l.terminal.x, l.terminal.y, l.corner, theme.ground);
+    self.paintToggle(p, l, view);
+    self.paintCaptionButtons(p, l, view);
+}
+
+pub const ButtonState = enum { rest, hover, pressed };
+
+pub fn buttonState(self: *const Chrome, hit: Hit) ButtonState {
+    if (!self.hover.eql(hit)) return .rest;
+    return if (self.pressed.eql(hit)) .pressed else .hover;
+}
+
+/// The active session's title, centered in the title bar.
+pub fn paintTitle(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
+    const color = if (view.focused) theme.text_muted else theme.text_inactive;
+    p.text(view.title(), self.fonts.title, l.title.inset(self.px(8), 0), color);
+}
+
+fn paintToggle(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
+    const r = l.toggle;
+    switch (self.buttonState(.toggle_mode)) {
+        .rest => {},
+        .hover => p.fill(r, theme.button_hover),
+        .pressed => p.fill(r, theme.button_pressed),
+    }
+    // A window with a pane down its left side.
+    const color = if (view.focused) theme.text else theme.text_inactive;
+    const w = self.stroke();
+    const box = r.center(self.px(16), self.px(14));
+    p.strokeRounded(box, self.px(2), w, color);
+    const x = crisp(box.x + self.px(5), w);
+    p.line(x, box.y, x, box.bottom(), w, color);
+}
+
+fn paintCaptionButtons(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
+    const glyph = if (view.focused) theme.text else theme.text_inactive;
+    const w = self.stroke();
+    const g = self.px(10);
+
+    for ([_]Hit{ .minimize, .maximize, .close }, [_]Rect{ l.minimize, l.maximize, l.close }) |hit, r| {
+        const state = self.buttonState(hit);
+        const bg: ?Color = switch (state) {
+            .rest => null,
+            .hover => if (hit == .close) theme.close_hover else theme.button_hover,
+            .pressed => if (hit == .close) theme.close_pressed else theme.button_pressed,
+        };
+        if (bg) |c| p.fill(r, c);
+        const color = if (hit == .close and state != .rest) theme.text_strong else glyph;
+        const box = r.center(g, g);
+        switch (hit) {
+            .minimize => {
+                const y = crisp(box.y + g / 2, w);
+                p.line(box.x, y, box.right(), y, w, color);
+            },
+            .maximize => if (view.maximized) {
+                // Restore: a window behind another.
+                const d = self.px(2);
+                const front: Rect = .{ .x = box.x, .y = box.y + d, .w = g - d, .h = g - d };
+                p.strokeRounded(.{ .x = box.x + d, .y = box.y, .w = g - d, .h = g - d }, self.px(1.5), w, color);
+                p.fill(front, bg orelse theme.ground);
+                p.strokeRounded(front, self.px(1.5), w, color);
+            } else {
+                p.strokeRounded(box, self.px(1.5), w, color);
+            },
+            .close => {
+                p.line(box.x, box.y, box.right(), box.bottom(), w, color);
+                p.line(box.right(), box.y, box.x, box.bottom(), w, color);
+            },
+            else => unreachable,
+        }
+    }
+}
+
+/// The width of icon strokes.
+pub fn stroke(self: *const Chrome) f32 {
+    return @max(1, @round(self.scale));
+}
+
+/// `v` moved so a horizontal or vertical line `width` thick covers whole
+/// pixels.
+pub fn crisp(v: f32, width: f32) f32 {
+    return if (@mod(width, 2) == 1) @floor(v) + 0.5 else @round(v);
+}
+
+/// A plus sign filling `box`.
+pub fn iconPlus(self: *const Chrome, p: *Painter, box: Rect, color: Color) void {
+    const w = self.stroke();
+    const cx = crisp(box.x + box.w / 2, w);
+    const cy = crisp(box.y + box.h / 2, w);
+    p.line(cx, box.y, cx, box.bottom(), w, color);
+    p.line(box.x, cy, box.right(), cy, w, color);
+}
+
+/// A shell prompt, `>_`, in a 16 DIP `box`.
+pub fn iconPrompt(self: *const Chrome, p: *Painter, box: Rect, color: Color) void {
+    const w = @max(1, self.scale * 1.5);
+    const x = box.x;
+    const y = box.y;
+    p.line(x + self.px(3), y + self.px(4.5), x + self.px(6.5), y + self.px(8), w, color);
+    p.line(x + self.px(6.5), y + self.px(8), x + self.px(3), y + self.px(11.5), w, color);
+    p.line(x + self.px(8), y + self.px(12), x + self.px(13), y + self.px(12), w, color);
+}
+
+/// An X filling `box`.
+pub fn iconClose(self: *const Chrome, p: *Painter, box: Rect, color: Color) void {
+    const w = self.stroke();
+    p.line(box.x, box.y, box.right(), box.bottom(), w, color);
+    p.line(box.right(), box.y, box.x, box.bottom(), w, color);
+}
+
+/// Text formats for the chrome, sized for the current scale. All lay out
+/// one line, centered vertically, trimmed with an ellipsis.
+pub const Fonts = struct {
+    factory: *dwrite.IFactory2,
+    /// List rows and buttons.
+    body: *dwrite.ITextFormat,
+    /// The active row.
+    body_strong: *dwrite.ITextFormat,
+    /// The window title, centered.
+    title: *dwrite.ITextFormat,
+    /// Section headers in the list.
+    section: *dwrite.ITextFormat,
+    /// Key hints, centered.
+    hint: *dwrite.ITextFormat,
+
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const families = [_][:0]const u16{ L("Segoe UI Variable Text"), L("Segoe UI") };
+
+    fn init(scale: f32) !Fonts {
+        var factory: ?*dwrite.IFactory2 = null;
+        try com.check(
+            dwrite.DWriteCreateFactory(dwrite.FACTORY_TYPE_SHARED, &dwrite.IFactory2.iid, @ptrCast(&factory)),
+            "DWriteCreateFactory",
+        );
+        errdefer com.releaseOpt(&factory);
+        const f = factory.?;
+        const family = findFamily(f);
+
+        var self: Fonts = undefined;
+        self.factory = f;
+        const specs = .{
+            .{ "body", dwrite.FONT_WEIGHT.NORMAL, 13, dwrite.TEXT_ALIGNMENT_LEADING },
+            .{ "body_strong", dwrite.FONT_WEIGHT.SEMI_BOLD, 13, dwrite.TEXT_ALIGNMENT_LEADING },
+            .{ "title", dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_CENTER },
+            .{ "section", dwrite.FONT_WEIGHT.SEMI_BOLD, 11, dwrite.TEXT_ALIGNMENT_LEADING },
+            .{ "hint", dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_CENTER },
+        };
+        var made: usize = 0;
+        errdefer inline for (specs, 0..) |spec, i| {
+            if (i < made) com.release(@field(self, spec[0]));
+        };
+        inline for (specs) |spec| {
+            @field(self, spec[0]) = try createFormat(f, family, spec[1], spec[2] * scale, spec[3]);
+            made += 1;
+        }
+        return self;
+    }
+
+    fn deinit(self: *Fonts) void {
+        inline for (.{ "body", "body_strong", "title", "section", "hint" }) |name| com.release(@field(self, name));
+        com.release(self.factory);
+        self.* = undefined;
+    }
+
+    fn findFamily(factory: *dwrite.IFactory2) [:0]const u16 {
+        var collection: ?*dwrite.IFontCollection = null;
+        if (factory.getSystemFontCollection(&collection) < 0) return families[families.len - 1];
+        defer com.releaseOpt(&collection);
+        for (families) |name| {
+            var index: u32 = 0;
+            var exists: win32.BOOL = win32.FALSE;
+            if (collection.?.findFamilyName(name.ptr, &index, &exists) >= 0 and exists != win32.FALSE) return name;
+        }
+        return families[families.len - 1];
+    }
+
+    fn createFormat(factory: *dwrite.IFactory2, family: [:0]const u16, weight: dwrite.FONT_WEIGHT, size: f32, alignment: u32) !*dwrite.ITextFormat {
+        var format: ?*dwrite.ITextFormat = null;
+        try com.check(factory.createTextFormat(family.ptr, weight, size, &format), "IDWriteFactory::CreateTextFormat");
+        errdefer com.releaseOpt(&format);
+        const f = format.?;
+        try com.check(f.setTextAlignment(alignment), "IDWriteTextFormat::SetTextAlignment");
+        try com.check(f.setParagraphAlignment(dwrite.PARAGRAPH_ALIGNMENT_CENTER), "IDWriteTextFormat::SetParagraphAlignment");
+        try com.check(f.setWordWrapping(dwrite.WORD_WRAPPING_NO_WRAP), "IDWriteTextFormat::SetWordWrapping");
+        var sign: ?*dwrite.IInlineObject = null;
+        try com.check(factory.createEllipsisTrimmingSign(f, &sign), "IDWriteFactory::CreateEllipsisTrimmingSign");
+        defer com.releaseOpt(&sign);
+        try com.check(f.setTrimming(&.{ .granularity = dwrite.TRIMMING_GRANULARITY_CHARACTER }, sign), "IDWriteTextFormat::SetTrimming");
+        return f;
+    }
+
+    /// The width of `text` laid out in `format`, in pixels.
+    pub fn measure(self: *const Fonts, text: []const u16, format: *dwrite.ITextFormat) f32 {
+        var text_layout: ?*dwrite.ITextLayout = null;
+        // DirectWrite rejects infinite and huge bounds.
+        const unbounded = 100_000;
+        const hr = self.factory.createTextLayout(text, format, unbounded, unbounded, &text_layout);
+        if (hr < 0) {
+            com.check(hr, "IDWriteFactory::CreateTextLayout") catch {};
+            return 0;
+        }
+        defer com.releaseOpt(&text_layout);
+        var metrics: dwrite.TEXT_METRICS = undefined;
+        if (text_layout.?.getMetrics(&metrics) < 0) return 0;
+        return metrics.widthIncludingTrailingWhitespace;
+    }
+};
+
+test "layout and hit testing" {
+    var chrome: Chrome = .{ .scale = 1, .fonts = undefined };
+    const view: View = .{
+        .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = true } },
+        .active = 0,
+        .focused = true,
+        .maximized = false,
+        .terminal_bg = theme.ground,
+    };
+    var l = chrome.layout(1000, 600);
+    try std.testing.expectEqual(Hit.close, chrome.hitTest(&l, &view, 999, 5));
+    try std.testing.expectEqual(Hit.caption, chrome.hitTest(&l, &view, 500, 5));
+    try std.testing.expectEqual(Hit.toggle_mode, chrome.hitTest(&l, &view, 5, 5));
+    try std.testing.expectEqual(Hit.terminal, chrome.hitTest(&l, &view, l.terminal.x + 1, l.terminal.y + 1));
+    try std.testing.expect(l.list.w > 0 and l.terminal.x == l.list.right());
+
+    chrome.toggleMode();
+    l = chrome.layout(1000, 600);
+    try std.testing.expectEqual(@as(f32, 0), l.list.w);
+    try std.testing.expectEqual(@as(f32, 0), l.terminal.x);
+    try std.testing.expectEqual(l.window.w, l.terminal.w);
+}
+
+test crisp {
+    try std.testing.expectEqual(@as(f32, 10.5), crisp(10.2, 1));
+    try std.testing.expectEqual(@as(f32, 10), crisp(10.2, 2));
+}
