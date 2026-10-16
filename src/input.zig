@@ -133,6 +133,27 @@ pub const Win32KeyEvent = struct {
     }
 };
 
+/// The character a key makes in the current layout and modifier state.
+/// Releases get no WM_CHAR, but the console and Windows Terminal report
+/// them with the character, and apps match presses to releases by it
+/// (herdr drops a space release without one). 0 for none or a dead key.
+pub fn releaseChar(wparam: win32.WPARAM, lparam: win32.LPARAM) u16 {
+    var state: [256]u8 = undefined;
+    if (win32.GetKeyboardState(&state) == 0) return 0;
+    const flags: usize = @bitCast(lparam);
+    var buf: [4]u16 = undefined;
+    const n = win32.ToUnicodeEx(
+        @truncate(wparam),
+        @truncate((flags >> 16) & 0xFF),
+        &state,
+        &buf,
+        buf.len,
+        win32.TOUNICODE_NO_STATE_CHANGE,
+        win32.GetKeyboardLayout(0),
+    );
+    return if (n == 1) buf[0] else 0;
+}
+
 /// The current modifiers and lock keys as KEY_EVENT_RECORD's
 /// dwControlKeyState.
 pub fn controlKeyState(enhanced: bool) u32 {

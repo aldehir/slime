@@ -21,6 +21,7 @@ pub const LPCWSTR = [*:0]const u16;
 pub const LPWSTR = [*:0]u16;
 
 pub const HANDLE = *anyopaque;
+pub const HKL = *opaque {};
 pub const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(std.math.maxInt(usize));
 pub const HMODULE = *opaque {};
 pub const HWND = *opaque {};
@@ -237,6 +238,9 @@ pub const CREATE_WAITABLE_TIMER_MANUAL_RESET = 0x00000001;
 pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
 pub const TIMER_ALL_ACCESS = 0x001F0003;
 pub const MAPVK_VK_TO_CHAR = 2;
+/// ToUnicodeEx flag (Windows 10 1607+): leave the keyboard state, and so
+/// any pending dead key, alone.
+pub const TOUNICODE_NO_STATE_CHANGE = 0x4;
 
 // Mouse
 pub const MK_LBUTTON = 0x0001;
@@ -386,6 +390,9 @@ pub extern "user32" fn PostMessageW(?HWND, u32, WPARAM, LPARAM) callconv(.winapi
 pub extern "user32" fn PeekMessageW(*MSG, ?HWND, u32, u32, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn GetKeyState(i32) callconv(.winapi) i16;
 pub extern "user32" fn MapVirtualKeyW(u32, u32) callconv(.winapi) u32;
+pub extern "user32" fn GetKeyboardState(*[256]u8) callconv(.winapi) BOOL;
+pub extern "user32" fn GetKeyboardLayout(u32) callconv(.winapi) ?HKL;
+pub extern "user32" fn ToUnicodeEx(u32, u32, *const [256]u8, [*]u16, i32, u32, ?HKL) callconv(.winapi) i32;
 pub extern "user32" fn SetCapture(HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) BOOL;

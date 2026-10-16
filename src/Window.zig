@@ -476,7 +476,9 @@ fn win32KeyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     if (text.len == 0) {
-        input.Win32KeyEvent.fromKey(msg, wparam, lparam, 0).encode(&w) catch unreachable;
+        const up = msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP;
+        const char = if (up) input.releaseChar(wparam, lparam) else 0;
+        input.Win32KeyEvent.fromKey(msg, wparam, lparam, char).encode(&w) catch unreachable;
     }
     for (text) |unit| {
         input.Win32KeyEvent.fromKey(msg, wparam, lparam, unit).encode(&w) catch unreachable;
