@@ -18,8 +18,10 @@ bar's toggle: a sidebar, which is done, and tabs, which isn't.
   exit status. The mockups keep a failed one open with its status.
 - **Keyboard access** to the chrome (focusing the list, UI Automation),
   a key for the toggle, and jumping to a session by number.
-- **The chrome's colors** are fixed and dark. They should follow the
-  theme or the system's light mode.
+- **The chrome's colors** come from the configured background and
+  foreground at startup. They don't follow a program's OSC 10/11, and
+  switching between a light/dark theme pair waits on following the
+  system's mode live (see Configuration).
 - **Remembering the layout** (sidebar or tabs) and the sidebar width.
 
 ## Needs app chrome

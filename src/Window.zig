@@ -192,13 +192,16 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line:
     const hwnd = self.hwnd.?;
     errdefer _ = win32.DestroyWindow(hwnd);
 
-    const dark: win32.BOOL = win32.TRUE;
+    // The chrome follows the terminal's colors, and the frame Windows
+    // draws (border, system menu) follows the chrome.
+    const theme: Chrome.Theme = .init(config.background, config.foreground);
+    const dark: win32.BOOL = if (theme.light) win32.FALSE else win32.TRUE;
     _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL));
 
     self.dpi = win32.GetDpiForWindow(hwnd);
     self.grid = try .init(alloc, io, config.@"font-family".items, config.@"font-size", self.dpi);
     errdefer self.grid.deinit();
-    self.chrome = try .init(self.dpi);
+    self.chrome = try .init(self.dpi, theme);
     errdefer self.chrome.deinit();
 
     const size = self.clientSize();

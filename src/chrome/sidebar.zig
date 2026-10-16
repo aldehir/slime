@@ -4,7 +4,6 @@
 const std = @import("std");
 const Chrome = @import("Chrome.zig");
 const Painter = @import("../renderer/Painter.zig");
-const theme = @import("theme.zig");
 
 const Rect = Chrome.Rect;
 const Hit = Chrome.Hit;
@@ -48,14 +47,14 @@ pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.Vi
 }
 
 pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *const Chrome.View) void {
-    p.fill(l.list, theme.ground);
+    p.fill(l.list, c.theme.ground);
     c.paintTitle(p, l, view);
     p.pushClip(l.list);
     defer p.popClip();
 
     const parts: Parts = .init(c, l);
     paintNewSession(c, p, parts.new_session);
-    p.text(L("LOCAL"), c.fonts.section, parts.header.inset(c.px(2), 0), theme.text_muted);
+    p.text(L("LOCAL"), c.fonts.section, parts.header.inset(c.px(2), 0), c.theme.text_muted);
     for (view.sessions, 0..) |session, i| {
         const r = parts.row(i);
         if (r.y >= l.list.bottom()) break;
@@ -65,12 +64,12 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
 
 fn paintNewSession(c: *const Chrome, p: *Painter, r: Rect) void {
     const bg = switch (c.buttonState(.new_session)) {
-        .rest => theme.surface,
-        .hover, .pressed => theme.surface_hover,
+        .rest => c.theme.surface,
+        .hover, .pressed => c.theme.surface_hover,
     };
     p.fillRounded(r, c.px(6), bg);
     const icon_x = r.x + c.px(10);
-    c.iconPlus(p, .{ .x = icon_x, .y = r.y + @round((r.h - c.px(12)) / 2), .w = c.px(12), .h = c.px(12) }, theme.text);
+    c.iconPlus(p, .{ .x = icon_x, .y = r.y + @round((r.h - c.px(12)) / 2), .w = c.px(12), .h = c.px(12) }, c.theme.text);
 
     // The key hint, in an outlined chip at the right.
     const hint_w = @ceil(c.fonts.measure(new_session_hint, c.fonts.hint)) + c.px(10);
@@ -80,11 +79,11 @@ fn paintNewSession(c: *const Chrome, p: *Painter, r: Rect) void {
         .w = hint_w,
         .h = c.px(18),
     };
-    p.strokeRounded(hint, c.px(4), c.stroke(), theme.outline);
-    p.text(new_session_hint, c.fonts.hint, hint, theme.text_muted);
+    p.strokeRounded(hint, c.px(4), c.stroke(), c.theme.outline);
+    p.text(new_session_hint, c.fonts.hint, hint, c.theme.text_muted);
 
     const label_x = icon_x + c.px(20);
-    p.text(L("New session"), c.fonts.body, .{ .x = label_x, .y = r.y, .w = hint.x - c.px(8) - label_x, .h = r.h }, theme.text);
+    p.text(L("New session"), c.fonts.body, .{ .x = label_x, .y = r.y, .w = hint.x - c.px(8) - label_x, .h = r.h }, c.theme.text);
 }
 
 fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.View.Session, active: bool) void {
@@ -92,13 +91,13 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.Vi
     const hovered = close_hovered or c.hover.eql(.{ .session = i });
     const radius = c.px(6);
     if (active) {
-        p.fillRounded(r, radius, theme.row_selected);
+        p.fillRounded(r, radius, c.theme.row_selected);
     } else if (hovered) {
-        p.fillRounded(r, radius, theme.row_hover);
+        p.fillRounded(r, radius, c.theme.row_hover);
     }
 
     const icon = c.px(16);
-    const icon_color = if (active) theme.text else theme.text_muted;
+    const icon_color = if (active) c.theme.text else c.theme.text_muted;
     c.iconPrompt(p, .{ .x = r.x + c.px(10), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, icon_color);
 
     const close = closeButton(c, r);
@@ -106,20 +105,20 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.Vi
     const text_right = if (hovered or active or session.activity) close.x - c.px(4) else r.right() - c.px(8);
     const text_rect: Rect = .{ .x = text_x, .y = r.y, .w = @max(0, text_right - text_x), .h = r.h };
     if (active) {
-        p.text(session.title, c.fonts.body_strong, text_rect, theme.text_strong);
+        p.text(session.title, c.fonts.body_strong, text_rect, c.theme.text_strong);
     } else {
-        p.text(session.title, c.fonts.body, text_rect, theme.text);
+        p.text(session.title, c.fonts.body, text_rect, c.theme.text);
     }
 
     if (hovered or active) {
         if (close_hovered) p.fillRounded(close, c.px(4), switch (c.buttonState(.{ .close_session = i })) {
-            .pressed => theme.button_pressed,
-            else => theme.button_hover,
+            .pressed => c.theme.button_pressed,
+            else => c.theme.button_hover,
         });
         const g = c.px(8);
-        c.iconClose(p, close.center(g, g), if (close_hovered) theme.text_strong else theme.text_muted);
+        c.iconClose(p, close.center(g, g), if (close_hovered) c.theme.text_strong else c.theme.text_muted);
     } else if (session.activity) {
-        p.dot(close.x + close.w / 2, close.y + close.h / 2, c.px(3), theme.accent);
+        p.dot(close.x + close.w / 2, close.y + close.h / 2, c.px(3), c.theme.accent);
     }
 }
 
@@ -161,13 +160,13 @@ const Parts = struct {
 };
 
 test "rows and their close buttons" {
-    const c: Chrome = .{ .scale = 1, .fonts = undefined };
+    const c: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: Chrome.View = .{
         .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = false } },
         .active = 0,
         .focused = true,
         .maximized = false,
-        .terminal_bg = theme.ground,
+        .terminal_bg = .{ 0, 0, 0, 1 },
     };
     const l = c.layout(1000, 600);
     const parts: Parts = .init(&c, &l);

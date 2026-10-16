@@ -14,7 +14,7 @@ const win32 = @import("../win32/win32.zig");
 const com = win32.com;
 const dwrite = win32.dwrite;
 const Painter = @import("../renderer/Painter.zig");
-const theme = @import("theme.zig");
+pub const Theme = @import("theme.zig").Theme;
 
 pub const Rect = Painter.Rect;
 pub const Color = Painter.Color;
@@ -37,6 +37,7 @@ mode: Mode = .sidebar,
 /// Pixels per DIP.
 scale: f32,
 fonts: Fonts,
+theme: Theme,
 /// What the mouse is over, and what a button went down on.
 hover: Hit = .none,
 pressed: Hit = .none,
@@ -97,9 +98,9 @@ pub const Layout = struct {
     corner: f32 = 0,
 };
 
-pub fn init(dpi: u32) !Chrome {
+pub fn init(dpi: u32, theme: Theme) !Chrome {
     const scale = scaleFor(dpi);
-    return .{ .scale = scale, .fonts = try .init(scale) };
+    return .{ .scale = scale, .fonts = try .init(scale), .theme = theme };
 }
 
 pub fn deinit(self: *Chrome) void {
@@ -187,11 +188,11 @@ pub fn toggleMode(self: *Chrome) void {
 }
 
 pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
-    p.fill(l.titlebar, theme.ground);
+    p.fill(l.titlebar, self.theme.ground);
     switch (self.mode) {
         inline else => |m| Impl(m).paint(self, p, l, view),
     }
-    if (l.corner > 0) p.cornerMask(l.terminal.x, l.terminal.y, l.corner, theme.ground);
+    if (l.corner > 0) p.cornerMask(l.terminal.x, l.terminal.y, l.corner, self.theme.ground);
     self.paintToggle(p, l, view);
     self.paintCaptionButtons(p, l, view);
 }
@@ -205,7 +206,7 @@ pub fn buttonState(self: *const Chrome, hit: Hit) ButtonState {
 
 /// The active session's title, centered in the title bar.
 pub fn paintTitle(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
-    const color = if (view.focused) theme.text_muted else theme.text_inactive;
+    const color = if (view.focused) self.theme.text_muted else self.theme.text_inactive;
     p.text(view.title(), self.fonts.title, l.title.inset(self.px(8), 0), color);
 }
 
@@ -213,11 +214,11 @@ fn paintToggle(self: *const Chrome, p: *Painter, l: *const Layout, view: *const 
     const r = l.toggle;
     switch (self.buttonState(.toggle_mode)) {
         .rest => {},
-        .hover => p.fill(r, theme.button_hover),
-        .pressed => p.fill(r, theme.button_pressed),
+        .hover => p.fill(r, self.theme.button_hover),
+        .pressed => p.fill(r, self.theme.button_pressed),
     }
     // A window with a pane down its left side.
-    const color = if (view.focused) theme.text else theme.text_inactive;
+    const color = if (view.focused) self.theme.text else self.theme.text_inactive;
     const w = self.stroke();
     const box = r.center(self.px(16), self.px(14));
     p.strokeRounded(box, self.px(2), w, color);
@@ -226,7 +227,7 @@ fn paintToggle(self: *const Chrome, p: *Painter, l: *const Layout, view: *const 
 }
 
 fn paintCaptionButtons(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
-    const glyph = if (view.focused) theme.text else theme.text_inactive;
+    const glyph = if (view.focused) self.theme.text else self.theme.text_inactive;
     const w = self.stroke();
     const g = self.px(10);
 
@@ -234,11 +235,11 @@ fn paintCaptionButtons(self: *const Chrome, p: *Painter, l: *const Layout, view:
         const state = self.buttonState(hit);
         const bg: ?Color = switch (state) {
             .rest => null,
-            .hover => if (hit == .close) theme.close_hover else theme.button_hover,
-            .pressed => if (hit == .close) theme.close_pressed else theme.button_pressed,
+            .hover => if (hit == .close) self.theme.close_hover else self.theme.button_hover,
+            .pressed => if (hit == .close) self.theme.close_pressed else self.theme.button_pressed,
         };
         if (bg) |c| p.fill(r, c);
-        const color = if (hit == .close and state != .rest) theme.text_strong else glyph;
+        const color = if (hit == .close and state != .rest) self.theme.close_glyph else glyph;
         const box = r.center(g, g);
         switch (hit) {
             .minimize => {
@@ -250,7 +251,7 @@ fn paintCaptionButtons(self: *const Chrome, p: *Painter, l: *const Layout, view:
                 const d = self.px(2);
                 const front: Rect = .{ .x = box.x, .y = box.y + d, .w = g - d, .h = g - d };
                 p.strokeRounded(.{ .x = box.x + d, .y = box.y, .w = g - d, .h = g - d }, self.px(1.5), w, color);
-                p.fill(front, bg orelse theme.ground);
+                p.fill(front, bg orelse self.theme.ground);
                 p.strokeRounded(front, self.px(1.5), w, color);
             } else {
                 p.strokeRounded(box, self.px(1.5), w, color);
@@ -400,13 +401,13 @@ pub const Fonts = struct {
 };
 
 test "layout and hit testing" {
-    var chrome: Chrome = .{ .scale = 1, .fonts = undefined };
+    var chrome: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: View = .{
         .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = true } },
         .active = 0,
         .focused = true,
         .maximized = false,
-        .terminal_bg = theme.ground,
+        .terminal_bg = .{ 0, 0, 0, 1 },
     };
     var l = chrome.layout(1000, 600);
     try std.testing.expectEqual(Hit.close, chrome.hitTest(&l, &view, 999, 5));
