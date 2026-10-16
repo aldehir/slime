@@ -1,6 +1,6 @@
 # Development environment for slime. Dot-source it:
 #
-#   . .\env.ps1
+#   . .\scripts\setup-msvc.ps1
 #
 # Puts the project-local Zig on PATH and points clang at a modern MSVC
 # toolset. Zig picks MSVC include paths on its own, but its bundled clang
@@ -10,7 +10,7 @@
 # keyword in MSVC 2013 mode). VCToolsInstallDir takes precedence over that
 # legacy discovery.
 
-$zigDir = Join-Path $PSScriptRoot 'tools\zig-x86_64-windows-0.16.0'
+$zigDir = Join-Path $PSScriptRoot '..\tools\zig-x86_64-windows-0.16.0'
 if (-not (Test-Path (Join-Path $zigDir 'zig.exe'))) {
     Write-Error "zig not found at $zigDir"
     return

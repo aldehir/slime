@@ -10,7 +10,7 @@ const conpty_dir = "tools/conpty-" ++ conpty_version;
 
 pub fn build(b: *std.Build) void {
     // Building libghostty-vt's C++ dependencies against MSVC needs the
-    // environment from env.ps1.
+    // environment from scripts/setup-msvc.ps1.
     const target = b.standardTargetOptions(.{
         .default_target = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .msvc },
     });
