@@ -67,10 +67,8 @@ uniforms: *d3d11.IBuffer,
 bg_cells: DynamicBuffer = .{ .stride = @sizeOf(u32) },
 instances: DynamicBuffer = .{ .stride = @sizeOf(cells.Instance) },
 
-atlas_texture: ?*d3d11.ITexture2D = null,
-atlas_srv: ?*d3d11.IShaderResourceView = null,
-atlas_size: u32 = 0,
-atlas_generation: u64 = 0,
+atlas: AtlasTexture = .{},
+color_atlas: AtlasTexture = .{},
 
 /// The placement being drawn (see `drawImages`).
 image_placement: *d3d11.IBuffer,
@@ -115,6 +113,7 @@ pub const Frame = struct {
     images: *image.Images,
     textures: *ImageTextures,
     atlas: *const font.Atlas,
+    color_atlas: *const font.Atlas,
     metrics: font.Grid.Metrics,
     /// The terminal's part of the window, which clips it.
     viewport: Painter.Rect,
@@ -246,8 +245,8 @@ pub fn deinit(self: *D3D11) void {
     if (self.lucide) |*icons| Painter.deinitLucide(icons);
     (D2d{ .factory = self.d2d_factory, .device = self.d2d_device, .context = self.d2d_context, .brush = self.brush }).deinit();
     com.release(self.image_placement);
-    com.releaseOpt(&self.atlas_srv);
-    com.releaseOpt(&self.atlas_texture);
+    self.color_atlas.deinit();
+    self.atlas.deinit();
     self.instances.deinit();
     self.bg_cells.deinit();
     com.release(self.uniforms);
@@ -367,7 +366,8 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
     const ctx = self.context;
     self.waitForFrame();
 
-    try self.uploadAtlas(f.atlas);
+    try self.atlas.upload(self.device, ctx, f.atlas);
+    try self.color_atlas.upload(self.device, ctx, f.color_atlas);
     try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.bg.items));
     try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.instances.items));
     try self.uploadImages(alloc, f.images, f.textures);
@@ -423,7 +423,7 @@ fn drawGrid(self: *D3D11, f: Frame) Error!void {
         ctx.vsSetConstantBuffers(0, &.{self.uniforms});
         ctx.vsSetShaderResources(1, &.{self.instances.srv});
         ctx.psSetShader(self.pipeline.text_ps);
-        ctx.psSetShaderResources(2, &.{self.atlas_srv});
+        ctx.psSetShaderResources(2, &.{ self.atlas.srv, self.color_atlas.srv });
         ctx.omSetBlendState(self.pipeline.blend);
         ctx.drawInstanced(4, @intCast(frame.instances.items.len), 0, 0);
     }
@@ -461,34 +461,49 @@ fn drawImages(self: *D3D11, images: *const image.Images, textures: *const ImageT
     }
 }
 
-/// Mirror the CPU atlas on the GPU, reallocating if it grew.
-fn uploadAtlas(self: *D3D11, atlas: *const font.Atlas) Error!void {
-    if (self.atlas_size != atlas.size) {
-        com.releaseOpt(&self.atlas_srv);
-        com.releaseOpt(&self.atlas_texture);
-        self.atlas_size = 0;
+/// The GPU copy of a font atlas.
+const AtlasTexture = struct {
+    texture: ?*d3d11.ITexture2D = null,
+    srv: ?*d3d11.IShaderResourceView = null,
+    size: u32 = 0,
+    generation: u64 = 0,
 
-        try com.check(self.device.createTexture2D(&.{
-            .Width = atlas.size,
-            .Height = atlas.size,
-            .Format = .R8_UNORM,
-            .Usage = d3d11.USAGE_DEFAULT,
-            .BindFlags = d3d11.BIND_SHADER_RESOURCE,
-        }, &self.atlas_texture), "ID3D11Device::CreateTexture2D(atlas)");
-        try com.check(
-            self.device.createShaderResourceView(self.atlas_texture.?.resource(), &self.atlas_srv),
-            "ID3D11Device::CreateShaderResourceView(atlas)",
-        );
-        self.atlas_size = atlas.size;
-        self.atlas_generation = atlas.generation -% 1;
-        log.debug("atlas texture {d}x{d}", .{ atlas.size, atlas.size });
+    fn deinit(self: *AtlasTexture) void {
+        com.releaseOpt(&self.srv);
+        com.releaseOpt(&self.texture);
     }
 
-    if (self.atlas_generation != atlas.generation) {
-        self.context.updateSubresource(self.atlas_texture.?.resource(), atlas.data.ptr, atlas.size);
-        self.atlas_generation = atlas.generation;
+    /// Mirror `atlas`, reallocating if it grew.
+    fn upload(self: *AtlasTexture, device: *d3d11.IDevice, ctx: *d3d11.IDeviceContext, atlas: *const font.Atlas) Error!void {
+        if (self.size != atlas.size) {
+            self.deinit();
+            self.size = 0;
+
+            try com.check(device.createTexture2D(&.{
+                .Width = atlas.size,
+                .Height = atlas.size,
+                .Format = switch (atlas.format) {
+                    .gray => .R8_UNORM,
+                    .rgba => .R8G8B8A8_UNORM,
+                },
+                .Usage = d3d11.USAGE_DEFAULT,
+                .BindFlags = d3d11.BIND_SHADER_RESOURCE,
+            }, &self.texture), "ID3D11Device::CreateTexture2D(atlas)");
+            try com.check(
+                device.createShaderResourceView(self.texture.?.resource(), &self.srv),
+                "ID3D11Device::CreateShaderResourceView(atlas)",
+            );
+            self.size = atlas.size;
+            self.generation = atlas.generation -% 1;
+            log.debug("{t} atlas texture {d}x{d}", .{ atlas.format, atlas.size, atlas.size });
+        }
+
+        if (self.generation != atlas.generation) {
+            ctx.updateSubresource(self.texture.?.resource(), atlas.data.ptr, atlas.size * atlas.format.depth());
+            self.generation = atlas.generation;
+        }
     }
-}
+};
 
 /// Mirror the snapshot's images on the GPU: upload new or changed images,
 /// freeing their pixels, and release textures of images no longer in it.

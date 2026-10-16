@@ -5,6 +5,7 @@ pub const Shaper = @import("Shaper.zig");
 
 test {
     _ = Atlas;
+    _ = Face;
     _ = Grid;
     _ = Shaper;
     _ = @import("sprite/Sprite.zig");

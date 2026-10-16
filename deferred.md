@@ -61,8 +61,17 @@ than being piecemealed with MessageBox and the like.
 
 ## Rendering
 
-- **Color emoji**: an RGBA atlas and `TranslateColorGlyphRun`.
 - **Emoji scaling** to the cell width.
+- **Default emoji presentation.** A codepoint like U+2B50 (⭐) is drawn
+  by the primary font whenever it has the glyph; only U+FE0F asks for
+  Segoe UI Emoji. Ghostty picks emoji presentation from the codepoint.
+- **Color layers in the text color** (palette index 0xFFFF) are drawn
+  white: color glyphs are cached without their cell's colors.
+- **Bitmap and COLRv1 color fonts** (PNG, SVG, gradients) need
+  `IDWriteFactory4::TranslateColorGlyphRun`; we only composite COLRv0
+  layers. Segoe UI Emoji has those.
+- **Text antialiasing** is always grayscale, in the grid and the chrome.
+  ClearType needs a third, subpixel atlas and dual-source blending.
 - **Gamma and contrast** tuning for text.
 - **Distinct underline styles** (double, curly, dotted, dashed).
 

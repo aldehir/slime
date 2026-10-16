@@ -42,6 +42,8 @@ pub const Instance = extern struct {
     pub const Kind = enum(u32) {
         glyph = 0,
         rect = 1,
+        /// A glyph from the color atlas, drawn in its own colors.
+        color_glyph = 2,
     };
 };
 
@@ -469,7 +471,7 @@ fn glyphInstance(m: font.Grid.Metrics, x: u32, dx: i32, dy: i32, g: font.Grid.Gl
         .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
         .atlas = .{ g.region.x, g.region.y },
         .color = color,
-        .kind = .glyph,
+        .kind = if (g.color) .color_glyph else .glyph,
     };
 }
 

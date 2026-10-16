@@ -126,6 +126,27 @@ pub const IFactory2 = extern struct {
         return com.call(self, 26, fn (*?*IFontFallback) HRESULT, .{out});
     }
 
+    /// Split a run into its color layers, in palette 0. Returns E_NOCOLOR
+    /// if the run has no color glyphs.
+    pub fn translateColorGlyphRun(
+        self: *IFactory2,
+        origin_x: f32,
+        origin_y: f32,
+        run: *const GLYPH_RUN,
+        out: *?*IColorGlyphRunEnumerator,
+    ) HRESULT {
+        return com.call(self, 28, fn (
+            f32,
+            f32,
+            *const GLYPH_RUN,
+            ?*const anyopaque, // DWRITE_GLYPH_RUN_DESCRIPTION
+            u32,
+            ?*const anyopaque, // DWRITE_MATRIX
+            u32,
+            *?*IColorGlyphRunEnumerator,
+        ) HRESULT, .{ origin_x, origin_y, run, null, MEASURING_MODE_NATURAL, null, 0, out });
+    }
+
     /// IDWriteFactory2::CreateGlyphRunAnalysis, the overload that takes
     /// grid fit and antialias modes.
     pub fn createGlyphRunAnalysis(
@@ -281,6 +302,51 @@ pub const IFontFace = extern struct {
         return com.call(self, 11, fn ([*]const u32, u32, [*]u16) HRESULT, .{
             codepoints.ptr, @as(u32, @intCast(codepoints.len)), out.ptr,
         });
+    }
+};
+
+pub const IFontFace2 = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0xd8b768ff,
+        .data2 = 0x64bc,
+        .data3 = 0x4e66,
+        .data4 = .{ 0x98, 0x2b, 0xec, 0x8e, 0x87, 0xf6, 0x93, 0xf7 },
+    };
+
+    pub fn isColorFont(self: *IFontFace2) bool {
+        return com.call(self, 30, fn () BOOL, .{}) != win32.FALSE;
+    }
+};
+
+pub const E_NOCOLOR: HRESULT = @bitCast(@as(u32, 0x8898500C));
+
+/// A layer's `paletteIndex` when it's drawn in the text color.
+pub const NO_PALETTE_INDEX: u16 = 0xFFFF;
+
+/// Straight (not premultiplied) RGBA.
+pub const COLOR_F = extern struct { r: f32, g: f32, b: f32, a: f32 };
+
+pub const COLOR_GLYPH_RUN = extern struct {
+    glyphRun: GLYPH_RUN,
+    glyphRunDescription: ?*const anyopaque,
+    baselineOriginX: f32,
+    baselineOriginY: f32,
+    runColor: COLOR_F,
+    paletteIndex: u16,
+};
+
+pub const IColorGlyphRunEnumerator = extern struct {
+    vtable: com.VTable,
+
+    pub fn moveNext(self: *IColorGlyphRunEnumerator, has_run: *BOOL) HRESULT {
+        return com.call(self, 3, fn (*BOOL) HRESULT, .{has_run});
+    }
+
+    /// Valid until the next `moveNext`.
+    pub fn getCurrentRun(self: *IColorGlyphRunEnumerator, out: *?*const COLOR_GLYPH_RUN) HRESULT {
+        return com.call(self, 4, fn (*?*const COLOR_GLYPH_RUN) HRESULT, .{out});
     }
 };
 

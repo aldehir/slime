@@ -772,6 +772,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         .images = &s.images,
         .textures = &s.textures,
         .atlas = &self.grid.atlas,
+        .color_atlas = &self.grid.color_atlas,
         .metrics = self.grid.metrics,
         .viewport = self.chrome_layout.terminal,
         .grid_offset = .{ @floatFromInt(pad.left), @floatFromInt(pad.top) },

@@ -4,9 +4,9 @@
 //   1. bg: a full-screen triangle; each pixel looks up its cell's
 //      background color. Default backgrounds are transparent, over the
 //      cleared frame and any kitty images below the background.
-//   2. text: instanced quads for glyphs (sampled from the atlas) and solid
-//      rectangles (cursor, underline, strikethrough), blended with
-//      premultiplied alpha.
+//   2. text: instanced quads for glyphs (sampled from the coverage atlas,
+//      or for color glyphs the RGBA one) and solid rectangles (cursor,
+//      underline, strikethrough), blended with premultiplied alpha.
 //
 // Everything is drawn into a viewport, the window's terminal area, which
 // clips it. Positions are in render target pixels, as SV_Position is.
@@ -33,8 +33,10 @@ struct Instance {
 StructuredBuffer<uint> bg_cells : register(t0);
 StructuredBuffer<Instance> instances : register(t1);
 Texture2D<float> atlas : register(t2);
+Texture2D<float4> color_atlas : register(t3);
 
 static const uint KIND_GLYPH = 0;
+static const uint KIND_COLOR_GLYPH = 2;
 
 float4 unpack(uint c) {
     return float4(c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff, c >> 24) / 255.0;
@@ -81,7 +83,9 @@ TextVsOut text_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
 
 float4 text_ps(TextVsOut i) : SV_Target {
     // Quads are pixel aligned, so the interpolated texel coordinate lands
-    // on texel centers and Load needs no sampler.
+    // on texel centers and Load needs no sampler. Color glyphs are
+    // premultiplied and keep only their cell color's alpha.
+    if (i.kind == KIND_COLOR_GLYPH) return color_atlas.Load(int3(i.tex, 0)) * i.color.a;
     float a = i.kind == KIND_GLYPH ? atlas.Load(int3(i.tex, 0)) : 1.0;
     a *= i.color.a;
     return float4(i.color.rgb * a, a);

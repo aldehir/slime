@@ -1,6 +1,6 @@
 //! Fonts for a terminal grid: the primary family's four style faces plus
 //! any fallback faces discovered along the way, cell metrics at the
-//! current size, the shaper, and the atlas of rasterized glyphs.
+//! current size, the shaper, and the atlases of rasterized glyphs.
 //!
 //! Faces are identified by `FaceId`, an index into `faces`. Glyphs are
 //! cached by (face, glyph index), never by codepoint: after shaping, one
@@ -77,9 +77,11 @@ pub const Metrics = struct {
 /// A rasterized glyph's location in the atlas and its placement relative
 /// to the pen position at the top-left corner of its cell.
 pub const Glyph = struct {
+    /// In `color_atlas` if `color`, otherwise in `atlas`.
     region: Atlas.Region,
     offset_x: i32,
     offset_y: i32,
+    color: bool = false,
 };
 
 const GlyphKey = struct {
@@ -112,7 +114,10 @@ size_pt: f32,
 dpi: u32,
 em_px: f32,
 metrics: Metrics,
+/// Coverage of plain glyphs and sprites, drawn in their cell's color.
 atlas: Atlas,
+/// Color glyphs (emoji), drawn as they are. Reset along with `atlas`.
+color_atlas: Atlas,
 
 /// Which face renders a grapheme, keyed by its first codepoint.
 face_for: std.AutoHashMapUnmanaged(FaceKey, FaceId) = .empty,
@@ -144,8 +149,10 @@ pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt:
     var shaper: Shaper = try .init(alloc, factory.?);
     errdefer shaper.deinit(alloc);
 
-    var atlas: Atlas = try .init(alloc, 512);
+    var atlas: Atlas = try .init(alloc, 512, .gray);
     errdefer atlas.deinit(alloc);
+    var color_atlas: Atlas = try .init(alloc, 128, .rgba);
+    errdefer color_atlas.deinit(alloc);
 
     var self: Grid = .{
         .alloc = alloc,
@@ -160,6 +167,7 @@ pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt:
         .em_px = undefined,
         .metrics = undefined,
         .atlas = atlas,
+        .color_atlas = color_atlas,
     };
     errdefer self.deinitFaces();
 
@@ -176,6 +184,7 @@ pub fn deinit(self: *Grid) void {
     self.glyphs.deinit(self.alloc);
     self.face_for.deinit(self.alloc);
     self.atlas.deinit(self.alloc);
+    self.color_atlas.deinit(self.alloc);
     self.shaper.deinit(self.alloc);
     self.deinitFaces();
     com.release(self.fallback);
@@ -231,6 +240,7 @@ fn resize(self: *Grid) void {
     self.metrics = self.computeMetrics();
     self.glyphs.clearRetainingCapacity();
     self.atlas.reset();
+    self.color_atlas.reset();
     self.shaper.reset();
     log.info("size={d}pt dpi={d} em={d:.2}px cell={d}x{d}", .{
         self.size_pt,
@@ -331,11 +341,16 @@ pub fn glyph(self: *Grid, face_id: FaceId, index: u16) !?Glyph {
         return null;
     }
 
-    const region = try self.atlas.insert(self.alloc, bitmap.width, bitmap.height, bitmap.pixels);
+    const atlas = switch (bitmap.format) {
+        .gray => &self.atlas,
+        .rgba => &self.color_atlas,
+    };
+    const region = try atlas.insert(self.alloc, bitmap.width, bitmap.height, bitmap.pixels);
     gop.value_ptr.* = .{
         .region = region,
         .offset_x = bitmap.left,
         .offset_y = @as(i32, @intCast(self.metrics.baseline)) + bitmap.top,
+        .color = bitmap.format == .rgba,
     };
     return gop.value_ptr.*;
 }

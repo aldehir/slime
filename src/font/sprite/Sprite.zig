@@ -151,7 +151,7 @@ test "ranges cover box drawing, blocks, braille, and Powerline" {
 
 test "a horizontal line spans the cell" {
     const alloc = std.testing.allocator;
-    var atlas: Atlas = try .init(alloc, 64);
+    var atlas: Atlas = try .init(alloc, 64, .gray);
     defer atlas.deinit(alloc);
 
     const m: Metrics = .{
