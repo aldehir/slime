@@ -213,9 +213,11 @@ func TestPermissionDenied(t *testing.T) {
 	srv := startServer(t, sshtest.Options{KeyThenDuo: true, AuthorizedKeys: []ssh.PublicKey{other}})
 	h := newHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withAgent(t, priv))
 	tm := h.open(1, 80, 24, "")
-	tm.expect(t, "alde@127.0.0.1: Permission denied (publickey).\r\n")
-	h.expectDisconnected("Permission denied")
+	h.expectDisconnected("alde@127.0.0.1: Permission denied (publickey).")
 	tm.expectEOF(t)
+	if strings.Contains(tm.contents(), "handshake") {
+		t.Errorf("x/crypto's wrapping reached the screen:\n%s", tm.contents())
+	}
 }
 
 // A key file the agent already holds isn't offered again, so a key the

@@ -321,13 +321,8 @@ func (s *Server) connect(ch *channel) {
 			s.finish(nil, "cancelled")
 			return
 		}
-		var denied *deniedError
-		if errors.As(err, &denied) {
-			p.Print(denied.Error() + "\n")
-		} else {
-			p.Print(fmt.Sprintf("slime-ssh: %v\n", err))
-		}
-		s.finish(fmt.Errorf("connecting to %s: %w", s.opts.Dest.Addr(), err), err.Error())
+		// slime shows the reason in the channel's terminal.
+		s.finish(fmt.Errorf("connecting to %s: %w", s.opts.Dest.Addr(), err), failReason(err))
 		return
 	}
 	s.client = client
@@ -535,6 +530,21 @@ func (s *Server) watch(client *ssh.Client) {
 		return
 	}
 	s.finish(s.connErr, connReason(s.connErr))
+}
+
+// failReason says why connecting failed, without x/crypto's "ssh:
+// handshake failed:" wrapping where ours says it better.
+func failReason(err error) string {
+	var denied *deniedError
+	switch {
+	case errors.As(err, &denied):
+		return denied.Error()
+	case errors.Is(err, errHostKeyRejected):
+		return errHostKeyRejected.Error()
+	case errors.Is(err, prompt.ErrInterrupted):
+		return "interrupted"
+	}
+	return err.Error()
 }
 
 func connReason(err error) string {
