@@ -40,3 +40,31 @@ pub fn set(hwnd: win32.HWND, text: []const u8) !void {
     if (win32.SetClipboardData(win32.CF_UNICODETEXT, mem) == null) return win32.lastError("SetClipboardData");
     owned = false;
 }
+
+/// Whether the clipboard holds text.
+pub fn hasText() bool {
+    return win32.IsClipboardFormatAvailable(win32.CF_UNICODETEXT) != 0;
+}
+
+/// The clipboard's text, or null if it holds none. Owned by the caller.
+pub fn get(alloc: std.mem.Allocator, hwnd: win32.HWND) !?[]u8 {
+    if (win32.OpenClipboard(hwnd) == 0) return win32.lastError("OpenClipboard");
+    defer _ = win32.CloseClipboard();
+    const mem = win32.GetClipboardData(win32.CF_UNICODETEXT) orelse return null;
+
+    const ptr: [*]const u16 = @ptrCast(@alignCast(win32.GlobalLock(mem) orelse return win32.lastError("GlobalLock")));
+    defer _ = win32.GlobalUnlock(mem);
+    // Stop at the terminator, which the memory should but needn't have.
+    const units = ptr[0 .. win32.GlobalSize(mem) / @sizeOf(u16)];
+    const utf16 = units[0 .. std.mem.indexOfScalar(u16, units, 0) orelse units.len];
+
+    const text = try std.unicode.utf16LeToUtf8Alloc(alloc, utf16);
+    // CRLF to LF, in place.
+    var n: usize = 0;
+    for (text, 0..) |c, i| {
+        if (c == '\r' and i + 1 < text.len and text[i + 1] == '\n') continue;
+        text[n] = c;
+        n += 1;
+    }
+    return try alloc.realloc(text, n);
+}

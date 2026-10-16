@@ -383,8 +383,9 @@ fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM)
     if (self.pty) |*pty| pty.write(w.buffered());
 }
 
-/// Run the key binding a key press triggers, Ghostty's defaults for
-/// copying: ctrl+shift+c when there is a selection, and ctrl+insert.
+/// Run the key binding a key press triggers, Ghostty's defaults: copy
+/// with ctrl+shift+c (when there is a selection) or ctrl+insert, paste
+/// with ctrl+shift+v (when the clipboard has text) or shift+insert.
 /// Returns true if the key is consumed, which also holds for the release
 /// of a key that ran a binding.
 fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
@@ -396,11 +397,16 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
     }
 
     const mods = input.currentMods();
-    if (mods.alt or mods.super or !mods.ctrl) return false;
-    if (mods.shift and vk == 'C') {
+    if (mods.alt or mods.super) return false;
+    if (mods.ctrl and mods.shift and vk == 'C') {
         if (!self.copySelection()) return false;
-    } else if (!mods.shift and vk == win32.VK_INSERT) {
+    } else if (mods.ctrl and !mods.shift and vk == win32.VK_INSERT) {
         _ = self.copySelection();
+    } else if (mods.ctrl and mods.shift and vk == 'V') {
+        if (!clipboard.hasText()) return false;
+        self.paste();
+    } else if (!mods.ctrl and mods.shift and vk == win32.VK_INSERT) {
+        self.paste();
     } else return false;
 
     // Drop the text TranslateMessage posted for the key (ctrl+shift+c
@@ -430,6 +436,26 @@ fn copySelection(self: *Window) bool {
     defer self.alloc.free(utf8);
     clipboard.set(self.hwnd.?, utf8) catch |err| log.err("copy failed: {}", .{err});
     return true;
+}
+
+/// Send the clipboard's text to the child: bracketed if it asked for
+/// that (mode 2004), else with newlines as CR, as the enter key sends.
+/// Either way, control bytes that could signal the child or end the
+/// paste early (ESC, ^C, ...) become spaces.
+fn paste(self: *Window) void {
+    const text = (clipboard.get(self.alloc, self.hwnd.?) catch |err| {
+        log.err("paste failed: {}", .{err});
+        return;
+    }) orelse return;
+    defer self.alloc.free(text);
+    if (text.len == 0) return;
+
+    self.lockTerminal();
+    const opts: ghostty_vt.input.PasteOptions = .fromTerminal(&self.terminal);
+    self.unlockTerminal();
+    self.typed();
+    const parts = ghostty_vt.input.encodePaste(text, opts);
+    if (self.pty) |*pty| for (parts) |part| pty.write(part);
 }
 
 /// Send text from a WM_CHAR that no key message claimed: IME commits,

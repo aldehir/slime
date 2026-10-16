@@ -98,6 +98,8 @@ src/win32/*.zig         hand-written bindings (conpty.zig loads our conpty.dll a
   swap chain's latency-1 waitable) only while the terminal is dirty. Every
   Present needs exactly one wait on the waitable. Over Remote Desktop DWM
   composes at ~32 Hz and doesn't pace presents, so fps there isn't vsync.
+- `deferred.md` lists features left for later. Check it before building
+  something adjacent, add to it when deferring, and remove items when done.
 - Match the existing comment density; doc comments on files and public decls.
 - Commits: one-line conventional commits with an `Assisted-by:` trailer.
   Only commit when asked.

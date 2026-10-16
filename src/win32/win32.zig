@@ -351,6 +351,7 @@ pub extern "kernel32" fn GlobalAlloc(u32, usize) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn GlobalLock(HANDLE) callconv(.winapi) ?*anyopaque;
 pub extern "kernel32" fn GlobalUnlock(HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GlobalFree(HANDLE) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn GlobalSize(HANDLE) callconv(.winapi) usize;
 
 pub extern "user32" fn SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetDpiForWindow(HWND) callconv(.winapi) u32;
@@ -404,6 +405,8 @@ pub extern "user32" fn OpenClipboard(?HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
 pub extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
 pub extern "user32" fn SetClipboardData(u32, ?HANDLE) callconv(.winapi) ?HANDLE;
+pub extern "user32" fn GetClipboardData(u32) callconv(.winapi) ?HANDLE;
+pub extern "user32" fn IsClipboardFormatAvailable(u32) callconv(.winapi) BOOL;
 
 pub extern "dwmapi" fn DwmGetCompositionTimingInfo(?HWND, *DWM_TIMING_INFO) callconv(.winapi) HRESULT;
 pub extern "dwmapi" fn DwmSetWindowAttribute(HWND, u32, *const anyopaque, u32) callconv(.winapi) HRESULT;
