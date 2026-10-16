@@ -53,6 +53,10 @@ pub fn build(b: *std.Build) void {
     })) |dep| {
         exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
     }
+    exe_mod.addImport("z2d", b.dependency("z2d", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("z2d"));
 
     // The app icon, rendered from assets/icon by a host tool. Zig's cache
     // reruns it only when the tool or an SVG changes.

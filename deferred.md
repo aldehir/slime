@@ -39,8 +39,6 @@ wait until there is a proper design for it.
 
 - **Color emoji**: an RGBA atlas and `TranslateColorGlyphRun`.
 - **Emoji scaling** to the cell width.
-- **Sprite-drawn box drawing** and block elements, so they join
-  seamlessly across cells.
 - **Gamma and contrast** tuning for text.
 - **Distinct underline styles** (double, curly, dotted, dashed).
 

@@ -5,6 +5,8 @@
 //! Faces are identified by `FaceId`, an index into `faces`. Glyphs are
 //! cached by (face, glyph index), never by codepoint: after shaping, one
 //! codepoint can become different glyphs depending on its neighbors.
+//! The exception is `sprite_face`, whose glyphs we draw ourselves (see
+//! `Sprite`), keyed by codepoint and width.
 const Grid = @This();
 
 const std = @import("std");
@@ -16,6 +18,7 @@ const analysis = @import("analysis.zig");
 const Atlas = @import("Atlas.zig");
 const Face = @import("Face.zig");
 const Shaper = @import("Shaper.zig");
+const Sprite = @import("sprite/Sprite.zig");
 
 const log = std.log.scoped(.font);
 
@@ -32,6 +35,9 @@ const default_families = [_][:0]const u16{
 const emoji_family = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
 
 pub const FaceId = u16;
+
+/// The face for codepoints `Sprite` draws. They're never shaped.
+pub const sprite_face: FaceId = std.math.maxInt(FaceId);
 
 pub const Style = enum(u2) {
     regular,
@@ -78,7 +84,9 @@ pub const Glyph = struct {
 
 const GlyphKey = struct {
     face: FaceId,
-    index: u16,
+    /// A glyph index, or for `sprite_face`, the codepoint and the number
+    /// of cells it spans packed above it.
+    index: u32,
 };
 
 const FaceKey = struct {
@@ -88,6 +96,8 @@ const FaceKey = struct {
 };
 
 alloc: Allocator,
+/// For drawing sprites.
+io: std.Io,
 factory: *dwrite.IFactory2,
 collection: *dwrite.IFontCollection,
 fallback: *dwrite.IFontFallback,
@@ -110,7 +120,7 @@ face_for: std.AutoHashMapUnmanaged(FaceKey, FaceId) = .empty,
 glyphs: std.AutoHashMapUnmanaged(GlyphKey, ?Glyph) = .empty,
 
 /// `families` are tried in order (UTF-8), then the defaults.
-pub fn init(alloc: Allocator, families: []const []const u8, size_pt: f32, dpi: u32) !Grid {
+pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt: f32, dpi: u32) !Grid {
     var factory: ?*dwrite.IFactory2 = null;
     try com.check(
         dwrite.DWriteCreateFactory(dwrite.FACTORY_TYPE_SHARED, &dwrite.IFactory2.iid, @ptrCast(&factory)),
@@ -138,6 +148,7 @@ pub fn init(alloc: Allocator, families: []const []const u8, size_pt: f32, dpi: u
 
     var self: Grid = .{
         .alloc = alloc,
+        .io = io,
         .factory = factory.?,
         .collection = collection.?,
         .fallback = fallback.?,
@@ -222,17 +233,19 @@ pub fn beginFrame(self: *Grid) void {
     self.shaper.trim();
 }
 
-/// The face that renders a grapheme, given all its codepoints. The
-/// primary face is used whenever it has the first codepoint, unless the
-/// grapheme asks for emoji presentation; otherwise DirectWrite's system
-/// fallback picks one.
+/// The face that renders a grapheme, given all its codepoints. Sprites
+/// come first, as in Ghostty. Then the primary face is used whenever it
+/// has the first codepoint, unless the grapheme asks for emoji
+/// presentation; otherwise DirectWrite's system fallback picks one.
 pub fn faceFor(self: *Grid, style: Style, cps: []const u21) !FaceId {
     const emoji = std.mem.indexOfScalar(u21, cps, 0xFE0F) != null;
     const gop = try self.face_for.getOrPut(self.alloc, .{ .style = style, .cp = cps[0], .emoji = emoji });
     if (gop.found_existing) return gop.value_ptr.*;
     errdefer self.face_for.removeByPtr(gop.key_ptr);
 
-    gop.value_ptr.* = if (!emoji and self.faces.items[style.primary()].glyphIndex(cps[0]) != null)
+    gop.value_ptr.* = if (Sprite.hasCodepoint(cps[0]))
+        sprite_face
+    else if (!emoji and self.faces.items[style.primary()].glyphIndex(cps[0]) != null)
         style.primary()
     else
         try self.resolveFallback(style, cps, emoji);
@@ -311,6 +324,34 @@ pub fn glyph(self: *Grid, face_id: FaceId, index: u16) !?Glyph {
         .offset_x = bitmap.left,
         .offset_y = @as(i32, @intCast(self.metrics.baseline)) + bitmap.top,
     };
+    return gop.value_ptr.*;
+}
+
+/// Get (drawing on first use) the sprite for `cp` spanning `cells` cells.
+pub fn spriteGlyph(self: *Grid, cp: u21, cells: u32) !?Glyph {
+    const gop = try self.glyphs.getOrPut(self.alloc, .{ .face = sprite_face, .index = cp | cells << 21 });
+    if (gop.found_existing) return gop.value_ptr.*;
+    errdefer self.glyphs.removeByPtr(gop.key_ptr);
+
+    const m = self.metrics;
+    const placed = try Sprite.render(self.alloc, self.io, &self.atlas, .{
+        .cell_width = m.cell_width,
+        .cell_height = m.cell_height,
+        .underline_position = m.underline_position,
+        .underline_thickness = m.underline_thickness,
+        .strikethrough_position = m.strikethrough_position,
+        .strikethrough_thickness = m.strikethrough_thickness,
+        .overline_position = 0,
+        // Ghostty's defaults: overlines and box lines match underlines.
+        .overline_thickness = m.underline_thickness,
+        .box_thickness = m.underline_thickness,
+        .cursor_height = m.cell_height,
+    }, cp, cells);
+    gop.value_ptr.* = if (placed) |p| .{
+        .region = p.region,
+        .offset_x = p.offset_x,
+        .offset_y = p.offset_y,
+    } else null;
     return gop.value_ptr.*;
 }
 

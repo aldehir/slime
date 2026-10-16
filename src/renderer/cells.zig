@@ -278,6 +278,18 @@ pub const Cells = struct {
                 continue;
             }
 
+            // Sprites are drawn to fit their cells, with nothing to shape.
+            if (first.face == font.Grid.sprite_face) {
+                const raw = row.raws[x];
+                if (first.color >> 24 != 0) {
+                    if (try grid.spriteGlyph(raw.codepoint(), if (raw.wide == .wide) 2 else 1)) |g| {
+                        try out.instances.append(alloc, glyphInstance(m, x, 0, 0, g, first.color));
+                    }
+                }
+                x += 1;
+                continue;
+            }
+
             const run_start = x;
             self.run_text.clearRetainingCapacity();
             self.run_cells.clearRetainingCapacity();
@@ -302,18 +314,7 @@ pub const Cells = struct {
                 const color = self.row_text.items[cell_x].color;
                 if (color >> 24 == 0) continue;
                 const g = try grid.glyph(first.face, sg.index) orelse continue;
-
-                const origin_x: i32 = @intCast(cell_x * m.cell_width);
-                try out.instances.append(alloc, .{
-                    .pos = .{
-                        @floatFromInt(origin_x + sg.x + g.offset_x),
-                        @floatFromInt(sg.y + g.offset_y),
-                    },
-                    .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
-                    .atlas = .{ g.region.x, g.region.y },
-                    .color = color,
-                    .kind = .glyph,
-                });
+                try out.instances.append(alloc, glyphInstance(m, cell_x, sg.x, sg.y, g, color));
             }
         }
     }
@@ -440,6 +441,22 @@ fn cursorStyle(state: *const RenderState, opts: CursorOptions) ?ghostty_vt.Curso
     if (!opts.focused) return .block_hollow;
     if (state.cursor.blinking and !opts.blink_visible) return null;
     return state.cursor.visual_style;
+}
+
+/// A glyph in cell `x` of a row at the top of the grid, offset by
+/// (`dx`, `dy`) from where its cell would put it.
+fn glyphInstance(m: font.Grid.Metrics, x: u32, dx: i32, dy: i32, g: font.Grid.Glyph, color: u32) Instance {
+    const origin_x: i32 = @intCast(x * m.cell_width);
+    return .{
+        .pos = .{
+            @floatFromInt(origin_x + dx + g.offset_x),
+            @floatFromInt(dy + g.offset_y),
+        },
+        .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
+        .atlas = .{ g.region.x, g.region.y },
+        .color = color,
+        .kind = .glyph,
+    };
 }
 
 /// A solid rectangle within cell (x, y), `dy` pixels below its top.

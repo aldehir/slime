@@ -2,7 +2,9 @@
 
 slime is built on [libghostty-vt](https://github.com/ghostty-org/ghostty),
 the terminal emulation core of Ghostty, which is compiled into the
-executable. Ghostty's bundled color themes are also installed alongside it.
+executable. Ghostty's bundled color themes are also installed alongside it,
+and its sprite drawing code (box drawing, blocks, and similar glyphs) is
+vendored in `src/font/sprite`.
 
 ## Ghostty
 
@@ -29,6 +31,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## z2d
+
+The sprite drawing code uses [z2d](https://github.com/vancluever/z2d),
+Copyright © 2024-2026 Chris Marchesi, which is compiled into the
+executable unmodified. It is licensed under the
+[Mozilla Public License 2.0](https://mozilla.org/MPL/2.0/), and its source
+is available at https://github.com/vancluever/z2d.
 
 ## ConPTY
 

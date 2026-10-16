@@ -218,7 +218,7 @@ pub fn create(
     _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL));
 
     self.dpi = win32.GetDpiForWindow(hwnd);
-    self.grid = try .init(alloc, config.@"font-family".items, config.@"font-size", self.dpi);
+    self.grid = try .init(alloc, io, config.@"font-family".items, config.@"font-size", self.dpi);
     errdefer self.grid.deinit();
 
     const size = self.clientSize();

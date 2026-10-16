@@ -7,4 +7,5 @@ test {
     _ = Atlas;
     _ = Grid;
     _ = Shaper;
+    _ = @import("sprite/Sprite.zig");
 }
