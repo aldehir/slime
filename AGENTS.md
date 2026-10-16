@@ -26,6 +26,12 @@ Other options: `-Dstats` (frame stats in the title; default on in Debug),
   libghostty-vt's C++ deps (simdutf, highway) fail with `char16_t`
   undeclared. Do not "fix" this by removing the machine's old VS installs.
 - Clone with `--recursive` (or `git submodule update --init`).
+- `ghostty/` tracks Alde's fork (`aldehir/ghostty`, branch
+  `vt-unknown-modes`), which carries our libghostty-vt patches on top of
+  upstream. In the submodule, `origin` is the fork and `upstream` is
+  ghostty-org. **Never open a pull request against upstream
+  ghostty-org/ghostty**, and never push, comment, or file issues there.
+  Patches go to the fork only.
 - We ship our own ConPTY (`Microsoft.Windows.Console.ConPTY`, version and
   SHA-256 pinned in `build.zig`). The build runs `scripts\fetch-conpty.ps1`
   when `tools\conpty-<ver>\` is missing, then installs `conpty.dll` and
