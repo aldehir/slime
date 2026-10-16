@@ -200,14 +200,14 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line:
     _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL));
 
     self.dpi = win32.GetDpiForWindow(hwnd);
-    self.grid = try .init(alloc, io, config.@"font-family".items, config.@"font-size", self.dpi);
+    self.grid = try .init(alloc, io, config.@"font-family".items, config.@"font-size", self.dpi, config.@"font-antialias");
     errdefer self.grid.deinit();
     self.chrome = try .init(self.dpi, theme);
     errdefer self.chrome.deinit();
 
     const size = self.clientSize();
     self.updateLayout(size);
-    self.renderer = try Renderer.init(hwnd, size.width, size.height);
+    self.renderer = try Renderer.init(hwnd, size.width, size.height, config.@"font-antialias");
     errdefer {
         self.renderer.?.deinit();
         self.renderer = null;
@@ -773,6 +773,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         .textures = &s.textures,
         .atlas = &self.grid.atlas,
         .color_atlas = &self.grid.color_atlas,
+        .lcd_atlas = &self.grid.lcd_atlas,
         .metrics = self.grid.metrics,
         .viewport = self.chrome_layout.terminal,
         .grid_offset = .{ @floatFromInt(pad.left), @floatFromInt(pad.top) },

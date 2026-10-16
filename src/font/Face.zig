@@ -18,6 +18,15 @@ color: bool,
 
 pub const Error = com.Error || error{FontNotFound};
 
+/// How glyph edges are smoothed. Color glyphs are always grayscale.
+pub const Antialias = enum {
+    grayscale,
+    /// Per-subpixel coverage, for RGB-striped displays.
+    cleartype,
+    /// No smoothing: pixels are on or off.
+    aliased,
+};
+
 pub fn init(
     collection: *dwrite.IFontCollection,
     family: [:0]const u16,
@@ -97,7 +106,8 @@ pub const Bitmap = struct {
     top: i32,
     width: u32,
     height: u32,
-    /// Coverage for most glyphs, premultiplied RGBA for color glyphs.
+    /// Coverage for most glyphs (`.lcd` with ClearType), premultiplied
+    /// RGBA for color glyphs.
     format: Atlas.Format,
     /// Tightly packed rows. Empty for blank glyphs.
     pixels: []u8,
@@ -108,14 +118,15 @@ pub const Bitmap = struct {
     }
 };
 
-/// Rasterize a glyph at `em_px` pixels per em: grayscale coverage, or
-/// for a color glyph, its layers composited in palette 0.
+/// Rasterize a glyph at `em_px` pixels per em: coverage, or for a color
+/// glyph, its layers composited in palette 0.
 pub fn rasterize(
     self: *const Face,
     alloc: Allocator,
     factory: *dwrite.IFactory2,
     glyph: u16,
     em_px: f32,
+    antialias: Antialias,
 ) (com.Error || Allocator.Error)!Bitmap {
     const glyphs = [_]u16{glyph};
     const advances = [_]f32{0};
@@ -131,8 +142,8 @@ pub fn rasterize(
         if (try rasterizeColor(alloc, factory, &run)) |bitmap| return bitmap;
     }
 
-    const c = try coverage(alloc, factory, &run, 0, 0);
-    return .{
+    const c = try coverage(alloc, factory, &run, 0, 0, antialias);
+    var bitmap: Bitmap = .{
         .left = c.bounds.left,
         .top = c.bounds.top,
         .width = c.width(),
@@ -140,6 +151,17 @@ pub fn rasterize(
         .format = .gray,
         .pixels = c.pixels,
     };
+    if (antialias != .cleartype) return bitmap;
+
+    // Pad each pixel's three subpixels out to a texel.
+    defer alloc.free(c.pixels);
+    bitmap.format = .lcd;
+    bitmap.pixels = try alloc.alloc(u8, c.pixels.len / 3 * 4);
+    for (0..c.pixels.len / 3) |i| {
+        const rgb = c.pixels[i * 3 ..][0..3];
+        bitmap.pixels[i * 4 ..][0..4].* = .{ rgb[0], rgb[1], rgb[2], @max(rgb[0], rgb[1], rgb[2]) };
+    }
+    return bitmap;
 }
 
 const Coverage = struct {
@@ -155,40 +177,47 @@ const Coverage = struct {
     }
 };
 
-/// Grayscale coverage of `run` with its baseline origin at (`x`, `y`).
+/// Coverage of `run` with its baseline origin at (`x`, `y`): a byte per
+/// pixel, or with ClearType, three (red, green, blue subpixels).
 fn coverage(
     alloc: Allocator,
     factory: *dwrite.IFactory2,
     run: *const dwrite.GLYPH_RUN,
     x: f32,
     y: f32,
+    antialias: Antialias,
 ) (com.Error || Allocator.Error)!Coverage {
     var analysis: ?*dwrite.IGlyphRunAnalysis = null;
     try com.check(factory.createGlyphRunAnalysis(
         run,
-        dwrite.RENDERING_MODE_NATURAL_SYMMETRIC,
+        if (antialias == .aliased) dwrite.RENDERING_MODE_ALIASED else dwrite.RENDERING_MODE_NATURAL_SYMMETRIC,
         dwrite.MEASURING_MODE_NATURAL,
         dwrite.GRID_FIT_MODE_DEFAULT,
-        dwrite.TEXT_ANTIALIAS_MODE_GRAYSCALE,
+        if (antialias == .cleartype) dwrite.TEXT_ANTIALIAS_MODE_CLEARTYPE else dwrite.TEXT_ANTIALIAS_MODE_GRAYSCALE,
         x,
         y,
         &analysis,
     ), "IDWriteFactory2::CreateGlyphRunAnalysis");
     defer com.releaseOpt(&analysis);
 
-    // With grayscale antialiasing the 1x1 texture holds coverage values,
-    // not just on/off pixels.
+    // The analysis only fills the texture type matching its modes. For
+    // grayscale the 1x1 texture holds coverage values, not just on/off
+    // pixels.
+    const texture, const depth: usize = if (antialias == .cleartype)
+        .{ dwrite.TEXTURE_CLEARTYPE_3x1, 3 }
+    else
+        .{ dwrite.TEXTURE_ALIASED_1x1, 1 };
     var c: Coverage = .{ .bounds = undefined, .pixels = &.{} };
     try com.check(
-        analysis.?.getAlphaTextureBounds(dwrite.TEXTURE_ALIASED_1x1, &c.bounds),
+        analysis.?.getAlphaTextureBounds(texture, &c.bounds),
         "IDWriteGlyphRunAnalysis::GetAlphaTextureBounds",
     );
 
-    c.pixels = try alloc.alloc(u8, @as(usize, c.width()) * c.height());
+    c.pixels = try alloc.alloc(u8, @as(usize, c.width()) * c.height() * depth);
     errdefer alloc.free(c.pixels);
     if (c.pixels.len > 0) {
         try com.check(
-            analysis.?.createAlphaTexture(dwrite.TEXTURE_ALIASED_1x1, &c.bounds, c.pixels),
+            analysis.?.createAlphaTexture(texture, &c.bounds, c.pixels),
             "IDWriteGlyphRunAnalysis::CreateAlphaTexture",
         );
     }
@@ -232,7 +261,7 @@ fn rasterizeColor(
         const l = layer.?;
 
         try layers.ensureUnusedCapacity(alloc, 1);
-        const c = try coverage(alloc, factory, &l.glyphRun, l.baselineOriginX, l.baselineOriginY);
+        const c = try coverage(alloc, factory, &l.glyphRun, l.baselineOriginX, l.baselineOriginY, .grayscale);
         layers.appendAssumeCapacity(.{ .coverage = c, .color = layerColor(l) });
         if (c.pixels.len == 0) continue;
         bounds.left = @min(bounds.left, c.bounds.left);

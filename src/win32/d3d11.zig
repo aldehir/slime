@@ -37,6 +37,8 @@ pub const MAP_WRITE_DISCARD: u32 = 4;
 
 pub const BLEND_ONE: u32 = 2;
 pub const BLEND_INV_SRC_ALPHA: u32 = 6;
+pub const BLEND_INV_SRC1_COLOR: u32 = 17;
+pub const BLEND_INV_SRC1_ALPHA: u32 = 19;
 pub const BLEND_OP_ADD: u32 = 1;
 pub const COLOR_WRITE_ENABLE_ALL: u8 = 0xF;
 

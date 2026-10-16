@@ -69,6 +69,7 @@ instances: DynamicBuffer = .{ .stride = @sizeOf(cells.Instance) },
 
 atlas: AtlasTexture = .{},
 color_atlas: AtlasTexture = .{},
+lcd_atlas: AtlasTexture = .{},
 
 /// The placement being drawn (see `drawImages`).
 image_placement: *d3d11.IBuffer,
@@ -114,6 +115,7 @@ pub const Frame = struct {
     textures: *ImageTextures,
     atlas: *const font.Atlas,
     color_atlas: *const font.Atlas,
+    lcd_atlas: *const font.Atlas,
     metrics: font.Grid.Metrics,
     /// The terminal's part of the window, which clips it.
     viewport: Painter.Rect,
@@ -123,7 +125,8 @@ pub const Frame = struct {
 
 pub const Error = com.Error;
 
-pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
+/// `antialias` is for the chrome's text; the grid's comes rasterized.
+pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias) Error!D3D11 {
     var device: ?*d3d11.IDevice = null;
     var context: ?*d3d11.IDeviceContext = null;
     try createDevice(&device, &context);
@@ -203,7 +206,7 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
     }, &image_placement), "ID3D11Device::CreateBuffer(image placement)");
     errdefer com.releaseOpt(&image_placement);
 
-    const d2d = try createD2d(device.?);
+    const d2d = try createD2d(device.?, antialias);
     errdefer d2d.deinit();
 
     var self: D3D11 = .{
@@ -245,6 +248,7 @@ pub fn deinit(self: *D3D11) void {
     if (self.lucide) |*icons| Painter.deinitLucide(icons);
     (D2d{ .factory = self.d2d_factory, .device = self.d2d_device, .context = self.d2d_context, .brush = self.brush }).deinit();
     com.release(self.image_placement);
+    self.lcd_atlas.deinit();
     self.color_atlas.deinit();
     self.atlas.deinit();
     self.instances.deinit();
@@ -368,6 +372,7 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
 
     try self.atlas.upload(self.device, ctx, f.atlas);
     try self.color_atlas.upload(self.device, ctx, f.color_atlas);
+    try self.lcd_atlas.upload(self.device, ctx, f.lcd_atlas);
     try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.bg.items));
     try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.instances.items));
     try self.uploadImages(alloc, f.images, f.textures);
@@ -423,8 +428,8 @@ fn drawGrid(self: *D3D11, f: Frame) Error!void {
         ctx.vsSetConstantBuffers(0, &.{self.uniforms});
         ctx.vsSetShaderResources(1, &.{self.instances.srv});
         ctx.psSetShader(self.pipeline.text_ps);
-        ctx.psSetShaderResources(2, &.{ self.atlas.srv, self.color_atlas.srv });
-        ctx.omSetBlendState(self.pipeline.blend);
+        ctx.psSetShaderResources(2, &.{ self.atlas.srv, self.color_atlas.srv, self.lcd_atlas.srv });
+        ctx.omSetBlendState(self.pipeline.text_blend);
         ctx.drawInstanced(4, @intCast(frame.instances.items.len), 0, 0);
     }
     try self.drawImages(images, f.textures, .above_text);
@@ -456,7 +461,7 @@ fn drawImages(self: *D3D11, images: *const image.Images, textures: *const ImageT
         try com.check(ctx.map(self.image_placement.resource(), d3d11.MAP_WRITE_DISCARD, &mapped), "Map(image placement)");
         @as(*image.Placement, @ptrCast(@alignCast(mapped.pData.?))).* = p;
         ctx.unmap(self.image_placement.resource());
-        ctx.psSetShaderResources(4, &.{tex.srv});
+        ctx.psSetShaderResources(5, &.{tex.srv});
         ctx.draw(4, 0);
     }
 }
@@ -484,7 +489,7 @@ const AtlasTexture = struct {
                 .Height = atlas.size,
                 .Format = switch (atlas.format) {
                     .gray => .R8_UNORM,
-                    .rgba => .R8G8B8A8_UNORM,
+                    .rgba, .lcd => .R8G8B8A8_UNORM,
                 },
                 .Usage = d3d11.USAGE_DEFAULT,
                 .BindFlags = d3d11.BIND_SHADER_RESOURCE,
@@ -590,7 +595,7 @@ const D2d = struct {
 
 /// A Direct2D device context on our D3D device, which was created with
 /// BGRA support for this. Its DPI stays at 96, so it draws in pixels.
-fn createD2d(device: *d3d11.IDevice) Error!D2d {
+fn createD2d(device: *d3d11.IDevice, antialias: font.Antialias) Error!D2d {
     var factory: ?*d2d1.IFactory1 = null;
     try com.check(
         d2d1.D2D1CreateFactory(d2d1.FACTORY_TYPE_SINGLE_THREADED, &d2d1.IFactory1.iid, null, @ptrCast(&factory)),
@@ -610,7 +615,11 @@ fn createD2d(device: *d3d11.IDevice) Error!D2d {
     var context: ?*d2d1.IDeviceContext = null;
     try com.check(d2d_device.?.createDeviceContext(0, &context), "ID2D1Device::CreateDeviceContext");
     errdefer com.releaseOpt(&context);
-    context.?.setTextAntialiasMode(d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    context.?.setTextAntialiasMode(switch (antialias) {
+        .grayscale => d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE,
+        .cleartype => d2d1.TEXT_ANTIALIAS_MODE_CLEARTYPE,
+        .aliased => d2d1.TEXT_ANTIALIAS_MODE_ALIASED,
+    });
 
     var brush: ?*d2d1.ISolidColorBrush = null;
     try com.check(context.?.createSolidColorBrush(&.{ 0, 0, 0, 1 }, &brush), "ID2D1DeviceContext::CreateSolidColorBrush");
@@ -675,6 +684,7 @@ const Pipeline = struct {
     image_ps: *d3d11.IPixelShader,
     image_sampler: *d3d11.ISamplerState,
     blend: *d3d11.IBlendState,
+    text_blend: *d3d11.IBlendState,
 
     fn init(device: *d3d11.IDevice) Error!Pipeline {
         var bg_vs: ?*d3d11.IVertexShader = null;
@@ -685,6 +695,7 @@ const Pipeline = struct {
         var image_ps: ?*d3d11.IPixelShader = null;
         var image_sampler: ?*d3d11.ISamplerState = null;
         var blend: ?*d3d11.IBlendState = null;
+        var text_blend: ?*d3d11.IBlendState = null;
         errdefer {
             com.releaseOpt(&bg_vs);
             com.releaseOpt(&bg_ps);
@@ -694,6 +705,7 @@ const Pipeline = struct {
             com.releaseOpt(&image_ps);
             com.releaseOpt(&image_sampler);
             com.releaseOpt(&blend);
+            com.releaseOpt(&text_blend);
         }
 
         try createShader(device, "bg_vs", &bg_vs);
@@ -717,6 +729,14 @@ const Pipeline = struct {
         };
         try com.check(device.createBlendState(&desc, &blend), "ID3D11Device::CreateBlendState");
 
+        // Text blends each channel by its own alpha, the second output
+        // of text_ps, so ClearType's subpixels mix separately:
+        // out = src0 + dst * (1 - src1). With equal channels it's the
+        // premultiplied blend above.
+        desc.RenderTarget[0].DestBlend = d3d11.BLEND_INV_SRC1_COLOR;
+        desc.RenderTarget[0].DestBlendAlpha = d3d11.BLEND_INV_SRC1_ALPHA;
+        try com.check(device.createBlendState(&desc, &text_blend), "ID3D11Device::CreateBlendState(text)");
+
         return .{
             .bg_vs = bg_vs.?,
             .bg_ps = bg_ps.?,
@@ -726,6 +746,7 @@ const Pipeline = struct {
             .image_ps = image_ps.?,
             .image_sampler = image_sampler.?,
             .blend = blend.?,
+            .text_blend = text_blend.?,
         };
     }
 
@@ -738,6 +759,7 @@ const Pipeline = struct {
         com.release(self.image_ps);
         com.release(self.image_sampler);
         com.release(self.blend);
+        com.release(self.text_blend);
         self.* = undefined;
     }
 

@@ -1,4 +1,5 @@
-//! A texture atlas, 8-bit coverage or RGBA, using shelf packing.
+//! A texture atlas of 8-bit coverage, RGBA, or subpixel coverage, using
+//! shelf packing.
 //!
 //! Glyphs are packed left to right into horizontal shelves. A glyph goes
 //! on the first shelf that is tall enough (but not wastefully tall) and
@@ -36,11 +37,14 @@ pub const Format = enum {
     gray,
     /// Premultiplied RGBA, four bytes per pixel.
     rgba,
+    /// ClearType coverage of the red, green, and blue subpixels, then
+    /// the largest of them, four bytes per pixel.
+    lcd,
 
     pub fn depth(self: Format) u32 {
         return switch (self) {
             .gray => 1,
-            .rgba => 4,
+            .rgba, .lcd => 4,
         };
     }
 };

@@ -5,8 +5,9 @@
 //      background color. Default backgrounds are transparent, over the
 //      cleared frame and any kitty images below the background.
 //   2. text: instanced quads for glyphs (sampled from the coverage atlas,
-//      or for color glyphs the RGBA one) and solid rectangles (cursor,
-//      underline, strikethrough), blended with premultiplied alpha.
+//      the RGBA one for color glyphs, or the ClearType one) and solid
+//      rectangles (cursor, underline, strikethrough), blended with a
+//      premultiplied alpha per channel (dual-source blending).
 //
 // Everything is drawn into a viewport, the window's terminal area, which
 // clips it. Positions are in render target pixels, as SV_Position is.
@@ -34,9 +35,11 @@ StructuredBuffer<uint> bg_cells : register(t0);
 StructuredBuffer<Instance> instances : register(t1);
 Texture2D<float> atlas : register(t2);
 Texture2D<float4> color_atlas : register(t3);
+Texture2D<float4> lcd_atlas : register(t4);
 
 static const uint KIND_GLYPH = 0;
 static const uint KIND_COLOR_GLYPH = 2;
+static const uint KIND_LCD_GLYPH = 3;
 
 float4 unpack(uint c) {
     return float4(c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff, c >> 24) / 255.0;
@@ -81,14 +84,31 @@ TextVsOut text_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     return o;
 }
 
-float4 text_ps(TextVsOut i) : SV_Target {
+// The color, premultiplied, and the coverage each channel blends by.
+struct TextPsOut {
+    float4 color : SV_Target0;
+    float4 coverage : SV_Target1;
+};
+
+TextPsOut text_ps(TextVsOut i) {
     // Quads are pixel aligned, so the interpolated texel coordinate lands
     // on texel centers and Load needs no sampler. Color glyphs are
     // premultiplied and keep only their cell color's alpha.
-    if (i.kind == KIND_COLOR_GLYPH) return color_atlas.Load(int3(i.tex, 0)) * i.color.a;
-    float a = i.kind == KIND_GLYPH ? atlas.Load(int3(i.tex, 0)) : 1.0;
-    a *= i.color.a;
-    return float4(i.color.rgb * a, a);
+    int3 texel = int3(i.tex, 0);
+    TextPsOut o;
+    if (i.kind == KIND_COLOR_GLYPH) {
+        o.color = color_atlas.Load(texel) * i.color.a;
+        o.coverage = o.color.a;
+        return o;
+    }
+
+    float4 c;
+    if (i.kind == KIND_LCD_GLYPH) c = lcd_atlas.Load(texel);
+    else c = i.kind == KIND_GLYPH ? atlas.Load(texel) : 1.0;
+    c *= i.color.a;
+    o.color = float4(i.color.rgb * c.rgb, c.a);
+    o.coverage = c;
+    return o;
 }
 
 // Kitty graphics: one quad per placement, with the placement in a
@@ -103,7 +123,7 @@ cbuffer ImagePlacement : register(b1) {
     float2 image_src_size;
 };
 
-Texture2D<float4> image : register(t4);
+Texture2D<float4> image : register(t5);
 SamplerState image_sampler : register(s0);
 
 struct ImageVsOut {

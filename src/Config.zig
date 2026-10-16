@@ -12,6 +12,7 @@ const Config = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
+const font = @import("font/font.zig");
 
 const RGB = ghostty_vt.color.RGB;
 
@@ -22,6 +23,10 @@ const log = std.log.scoped(.config);
 @"font-family": std.ArrayList([]const u8) = .empty,
 /// In points.
 @"font-size": f32 = 12,
+/// `grayscale`, `cleartype` (for RGB-striped displays), or `aliased`, for
+/// the terminal's text and the chrome's. Not a Ghostty key; the values
+/// are Windows Terminal's.
+@"font-antialias": font.Antialias = .grayscale,
 
 /// Ghostty's default colors. Programs can override these with OSC 10/11.
 background: RGB = .{ .r = 0x28, .g = 0x2c, .b = 0x34 },
@@ -119,10 +124,6 @@ pub const ClipboardAccess = enum {
     allow,
     deny,
     ask,
-
-    fn parse(self: *ClipboardAccess, _: Allocator, value: []const u8) !void {
-        self.* = std.meta.stringToEnum(ClipboardAccess, value) orelse return error.InvalidValue;
-    }
 };
 
 pub const WordChars = struct {
@@ -283,7 +284,9 @@ fn set(self: *Config, key: []const u8, value: []const u8) !void {
                 ?Theme => ptr.* = try Theme.parse(alloc, value),
                 ?[]const u8 => ptr.* = try alloc.dupe(u8, value),
                 std.ArrayList([]const u8) => try ptr.append(alloc, try alloc.dupe(u8, value)),
-                else => try ptr.parse(alloc, value),
+                else => if (@typeInfo(field.type) == .@"enum") {
+                    ptr.* = std.meta.stringToEnum(field.type, value) orelse return error.InvalidValue;
+                } else try ptr.parse(alloc, value),
             }
             return;
         }
@@ -421,6 +424,7 @@ test "padding, word chars, theme, clipboard" {
         \\selection-word-chars = \t;\u{2502}
         \\theme = light: Catppuccin Latte , dark:Catppuccin Mocha
         \\clipboard-write = deny
+        \\font-antialias = cleartype
     );
     defer c.deinit();
     try std.testing.expectEqual(Padding{ .top_left = 2, .bottom_right = 4 }, c.@"window-padding-x");
@@ -430,6 +434,8 @@ test "padding, word chars, theme, clipboard" {
     try std.testing.expectEqualStrings("Catppuccin Mocha", c.theme.?.dark);
     try std.testing.expectEqual(.ask, c.@"clipboard-read");
     try std.testing.expectEqual(.deny, c.@"clipboard-write");
+    try std.testing.expectEqual(.cleartype, c.@"font-antialias");
+    try std.testing.expectError(error.InvalidValue, c.set("font-antialias", "subpixel"));
 
     try std.testing.expectError(error.InvalidTheme, Theme.parse(c._arena.allocator(), "light:A"));
     const path = try Theme.parse(c._arena.allocator(), "C:\\themes\\mine");

@@ -77,11 +77,11 @@ pub const Metrics = struct {
 /// A rasterized glyph's location in the atlas and its placement relative
 /// to the pen position at the top-left corner of its cell.
 pub const Glyph = struct {
-    /// In `color_atlas` if `color`, otherwise in `atlas`.
+    /// In the atlas of this format.
     region: Atlas.Region,
     offset_x: i32,
     offset_y: i32,
-    color: bool = false,
+    format: Atlas.Format = .gray,
 };
 
 const GlyphKey = struct {
@@ -114,10 +114,14 @@ size_pt: f32,
 dpi: u32,
 em_px: f32,
 metrics: Metrics,
+antialias: Face.Antialias,
 /// Coverage of plain glyphs and sprites, drawn in their cell's color.
 atlas: Atlas,
 /// Color glyphs (emoji), drawn as they are. Reset along with `atlas`.
 color_atlas: Atlas,
+/// Plain glyphs' subpixel coverage, with ClearType. Sprites stay in
+/// `atlas`. Reset along with `atlas`.
+lcd_atlas: Atlas,
 
 /// Which face renders a grapheme, keyed by its first codepoint.
 face_for: std.AutoHashMapUnmanaged(FaceKey, FaceId) = .empty,
@@ -126,7 +130,14 @@ face_for: std.AutoHashMapUnmanaged(FaceKey, FaceId) = .empty,
 glyphs: std.AutoHashMapUnmanaged(GlyphKey, ?Glyph) = .empty,
 
 /// `families` are tried in order (UTF-8), then the defaults.
-pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt: f32, dpi: u32) !Grid {
+pub fn init(
+    alloc: Allocator,
+    io: std.Io,
+    families: []const []const u8,
+    size_pt: f32,
+    dpi: u32,
+    antialias: Face.Antialias,
+) !Grid {
     var factory: ?*dwrite.IFactory2 = null;
     try com.check(
         dwrite.DWriteCreateFactory(dwrite.FACTORY_TYPE_SHARED, &dwrite.IFactory2.iid, @ptrCast(&factory)),
@@ -153,6 +164,8 @@ pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt:
     errdefer atlas.deinit(alloc);
     var color_atlas: Atlas = try .init(alloc, 128, .rgba);
     errdefer color_atlas.deinit(alloc);
+    var lcd_atlas: Atlas = try .init(alloc, if (antialias == .cleartype) 512 else 16, .lcd);
+    errdefer lcd_atlas.deinit(alloc);
 
     var self: Grid = .{
         .alloc = alloc,
@@ -166,8 +179,10 @@ pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt:
         .dpi = dpi,
         .em_px = undefined,
         .metrics = undefined,
+        .antialias = antialias,
         .atlas = atlas,
         .color_atlas = color_atlas,
+        .lcd_atlas = lcd_atlas,
     };
     errdefer self.deinitFaces();
 
@@ -185,6 +200,7 @@ pub fn deinit(self: *Grid) void {
     self.face_for.deinit(self.alloc);
     self.atlas.deinit(self.alloc);
     self.color_atlas.deinit(self.alloc);
+    self.lcd_atlas.deinit(self.alloc);
     self.shaper.deinit(self.alloc);
     self.deinitFaces();
     com.release(self.fallback);
@@ -241,6 +257,7 @@ fn resize(self: *Grid) void {
     self.glyphs.clearRetainingCapacity();
     self.atlas.reset();
     self.color_atlas.reset();
+    self.lcd_atlas.reset();
     self.shaper.reset();
     log.info("size={d}pt dpi={d} em={d:.2}px cell={d}x{d}", .{
         self.size_pt,
@@ -333,7 +350,7 @@ pub fn glyph(self: *Grid, face_id: FaceId, index: u16) !?Glyph {
     if (gop.found_existing) return gop.value_ptr.*;
     errdefer self.glyphs.removeByPtr(gop.key_ptr);
 
-    var bitmap = try self.faces.items[face_id].rasterize(self.alloc, self.factory, index, self.em_px);
+    var bitmap = try self.faces.items[face_id].rasterize(self.alloc, self.factory, index, self.em_px, self.antialias);
     defer bitmap.deinit(self.alloc);
 
     if (bitmap.pixels.len == 0) {
@@ -344,13 +361,14 @@ pub fn glyph(self: *Grid, face_id: FaceId, index: u16) !?Glyph {
     const atlas = switch (bitmap.format) {
         .gray => &self.atlas,
         .rgba => &self.color_atlas,
+        .lcd => &self.lcd_atlas,
     };
     const region = try atlas.insert(self.alloc, bitmap.width, bitmap.height, bitmap.pixels);
     gop.value_ptr.* = .{
         .region = region,
         .offset_x = bitmap.left,
         .offset_y = @as(i32, @intCast(self.metrics.baseline)) + bitmap.top,
-        .color = bitmap.format == .rgba,
+        .format = bitmap.format,
     };
     return gop.value_ptr.*;
 }

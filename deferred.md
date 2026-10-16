@@ -70,8 +70,10 @@ than being piecemealed with MessageBox and the like.
 - **Bitmap and COLRv1 color fonts** (PNG, SVG, gradients) need
   `IDWriteFactory4::TranslateColorGlyphRun`; we only composite COLRv0
   layers. Segoe UI Emoji has those.
-- **Text antialiasing** is always grayscale, in the grid and the chrome.
-  ClearType needs a third, subpixel atlas and dual-source blending.
+- **ClearType's pixel geometry** is always RGB. BGR panels would need the
+  subpixels swapped, from the monitor's rendering params or a setting.
+- **The system's font smoothing setting** isn't followed:
+  `font-antialias` defaults to grayscale whatever Windows uses.
 - **Gamma and contrast** tuning for text.
 - **Distinct underline styles** (double, curly, dotted, dashed).
 

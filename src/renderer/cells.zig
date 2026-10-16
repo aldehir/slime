@@ -44,6 +44,8 @@ pub const Instance = extern struct {
         rect = 1,
         /// A glyph from the color atlas, drawn in its own colors.
         color_glyph = 2,
+        /// A glyph from the ClearType atlas.
+        lcd_glyph = 3,
     };
 };
 
@@ -471,7 +473,11 @@ fn glyphInstance(m: font.Grid.Metrics, x: u32, dx: i32, dy: i32, g: font.Grid.Gl
         .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
         .atlas = .{ g.region.x, g.region.y },
         .color = color,
-        .kind = if (g.color) .color_glyph else .glyph,
+        .kind = switch (g.format) {
+            .gray => .glyph,
+            .rgba => .color_glyph,
+            .lcd => .lcd_glyph,
+        },
     };
 }
 
