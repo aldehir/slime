@@ -1,4 +1,6 @@
 const std = @import("std");
+const ghostty_vt = @import("ghostty-vt");
+const wuffs = @import("wuffs");
 const win32 = @import("win32/win32.zig");
 const Window = @import("Window.zig");
 const Config = @import("Config.zig");
@@ -14,6 +16,7 @@ pub fn main(init: std.process.Init) !void {
     // Per-monitor v2 gives us WM_DPICHANGED and unscaled client sizes.
     // This should eventually move to the application manifest.
     _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ghostty_vt.sys.decode_png = &decodePng;
 
     var config = try loadConfig(init);
     defer config.deinit();
@@ -61,6 +64,15 @@ pub fn main(init: std.process.Init) !void {
             window.frameGateFired(handles[1]);
         }
     }
+}
+
+/// Decode PNGs for kitty graphics.
+fn decodePng(alloc: std.mem.Allocator, data: []const u8) ghostty_vt.sys.DecodeError!ghostty_vt.sys.Image {
+    const img = wuffs.png.decode(alloc, data) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidData,
+    };
+    return .{ .width = img.width, .height = img.height, .data = img.data };
 }
 
 /// Load the config from the default directory, with the bundled themes

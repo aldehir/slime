@@ -40,6 +40,10 @@ pub const BLEND_INV_SRC_ALPHA: u32 = 6;
 pub const BLEND_OP_ADD: u32 = 1;
 pub const COLOR_WRITE_ENABLE_ALL: u8 = 0xF;
 
+pub const FILTER_MIN_MAG_LINEAR_MIP_POINT: u32 = 0x14;
+pub const TEXTURE_ADDRESS_CLAMP: u32 = 3;
+pub const COMPARISON_NEVER: u32 = 1;
+
 pub const PRIMITIVE_TOPOLOGY_TRIANGLELIST: u32 = 4;
 pub const PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: u32 = 5;
 
@@ -91,6 +95,19 @@ pub const BLEND_DESC = extern struct {
     RenderTarget: [8]RENDER_TARGET_BLEND_DESC = @splat(.{}),
 };
 
+pub const SAMPLER_DESC = extern struct {
+    Filter: u32,
+    AddressU: u32 = TEXTURE_ADDRESS_CLAMP,
+    AddressV: u32 = TEXTURE_ADDRESS_CLAMP,
+    AddressW: u32 = TEXTURE_ADDRESS_CLAMP,
+    MipLODBias: f32 = 0,
+    MaxAnisotropy: u32 = 1,
+    ComparisonFunc: u32 = COMPARISON_NEVER,
+    BorderColor: [4]f32 = @splat(0),
+    MinLOD: f32 = 0,
+    MaxLOD: f32 = 3.402823466e+38,
+};
+
 pub const MAPPED_SUBRESOURCE = extern struct {
     pData: ?*anyopaque,
     RowPitch: u32,
@@ -106,6 +123,7 @@ pub const IShaderResourceView = extern struct { vtable: com.VTable };
 pub const IVertexShader = extern struct { vtable: com.VTable };
 pub const IPixelShader = extern struct { vtable: com.VTable };
 pub const IBlendState = extern struct { vtable: com.VTable };
+pub const ISamplerState = extern struct { vtable: com.VTable };
 
 pub const IBuffer = extern struct {
     vtable: com.VTable,
@@ -173,6 +191,10 @@ pub const IDevice = extern struct {
     pub fn createBlendState(self: *IDevice, desc: *const BLEND_DESC, out: *?*IBlendState) HRESULT {
         return com.call(self, 20, fn (*const BLEND_DESC, *?*IBlendState) HRESULT, .{ desc, out });
     }
+
+    pub fn createSamplerState(self: *IDevice, desc: *const SAMPLER_DESC, out: *?*ISamplerState) HRESULT {
+        return com.call(self, 23, fn (*const SAMPLER_DESC, *?*ISamplerState) HRESULT, .{ desc, out });
+    }
 };
 
 pub const IDeviceContext = extern struct {
@@ -192,6 +214,12 @@ pub const IDeviceContext = extern struct {
 
     pub fn psSetShader(self: *IDeviceContext, shader: ?*IPixelShader) void {
         com.call(self, 9, fn (?*IPixelShader, ?*anyopaque, u32) void, .{ shader, null, 0 });
+    }
+
+    pub fn psSetSamplers(self: *IDeviceContext, start: u32, samplers: []const ?*ISamplerState) void {
+        com.call(self, 10, fn (u32, u32, [*]const ?*ISamplerState) void, .{
+            start, @as(u32, @intCast(samplers.len)), samplers.ptr,
+        });
     }
 
     pub fn vsSetShader(self: *IDeviceContext, shader: ?*IVertexShader) void {

@@ -46,6 +46,22 @@ wait until there is a proper design for it.
 - **Gamma and contrast** tuning for text.
 - **Distinct underline styles** (double, curly, dotted, dashed).
 
+## Kitty graphics
+
+Images placed at the cursor are drawn, in kitty's three z layers.
+
+- **Unicode placeholders** (`U=1`, `U+10EEEE` cells) and **relative
+  placements** (`P=`/`Q=`). Ghostty's `renderer/image.zig` has the
+  placement walk to port; placeholder cells should draw no glyph.
+- **Animation.** Nothing calls `ImageStorage.animationTick`, so
+  animated images stay on one frame. It returns the next deadline,
+  for a UI-thread timer.
+- **File and temp-file media.** `image_limits` is left at `.direct`.
+  Shared memory is POSIX `shm_open`; Windows would need its own scheme.
+- **`image-storage-limit`** config.
+- **Device loss.** Image pixels are freed after upload, so recreating
+  textures would need them copied from the terminal again.
+
 ## Terminal and window
 
 - **PSEUDOCONSOLE_INHERIT_CURSOR.** Skipped because the screen starts

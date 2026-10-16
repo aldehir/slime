@@ -20,6 +20,7 @@ const Config = @import("Config.zig");
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
+const Images = @import("renderer/image.zig").Images;
 
 const log = std.log.scoped(.window);
 
@@ -91,6 +92,7 @@ terminal: ghostty_vt.Terminal,
 stream: ghostty_vt.TerminalStream,
 render_state: ghostty_vt.RenderState = .empty,
 cells: Cells = .{},
+images: Images = .{},
 
 /// Set last during creation; messages sent during CreateWindowExW
 /// (WM_SIZE, etc.) arrive before everything else is ready.
@@ -252,6 +254,13 @@ pub fn create(
         .default_cursor_blink = null,
     });
     errdefer self.terminal.deinit(alloc);
+    // Init takes no pixel size, and kitty images and pixel size reports
+    // need one before the first resize.
+    try self.terminal.resize(alloc, .{
+        .cols = grid_size.cols,
+        .rows = grid_size.rows,
+        .cell_size_px = self.cellSizePx(),
+    });
     // An arrow until the child asks for another shape with OSC 22. An
     // I-beam (Ghostty's default) looks wrong over TUIs. An empty OSC 22
     // still resets it to the I-beam.
@@ -267,7 +276,7 @@ pub fn create(
 
     self.renderer = try Renderer.init(hwnd, size.width, size.height);
     errdefer {
-        self.renderer.?.deinit();
+        self.renderer.?.deinit(self.alloc);
         self.renderer = null;
     }
 
@@ -300,8 +309,9 @@ pub fn create(
 pub fn destroy(self: *Window) void {
     self.stopPty();
     if (self.renderer) |*r| {
-        r.deinit();
+        r.deinit(self.alloc);
         self.cells.deinit(self.alloc);
+        self.images.deinit(self.alloc);
         self.render_state.deinit(self.alloc);
         self.selection.deinit(&self.terminal);
         self.stream.deinit();
@@ -1115,6 +1125,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         self.lockTerminal();
         defer self.unlockTerminal();
         try self.render_state.update(self.alloc, &self.terminal);
+        try self.images.update(self.alloc, &self.terminal);
     }
     if (stats) t = self.stats.lap(.update, t);
     self.cursor_shown = self.render_state.cursor.visible;
@@ -1129,7 +1140,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     });
     if (stats) t = self.stats.lap(.build, t);
     const pad = self.paddingPx();
-    try r.draw(&self.cells, &self.grid.atlas, self.grid.metrics, .{ @floatFromInt(pad.left), @floatFromInt(pad.top) });
+    try r.draw(self.alloc, &self.cells, &self.images, &self.grid.atlas, self.grid.metrics, .{ @floatFromInt(pad.left), @floatFromInt(pad.top) });
     if (stats) {
         _ = self.stats.lap(.draw, t);
         self.stats.frames += 1;
@@ -1190,6 +1201,11 @@ test titleToUtf16 {
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("ab"), out[0..titleToUtf16(&out, cut)]);
 }
 
+fn cellSizePx(self: *const Window) std.meta.Child(@FieldType(ghostty_vt.Terminal.Resize, "cell_size_px")) {
+    const m = self.grid.metrics;
+    return .{ .width = m.cell_width, .height = m.cell_height };
+}
+
 /// Fit the swap chain and terminal grid to the client area and redraw.
 fn layout(self: *Window) void {
     const r = &(self.renderer orelse return);
@@ -1204,14 +1220,15 @@ fn layout(self: *Window) void {
     const grid_size = self.gridSize(size.width, size.height);
     self.lockTerminal();
     const changed = grid_size.cols != self.terminal.cols or grid_size.rows != self.terminal.rows;
-    if (changed) {
+    // A new font size (e.g. on a DPI change) can keep the grid size.
+    const cell = self.cellSizePx();
+    const px_changed = self.terminal.width_px != @as(u32, grid_size.cols) * cell.width or
+        self.terminal.height_px != @as(u32, grid_size.rows) * cell.height;
+    if (changed or px_changed) {
         self.terminal.resize(self.alloc, .{
             .cols = grid_size.cols,
             .rows = grid_size.rows,
-            .cell_size_px = .{
-                .width = self.grid.metrics.cell_width,
-                .height = self.grid.metrics.cell_height,
-            },
+            .cell_size_px = cell,
         }) catch |err| log.err("terminal resize failed: {}", .{err});
     }
     self.unlockTerminal();

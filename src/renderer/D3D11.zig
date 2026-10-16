@@ -20,6 +20,7 @@ const d3dcompiler = win32.d3dcompiler;
 const dxgi = win32.dxgi;
 const font = @import("../font/font.zig");
 const cells = @import("cells.zig");
+const image = @import("image.zig");
 
 const log = std.log.scoped(.d3d11);
 
@@ -67,6 +68,21 @@ atlas_texture: ?*d3d11.ITexture2D = null,
 atlas_srv: ?*d3d11.IShaderResourceView = null,
 atlas_size: u32 = 0,
 atlas_generation: u64 = 0,
+
+/// The placement being drawn (see `drawImages`).
+image_placement: *d3d11.IBuffer,
+/// GPU copies of the images in `image.Images`, by kitty image ID.
+image_textures: std.AutoArrayHashMapUnmanaged(u32, ImageTexture) = .empty,
+
+const ImageTexture = struct {
+    texture: *d3d11.ITexture2D,
+    srv: *d3d11.IShaderResourceView,
+
+    fn deinit(self: ImageTexture) void {
+        com.release(self.srv);
+        com.release(self.texture);
+    }
+};
 
 pub const Error = com.Error;
 
@@ -141,6 +157,15 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
     }, &uniforms), "ID3D11Device::CreateBuffer(uniforms)");
     errdefer com.releaseOpt(&uniforms);
 
+    var image_placement: ?*d3d11.IBuffer = null;
+    try com.check(device.?.createBuffer(&.{
+        .ByteWidth = @sizeOf(image.Placement),
+        .Usage = d3d11.USAGE_DYNAMIC,
+        .BindFlags = d3d11.BIND_CONSTANT_BUFFER,
+        .CPUAccessFlags = d3d11.CPU_ACCESS_WRITE,
+    }, &image_placement), "ID3D11Device::CreateBuffer(image placement)");
+    errdefer com.releaseOpt(&image_placement);
+
     var self: D3D11 = .{
         .device = device.?,
         .context = context.?,
@@ -153,6 +178,7 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
         .height = height,
         .pipeline = pipeline,
         .uniforms = uniforms.?,
+        .image_placement = image_placement.?,
     };
     try self.createRenderTarget();
     self.updateRefreshRate();
@@ -165,8 +191,11 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32) Error!D3D11 {
     return self;
 }
 
-pub fn deinit(self: *D3D11) void {
+pub fn deinit(self: *D3D11, alloc: std.mem.Allocator) void {
     self.context.clearState();
+    for (self.image_textures.values()) |t| t.deinit();
+    self.image_textures.deinit(alloc);
+    com.release(self.image_placement);
     com.releaseOpt(&self.atlas_srv);
     com.releaseOpt(&self.atlas_texture);
     self.instances.deinit();
@@ -282,7 +311,9 @@ pub fn resize(self: *D3D11, width: u32, height: u32) Error!void {
 /// `waitForFrame` or `frameAcquired` already did.
 pub fn draw(
     self: *D3D11,
+    alloc: std.mem.Allocator,
     frame: *const cells.Cells,
+    images: *image.Images,
     atlas: *const font.Atlas,
     metrics: font.Grid.Metrics,
     grid_offset: [2]f32,
@@ -294,6 +325,7 @@ pub fn draw(
     try self.uploadAtlas(atlas);
     try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(frame.bg.items));
     try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(frame.instances.items));
+    try self.uploadImages(alloc, images);
 
     const uniforms = frame.uniforms(metrics, self.width, self.height, grid_offset);
     var mapped: d3d11.MAPPED_SUBRESOURCE = undefined;
@@ -307,6 +339,7 @@ pub fn draw(
         .Height = @floatFromInt(self.height),
     }});
     ctx.clearRenderTargetView(rtv, &uniforms.default_bg);
+    try self.drawImages(images, .below_bg);
 
     if (frame.bg.items.len > 0) {
         ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -314,9 +347,10 @@ pub fn draw(
         ctx.psSetShader(self.pipeline.bg_ps);
         ctx.psSetConstantBuffers(0, &.{self.uniforms});
         ctx.psSetShaderResources(0, &.{self.bg_cells.srv});
-        ctx.omSetBlendState(null);
+        ctx.omSetBlendState(self.pipeline.blend);
         ctx.draw(3, 0);
     }
+    try self.drawImages(images, .below_text);
 
     if (frame.instances.items.len > 0) {
         ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -328,6 +362,7 @@ pub fn draw(
         ctx.omSetBlendState(self.pipeline.blend);
         ctx.drawInstanced(4, @intCast(frame.instances.items.len), 0, 0);
     }
+    try self.drawImages(images, .above_text);
 
     self.frame_acquired = false;
     self.frame_started = false;
@@ -337,6 +372,29 @@ pub fn draw(
         return error.DeviceLost;
     }
     try com.check(hr, "IDXGISwapChain::Present");
+}
+
+/// Draw one layer of kitty images, each placement a quad with its image
+/// bound (see shaders.hlsl).
+fn drawImages(self: *D3D11, images: *const image.Images, layer: image.Layer) Error!void {
+    const start, const end = images.layer(layer);
+    if (start == end) return;
+    const ctx = self.context;
+    ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx.vsSetShader(self.pipeline.image_vs);
+    ctx.vsSetConstantBuffers(0, &.{ self.uniforms, self.image_placement });
+    ctx.psSetShader(self.pipeline.image_ps);
+    ctx.psSetSamplers(0, &.{self.pipeline.image_sampler});
+    ctx.omSetBlendState(self.pipeline.blend);
+    for (images.placements.items[start..end], images.placement_ids.items[start..end]) |p, id| {
+        const tex = self.image_textures.get(id) orelse continue;
+        var mapped: d3d11.MAPPED_SUBRESOURCE = undefined;
+        try com.check(ctx.map(self.image_placement.resource(), d3d11.MAP_WRITE_DISCARD, &mapped), "Map(image placement)");
+        @as(*image.Placement, @ptrCast(@alignCast(mapped.pData.?))).* = p;
+        ctx.unmap(self.image_placement.resource());
+        ctx.psSetShaderResources(4, &.{tex.srv});
+        ctx.draw(4, 0);
+    }
 }
 
 /// Mirror the CPU atlas on the GPU, reallocating if it grew.
@@ -365,6 +423,48 @@ fn uploadAtlas(self: *D3D11, atlas: *const font.Atlas) Error!void {
     if (self.atlas_generation != atlas.generation) {
         self.context.updateSubresource(self.atlas_texture.?.resource(), atlas.data.ptr, atlas.size);
         self.atlas_generation = atlas.generation;
+    }
+}
+
+/// Mirror the snapshot's images on the GPU: upload new or changed images,
+/// freeing their pixels, and release textures of images no longer in it.
+fn uploadImages(self: *D3D11, alloc: std.mem.Allocator, images: *image.Images) Error!void {
+    var i: usize = 0;
+    while (i < self.image_textures.count()) {
+        if (images.images.contains(self.image_textures.keys()[i])) {
+            i += 1;
+            continue;
+        }
+        self.image_textures.values()[i].deinit();
+        self.image_textures.swapRemoveAt(i);
+    }
+
+    var it = images.images.iterator();
+    while (it.next()) |kv| {
+        const img = kv.value_ptr;
+        const rgba = img.rgba orelse continue;
+        const gop = self.image_textures.getOrPut(alloc, kv.key_ptr.*) catch return error.HResult;
+        if (gop.found_existing) gop.value_ptr.deinit();
+        errdefer self.image_textures.swapRemoveAt(gop.index);
+
+        var texture: ?*d3d11.ITexture2D = null;
+        try com.check(self.device.createTexture2D(&.{
+            .Width = img.width,
+            .Height = img.height,
+            .Format = .R8G8B8A8_UNORM,
+            .Usage = d3d11.USAGE_DEFAULT,
+            .BindFlags = d3d11.BIND_SHADER_RESOURCE,
+        }, &texture), "ID3D11Device::CreateTexture2D(image)");
+        errdefer com.releaseOpt(&texture);
+        var srv: ?*d3d11.IShaderResourceView = null;
+        try com.check(
+            self.device.createShaderResourceView(texture.?.resource(), &srv),
+            "ID3D11Device::CreateShaderResourceView(image)",
+        );
+        self.context.updateSubresource(texture.?.resource(), rgba.ptr, img.width * 4);
+        gop.value_ptr.* = .{ .texture = texture.?, .srv = srv.? };
+        image.Images.freePixels(alloc, img);
+        log.debug("image texture id={d} {d}x{d}", .{ kv.key_ptr.*, img.width, img.height });
     }
 }
 
@@ -435,6 +535,9 @@ const Pipeline = struct {
     bg_ps: *d3d11.IPixelShader,
     text_vs: *d3d11.IVertexShader,
     text_ps: *d3d11.IPixelShader,
+    image_vs: *d3d11.IVertexShader,
+    image_ps: *d3d11.IPixelShader,
+    image_sampler: *d3d11.ISamplerState,
     blend: *d3d11.IBlendState,
 
     fn init(device: *d3d11.IDevice) Error!Pipeline {
@@ -442,12 +545,18 @@ const Pipeline = struct {
         var bg_ps: ?*d3d11.IPixelShader = null;
         var text_vs: ?*d3d11.IVertexShader = null;
         var text_ps: ?*d3d11.IPixelShader = null;
+        var image_vs: ?*d3d11.IVertexShader = null;
+        var image_ps: ?*d3d11.IPixelShader = null;
+        var image_sampler: ?*d3d11.ISamplerState = null;
         var blend: ?*d3d11.IBlendState = null;
         errdefer {
             com.releaseOpt(&bg_vs);
             com.releaseOpt(&bg_ps);
             com.releaseOpt(&text_vs);
             com.releaseOpt(&text_ps);
+            com.releaseOpt(&image_vs);
+            com.releaseOpt(&image_ps);
+            com.releaseOpt(&image_sampler);
             com.releaseOpt(&blend);
         }
 
@@ -455,6 +564,11 @@ const Pipeline = struct {
         try createShader(device, "bg_ps", &bg_ps);
         try createShader(device, "text_vs", &text_vs);
         try createShader(device, "text_ps", &text_ps);
+        try createShader(device, "image_vs", &image_vs);
+        try createShader(device, "image_ps", &image_ps);
+        try com.check(device.createSamplerState(&.{
+            .Filter = d3d11.FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        }, &image_sampler), "ID3D11Device::CreateSamplerState");
 
         // Premultiplied alpha: out = src + dst * (1 - src.a).
         var desc: d3d11.BLEND_DESC = .{};
@@ -472,6 +586,9 @@ const Pipeline = struct {
             .bg_ps = bg_ps.?,
             .text_vs = text_vs.?,
             .text_ps = text_ps.?,
+            .image_vs = image_vs.?,
+            .image_ps = image_ps.?,
+            .image_sampler = image_sampler.?,
             .blend = blend.?,
         };
     }
@@ -481,6 +598,9 @@ const Pipeline = struct {
         com.release(self.bg_ps);
         com.release(self.text_vs);
         com.release(self.text_ps);
+        com.release(self.image_vs);
+        com.release(self.image_ps);
+        com.release(self.image_sampler);
         com.release(self.blend);
         self.* = undefined;
     }

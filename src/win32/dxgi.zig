@@ -9,6 +9,7 @@ const GUID = win32.GUID;
 
 pub const FORMAT = enum(u32) {
     UNKNOWN = 0,
+    R8G8B8A8_UNORM = 28,
     R8_UNORM = 61,
     B8G8R8A8_UNORM = 87,
     _,

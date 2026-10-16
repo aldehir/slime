@@ -1,7 +1,9 @@
-// Terminal grid shaders. Two passes:
+// Terminal grid shaders. Two passes, with kitty images (image_vs/ps)
+// drawn before, between, and after them by z-index:
 //
 //   1. bg: a full-screen triangle; each pixel looks up its cell's
-//      background color.
+//      background color. Default backgrounds are transparent, over the
+//      cleared frame and any kitty images below the background.
 //   2. text: instanced quads for glyphs (sampled from the atlas) and solid
 //      rectangles (cursor, underline, strikethrough), blended with
 //      premultiplied alpha.
@@ -46,9 +48,9 @@ float4 bg_vs(uint id : SV_VertexID) : SV_Position {
 
 float4 bg_ps(float4 pos : SV_Position) : SV_Target {
     float2 p = pos.xy - grid_offset;
-    if (p.x < 0 || p.y < 0) return default_bg;
+    if (p.x < 0 || p.y < 0) return 0;
     uint2 cell = uint2(p / cell_size);
-    if (cell.x >= grid_size.x || cell.y >= grid_size.y) return default_bg;
+    if (cell.x >= grid_size.x || cell.y >= grid_size.y) return 0;
     return unpack(bg_cells[cell.y * grid_size.x + cell.x]);
 }
 
@@ -79,4 +81,39 @@ float4 text_ps(TextVsOut i) : SV_Target {
     float a = i.kind == KIND_GLYPH ? atlas.Load(int3(i.tex, 0)) : 1.0;
     a *= i.color.a;
     return float4(i.color.rgb * a, a);
+}
+
+// Kitty graphics: one quad per placement, with the placement in a
+// constant buffer and its image bound per draw. Images are
+// premultiplied, so linear filtering doesn't bleed the color of
+// transparent pixels. Layout must match `Placement` in image.zig.
+
+cbuffer ImagePlacement : register(b1) {
+    float2 image_pos;
+    float2 image_size;
+    float2 image_src_pos;
+    float2 image_src_size;
+};
+
+Texture2D<float4> image : register(t4);
+SamplerState image_sampler : register(s0);
+
+struct ImageVsOut {
+    float4 pos : SV_Position;
+    float2 tex : TEXCOORD0;
+};
+
+ImageVsOut image_vs(uint vid : SV_VertexID) {
+    float2 corner = float2(vid & 1, vid >> 1);
+
+    ImageVsOut o;
+    o.pos = to_ndc(grid_offset + image_pos + corner * image_size);
+    o.tex = image_src_pos + corner * image_src_size;
+    return o;
+}
+
+float4 image_ps(ImageVsOut i) : SV_Target {
+    float2 size;
+    image.GetDimensions(size.x, size.y);
+    return image.Sample(image_sampler, i.tex / size);
 }

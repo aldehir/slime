@@ -52,6 +52,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     })) |dep| {
         exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        // Already compiled into ghostty-vt for kitty graphics; we use its
+        // PNG decoder, which libghostty-vt leaves to the embedder.
+        if (dep.builder.lazyDependency("wuffs", .{
+            .target = target,
+            .optimize = optimize,
+        })) |wuffs| exe_mod.addImport("wuffs", wuffs.module("wuffs"));
     }
     exe_mod.addImport("z2d", b.dependency("z2d", .{
         .target = target,

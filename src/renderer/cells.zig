@@ -236,7 +236,11 @@ pub const Cells = struct {
                 bg = if (config.selection_background) |c| c.resolve(cell_fg, cell_bg) else colors.foreground;
                 fg = if (config.selection_foreground) |c| c.resolve(cell_fg, cell_bg) else colors.background;
             }
-            out.bg.items[x] = pack(bg, 255);
+            // Default backgrounds are left transparent: the frame is
+            // cleared to it, and kitty images below the background
+            // show through.
+            const default_bg = !selected and !style.flags.inverse and style.bg(&raw, &colors.palette) == null;
+            out.bg.items[x] = if (default_bg) 0 else pack(bg, 255);
 
             self.row_text.items[x] = .{ .has_text = false, .face = 0, .color = 0 };
             if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
