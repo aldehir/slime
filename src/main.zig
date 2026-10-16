@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
         init.gpa,
         init.io,
         &config,
-        std.unicode.utf8ToUtf16LeStringLiteral("ghostty-win"),
+        std.unicode.utf8ToUtf16LeStringLiteral("slime"),
         command_line,
     );
     defer window.destroy();
@@ -96,7 +96,7 @@ fn appsUseLightTheme() bool {
 }
 
 /// The command to run in the terminal: our own command line after the
-/// program name, verbatim (`ghostty-win pwsh -NoLogo`), else the
+/// program name, verbatim (`slime pwsh -NoLogo`), else the
 /// configured `command`, else %COMSPEC%.
 fn shellCommand(alloc: std.mem.Allocator, configured: ?[]const u8) ![:0]u16 {
     const args = argsAfterProgram(std.mem.span(win32.GetCommandLineW()));

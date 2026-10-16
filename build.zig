@@ -54,8 +54,16 @@ pub fn build(b: *std.Build) void {
         exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
     }
 
+    // The app icon, rendered from assets/icon by a host tool. Zig's cache
+    // reruns it only when the tool or an SVG changes.
+    const icon = renderIcon(b);
+    exe_mod.addWin32ResourceFile(.{
+        .file = b.path("src/slime.rc"),
+        .include_paths = &.{icon.ico.dirname()},
+    });
+
     const exe = b.addExecutable(.{
-        .name = "ghostty-win",
+        .name = "slime",
         .root_module = exe_mod,
     });
     exe.subsystem = if (console) .console else .windows;
@@ -76,6 +84,13 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    const icons = b.addInstallDirectory(.{
+        .source_dir = icon.png_dir,
+        .install_dir = .prefix,
+        .install_subdir = "icons",
+    });
+    b.step("icons", "Render the app icon PNGs into zig-out/icons").dependOn(&icons.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
@@ -83,6 +98,27 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
+}
+
+const Icon = struct {
+    ico: std.Build.LazyPath,
+    png_dir: std.Build.LazyPath,
+};
+
+fn renderIcon(b: *std.Build) Icon {
+    const tool = b.addExecutable(.{
+        .name = "icon",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/icon.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.addFileArg(b.path("assets/icon/slime.svg"));
+    run.addFileArg(b.path("assets/icon/slime-small.svg"));
+    const ico = run.addOutputFileArg("slime.ico");
+    const png_dir = run.addOutputDirectoryArg("png");
+    return .{ .ico = ico, .png_dir = png_dir };
 }
 
 fn installConpty(b: *std.Build) void {

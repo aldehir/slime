@@ -1,0 +1,5 @@
+// Resources linked into slime.exe. build.zig renders slime.ico from
+// assets/icon and passes its directory as an include path.
+
+// Explorer shows the first icon group; Window.zig loads it by this ID.
+1 ICON "slime.ico"

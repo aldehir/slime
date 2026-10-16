@@ -23,7 +23,10 @@ const Cells = @import("renderer/cells.zig").Cells;
 
 const log = std.log.scoped(.window);
 
-const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ghostty-win");
+const class_name = std.unicode.utf8ToUtf16LeStringLiteral("slime");
+
+/// The icon resource in src/slime.rc.
+const icon_id = 1;
 
 /// Posted from a thread pool wait when the child process exits.
 const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
@@ -1077,6 +1080,8 @@ fn registerClass(instance: ?win32.HINSTANCE) !void {
     const wc: win32.WNDCLASSEXW = .{
         .lpfnWndProc = wndProc,
         .hInstance = instance,
+        // Windows picks the small icon from the same resource.
+        .hIcon = win32.LoadIconW(instance, icon_id),
         .hCursor = win32.LoadCursorW(null, win32.IDC_ARROW),
         .lpszClassName = class_name,
     };

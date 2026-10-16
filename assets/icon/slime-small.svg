@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="108 158 808 808" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFF4D6"/>
+      <stop offset="1" stop-color="#FFD9E8"/>
+    </linearGradient>
+    <radialGradient id="body" cx="0.36" cy="0.25" r="0.85">
+      <stop offset="0" stop-color="#8FD8FF"/>
+      <stop offset="0.55" stop-color="#3FA2F2"/>
+      <stop offset="1" stop-color="#1F6FD1"/>
+    </radialGradient>
+    <radialGradient id="shadow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2A4A8A" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#2A4A8A" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="squircle">
+      <rect width="1024" height="1024" rx="230" ry="230"/>
+    </clipPath>
+  </defs>
+
+  <g>
+    <!-- Slime body: domed top, sides bulging low, flat squished base -->
+    <path fill="url(#body)" d="
+      M 512 250
+      C 700 248, 850 380, 880 560
+      C 900 680, 905 780, 860 825
+      C 830 852, 760 858, 700 858
+      C 600 862, 420 856, 330 858
+      C 260 858, 185 852, 158 822
+      C 115 775, 125 670, 145 560
+      C 178 385, 320 252, 512 250 Z"/>
+
+    <!-- Glossy highlights on the dome -->
+    <path d="M 210.5 516.4 L 213.1 509.4 L 215.8 502.4 L 218.7 495.5 L 221.8 488.6 L 224.9 481.9 L 228.2 475.3 L 231.7 468.7 L 235.3 462.3 L 239.0 456.0 L 242.8 449.7 L 246.8 443.6 L 250.9 437.5 L 255.1 431.6 L 259.5 425.7 L 264.0 420.0 L 268.6 414.4 L 273.3 408.9 L 278.2 403.5 L 283.1 398.3 L 288.2 393.1 L 293.4 388.1 L 298.7 383.2 L 304.1 378.4 L 309.6 373.7 L 315.3 369.2 L 321.0 364.8 L 326.9 360.5 L 332.8 356.4 L 338.9 352.4 L 345.1 348.5" stroke="#FFFFFF" stroke-width="38" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.75"/>
+    <!-- Eyes -->
+    <g>
+      <ellipse cx="405" cy="545" rx="64" ry="82" fill="#1B2440"/>
+      <ellipse cx="625" cy="545" rx="64" ry="82" fill="#1B2440"/>
+      <circle cx="383" cy="512" r="24" fill="#FFFFFF"/>
+      <circle cx="603" cy="512" r="24" fill="#FFFFFF"/>
+      <circle cx="427" cy="583" r="11" fill="#FFFFFF"/>
+      <circle cx="647" cy="583" r="11" fill="#FFFFFF"/>
+    </g>
+
+    <!-- Blush -->
+    <ellipse cx="295" cy="652" rx="50" ry="24" fill="#FF8FB8" opacity="0.6"/>
+    <ellipse cx="735" cy="652" rx="50" ry="24" fill="#FF8FB8" opacity="0.6"/>
+
+    <!-- Small smile -->
+    <path d="M 481 652 Q 515 688 549 652" stroke="#1B2440" stroke-width="20" stroke-linecap="round" fill="none"/>
+  </g>
+</svg>

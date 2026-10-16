@@ -1,16 +1,16 @@
 # Smoke test: launch the app, screenshot it at two sizes, close it via
 # WM_CLOSE, and print its exit code and log.
 #
-#   .\scripts\smoke.ps1 -Out <dir> [-Exe zig-out\bin\ghostty-win.exe]
+#   .\scripts\smoke.ps1 -Out <dir> [-Exe zig-out\bin\slime.exe]
 #
 # Writes <Out>\shot1.png (900x600), <Out>\shot2.png (1300x800) and
 # <Out>\stderr.txt. Resizing exercises swap chain resize and terminal reflow.
 #
 # Only touches the window of the process it started (matched by PID), so
-# other ghostty-win windows that are open are left alone. Captures with
+# other slime windows that are open are left alone. Captures with
 # PrintWindow, which works even when the window is covered.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\zig-out\bin\ghostty-win.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\zig-out\bin\slime.exe'),
     [Parameter(Mandatory)][string]$Out
 )
 
@@ -33,7 +33,7 @@ public static class SmokeUser32 {
     EnumWindows((h, l) => {
       uint p; GetWindowThreadProcessId(h, out p);
       var sb = new StringBuilder(64); GetClassNameW(h, sb, 64);
-      if (p == pid && sb.ToString() == "ghostty-win") { found = h; return false; }
+      if (p == pid && sb.ToString() == "slime") { found = h; return false; }
       return true;
     }, IntPtr.Zero);
     return found;

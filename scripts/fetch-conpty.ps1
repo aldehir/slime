@@ -18,7 +18,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $id = 'microsoft.windows.console.conpty'
 $url = "https://api.nuget.org/v3-flatcontainer/$id/$Version/$id.$Version.nupkg"
-$tmp = Join-Path ([IO.Path]::GetTempPath()) "ghostty-win-conpty-$Version"
+$tmp = Join-Path ([IO.Path]::GetTempPath()) "slime-conpty-$Version"
 $zip = "$tmp.zip"
 
 Write-Host "fetching $url"

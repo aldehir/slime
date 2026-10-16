@@ -1,4 +1,4 @@
-# ghostty-win
+# slime
 
 A Windows terminal built on **libghostty-vt** (Ghostty's terminal core,
 `ghostty/` submodule) with our own Win32 window, Direct3D 11 renderer, and
@@ -38,10 +38,14 @@ Other options: `-Dstats` (frame stats in the title; default on in Debug),
   `x64\OpenConsole.exe` next to the exe. `zig fetch` can't unpack `.nupkg`.
 - `zig build run -- pwsh -NoLogo` runs that command; with no args it's the
   config's `command`, then `%COMSPEC%`.
-- Config lives in `%XDG_CONFIG_HOME%\ghostty-win\config.ghostty` (else
-  `%APPDATA%\ghostty-win\`). To test with your own config, point
+- Config lives in `%XDG_CONFIG_HOME%\slime\config.ghostty` (else
+  `%APPDATA%\slime\`). To test with your own config, point
   `XDG_CONFIG_HOME` at a scratch dir rather than editing Alde's. Ghostty's
-  bundled themes (pinned in `build.zig.zon`) install to `zig-outin	hemes`.
+  bundled themes (pinned in `build.zig.zon`) install to `zig-out\bin\themes`.
+- The app icon is rendered at build time from `assets/icon/*.svg` by
+  `src/build/icon.zig` (Direct2D SVG + WIC, run on the host) and linked in
+  through `src/slime.rc`. `zig build icons` writes PNGs to `zig-out\icons`.
+  Edit both SVGs when changing the slime itself; see `assets/icon/README.md`.
 - This session's environment may carry `NO_COLOR=1`, which the children
   of launched windows inherit; unset it when checking colors.
 
@@ -52,10 +56,10 @@ Other options: `-Dstats` (frame stats in the title; default on in Debug),
   log. Read the PNGs to check rendering. Use it after renderer/font changes.
 - The display is 175% scale (DPI 168): Cascadia Code 12pt is a 16x33 px cell.
 - The D3D11 debug layer reports through OutputDebugString, not stderr.
-- Alde may be dogfooding a ghostty-win window while you work. Only touch
+- Alde may be dogfooding a slime window while you work. Only touch
   the process you started and its window, matched by PID: never
   `Stop-Process -Name`, never `FindWindow` by class. `smoke.ps1` does this.
-  A running `zig-out\bin\ghostty-win.exe` locks the install; build test
+  A running `zig-out\bin\slime.exe` locks the install; build test
   copies elsewhere with `-p <dir>` instead.
 - To script input, post WM_KEYDOWN/WM_CHAR to our HWND (find it by PID) and
   capture with `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)`. Never use
@@ -81,6 +85,9 @@ src/font/analysis.zig   our COM implementations of IDWriteTextAnalysisSource/Sin
 src/font/Atlas.zig      grayscale shelf-packed atlas (CPU side)
 src/font/Face.zig       one IDWriteFontFace
 src/win32/*.zig         hand-written bindings (conpty.zig loads our conpty.dll at runtime)
+src/slime.rc            Win32 resources (the app icon)
+src/build/icon.zig      host tool: assets/icon SVGs -> slime.ico + PNGs
+assets/icon/            icon sources: full SVG (64px+) and small cut (48px and below)
 ```
 
 ## Conventions

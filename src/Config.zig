@@ -170,11 +170,11 @@ pub const LoadOptions = struct {
     light: bool = false,
 };
 
-/// The config directory: `%XDG_CONFIG_HOME%\ghostty-win` if that's set,
-/// else `%APPDATA%\ghostty-win`.
+/// The config directory: `%XDG_CONFIG_HOME%\slime` if that's set,
+/// else `%APPDATA%\slime`.
 pub fn defaultDir(alloc: Allocator, environ: *const std.process.Environ.Map) !?[]u8 {
     const base = environ.get("XDG_CONFIG_HOME") orelse environ.get("APPDATA") orelse return null;
-    return try std.fs.path.join(alloc, &.{ base, "ghostty-win" });
+    return try std.fs.path.join(alloc, &.{ base, "slime" });
 }
 
 /// Load the configuration. Missing files aren't an error: everything

@@ -1,7 +1,7 @@
 .{
-    .name = .ghostty_win,
+    .name = .slime,
     .version = "0.0.0",
-    .fingerprint = 0xd1ee6a148d7ff826,
+    .fingerprint = 0xa32d552b8d7ff826,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ghostty = .{ .path = "ghostty" },
@@ -17,5 +17,6 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "assets",
     },
 }

@@ -388,6 +388,7 @@ pub extern "user32" fn ValidateRect(HWND, ?*const RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn SetWindowLongPtrW(HWND, i32, isize) callconv(.winapi) isize;
 pub extern "user32" fn GetWindowLongPtrW(HWND, i32) callconv(.winapi) isize;
 pub extern "user32" fn LoadCursorW(?HINSTANCE, usize) callconv(.winapi) ?HCURSOR;
+pub extern "user32" fn LoadIconW(?HINSTANCE, usize) callconv(.winapi) ?HICON;
 pub extern "user32" fn GetMessageW(*MSG, ?HWND, u32, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) BOOL;
 pub extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) LRESULT;

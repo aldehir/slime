@@ -1,4 +1,4 @@
-# Development environment for ghostty-win. Dot-source it:
+# Development environment for slime. Dot-source it:
 #
 #   . .\env.ps1
 #
