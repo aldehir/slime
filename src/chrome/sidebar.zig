@@ -12,13 +12,13 @@ const L = std.unicode.utf8ToUtf16LeStringLiteral;
 // Sizes in DIPs.
 pub const titlebar_height = 36;
 const width = 240;
-const pad_left = 12;
-const pad_right = 8;
+const pad_x = 12;
 const pad_top = 8;
 const button_height = 32;
 const section_gap = 10;
 const header_height = 28;
 const row_height = 30;
+const row_gap = 4;
 const close_size = 20;
 const corner = 10;
 
@@ -68,11 +68,11 @@ fn paintStats(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, stats: []c
     if (stats.len == 0) return;
     const line_h = c.px(16);
     const lines: f32 = @floatFromInt(std.mem.countScalar(u16, stats, '\n') + 1);
-    const x = l.list.x + c.px(pad_left) + c.px(2);
+    const x = l.list.x + c.px(pad_x) + c.px(2);
     var r: Rect = .{
         .x = x,
         .y = l.list.bottom() - c.px(10) - lines * line_h,
-        .w = @max(0, l.list.right() - c.px(pad_right) - x),
+        .w = @max(0, l.list.right() - c.px(pad_x) - x),
         .h = line_h,
     };
     var it = std.mem.splitScalar(u16, stats, '\n');
@@ -153,15 +153,18 @@ fn closeButton(c: *const Chrome, row: Rect) Rect {
 const Parts = struct {
     new_session: Rect,
     header: Rect,
+    /// From one row's top to the next's.
+    row_step: f32,
     row_h: f32,
 
     fn init(c: *const Chrome, l: *const Chrome.Layout) Parts {
-        const x = l.list.x + c.px(pad_left);
-        const w = @max(0, l.list.w - c.px(pad_left) - c.px(pad_right));
+        const x = l.list.x + c.px(pad_x);
+        const w = @max(0, l.list.w - 2 * c.px(pad_x));
         const new_session: Rect = .{ .x = x, .y = l.list.y + c.px(pad_top), .w = w, .h = c.px(button_height) };
         return .{
             .new_session = new_session,
             .header = .{ .x = x, .y = new_session.bottom() + c.px(section_gap), .w = w, .h = c.px(header_height) },
+            .row_step = c.px(row_height) + c.px(row_gap),
             .row_h = c.px(row_height),
         };
     }
@@ -169,7 +172,7 @@ const Parts = struct {
     fn row(self: Parts, i: usize) Rect {
         return .{
             .x = self.header.x,
-            .y = self.header.bottom() + @as(f32, @floatFromInt(i)) * self.row_h,
+            .y = self.header.bottom() + @as(f32, @floatFromInt(i)) * self.row_step,
             .w = self.header.w,
             .h = self.row_h,
         };
