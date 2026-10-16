@@ -5,6 +5,10 @@
 #
 # Writes <Out>\shot1.png (900x600), <Out>\shot2.png (1300x800) and
 # <Out>\stderr.txt. Resizing exercises swap chain resize and terminal reflow.
+#
+# Only touches the window of the process it started (matched by PID), so
+# other ghostty-win windows that are open are left alone. Captures with
+# PrintWindow, which works even when the window is covered.
 param(
     [string]$Exe = (Join-Path $PSScriptRoot '..\zig-out\bin\ghostty-win.exe'),
     [Parameter(Mandatory)][string]$Out
@@ -12,15 +16,28 @@ param(
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
-using System; using System.Runtime.InteropServices;
+using System; using System.Runtime.InteropServices; using System.Text;
 public static class SmokeUser32 {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr c);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int w, int c, uint f);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string c, string n);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc f, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
   [DllImport("user32.dll")] public static extern IntPtr PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+  public static IntPtr FindForPid(uint pid) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => {
+      uint p; GetWindowThreadProcessId(h, out p);
+      var sb = new StringBuilder(64); GetClassNameW(h, sb, 64);
+      if (p == pid && sb.ToString() == "ghostty-win") { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
 }
 '@
 
@@ -33,7 +50,9 @@ function Shot($h, $path) {
     [SmokeUser32]::GetWindowRect($h, [ref]$r) | Out-Null
     $bmp = New-Object Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
     $g = [Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+    $dc = $g.GetHdc()
+    [SmokeUser32]::PrintWindow($h, $dc, 2) | Out-Null # PW_RENDERFULLCONTENT
+    $g.ReleaseHdc($dc)
     $bmp.Save($path)
     $g.Dispose(); $bmp.Dispose()
     "$path  $($r.R - $r.L)x$($r.B - $r.T)"
@@ -41,23 +60,23 @@ function Shot($h, $path) {
 
 New-Item -ItemType Directory -Force $Out | Out-Null
 $p = Start-Process $Exe -PassThru -RedirectStandardError "$Out\stderr.txt" -WindowStyle Normal
+$null = $p.Handle # keeps ExitCode available after exit
 
-# Find our window by class. In console-subsystem builds MainWindowHandle
-# is the console host, not our window. [NullString] because PowerShell
-# would otherwise pass "" as the title.
+# In console-subsystem builds MainWindowHandle is the console host, not
+# our window, so look for our window class owned by this PID.
 $h = [IntPtr]::Zero
 for ($i = 0; $i -lt 50 -and $h -eq [IntPtr]::Zero; $i++) {
     Start-Sleep -Milliseconds 100
-    $h = [SmokeUser32]::FindWindowW("ghostty-win", [NullString]::Value)
+    $h = [SmokeUser32]::FindForPid([uint32]$p.Id)
 }
-"hwnd=$h"
+if ($h -eq [IntPtr]::Zero) { "no window for pid $($p.Id)"; $p.Kill(); exit 1 }
+"hwnd=$h pid=$($p.Id)"
 
-[SmokeUser32]::SetWindowPos($h, [IntPtr]::Zero, 100, 100, 900, 600, 0x4) | Out-Null
-[SmokeUser32]::SetForegroundWindow($h) | Out-Null
+[SmokeUser32]::SetWindowPos($h, [IntPtr]::Zero, 100, 100, 900, 600, 0x14) | Out-Null # NOZORDER|NOACTIVATE
 Start-Sleep -Milliseconds 600
 Shot $h "$Out\shot1.png"
 
-[SmokeUser32]::SetWindowPos($h, [IntPtr]::Zero, 100, 100, 1300, 800, 0x4) | Out-Null
+[SmokeUser32]::SetWindowPos($h, [IntPtr]::Zero, 100, 100, 1300, 800, 0x14) | Out-Null
 Start-Sleep -Milliseconds 600
 Shot $h "$Out\shot2.png"
 

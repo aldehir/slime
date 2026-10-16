@@ -32,6 +32,16 @@ pub fn release(self: anytype) void {
     _ = call(self, 2, fn () u32, .{});
 }
 
+/// IUnknown::QueryInterface (slot 0) for a wrapper type `T` with an
+/// `iid`. Returns null if the object doesn't implement it. The caller
+/// owns the returned reference.
+pub fn query(self: anytype, comptime T: type) ?*T {
+    var out: ?*anyopaque = null;
+    const hr = call(self, 0, fn (*const win32.GUID, *?*anyopaque) win32.HRESULT, .{ &T.iid, &out });
+    if (hr < 0) return null;
+    return @ptrCast(@alignCast(out));
+}
+
 /// Release a COM pointer if non-null and set it to null.
 pub fn releaseOpt(ptr: anytype) void {
     if (ptr.*) |p| release(p);

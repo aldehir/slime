@@ -14,6 +14,9 @@ zig build test
 zig build "-Doptimize=ReleaseFast"   # GUI subsystem; quote -D args in PowerShell
 ```
 
+Other options: `-Dstats` (frame stats in the title; default on in Debug),
+`-Dconsole`, `-Dmax-fps=<n>` (frame cap; default 0 follows the display).
+
 - Zig 0.16.0 lives in `tools\zig-x86_64-windows-0.16.0` (gitignored; download
   from ziglang.org if missing). `env.ps1` puts it on PATH.
 - Target defaults to `x86_64-windows-msvc`. `env.ps1` sets `VCToolsInstallDir`
@@ -37,6 +40,11 @@ zig build "-Doptimize=ReleaseFast"   # GUI subsystem; quote -D args in PowerShel
   log. Read the PNGs to check rendering. Use it after renderer/font changes.
 - The display is 175% scale (DPI 168): Cascadia Code 12pt is a 16x33 px cell.
 - The D3D11 debug layer reports through OutputDebugString, not stderr.
+- Alde may be dogfooding a ghostty-win window while you work. Only touch
+  the process you started and its window, matched by PID: never
+  `Stop-Process -Name`, never `FindWindow` by class. `smoke.ps1` does this.
+  A running `zig-out\bin\ghostty-win.exe` locks the install; build test
+  copies elsewhere with `-p <dir>` instead.
 - To script input, post WM_KEYDOWN/WM_CHAR to our HWND (find it by PID) and
   capture with `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)`. Never use
   SendKeys/SendInput: focus-steal prevention sends the keys to whatever
@@ -78,6 +86,11 @@ src/win32/*.zig         hand-written bindings (conpty.zig loads our conpty.dll a
 - **Threads**: the reader thread parses output with the terminal locked, and
   stream effects (`write_pty`, ...) run there. Never call anything that waits
   on the UI thread (SendMessage, SetWindowTextW) from it; PostMessage instead.
+- **Frame pacing** (no vsync): the message loop handles all messages, then
+  waits on the renderer's `frameGate` (a refresh-period timer, then the
+  swap chain's latency-1 waitable) only while the terminal is dirty. Every
+  Present needs exactly one wait on the waitable. Over Remote Desktop DWM
+  composes at ~32 Hz and doesn't pace presents, so fps there isn't vsync.
 - Match the existing comment density; doc comments on files and public decls.
 - Commits: one-line conventional commits with an `Assisted-by:` trailer.
   Only commit when asked.

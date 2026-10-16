@@ -68,9 +68,12 @@ exit_wait: ?win32.HANDLE = null,
 
 /// Auto-reset event the reader thread sets after feeding output to the
 /// terminal. The message loop waits on it alongside messages and calls
-/// `drawOutput`. Not a posted message: those are retrieved before input
+/// `outputArrived`. Not a posted message: those are retrieved before input
 /// and timers, so a steady stream of them starves the keyboard.
 output_event: win32.HANDLE,
+
+/// The terminal changed since the last frame. UI thread only.
+dirty: bool = false,
 
 /// The first half of a surrogate pair from a lone WM_CHAR.
 high_surrogate: ?u16 = null,
@@ -186,10 +189,30 @@ pub fn destroy(self: *Window) void {
     self.alloc.destroy(self);
 }
 
-/// Draw output the reader fed since the last frame. Call when
-/// `output_event` is signaled, after handling all pending messages.
-pub fn drawOutput(self: *Window) void {
-    self.render();
+/// The message loop's view of frame pacing: when `output_event` fires,
+/// call `outputArrived`; while `needsFrame`, also wait on `frameGate` and
+/// pass it to `frameGateFired` when it fires. Drawing then happens at most
+/// once per display refresh, and right away when the terminal was idle.
+pub fn outputArrived(self: *Window) void {
+    self.dirty = true;
+}
+
+pub fn needsFrame(self: *const Window) bool {
+    return self.dirty;
+}
+
+pub fn frameGate(self: *const Window) win32.HANDLE {
+    return self.renderer.?.frameGate();
+}
+
+pub fn frameGateFired(self: *Window, gate: win32.HANDLE) void {
+    const r = &self.renderer.?;
+    // The pace timer only moves us on to waiting for the swap chain.
+    if (gate != r.frame_waitable) return;
+    r.frameAcquired();
+    // A synchronous render (resize, WM_PAINT) may have drawn it already;
+    // the acquired frame then waits for the next change.
+    if (self.dirty) self.render();
 }
 
 /// Close the pseudoconsole, wait for the reader to drain it, and kill
@@ -340,6 +363,8 @@ fn render(self: *Window) void {
 }
 
 fn renderFallible(self: *Window, r: *Renderer) !void {
+    r.waitForFrame();
+    self.dirty = false;
     const stats = build_options.stats;
     var t: i64 = if (stats) Stats.now() else 0;
     {
@@ -459,14 +484,22 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
         win32.WM_EXITSIZEMOVE => {
             _ = win32.KillTimer(hwnd, sizemove_timer_id);
+            // The window may now be on a display with another refresh rate.
+            if (self.renderer) |*r| r.updateRefreshRate();
+            return 0;
+        },
+
+        win32.WM_DISPLAYCHANGE => {
+            if (self.renderer) |*r| r.updateRefreshRate();
             return 0;
         },
 
         win32.WM_TIMER => {
             switch (wparam) {
                 stats_timer_id => if (build_options.stats) self.showStats(),
-                sizemove_timer_id => if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) {
-                    self.render();
+                sizemove_timer_id => {
+                    if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.dirty = true;
+                    if (self.dirty) self.render();
                 },
                 else => {},
             }

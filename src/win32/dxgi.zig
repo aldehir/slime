@@ -1,4 +1,5 @@
-//! DXGI interfaces. Slot numbers are from dxgi.h / dxgi1_2.h.
+//! DXGI interfaces. Slot numbers are from dxgi.h / dxgi1_2.h / dxgi1_3.h
+//! / dxgi1_5.h.
 
 const win32 = @import("win32.zig");
 const com = @import("com.zig");
@@ -19,6 +20,10 @@ pub const SWAP_EFFECT_FLIP_DISCARD: u32 = 4;
 pub const ALPHA_MODE_IGNORE: u32 = 3;
 pub const MWA_NO_ALT_ENTER: u32 = 0x2;
 pub const CREATE_FACTORY_DEBUG: u32 = 0x1;
+pub const SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT: u32 = 0x40;
+pub const SWAP_CHAIN_FLAG_ALLOW_TEARING: u32 = 0x800;
+pub const PRESENT_ALLOW_TEARING: u32 = 0x200;
+pub const FEATURE_PRESENT_ALLOW_TEARING: u32 = 0;
 
 pub const ERROR_DEVICE_REMOVED: HRESULT = @bitCast(@as(u32, 0x887A0005));
 pub const ERROR_DEVICE_RESET: HRESULT = @bitCast(@as(u32, 0x887A0007));
@@ -71,6 +76,40 @@ pub const IFactory2 = extern struct {
             ?*anyopaque, // IDXGIOutput (restrict to output)
             *?*ISwapChain1,
         ) HRESULT, .{ device, hwnd, desc, null, null, out });
+    }
+};
+
+pub const IFactory5 = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0x7632e1f5,
+        .data2 = 0xee65,
+        .data3 = 0x4dca,
+        .data4 = .{ 0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d },
+    };
+
+    pub fn checkFeatureSupport(self: *IFactory5, feature: u32, data: *anyopaque, size: u32) HRESULT {
+        return com.call(self, 28, fn (u32, *anyopaque, u32) HRESULT, .{ feature, data, size });
+    }
+};
+
+pub const ISwapChain2 = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0xa8be2ac4,
+        .data2 = 0x199f,
+        .data3 = 0x4946,
+        .data4 = .{ 0xb3, 0x31, 0x79, 0x59, 0x9f, 0xb9, 0x8d, 0xe7 },
+    };
+
+    pub fn setMaximumFrameLatency(self: *ISwapChain2, latency: u32) HRESULT {
+        return com.call(self, 31, fn (u32) HRESULT, .{latency});
+    }
+
+    pub fn getFrameLatencyWaitableObject(self: *ISwapChain2) ?win32.HANDLE {
+        return com.call(self, 33, fn () ?win32.HANDLE, .{});
     }
 };
 

@@ -25,15 +25,21 @@ pub fn main(init: std.process.Init) !void {
     );
     defer window.destroy();
 
-    // Handle every pending message (input first) before drawing new
-    // output, so a flood of output can't delay keys. Present waits for
-    // vblank, which paces the loop while output streams.
-    const events = [_]win32.HANDLE{window.output_event};
+    // Handle every pending message (input first) before drawing, so a
+    // flood of output can't delay keys. The frame gate is only waited on
+    // while there's something to draw: waiting on the swap chain's
+    // waitable takes a frame.
+    var handles: [2]win32.HANDLE = .{ window.output_event, undefined };
     var msg: win32.MSG = undefined;
     while (true) {
+        var count: u32 = 1;
+        if (window.needsFrame()) {
+            handles[1] = window.frameGate();
+            count = 2;
+        }
         const woke = win32.MsgWaitForMultipleObjectsEx(
-            events.len,
-            &events,
+            count,
+            &handles,
             win32.INFINITE,
             win32.QS_ALLINPUT,
             win32.MWMO_INPUTAVAILABLE,
@@ -43,7 +49,12 @@ pub fn main(init: std.process.Init) !void {
             _ = win32.TranslateMessage(&msg);
             _ = win32.DispatchMessageW(&msg);
         }
-        if (woke == win32.WAIT_OBJECT_0) window.drawOutput();
+        // woke == count means a message, which was handled above.
+        if (woke == win32.WAIT_OBJECT_0) {
+            window.outputArrived();
+        } else if (count == 2 and woke == win32.WAIT_OBJECT_0 + 1) {
+            window.frameGateFired(handles[1]);
+        }
     }
 }
 

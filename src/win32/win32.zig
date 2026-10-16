@@ -113,6 +113,20 @@ pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
     PeakJobMemoryUsed: usize = 0,
 };
 
+/// Only the leading fields we read; the rest is padding. Byte packed in
+/// dwmapi.h (292 bytes).
+pub const DWM_TIMING_INFO = extern struct {
+    cbSize: u32 align(1) = @sizeOf(DWM_TIMING_INFO),
+    rateRefreshNumerator: u32 align(1) = 0,
+    rateRefreshDenominator: u32 align(1) = 0,
+    qpcRefreshPeriod: u64 align(1) = 0,
+    rest: [272]u8 = @splat(0),
+
+    comptime {
+        std.debug.assert(@sizeOf(DWM_TIMING_INFO) == 292);
+    }
+};
+
 pub const WAITORTIMERCALLBACK = *const fn (?*anyopaque, u8) callconv(.winapi) void;
 
 pub const WNDPROC = *const fn (HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
@@ -164,6 +178,7 @@ pub const WM_SYSKEYUP = 0x0105;
 pub const WM_SYSCHAR = 0x0106;
 pub const WM_SYSDEADCHAR = 0x0107;
 pub const WM_QUIT = 0x0012;
+pub const WM_DISPLAYCHANGE = 0x007E;
 pub const WM_TIMER = 0x0113;
 pub const WM_ENTERSIZEMOVE = 0x0231;
 pub const WM_EXITSIZEMOVE = 0x0232;
@@ -191,6 +206,9 @@ pub const PM_REMOVE = 0x0001;
 pub const QS_ALLINPUT = 0x04FF;
 pub const MWMO_INPUTAVAILABLE = 0x0004;
 pub const WAIT_OBJECT_0 = 0;
+pub const CREATE_WAITABLE_TIMER_MANUAL_RESET = 0x00000001;
+pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+pub const TIMER_ALL_ACCESS = 0x001F0003;
 pub const MAPVK_VK_TO_CHAR = 2;
 
 // Virtual keys
@@ -231,6 +249,9 @@ pub extern "kernel32" fn QueryPerformanceCounter(*i64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn QueryPerformanceFrequency(*i64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreateEventW(?*anyopaque, BOOL, BOOL, ?LPCWSTR) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn SetEvent(HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CreateWaitableTimerExW(?*anyopaque, ?LPCWSTR, u32, u32) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn GetSystemTimePreciseAsFileTime(*i64) callconv(.winapi) void;
+pub extern "kernel32" fn SetWaitableTimer(HANDLE, *const i64, i32, ?*anyopaque, ?*anyopaque, BOOL) callconv(.winapi) BOOL;
 pub extern "kernel32" fn WaitForSingleObject(HANDLE, u32) callconv(.winapi) u32;
 pub extern "kernel32" fn CloseHandle(HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreatePipe(*HANDLE, *HANDLE, ?*anyopaque, u32) callconv(.winapi) BOOL;
@@ -303,6 +324,7 @@ pub extern "user32" fn PeekMessageW(*MSG, ?HWND, u32, u32, u32) callconv(.winapi
 pub extern "user32" fn GetKeyState(i32) callconv(.winapi) i16;
 pub extern "user32" fn MapVirtualKeyW(u32, u32) callconv(.winapi) u32;
 
+pub extern "dwmapi" fn DwmGetCompositionTimingInfo(?HWND, *DWM_TIMING_INFO) callconv(.winapi) HRESULT;
 pub extern "dwmapi" fn DwmSetWindowAttribute(HWND, u32, *const anyopaque, u32) callconv(.winapi) HRESULT;
 
 pub inline fn loword(v: anytype) u16 {

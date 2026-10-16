@@ -36,6 +36,11 @@ pub fn build(b: *std.Build) void {
         "stats",
         "Show frame timing and throughput in the window title (default: true in Debug)",
     ) orelse (optimize == .Debug));
+    options.addOption(u32, "max_fps", b.option(
+        u32,
+        "max-fps",
+        "Frame rate cap (default: 0, the display's refresh rate)",
+    ) orelse 0);
     exe_mod.addOptions("build_options", options);
 
     for ([_][]const u8{ "user32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler" }) |lib| {
