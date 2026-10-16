@@ -27,6 +27,9 @@ shelves: std.ArrayList(Shelf) = .empty,
 /// Bumped on every modification.
 generation: u64 = 0,
 
+/// Bumped by `reset`, which invalidates every region handed out.
+resets: u32 = 0,
+
 pub const Region = struct {
     x: u32,
     y: u32,
@@ -82,6 +85,7 @@ pub fn reset(self: *Atlas) void {
     @memset(self.data, 0);
     self.shelves.clearRetainingCapacity();
     self.generation +%= 1;
+    self.resets +%= 1;
 }
 
 fn reserve(self: *Atlas, alloc: Allocator, width: u32, height: u32) Error!Region {

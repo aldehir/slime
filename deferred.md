@@ -42,8 +42,6 @@ wait until there is a proper design for it.
 - **Sprite-drawn box drawing** and block elements, so they join
   seamlessly across cells.
 - **Gamma and contrast** tuning for text.
-- **Per-row dirty caching** in `cells.zig`. Every frame rebuilds every
-  row, which costs more now that output streams continuously.
 - **Distinct underline styles** (double, curly, dotted, dashed).
 
 ## Terminal and window

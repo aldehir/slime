@@ -1,6 +1,9 @@
 //! Converts a terminal RenderState into GPU-ready data: one background
 //! color per cell, and a list of quads (glyphs and solid rectangles for
 //! the cursor and text decorations). Independent of the graphics API.
+//!
+//! Rows are cached by content, so a frame only rebuilds the rows that
+//! changed and then copies every row's quads into place.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -46,6 +49,19 @@ pub const Cells = struct {
     /// Quads in draw order.
     instances: std.ArrayList(Instance) = .empty,
 
+    /// Each row's quads and backgrounds, keyed by a hash of everything
+    /// building the row reads. Only rows whose content changed are
+    /// rebuilt, a row that scrolls reuses its entry at its new position,
+    /// and identical rows (blank ones, say) share one entry.
+    row_cache: std.AutoHashMapUnmanaged(u64, CachedRow) = .empty,
+
+    /// A hash of the state every cached row depends on. A change
+    /// empties the cache.
+    cache_key: u64 = 0,
+
+    /// Counts builds, to evict cached rows that have gone unused.
+    frame: u64 = 0,
+
     /// Per-row scratch: text state for each cell of the current row.
     row_text: std.ArrayList(TextCell) = .empty,
 
@@ -61,10 +77,24 @@ pub const Cells = struct {
         color: u32,
     };
 
+    const CachedRow = struct {
+        /// Quads with y relative to the top of the row.
+        instances: std.ArrayList(Instance) = .empty,
+        bg: std.ArrayList(u32) = .empty,
+        last_used: u64,
+
+        fn deinit(self: *CachedRow, alloc: Allocator) void {
+            self.instances.deinit(alloc);
+            self.bg.deinit(alloc);
+        }
+    };
+
     /// The most codepoints of one grapheme we pass to the font system.
     const max_grapheme = 16;
 
     pub fn deinit(self: *Cells, alloc: Allocator) void {
+        self.clearCache(alloc);
+        self.row_cache.deinit(alloc);
         self.bg.deinit(alloc);
         self.instances.deinit(alloc);
         self.row_text.deinit(alloc);
@@ -73,8 +103,9 @@ pub const Cells = struct {
         self.* = undefined;
     }
 
-    /// Rebuild everything from the render state. Rasterizes any glyphs
-    /// not yet in the atlas.
+    /// Rebuild the frame from the render state, reusing cached rows
+    /// whose content hasn't changed. Rasterizes any glyphs not yet in
+    /// the atlas.
     pub fn build(
         self: *Cells,
         alloc: Allocator,
@@ -93,6 +124,13 @@ pub const Cells = struct {
         try self.row_text.resize(alloc, self.cols);
         self.instances.clearRetainingCapacity();
         grid.beginFrame();
+        self.frame += 1;
+
+        const key = cacheKey(self.cols, colors, m, grid.atlas.resets, config);
+        if (key != self.cache_key) {
+            self.clearCache(alloc);
+            self.cache_key = key;
+        }
 
         // OSC 12 or a configured color, then one taken from the cursor's
         // cell, which Ghostty reads from the cursor's pen style.
@@ -109,110 +147,40 @@ pub const Cells = struct {
         };
 
         const rows = state.row_data.slice();
-        for (rows.items(.cells)[0..self.rows], 0..) |row_cells, y_usize| {
+        for (
+            rows.items(.cells)[0..self.rows],
+            rows.items(.selection)[0..self.rows],
+            0..,
+        ) |row_cells, selection, y_usize| {
             const y: u32 = @intCast(y_usize);
             const cells = row_cells.slice();
-            const raws = cells.items(.raw);
-            const styles = cells.items(.style);
-            const graphemes = cells.items(.grapheme);
-            const cursor_x: ?u32 = if (cursor_pos) |pos| (if (pos.y == y) pos.x else null) else null;
-            const selection = rows.items(.selection)[y];
+            const row: Row = .{
+                .raws = cells.items(.raw)[0..self.cols],
+                .styles = cells.items(.style),
+                .graphemes = cells.items(.grapheme),
+                .selection = selection,
+                .cursor_x = if (cursor_pos) |pos| (if (pos.y == y) pos.x else null) else null,
+                .cursor_block = cursor_style == .block,
+            };
 
-            // Pass 1: colors, decorations, and each cell's face.
-            for (raws[0..self.cols], 0..) |raw, x_usize| {
-                const x: u32 = @intCast(x_usize);
-                const style: ghostty_vt.Style = if (raw.hasStyling()) styles[x] else .{};
-
-                // Unconfigured selection colors are the default colors
-                // inverted, as in Ghostty.
-                const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
-                var fg, var bg = cellColors(style, raw, colors);
-                if (selected) {
-                    const cell_fg = fg;
-                    const cell_bg = bg;
-                    bg = if (config.selection_background) |c| c.resolve(cell_fg, cell_bg) else colors.foreground;
-                    fg = if (config.selection_foreground) |c| c.resolve(cell_fg, cell_bg) else colors.background;
-                }
-                self.bg.items[y * self.cols + x] = pack(bg, 255);
-
-                self.row_text.items[x] = .{ .has_text = false, .face = 0, .color = 0 };
-                if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
-                const width: u32 = if (raw.wide == .wide) 2 else 1;
-
-                // Text under a block cursor takes the cell's background
-                // color so it stays readable, unless configured.
-                const under_cursor = cursor_x == x and cursor_style == .block;
-                const cursor_text = if (config.cursor_text) |c| c.resolve(fg, bg) else bg;
-                const text_color = if (under_cursor) cursor_text else fg;
-                const alpha: u8 = if (style.flags.faint) 128 else 255;
-
-                if (raw.hasText()) {
-                    var cp_buf: [max_grapheme]u21 = undefined;
-                    const cps = graphemeCodepoints(raw, graphemes[x], &cp_buf);
-                    self.row_text.items[x] = .{
-                        .has_text = true,
-                        .face = try grid.faceFor(.init(style.flags.bold, style.flags.italic), cps),
-                        .color = if (style.flags.invisible) 0 else pack(text_color, alpha),
-                    };
-                }
-
-                // TODO: distinct double/curly/dotted/dashed underlines.
-                if (style.flags.underline != .none) {
-                    try self.instances.append(alloc, rectA(m, x, y, m.underline_position, width * m.cell_width, m.underline_thickness, text_color, alpha));
-                }
-                if (style.flags.strikethrough) {
-                    try self.instances.append(alloc, rectA(m, x, y, m.strikethrough_position, width * m.cell_width, m.strikethrough_thickness, text_color, alpha));
-                }
+            const gop = try self.row_cache.getOrPut(alloc, row.hash());
+            const cached = gop.value_ptr;
+            if (!gop.found_existing) {
+                cached.* = .{ .last_used = self.frame };
+                self.buildRow(alloc, cached, row, grid, colors, config) catch |err| {
+                    cached.deinit(alloc);
+                    self.row_cache.removeByPtr(gop.key_ptr);
+                    return err;
+                };
             }
+            cached.last_used = self.frame;
 
-            // Pass 2: shape runs of text sharing a face. Runs also end at
-            // the cursor so a ligature never hides its position.
-            var x: u32 = 0;
-            while (x < self.cols) {
-                const first = self.row_text.items[x];
-                if (!first.has_text) {
-                    x += 1;
-                    continue;
-                }
-
-                const run_start = x;
-                self.run_text.clearRetainingCapacity();
-                self.run_cells.clearRetainingCapacity();
-                while (x < self.cols) {
-                    const cell = self.row_text.items[x];
-                    if (!cell.has_text or cell.face != first.face) break;
-                    if (x != run_start and cursor_x == x) break;
-
-                    var cp_buf: [max_grapheme]u21 = undefined;
-                    var utf16_buf: [2 * max_grapheme]u16 = undefined;
-                    const text = font.Grid.encodeUtf16(graphemeCodepoints(raws[x], graphemes[x], &cp_buf), &utf16_buf);
-                    try self.run_text.appendSlice(alloc, text);
-                    try self.run_cells.appendNTimes(alloc, @intCast(x - run_start), text.len);
-
-                    x += 1;
-                    if (cursor_x == x - 1) break;
-                }
-
-                const shaped = try grid.shape(first.face, self.run_text.items, self.run_cells.items);
-                for (shaped) |sg| {
-                    const cell_x = run_start + sg.cell;
-                    const color = self.row_text.items[cell_x].color;
-                    if (color >> 24 == 0) continue;
-                    const g = try grid.glyph(first.face, sg.index) orelse continue;
-
-                    const origin_x: i32 = @intCast(cell_x * m.cell_width);
-                    const origin_y: i32 = @intCast(y * m.cell_height);
-                    try self.instances.append(alloc, .{
-                        .pos = .{
-                            @floatFromInt(origin_x + sg.x + g.offset_x),
-                            @floatFromInt(origin_y + sg.y + g.offset_y),
-                        },
-                        .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
-                        .atlas = .{ g.region.x, g.region.y },
-                        .color = color,
-                        .kind = .glyph,
-                    });
-                }
+            @memcpy(self.bg.items[y * self.cols ..][0..self.cols], cached.bg.items);
+            const top: f32 = @floatFromInt(y * m.cell_height);
+            const placed = try self.instances.addManyAsSlice(alloc, cached.instances.items.len);
+            for (placed, cached.instances.items) |*dst, src| {
+                dst.* = src;
+                dst.pos[1] += top;
             }
         }
 
@@ -235,6 +203,136 @@ pub const Cells = struct {
                 },
             }
         }
+
+        self.evict(alloc);
+    }
+
+    /// Build one row's backgrounds and quads into `out`, with the quads
+    /// positioned as if the row were at the top of the grid.
+    fn buildRow(
+        self: *Cells,
+        alloc: Allocator,
+        out: *CachedRow,
+        row: Row,
+        grid: *font.Grid,
+        colors: *const RenderState.Colors,
+        config: ColorOptions,
+    ) !void {
+        const m = grid.metrics;
+        try out.bg.resize(alloc, self.cols);
+
+        // Pass 1: colors, decorations, and each cell's face.
+        for (row.raws, 0..) |raw, x_usize| {
+            const x: u32 = @intCast(x_usize);
+            const style: ghostty_vt.Style = if (raw.hasStyling()) row.styles[x] else .{};
+
+            // Unconfigured selection colors are the default colors
+            // inverted, as in Ghostty.
+            const selected = if (row.selection) |sel| x >= sel[0] and x <= sel[1] else false;
+            var fg, var bg = cellColors(style, raw, colors);
+            if (selected) {
+                const cell_fg = fg;
+                const cell_bg = bg;
+                bg = if (config.selection_background) |c| c.resolve(cell_fg, cell_bg) else colors.foreground;
+                fg = if (config.selection_foreground) |c| c.resolve(cell_fg, cell_bg) else colors.background;
+            }
+            out.bg.items[x] = pack(bg, 255);
+
+            self.row_text.items[x] = .{ .has_text = false, .face = 0, .color = 0 };
+            if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
+            const width: u32 = if (raw.wide == .wide) 2 else 1;
+
+            // Text under a block cursor takes the cell's background
+            // color so it stays readable, unless configured.
+            const under_cursor = row.cursor_block and row.cursor_x == x;
+            const cursor_text = if (config.cursor_text) |c| c.resolve(fg, bg) else bg;
+            const text_color = if (under_cursor) cursor_text else fg;
+            const alpha: u8 = if (style.flags.faint) 128 else 255;
+
+            if (raw.hasText()) {
+                var cp_buf: [max_grapheme]u21 = undefined;
+                const cps = graphemeCodepoints(raw, row.graphemes[x], &cp_buf);
+                self.row_text.items[x] = .{
+                    .has_text = true,
+                    .face = try grid.faceFor(.init(style.flags.bold, style.flags.italic), cps),
+                    .color = if (style.flags.invisible) 0 else pack(text_color, alpha),
+                };
+            }
+
+            // TODO: distinct double/curly/dotted/dashed underlines.
+            if (style.flags.underline != .none) {
+                try out.instances.append(alloc, rectA(m, x, 0, m.underline_position, width * m.cell_width, m.underline_thickness, text_color, alpha));
+            }
+            if (style.flags.strikethrough) {
+                try out.instances.append(alloc, rectA(m, x, 0, m.strikethrough_position, width * m.cell_width, m.strikethrough_thickness, text_color, alpha));
+            }
+        }
+
+        // Pass 2: shape runs of text sharing a face. Runs also end at
+        // the cursor so a ligature never hides its position.
+        var x: u32 = 0;
+        while (x < self.cols) {
+            const first = self.row_text.items[x];
+            if (!first.has_text) {
+                x += 1;
+                continue;
+            }
+
+            const run_start = x;
+            self.run_text.clearRetainingCapacity();
+            self.run_cells.clearRetainingCapacity();
+            while (x < self.cols) {
+                const cell = self.row_text.items[x];
+                if (!cell.has_text or cell.face != first.face) break;
+                if (x != run_start and row.cursor_x == x) break;
+
+                var cp_buf: [max_grapheme]u21 = undefined;
+                var utf16_buf: [2 * max_grapheme]u16 = undefined;
+                const text = font.Grid.encodeUtf16(graphemeCodepoints(row.raws[x], row.graphemes[x], &cp_buf), &utf16_buf);
+                try self.run_text.appendSlice(alloc, text);
+                try self.run_cells.appendNTimes(alloc, @intCast(x - run_start), text.len);
+
+                x += 1;
+                if (row.cursor_x == x - 1) break;
+            }
+
+            const shaped = try grid.shape(first.face, self.run_text.items, self.run_cells.items);
+            for (shaped) |sg| {
+                const cell_x = run_start + sg.cell;
+                const color = self.row_text.items[cell_x].color;
+                if (color >> 24 == 0) continue;
+                const g = try grid.glyph(first.face, sg.index) orelse continue;
+
+                const origin_x: i32 = @intCast(cell_x * m.cell_width);
+                try out.instances.append(alloc, .{
+                    .pos = .{
+                        @floatFromInt(origin_x + sg.x + g.offset_x),
+                        @floatFromInt(sg.y + g.offset_y),
+                    },
+                    .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
+                    .atlas = .{ g.region.x, g.region.y },
+                    .color = color,
+                    .kind = .glyph,
+                });
+            }
+        }
+    }
+
+    /// Drop rows not drawn by this build or the last. Keeping the last
+    /// build's rows means a blinking cursor's row never rebuilds.
+    fn evict(self: *Cells, alloc: Allocator) void {
+        var it = self.row_cache.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.last_used + 1 >= self.frame) continue;
+            entry.value_ptr.deinit(alloc);
+            self.row_cache.removeByPtr(entry.key_ptr);
+        }
+    }
+
+    fn clearCache(self: *Cells, alloc: Allocator) void {
+        var it = self.row_cache.valueIterator();
+        while (it.next()) |cached| cached.deinit(alloc);
+        self.row_cache.clearRetainingCapacity();
     }
 
     pub fn uniforms(self: *const Cells, m: font.Grid.Metrics, screen_width: u32, screen_height: u32, offset: [2]f32) Uniforms {
@@ -264,6 +362,68 @@ pub const ColorOptions = struct {
     selection_background: ?TerminalColor = null,
     selection_foreground: ?TerminalColor = null,
 };
+
+/// Everything building one row reads, apart from the state hashed by
+/// `cacheKey`.
+const Row = struct {
+    raws: []const ghostty_vt.Cell,
+    /// Valid only for cells with styling.
+    styles: []const ghostty_vt.Style,
+    /// Valid only for cells with graphemes.
+    graphemes: []const []const u21,
+    selection: @FieldType(RenderState.Row, "selection"),
+    /// The cursor's column, if it's drawn on this row.
+    cursor_x: ?u32,
+    cursor_block: bool,
+
+    fn hash(self: Row) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.sliceAsBytes(self.raws));
+
+        // Style ids only mean something within one page, so also mix in
+        // the style each id resolves to. A row is in one page, so once
+        // per change of id is enough.
+        var style_id: @FieldType(ghostty_vt.Cell, "style_id") = 0;
+        for (self.raws, 0..) |raw, x| {
+            if (raw.hasStyling() and raw.style_id != style_id) {
+                style_id = raw.style_id;
+                std.hash.autoHash(&h, x);
+                std.hash.autoHash(&h, self.styles[x]);
+            }
+            if (raw.hasGrapheme()) {
+                std.hash.autoHash(&h, x);
+                h.update(std.mem.sliceAsBytes(self.graphemes[x]));
+            }
+        }
+
+        std.hash.autoHash(&h, self.selection);
+        std.hash.autoHash(&h, self.cursor_x);
+        std.hash.autoHash(&h, self.cursor_block);
+        return h.final();
+    }
+};
+
+/// A hash of the state shared by every row: the grid width, colors,
+/// cell metrics, and the atlas regions glyphs were placed in.
+fn cacheKey(
+    cols: u32,
+    colors: *const RenderState.Colors,
+    m: font.Grid.Metrics,
+    atlas_resets: u32,
+    config: ColorOptions,
+) u64 {
+    var h = std.hash.Wyhash.init(0);
+    std.hash.autoHash(&h, cols);
+    std.hash.autoHash(&h, pack(colors.background, 0));
+    std.hash.autoHash(&h, pack(colors.foreground, 0));
+    var palette: [colors.palette.len]u32 = undefined;
+    for (&palette, colors.palette) |*p, c| p.* = pack(c, 0);
+    h.update(std.mem.asBytes(&palette));
+    std.hash.autoHash(&h, m);
+    std.hash.autoHash(&h, atlas_resets);
+    std.hash.autoHash(&h, config);
+    return h.final();
+}
 
 /// A cell's foreground and background, after inverse.
 fn cellColors(style: ghostty_vt.Style, raw: ghostty_vt.Cell, colors: *const RenderState.Colors) struct { RGB, RGB } {
