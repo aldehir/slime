@@ -85,8 +85,10 @@ fn paintNewSession(c: *const Chrome, p: *Painter, r: Rect) void {
         .hover, .pressed => c.theme.surface_hover,
     };
     p.fillRounded(r, c.px(6), bg);
-    const icon_x = r.x + c.px(10);
-    c.iconPlus(p, .{ .x = icon_x, .y = r.y + @round((r.h - c.px(12)) / 2), .w = c.px(12), .h = c.px(12) }, c.theme.text);
+    // Lucide's plus spans 14 of its 24 units: 12 DIPs wide in this box,
+    // whose odd size centers the lines on pixels.
+    const icon = c.px(21);
+    c.drawIcon(p, .plus, .{ .x = r.x + c.px(6), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, c.theme.text);
 
     // The key hint, in an outlined chip at the right.
     const hint_w = @ceil(c.fonts.measure(new_session_hint, c.fonts.hint)) + c.px(10);
@@ -99,7 +101,7 @@ fn paintNewSession(c: *const Chrome, p: *Painter, r: Rect) void {
     p.strokeRounded(hint, c.px(4), c.stroke(), c.theme.outline);
     p.text(new_session_hint, c.fonts.hint, hint, c.theme.text_muted);
 
-    const label_x = icon_x + c.px(20);
+    const label_x = r.x + c.px(30);
     p.text(L("New session"), c.fonts.body, .{ .x = label_x, .y = r.y, .w = hint.x - c.px(8) - label_x, .h = r.h }, c.theme.text);
 }
 
@@ -115,7 +117,7 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.Vi
 
     const icon = c.px(16);
     const icon_color = if (active) c.theme.text else c.theme.text_muted;
-    c.iconPrompt(p, .{ .x = r.x + c.px(10), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, icon_color);
+    c.drawIcon(p, .terminal, .{ .x = r.x + c.px(10), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, icon_color);
 
     const close = closeButton(c, r);
     const text_x = r.x + c.px(34);
@@ -132,8 +134,9 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.Vi
             .pressed => c.theme.button_pressed,
             else => c.theme.button_hover,
         });
-        const g = c.px(8);
-        c.iconClose(p, close.center(g, g), if (close_hovered) c.theme.text_strong else c.theme.text_muted);
+        // Lucide's x spans 12 of its 24 units: 8 DIPs in this box.
+        const g = c.px(16);
+        c.drawIcon(p, .x, close.center(g, g), if (close_hovered) c.theme.text_strong else c.theme.text_muted);
     } else if (session.activity) {
         p.dot(close.x + close.w / 2, close.y + close.h / 2, c.px(3), c.theme.accent);
     }

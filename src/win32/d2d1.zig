@@ -207,7 +207,29 @@ pub const IDeviceContext5 = extern struct {
     }
 };
 
-pub const ISvgDocument = extern struct { vtable: com.VTable };
+pub const ISvgDocument = extern struct {
+    vtable: com.VTable,
+
+    /// The `<svg>` element, AddRef'd.
+    pub fn getRoot(self: *ISvgDocument, out: *?*ISvgElement) void {
+        com.call(self, 7, fn (*?*ISvgElement) void, .{out});
+    }
+};
+
+/// D2D1_SVG_ATTRIBUTE_POD_TYPE
+pub const SVG_ATTRIBUTE_POD_TYPE_FLOAT = 0;
+pub const SVG_ATTRIBUTE_POD_TYPE_COLOR = 1;
+
+pub const ISvgElement = extern struct {
+    vtable: com.VTable,
+
+    /// The SetAttributeValue overload taking a plain value. Slot 28, not
+    /// the 30 its declaration order gives: MSVC groups a method's
+    /// overloads at the first one's slot, in reverse order.
+    pub fn setAttributeValue(self: *ISvgElement, name: [*:0]const u16, @"type": u32, value: *const anyopaque, size: u32) HRESULT {
+        return com.call(self, 28, fn ([*:0]const u16, u32, *const anyopaque, u32) HRESULT, .{ name, @"type", value, size });
+    }
+};
 
 pub const IBitmap1 = extern struct { vtable: com.VTable };
 

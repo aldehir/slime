@@ -48,6 +48,8 @@ pub fn build(b: *std.Build) void {
     }
     // Drawn in the title bar, as the taskbar shows it at small sizes.
     exe_mod.addAnonymousImport("slime-small.svg", .{ .root_source_file = b.path("assets/icon/slime-small.svg") });
+    // The chrome's icons, embedded by the module next to them.
+    exe_mod.addAnonymousImport("lucide", .{ .root_source_file = b.path("assets/icons/lucide/lucide.zig") });
 
     if (b.lazyDependency("ghostty", .{
         .target = target,

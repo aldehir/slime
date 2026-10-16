@@ -231,13 +231,9 @@ fn paintToggle(self: *const Chrome, p: *Painter, l: *const Layout, view: *const 
         .hover => p.fill(r, self.theme.button_hover),
         .pressed => p.fill(r, self.theme.button_pressed),
     }
-    // A window with a pane down its left side.
     const color = if (view.focused) self.theme.text else self.theme.text_inactive;
-    const w = self.stroke();
-    const box = r.center(self.px(16), self.px(14));
-    p.strokeRounded(box, self.px(2), w, color);
-    const x = crisp(box.x + self.px(5), w);
-    p.line(x, box.y, x, box.bottom(), w, color);
+    const size = self.px(20);
+    self.drawIcon(p, .panel_left, r.center(size, size), color);
 }
 
 fn paintCaptionButtons(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
@@ -290,30 +286,11 @@ pub fn crisp(v: f32, width: f32) f32 {
     return if (@mod(width, 2) == 1) @floor(v) + 0.5 else @round(v);
 }
 
-/// A plus sign filling `box`.
-pub fn iconPlus(self: *const Chrome, p: *Painter, box: Rect, color: Color) void {
-    const w = self.stroke();
-    const cx = crisp(box.x + box.w / 2, w);
-    const cy = crisp(box.y + box.h / 2, w);
-    p.line(cx, box.y, cx, box.bottom(), w, color);
-    p.line(box.x, cy, box.right(), cy, w, color);
-}
-
-/// A shell prompt, `>_`, in a 16 DIP `box`.
-pub fn iconPrompt(self: *const Chrome, p: *Painter, box: Rect, color: Color) void {
-    const w = @max(1, self.scale * 1.5);
-    const x = box.x;
-    const y = box.y;
-    p.line(x + self.px(3), y + self.px(4.5), x + self.px(6.5), y + self.px(8), w, color);
-    p.line(x + self.px(6.5), y + self.px(8), x + self.px(3), y + self.px(11.5), w, color);
-    p.line(x + self.px(8), y + self.px(12), x + self.px(13), y + self.px(12), w, color);
-}
-
-/// An X filling `box`.
-pub fn iconClose(self: *const Chrome, p: *Painter, box: Rect, color: Color) void {
-    const w = self.stroke();
-    p.line(box.x, box.y, box.right(), box.bottom(), w, color);
-    p.line(box.right(), box.y, box.x, box.bottom(), w, color);
+/// The Lucide icon `name` scaled to the square `box`. Its strokes are
+/// `stroke` wide at any size, rather than Lucide's 2 of 24 units, so
+/// straight lines are crisp where `box` puts them on pixel centers.
+pub fn drawIcon(self: *const Chrome, p: *Painter, name: Painter.Lucide, box: Rect, color: Color) void {
+    p.lucideIcon(name, box, self.stroke(), color);
 }
 
 /// Text formats for the chrome, sized for the current scale. All lay out

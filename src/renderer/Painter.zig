@@ -7,12 +7,14 @@ const win32 = @import("../win32/win32.zig");
 const com = win32.com;
 const d2d1 = win32.d2d1;
 const dwrite = win32.dwrite;
+const lucide_svgs = @import("lucide");
 
 ctx: *d2d1.IDeviceContext,
 factory: *d2d1.IFactory1,
 /// One brush, recolored for each primitive.
 brush: *d2d1.ISolidColorBrush,
 icon: ?Icon = null,
+lucide: ?*const LucideIcons = null,
 
 /// An SVG image parsed once, drawn at any size.
 pub const Icon = struct {
@@ -21,10 +23,9 @@ pub const Icon = struct {
     /// The SVG's width and height, which it's parsed at and scaled from.
     size: f32,
 
-    /// Parse `svg`, whose root is 1024 x 1024. Null if Direct2D can't
+    /// Parse `svg`, whose root is `size` x `size`. Null if Direct2D can't
     /// draw SVG (before Windows 10 1703) or the SVG doesn't parse.
-    pub fn init(ctx: *d2d1.IDeviceContext, svg: []const u8) ?Icon {
-        const size = 1024;
+    pub fn init(ctx: *d2d1.IDeviceContext, svg: []const u8, size: f32) ?Icon {
         const ctx5 = com.query(ctx, d2d1.IDeviceContext5) orelse return null;
         var doc: ?*d2d1.ISvgDocument = null;
         defer if (doc == null) com.release(ctx5);
@@ -38,7 +39,36 @@ pub const Icon = struct {
         com.release(self.doc);
         com.release(self.ctx);
     }
+
+    /// Draw scaled to the square `r`.
+    fn draw(self: Icon, r: Rect) void {
+        const s = r.w / self.size;
+        self.ctx.setTransform(&.{ s, 0, 0, s, r.x, r.y });
+        self.ctx.drawSvgDocument(self.doc);
+        self.ctx.setTransform(&.{ 1, 0, 0, 1, 0, 0 });
+    }
 };
+
+/// Lucide icons (see assets/icons/lucide), by name.
+pub const Lucide = std.meta.DeclEnum(lucide_svgs);
+pub const LucideIcons = std.EnumArray(Lucide, Icon);
+
+/// Parse every Lucide icon. Null if one fails, as where Direct2D can't
+/// draw SVG.
+pub fn initLucide(ctx: *d2d1.IDeviceContext) ?LucideIcons {
+    var icons: LucideIcons = undefined;
+    inline for (comptime std.enums.values(Lucide), 0..) |name, i| {
+        icons.set(name, Icon.init(ctx, @field(lucide_svgs, @tagName(name)), 24) orelse {
+            for (std.enums.values(Lucide)[0..i]) |done| icons.get(done).deinit();
+            return null;
+        });
+    }
+    return icons;
+}
+
+pub fn deinitLucide(icons: *const LucideIcons) void {
+    for (icons.values) |icon| icon.deinit();
+}
 
 /// Straight (not premultiplied) RGBA.
 pub const Color = [4]f32;
@@ -148,10 +178,22 @@ pub fn text(self: *Painter, str: []const u16, format: *dwrite.ITextFormat, r: Re
 /// Draw the app icon scaled to the square `r`, if there is one.
 pub fn appIcon(self: *Painter, r: Rect) void {
     const icon = self.icon orelse return;
-    const s = r.w / icon.size;
-    icon.ctx.setTransform(&.{ s, 0, 0, s, r.x, r.y });
-    icon.ctx.drawSvgDocument(icon.doc);
-    icon.ctx.setTransform(&.{ 1, 0, 0, 1, 0, 0 });
+    icon.draw(r);
+}
+
+/// Draw the Lucide icon `name` scaled to the square `r`, its strokes
+/// `width` pixels thick in `c`. Lucide strokes in `currentColor`, so
+/// setting the root's `color` recolors the whole icon.
+pub fn lucideIcon(self: *Painter, name: Lucide, r: Rect, width: f32, c: Color) void {
+    const icon = (self.lucide orelse return).get(name);
+    var root: ?*d2d1.ISvgElement = null;
+    icon.doc.getRoot(&root);
+    defer com.releaseOpt(&root);
+    const stroke = width * icon.size / r.w;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    com.check(root.?.setAttributeValue(L("color"), d2d1.SVG_ATTRIBUTE_POD_TYPE_COLOR, &c, @sizeOf(Color)), "ID2D1SvgElement::SetAttributeValue(color)") catch return;
+    com.check(root.?.setAttributeValue(L("stroke-width"), d2d1.SVG_ATTRIBUTE_POD_TYPE_FLOAT, &stroke, @sizeOf(f32)), "ID2D1SvgElement::SetAttributeValue(stroke-width)") catch return;
+    icon.draw(r);
 }
 
 pub fn pushClip(self: *Painter, r: Rect) void {
