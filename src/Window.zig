@@ -27,6 +27,10 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ghostty-win");
 const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
 
 const StreamHandler = @FieldType(ghostty_vt.TerminalStream, "handler");
+const MouseButton = ghostty_vt.input.MouseButton;
+const MouseAction = ghostty_vt.input.MouseAction;
+const MouseEvent = ghostty_vt.input.MouseEncodeEvent;
+const MouseEncodeOptions = ghostty_vt.input.MouseEncodeOptions;
 
 const stats_timer_id = 1;
 /// Draws pending output while DefWindowProc's modal move/size loop runs
@@ -77,6 +81,14 @@ dirty: bool = false,
 
 /// The first half of a surrogate pair from a lone WM_CHAR.
 high_surrogate: ?u16 = null,
+
+/// The cell the last mouse event was reported in, so motion within one
+/// cell is reported once.
+mouse_cell: ?ghostty_vt.Coordinate = null,
+
+/// Wheel rotation not yet turned into scrolling, vertical then
+/// horizontal, in 1/WHEEL_DELTA notches times the lines per notch.
+wheel_remainder: [2]i32 = .{ 0, 0 },
 
 /// Only used with `-Dstats`.
 stats: Stats = .{},
@@ -138,6 +150,10 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
         .default_modes = .{ .grapheme_cluster = true },
     });
     errdefer self.terminal.deinit(alloc);
+    // An arrow until the child asks for another shape with OSC 22. An
+    // I-beam (Ghostty's default) looks wrong over TUIs. An empty OSC 22
+    // still resets it to the I-beam.
+    self.terminal.mouse_shape = .default;
     self.stream = self.terminal.vtStream();
     errdefer self.stream.deinit();
     self.stream.handler.effects.write_pty = &writePty;
@@ -308,6 +324,8 @@ fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM)
         log.warn("key encode failed: {}", .{err});
         return;
     };
+    if (w.buffered().len == 0) return;
+    if (event.action != .release) self.scrollToBottom();
     if (self.pty) |*pty| pty.write(w.buffered());
 }
 
@@ -329,7 +347,145 @@ fn charInput(self: *Window, unit: u16) void {
 
     var utf8: [8]u8 = undefined;
     const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
+    self.scrollToBottom();
     if (self.pty) |*pty| pty.write(utf8[0..len]);
+}
+
+/// Bring the viewport back from scrollback, as typing does.
+fn scrollToBottom(self: *Window) void {
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    if (self.terminal.screens.active.pages.viewport == .active) return;
+    self.terminal.scrollViewport(.bottom);
+    self.dirty = true;
+}
+
+/// Report a mouse button press or release, or motion, to the child if it
+/// asked for mouse events.
+fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+    const button: ?MouseButton, const action: MouseAction = if (input.mouseButton(msg, wparam)) |b|
+        .{ b[0], if (b[1]) .press else .release }
+    else
+        .{ input.heldButton(wparam), .motion };
+
+    // Capture the mouse while a button is down, so a drag past the edge
+    // still reports and the release comes back to us.
+    const held = input.heldButton(wparam) != null;
+    if (action == .press) {
+        _ = win32.SetCapture(self.hwnd.?);
+    } else if (action == .release and !held) {
+        _ = win32.ReleaseCapture();
+    }
+
+    self.lockTerminal();
+    var opts: MouseEncodeOptions = .fromTerminal(&self.terminal, self.surfaceSize());
+    self.unlockTerminal();
+    opts.any_button_pressed = held;
+    opts.last_cell = &self.mouse_cell;
+    self.mouseReport(.{
+        .action = action,
+        .button = button,
+        .mods = input.mouseMods(wparam),
+        .pos = .{
+            .x = @floatFromInt(win32.xLparam(lparam)),
+            .y = @floatFromInt(win32.yLparam(lparam)),
+        },
+    }, opts);
+}
+
+/// Scroll with the wheel: report wheel buttons if the child asked for
+/// mouse events, else send arrow keys on the alternate screen with
+/// alternate scroll (mode 1007) set, else move the viewport through
+/// scrollback.
+fn mouseWheel(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+    const horizontal = msg == win32.WM_MOUSEHWHEEL;
+    const rotation: i16 = @bitCast(win32.hiword(wparam));
+
+    // Unlike other mouse messages, the position is in screen coordinates.
+    var pt: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+    _ = win32.ScreenToClient(self.hwnd.?, &pt);
+
+    self.lockTerminal();
+    const t = &self.terminal;
+    const reporting = t.flags.mouse_event != .none;
+    const alternate_scroll = !reporting and
+        t.screens.active_key == .alternate and
+        t.modes.get(.mouse_alternate_scroll);
+    const cursor_keys = t.modes.get(.cursor_keys);
+    const opts: MouseEncodeOptions = .fromTerminal(t, self.surfaceSize());
+    const rows = t.rows;
+    self.unlockTerminal();
+
+    if (horizontal and !reporting) return;
+
+    // Reports are one per notch; programs pick how far that scrolls.
+    const lines: u32 = if (reporting) 1 else lines: {
+        var n: u32 = 3;
+        _ = win32.SystemParametersInfoW(win32.SPI_GETWHEELSCROLLLINES, 0, &n, 0);
+        break :lines if (n == win32.WHEEL_PAGESCROLL) rows else @min(n, rows);
+    };
+    const remainder = &self.wheel_remainder[@intFromBool(horizontal)];
+    remainder.* += @as(i32, rotation) * @as(i32, @intCast(lines));
+    const steps = @divTrunc(remainder.*, win32.WHEEL_DELTA);
+    remainder.* -= steps * win32.WHEEL_DELTA;
+    if (steps == 0) return;
+    // Positive rotation is away from the user, or to the right.
+    const up = steps > 0;
+    const count = @abs(steps);
+
+    if (reporting) {
+        const event: MouseEvent = .{
+            .button = if (horizontal)
+                (if (up) .seven else .six)
+            else
+                (if (up) .four else .five),
+            .mods = input.mouseMods(wparam),
+            .pos = .{ .x = @floatFromInt(pt.x), .y = @floatFromInt(pt.y) },
+        };
+        for (0..count) |_| self.mouseReport(event, opts);
+    } else if (alternate_scroll) {
+        const seq: []const u8 = if (cursor_keys)
+            (if (up) "\x1bOA" else "\x1bOB")
+        else
+            (if (up) "\x1b[A" else "\x1b[B");
+        if (self.pty) |*pty| for (0..count) |_| pty.write(seq);
+    } else {
+        const delta: isize = @intCast(count);
+        self.lockTerminal();
+        self.terminal.scrollViewport(.{ .delta = if (up) -delta else delta });
+        self.unlockTerminal();
+        self.dirty = true;
+    }
+}
+
+fn mouseReport(self: *Window, event: MouseEvent, opts: MouseEncodeOptions) void {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    ghostty_vt.input.encodeMouse(&w, event, opts) catch |err| {
+        log.warn("mouse encode failed: {}", .{err});
+        return;
+    };
+    if (w.buffered().len == 0) return;
+    if (self.pty) |*pty| pty.write(w.buffered());
+}
+
+/// The system cursor for a shape the child set with OSC 22.
+fn mouseCursor(shape: ghostty_vt.MouseShape) usize {
+    return switch (shape) {
+        .text, .vertical_text => win32.IDC_IBEAM,
+        .pointer, .alias, .copy, .grab, .grabbing => win32.IDC_HAND,
+        .help, .context_menu => win32.IDC_HELP,
+        .progress => win32.IDC_APPSTARTING,
+        .wait => win32.IDC_WAIT,
+        .cell, .crosshair => win32.IDC_CROSS,
+        .move, .all_scroll => win32.IDC_SIZEALL,
+        .no_drop, .not_allowed => win32.IDC_NO,
+        .col_resize, .e_resize, .w_resize, .ew_resize => win32.IDC_SIZEWE,
+        .row_resize, .n_resize, .s_resize, .ns_resize => win32.IDC_SIZENS,
+        .ne_resize, .sw_resize, .nesw_resize => win32.IDC_SIZENESW,
+        .nw_resize, .se_resize, .nwse_resize => win32.IDC_SIZENWSE,
+        .default, .zoom_in, .zoom_out => win32.IDC_ARROW,
+    };
 }
 
 const ClientSize = struct { width: u32, height: u32 };
@@ -340,6 +496,24 @@ fn clientSize(self: *const Window) ClientSize {
     return .{
         .width = @intCast(rect.right - rect.left),
         .height = @intCast(rect.bottom - rect.top),
+    };
+}
+
+/// The client area as the mouse encoder sees it, to map positions to
+/// cells. Call with the terminal locked.
+fn surfaceSize(self: *const Window) @FieldType(MouseEncodeOptions, "size") {
+    const size = self.clientSize();
+    const m = self.grid.metrics;
+    const pad = self.paddingPx();
+    return .{
+        .screen = .{ .width = size.width, .height = size.height },
+        .cell = .{ .width = m.cell_width, .height = m.cell_height },
+        .padding = .{
+            .top = pad,
+            .left = pad,
+            .right = size.width -| pad -| @as(u32, self.terminal.cols) * m.cell_width,
+            .bottom = size.height -| pad -| @as(u32, self.terminal.rows) * m.cell_height,
+        },
     };
 }
 
@@ -532,6 +706,39 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_DEADCHAR, win32.WM_SYSDEADCHAR => return 0,
+
+        win32.WM_MOUSEMOVE,
+        win32.WM_LBUTTONDOWN,
+        win32.WM_LBUTTONUP,
+        win32.WM_RBUTTONDOWN,
+        win32.WM_RBUTTONUP,
+        win32.WM_MBUTTONDOWN,
+        win32.WM_MBUTTONUP,
+        => {
+            self.mouseInput(msg, wparam, lparam);
+            return 0;
+        },
+
+        // These alone return TRUE when handled.
+        win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP => {
+            self.mouseInput(msg, wparam, lparam);
+            return win32.TRUE;
+        },
+
+        win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {
+            self.mouseWheel(msg, wparam, lparam);
+            return 0;
+        },
+
+        win32.WM_SETCURSOR => {
+            if (win32.loword(lparam) != win32.HTCLIENT or self.renderer == null)
+                return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            self.lockTerminal();
+            const shape = self.terminal.mouse_shape;
+            self.unlockTerminal();
+            _ = win32.SetCursor(win32.LoadCursorW(null, mouseCursor(shape)));
+            return win32.TRUE;
+        },
 
         win32.WM_DPICHANGED => {
             const rect: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));

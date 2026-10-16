@@ -1,6 +1,7 @@
-//! Win32 keyboard messages to libghostty-vt key events, which its
-//! encoder turns into the bytes a program expects (legacy, xterm
-//! modifyOtherKeys, or Kitty protocol, depending on terminal modes).
+//! Win32 keyboard and mouse messages to libghostty-vt key and mouse
+//! events, which its encoders turn into the bytes a program expects
+//! (legacy, xterm modifyOtherKeys, or Kitty protocol for keys; X10, SGR,
+//! ... for the mouse, depending on terminal modes).
 
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
@@ -9,6 +10,7 @@ const win32 = @import("win32/win32.zig");
 const Key = ghostty_vt.input.Key;
 const KeyEvent = ghostty_vt.input.KeyEvent;
 const Mods = ghostty_vt.input.KeyMods;
+const MouseButton = ghostty_vt.input.MouseButton;
 
 /// Build the event for a WM_(SYS)KEYDOWN or WM_(SYS)KEYUP. `text` is the
 /// UTF-8 the key produced (from the WM_(SYS)CHAR messages TranslateMessage
@@ -42,6 +44,48 @@ pub fn keyEvent(
         event.consumed_mods = .{ .shift = mods.shift, .ctrl = altgr, .alt = altgr };
     }
     return event;
+}
+
+/// The button a WM_*BUTTONDOWN/UP message is about, and whether it was
+/// pressed. Null for other messages.
+pub fn mouseButton(msg: u32, wparam: win32.WPARAM) ?struct { MouseButton, bool } {
+    return switch (msg) {
+        win32.WM_LBUTTONDOWN => .{ .left, true },
+        win32.WM_LBUTTONUP => .{ .left, false },
+        win32.WM_RBUTTONDOWN => .{ .right, true },
+        win32.WM_RBUTTONUP => .{ .right, false },
+        win32.WM_MBUTTONDOWN => .{ .middle, true },
+        win32.WM_MBUTTONUP => .{ .middle, false },
+        // Back and forward, which xterm numbers 8 and 9.
+        win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP => .{
+            if (win32.hiword(wparam) == win32.XBUTTON1) .eight else .nine,
+            msg == win32.WM_XBUTTONDOWN,
+        },
+        else => null,
+    };
+}
+
+/// The button a drag reports, from a mouse message's MK_* flags (which
+/// already reflect the message's own press or release). Null when no
+/// button is held.
+pub fn heldButton(wparam: win32.WPARAM) ?MouseButton {
+    // In Ghostty's order of preference.
+    if (wparam & win32.MK_LBUTTON != 0) return .left;
+    if (wparam & win32.MK_RBUTTON != 0) return .right;
+    if (wparam & win32.MK_MBUTTON != 0) return .middle;
+    if (wparam & win32.MK_XBUTTON1 != 0) return .eight;
+    if (wparam & win32.MK_XBUTTON2 != 0) return .nine;
+    return null;
+}
+
+/// Modifiers for a mouse event. Mouse protocols only carry shift, ctrl,
+/// and alt.
+pub fn mouseMods(wparam: win32.WPARAM) Mods {
+    return .{
+        .shift = wparam & win32.MK_SHIFT != 0,
+        .ctrl = wparam & win32.MK_CONTROL != 0,
+        .alt = down(win32.VK_MENU),
+    };
 }
 
 fn currentMods() Mods {

@@ -182,6 +182,18 @@ pub const WM_DISPLAYCHANGE = 0x007E;
 pub const WM_TIMER = 0x0113;
 pub const WM_ENTERSIZEMOVE = 0x0231;
 pub const WM_EXITSIZEMOVE = 0x0232;
+pub const WM_SETCURSOR = 0x0020;
+pub const WM_MOUSEMOVE = 0x0200;
+pub const WM_LBUTTONDOWN = 0x0201;
+pub const WM_LBUTTONUP = 0x0202;
+pub const WM_RBUTTONDOWN = 0x0204;
+pub const WM_RBUTTONUP = 0x0205;
+pub const WM_MBUTTONDOWN = 0x0207;
+pub const WM_MBUTTONUP = 0x0208;
+pub const WM_MOUSEWHEEL = 0x020A;
+pub const WM_XBUTTONDOWN = 0x020B;
+pub const WM_XBUTTONUP = 0x020C;
+pub const WM_MOUSEHWHEEL = 0x020E;
 pub const WM_DPICHANGED = 0x02E0;
 pub const WM_APP = 0x8000;
 
@@ -194,7 +206,21 @@ pub const GWLP_USERDATA = -21;
 pub const SIZE_MINIMIZED = 1;
 pub const SWP_NOZORDER = 0x0004;
 pub const SWP_NOACTIVATE = 0x0010;
-pub const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
+// Cursor resource IDs (MAKEINTRESOURCE values, which aren't u16-aligned).
+pub const IDC_ARROW: usize = 32512;
+pub const IDC_IBEAM: usize = 32513;
+pub const IDC_WAIT: usize = 32514;
+pub const IDC_CROSS: usize = 32515;
+pub const IDC_SIZENWSE: usize = 32642;
+pub const IDC_SIZENESW: usize = 32643;
+pub const IDC_SIZEWE: usize = 32644;
+pub const IDC_SIZENS: usize = 32645;
+pub const IDC_SIZEALL: usize = 32646;
+pub const IDC_NO: usize = 32648;
+pub const IDC_HAND: usize = 32649;
+pub const IDC_APPSTARTING: usize = 32650;
+pub const IDC_HELP: usize = 32651;
+pub const HTCLIENT = 1;
 pub const USER_DEFAULT_SCREEN_DPI = 96;
 
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
@@ -210,6 +236,19 @@ pub const CREATE_WAITABLE_TIMER_MANUAL_RESET = 0x00000001;
 pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
 pub const TIMER_ALL_ACCESS = 0x001F0003;
 pub const MAPVK_VK_TO_CHAR = 2;
+
+// Mouse
+pub const MK_LBUTTON = 0x0001;
+pub const MK_RBUTTON = 0x0002;
+pub const MK_SHIFT = 0x0004;
+pub const MK_CONTROL = 0x0008;
+pub const MK_MBUTTON = 0x0010;
+pub const MK_XBUTTON1 = 0x0020;
+pub const MK_XBUTTON2 = 0x0040;
+pub const XBUTTON1 = 0x0001;
+pub const WHEEL_DELTA = 120;
+pub const WHEEL_PAGESCROLL: u32 = 0xFFFFFFFF;
+pub const SPI_GETWHEELSCROLLLINES = 0x0068;
 
 // Virtual keys
 pub const VK_SHIFT = 0x10;
@@ -310,7 +349,7 @@ pub extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn ValidateRect(HWND, ?*const RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn SetWindowLongPtrW(HWND, i32, isize) callconv(.winapi) isize;
 pub extern "user32" fn GetWindowLongPtrW(HWND, i32) callconv(.winapi) isize;
-pub extern "user32" fn LoadCursorW(?HINSTANCE, LPCWSTR) callconv(.winapi) ?HCURSOR;
+pub extern "user32" fn LoadCursorW(?HINSTANCE, usize) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn GetMessageW(*MSG, ?HWND, u32, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) BOOL;
 pub extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) LRESULT;
@@ -323,6 +362,11 @@ pub extern "user32" fn PostMessageW(?HWND, u32, WPARAM, LPARAM) callconv(.winapi
 pub extern "user32" fn PeekMessageW(*MSG, ?HWND, u32, u32, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn GetKeyState(i32) callconv(.winapi) i16;
 pub extern "user32" fn MapVirtualKeyW(u32, u32) callconv(.winapi) u32;
+pub extern "user32" fn SetCapture(HWND) callconv(.winapi) ?HWND;
+pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+pub extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn SetCursor(?HCURSOR) callconv(.winapi) ?HCURSOR;
+pub extern "user32" fn SystemParametersInfoW(u32, u32, ?*anyopaque, u32) callconv(.winapi) BOOL;
 
 pub extern "dwmapi" fn DwmGetCompositionTimingInfo(?HWND, *DWM_TIMING_INFO) callconv(.winapi) HRESULT;
 pub extern "dwmapi" fn DwmSetWindowAttribute(HWND, u32, *const anyopaque, u32) callconv(.winapi) HRESULT;
@@ -333,6 +377,16 @@ pub inline fn loword(v: anytype) u16 {
 
 pub inline fn hiword(v: anytype) u16 {
     return @truncate(@as(usize, @bitCast(v)) >> 16);
+}
+
+/// The signed x coordinate in a mouse message's lParam (GET_X_LPARAM).
+pub inline fn xLparam(v: LPARAM) i32 {
+    return @as(i16, @bitCast(loword(v)));
+}
+
+/// The signed y coordinate in a mouse message's lParam (GET_Y_LPARAM).
+pub inline fn yLparam(v: LPARAM) i32 {
+    return @as(i16, @bitCast(hiword(v)));
 }
 
 /// Log the thread's last Win32 error and return a generic error.
