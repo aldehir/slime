@@ -102,6 +102,9 @@ pub const Layout = struct {
     terminal: Rect = .{},
     /// The radius of the terminal area's top-left corner.
     corner: f32 = 0,
+    /// Space inside the terminal area, before the grid, at its left and
+    /// top, which border the chrome. Added to the configured padding.
+    inset: f32 = 0,
 };
 
 pub fn init(dpi: u32, theme: Theme) !Chrome {
@@ -150,6 +153,7 @@ pub fn layout(self: *const Chrome, width: f32, height: f32) Layout {
         .minimize = minimize,
         .maximize = maximize,
         .close = close,
+        .inset = self.px(10),
     };
     switch (self.mode) {
         inline else => |m| Impl(m).layout(self, &l),

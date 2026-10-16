@@ -689,14 +689,17 @@ pub fn terminalSize(self: *const Window) ClientSize {
 
 pub const PaddingPx = struct { left: u32, right: u32, top: u32, bottom: u32 };
 
-/// The configured padding, in points, as pixels at the current DPI.
+/// The space around the grid in the terminal area: the configured
+/// padding, in points, as pixels at the current DPI, plus the chrome's
+/// inset at the left and top.
 pub fn paddingPx(self: *const Window) PaddingPx {
     const x = self.config.@"window-padding-x";
     const y = self.config.@"window-padding-y";
+    const inset: u32 = @intFromFloat(self.chrome_layout.inset);
     return .{
-        .left = x.top_left * self.dpi / 72,
+        .left = x.top_left * self.dpi / 72 + inset,
         .right = x.bottom_right * self.dpi / 72,
-        .top = y.top_left * self.dpi / 72,
+        .top = y.top_left * self.dpi / 72 + inset,
         .bottom = y.bottom_right * self.dpi / 72,
     };
 }
