@@ -45,9 +45,30 @@ pub const Cells = struct {
     /// Quads in draw order.
     instances: std.ArrayList(Instance) = .empty,
 
+    /// Per-row scratch: text state for each cell of the current row.
+    row_text: std.ArrayList(TextCell) = .empty,
+
+    /// Per-run scratch: UTF-16 text and each unit's cell offset.
+    run_text: std.ArrayList(u16) = .empty,
+    run_cells: std.ArrayList(u16) = .empty,
+
+    const TextCell = struct {
+        /// False for cells without text, including wide-char spacers.
+        has_text: bool,
+        face: font.Grid.FaceId,
+        /// Packed text color. Zero alpha means shape but don't draw.
+        color: u32,
+    };
+
+    /// The most codepoints of one grapheme we pass to the font system.
+    const max_grapheme = 16;
+
     pub fn deinit(self: *Cells, alloc: Allocator) void {
         self.bg.deinit(alloc);
         self.instances.deinit(alloc);
+        self.row_text.deinit(alloc);
+        self.run_text.deinit(alloc);
+        self.run_cells.deinit(alloc);
         self.* = undefined;
     }
 
@@ -61,7 +82,9 @@ pub const Cells = struct {
         self.rows = state.rows;
         self.default_bg = colors.background;
         try self.bg.resize(alloc, @as(usize, self.cols) * self.rows);
+        try self.row_text.resize(alloc, self.cols);
         self.instances.clearRetainingCapacity();
+        grid.beginFrame();
 
         const cursor_color = colors.cursor orelse colors.foreground;
         const cursor_pos = if (state.cursor.visible) state.cursor.viewport else null;
@@ -77,7 +100,10 @@ pub const Cells = struct {
             const cells = row_cells.slice();
             const raws = cells.items(.raw);
             const styles = cells.items(.style);
+            const graphemes = cells.items(.grapheme);
+            const cursor_x: ?u32 = if (cursor_pos) |pos| (if (pos.y == y) pos.x else null) else null;
 
+            // Pass 1: colors, decorations, and each cell's face.
             for (raws[0..self.cols], 0..) |raw, x_usize| {
                 const x: u32 = @intCast(x_usize);
                 const style: ghostty_vt.Style = if (raw.hasStyling()) styles[x] else .{};
@@ -87,34 +113,24 @@ pub const Cells = struct {
                 if (style.flags.inverse) std.mem.swap(RGB, &fg, &bg);
                 self.bg.items[y * self.cols + x] = pack(bg, 255);
 
+                self.row_text.items[x] = .{ .has_text = false, .face = 0, .color = 0 };
                 if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
                 const width: u32 = if (raw.wide == .wide) 2 else 1;
 
                 // Text under a block cursor takes the cell's background
                 // color so it stays readable.
-                const under_cursor = if (cursor_pos) |pos|
-                    state.cursor.visual_style == .block and pos.x == x and pos.y == y
-                else
-                    false;
+                const under_cursor = cursor_x == x and state.cursor.visual_style == .block;
                 const text_color = if (under_cursor) bg else fg;
                 const alpha: u8 = if (style.flags.faint) 128 else 255;
 
-                if (raw.hasText() and !style.flags.invisible) {
-                    const font_style: font.Grid.Style = .init(style.flags.bold, style.flags.italic);
-                    if (try grid.glyph(raw.codepoint(), font_style)) |g| {
-                        const origin_x: i32 = @intCast(x * m.cell_width);
-                        const origin_y: i32 = @intCast(y * m.cell_height);
-                        try self.instances.append(alloc, .{
-                            .pos = .{
-                                @floatFromInt(origin_x + g.offset_x),
-                                @floatFromInt(origin_y + g.offset_y),
-                            },
-                            .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
-                            .atlas = .{ g.region.x, g.region.y },
-                            .color = pack(text_color, alpha),
-                            .kind = .glyph,
-                        });
-                    }
+                if (raw.hasText()) {
+                    var cp_buf: [max_grapheme]u21 = undefined;
+                    const cps = graphemeCodepoints(raw, graphemes[x], &cp_buf);
+                    self.row_text.items[x] = .{
+                        .has_text = true,
+                        .face = try grid.faceFor(.init(style.flags.bold, style.flags.italic), cps),
+                        .color = if (style.flags.invisible) 0 else pack(text_color, alpha),
+                    };
                 }
 
                 // TODO: distinct double/curly/dotted/dashed underlines.
@@ -123,6 +139,56 @@ pub const Cells = struct {
                 }
                 if (style.flags.strikethrough) {
                     try self.instances.append(alloc, rectA(m, x, y, m.strikethrough_position, width * m.cell_width, m.strikethrough_thickness, text_color, alpha));
+                }
+            }
+
+            // Pass 2: shape runs of text sharing a face. Runs also end at
+            // the cursor so a ligature never hides its position.
+            var x: u32 = 0;
+            while (x < self.cols) {
+                const first = self.row_text.items[x];
+                if (!first.has_text) {
+                    x += 1;
+                    continue;
+                }
+
+                const run_start = x;
+                self.run_text.clearRetainingCapacity();
+                self.run_cells.clearRetainingCapacity();
+                while (x < self.cols) {
+                    const cell = self.row_text.items[x];
+                    if (!cell.has_text or cell.face != first.face) break;
+                    if (x != run_start and cursor_x == x) break;
+
+                    var cp_buf: [max_grapheme]u21 = undefined;
+                    var utf16_buf: [2 * max_grapheme]u16 = undefined;
+                    const text = font.Grid.encodeUtf16(graphemeCodepoints(raws[x], graphemes[x], &cp_buf), &utf16_buf);
+                    try self.run_text.appendSlice(alloc, text);
+                    try self.run_cells.appendNTimes(alloc, @intCast(x - run_start), text.len);
+
+                    x += 1;
+                    if (cursor_x == x - 1) break;
+                }
+
+                const shaped = try grid.shape(first.face, self.run_text.items, self.run_cells.items);
+                for (shaped) |sg| {
+                    const cell_x = run_start + sg.cell;
+                    const color = self.row_text.items[cell_x].color;
+                    if (color >> 24 == 0) continue;
+                    const g = try grid.glyph(first.face, sg.index) orelse continue;
+
+                    const origin_x: i32 = @intCast(cell_x * m.cell_width);
+                    const origin_y: i32 = @intCast(y * m.cell_height);
+                    try self.instances.append(alloc, .{
+                        .pos = .{
+                            @floatFromInt(origin_x + sg.x + g.offset_x),
+                            @floatFromInt(origin_y + sg.y + g.offset_y),
+                        },
+                        .size = .{ @floatFromInt(g.region.width), @floatFromInt(g.region.height) },
+                        .atlas = .{ g.region.x, g.region.y },
+                        .color = color,
+                        .kind = .glyph,
+                    });
                 }
             }
         }
@@ -192,4 +258,14 @@ pub fn toFloat(c: RGB) [4]f32 {
         @as(f32, @floatFromInt(c.b)) / 255.0,
         1.0,
     };
+}
+
+/// A cell's grapheme as codepoints: the base codepoint followed by any
+/// extra ones (combining marks, ZWJ sequences, variation selectors).
+fn graphemeCodepoints(raw: ghostty_vt.Cell, extra: []const u21, buf: *[Cells.max_grapheme]u21) []const u21 {
+    buf[0] = raw.codepoint();
+    if (!raw.hasGrapheme()) return buf[0..1];
+    const n = @min(extra.len, buf.len - 1);
+    @memcpy(buf[1..][0..n], extra[0..n]);
+    return buf[0 .. n + 1];
 }

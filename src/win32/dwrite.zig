@@ -80,6 +80,14 @@ pub const IFactory2 = extern struct {
         return com.call(self, 3, fn (*?*IFontCollection, BOOL) HRESULT, .{ out, win32.FALSE });
     }
 
+    pub fn createTextAnalyzer(self: *IFactory2, out: *?*ITextAnalyzer) HRESULT {
+        return com.call(self, 21, fn (*?*ITextAnalyzer) HRESULT, .{out});
+    }
+
+    pub fn getSystemFontFallback(self: *IFactory2, out: *?*IFontFallback) HRESULT {
+        return com.call(self, 26, fn (*?*IFontFallback) HRESULT, .{out});
+    }
+
     /// IDWriteFactory2::CreateGlyphRunAnalysis, the overload that takes
     /// grid fit and antialias modes.
     pub fn createGlyphRunAnalysis(
@@ -132,6 +140,10 @@ pub const IFontCollection = extern struct {
 pub const IFontFamily = extern struct {
     vtable: com.VTable,
 
+    pub fn getFamilyNames(self: *IFontFamily, out: *?*ILocalizedStrings) HRESULT {
+        return com.call(self, 6, fn (*?*ILocalizedStrings) HRESULT, .{out});
+    }
+
     pub fn getFirstMatchingFont(
         self: *IFontFamily,
         weight: FONT_WEIGHT,
@@ -148,8 +160,21 @@ pub const IFontFamily = extern struct {
 pub const IFont = extern struct {
     vtable: com.VTable,
 
+    pub fn getFontFamily(self: *IFont, out: *?*IFontFamily) HRESULT {
+        return com.call(self, 3, fn (*?*IFontFamily) HRESULT, .{out});
+    }
+
     pub fn createFontFace(self: *IFont, out: *?*IFontFace) HRESULT {
         return com.call(self, 13, fn (*?*IFontFace) HRESULT, .{out});
+    }
+};
+
+pub const ILocalizedStrings = extern struct {
+    vtable: com.VTable,
+
+    /// Copy string `index` into `buf`, truncating if needed.
+    pub fn getString(self: *ILocalizedStrings, index: u32, buf: []u16) HRESULT {
+        return com.call(self, 8, fn (u32, [*]u16, u32) HRESULT, .{ index, buf.ptr, @as(u32, @intCast(buf.len)) });
     }
 };
 
@@ -190,6 +215,205 @@ pub const IGlyphRunAnalysis = extern struct {
             texture_type, bounds, out.ptr, @as(u32, @intCast(out.len)),
         });
     }
+};
+
+pub const READING_DIRECTION_LEFT_TO_RIGHT: u32 = 0;
+pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = @bitCast(@as(u32, 0x8007007A));
+
+pub const SCRIPT_ANALYSIS = extern struct {
+    script: u16,
+    shapes: u32,
+};
+
+/// DWRITE_SHAPING_TEXT_PROPERTIES and DWRITE_SHAPING_GLYPH_PROPERTIES
+/// are 16-bit bitfields we only pass between GetGlyphs and
+/// GetGlyphPlacements.
+pub const SHAPING_TEXT_PROPERTIES = u16;
+pub const SHAPING_GLYPH_PROPERTIES = u16;
+
+pub const IFontFallback = extern struct {
+    vtable: com.VTable,
+
+    /// Find a font for the text at `position` in `source`. `mapped_len`
+    /// is how much of the text the returned font covers; `out` is null
+    /// if no font covers it.
+    pub fn mapCharacters(
+        self: *IFontFallback,
+        source: *ITextAnalysisSource,
+        position: u32,
+        len: u32,
+        base_collection: ?*IFontCollection,
+        base_family: ?win32.LPCWSTR,
+        weight: FONT_WEIGHT,
+        style: FONT_STYLE,
+        mapped_len: *u32,
+        out: *?*IFont,
+        scale: *f32,
+    ) HRESULT {
+        return com.call(self, 3, fn (
+            *ITextAnalysisSource,
+            u32,
+            u32,
+            ?*IFontCollection,
+            ?win32.LPCWSTR,
+            FONT_WEIGHT,
+            FONT_STYLE,
+            u32,
+            *u32,
+            *?*IFont,
+            *f32,
+        ) HRESULT, .{
+            source, position, len,                 base_collection, base_family,
+            weight, style,    FONT_STRETCH_NORMAL, mapped_len,      out,
+            scale,
+        });
+    }
+};
+
+pub const ITextAnalyzer = extern struct {
+    vtable: com.VTable,
+
+    pub fn analyzeScript(
+        self: *ITextAnalyzer,
+        source: *ITextAnalysisSource,
+        position: u32,
+        len: u32,
+        sink: *ITextAnalysisSink,
+    ) HRESULT {
+        return com.call(self, 3, fn (*ITextAnalysisSource, u32, u32, *ITextAnalysisSink) HRESULT, .{
+            source, position, len, sink,
+        });
+    }
+
+    /// Shape `text` into glyphs with the font's default OpenType features.
+    /// Returns E_NOT_SUFFICIENT_BUFFER if `glyphs` is too small.
+    pub fn getGlyphs(
+        self: *ITextAnalyzer,
+        text: []const u16,
+        face: *IFontFace,
+        analysis: *const SCRIPT_ANALYSIS,
+        locale: win32.LPCWSTR,
+        cluster_map: []u16,
+        text_props: []SHAPING_TEXT_PROPERTIES,
+        glyphs: []u16,
+        glyph_props: []SHAPING_GLYPH_PROPERTIES,
+        glyph_count: *u32,
+    ) HRESULT {
+        return com.call(self, 7, fn (
+            [*]const u16,
+            u32,
+            *IFontFace,
+            BOOL,
+            BOOL,
+            *const SCRIPT_ANALYSIS,
+            win32.LPCWSTR,
+            ?*anyopaque, // IDWriteNumberSubstitution
+            ?*const anyopaque, // features
+            ?*const u32, // feature range lengths
+            u32, // feature range count
+            u32,
+            [*]u16,
+            [*]SHAPING_TEXT_PROPERTIES,
+            [*]u16,
+            [*]SHAPING_GLYPH_PROPERTIES,
+            *u32,
+        ) HRESULT, .{
+            text.ptr,        @as(u32, @intCast(text.len)), face,       win32.FALSE,
+            win32.FALSE,     analysis,                     locale,     null,
+            null,            null,                         0,          @as(u32, @intCast(glyphs.len)),
+            cluster_map.ptr, text_props.ptr,               glyphs.ptr, glyph_props.ptr,
+            glyph_count,
+        });
+    }
+
+    pub fn getGlyphPlacements(
+        self: *ITextAnalyzer,
+        text: []const u16,
+        cluster_map: []const u16,
+        text_props: []SHAPING_TEXT_PROPERTIES,
+        glyphs: []const u16,
+        glyph_props: []const SHAPING_GLYPH_PROPERTIES,
+        face: *IFontFace,
+        em_size: f32,
+        analysis: *const SCRIPT_ANALYSIS,
+        locale: win32.LPCWSTR,
+        advances: []f32,
+        offsets: []GLYPH_OFFSET,
+    ) HRESULT {
+        return com.call(self, 8, fn (
+            [*]const u16,
+            [*]const u16,
+            [*]SHAPING_TEXT_PROPERTIES,
+            u32,
+            [*]const u16,
+            [*]const SHAPING_GLYPH_PROPERTIES,
+            u32,
+            *IFontFace,
+            f32,
+            BOOL,
+            BOOL,
+            *const SCRIPT_ANALYSIS,
+            win32.LPCWSTR,
+            ?*const anyopaque, // features
+            ?*const u32, // feature range lengths
+            u32, // feature range count
+            [*]f32,
+            [*]GLYPH_OFFSET,
+        ) HRESULT, .{
+            text.ptr,     cluster_map.ptr, text_props.ptr,                 @as(u32, @intCast(text.len)),
+            glyphs.ptr,   glyph_props.ptr, @as(u32, @intCast(glyphs.len)), face,
+            em_size,      win32.FALSE,     win32.FALSE,                    analysis,
+            locale,       null,            null,                           0,
+            advances.ptr, offsets.ptr,
+        });
+    }
+};
+
+/// Implemented by us: DirectWrite reads the text being analyzed through
+/// this interface. Embed as the first field of the implementing struct.
+pub const ITextAnalysisSource = extern struct {
+    vtable: *const VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0x688e1a58,
+        .data2 = 0x5094,
+        .data3 = 0x47c8,
+        .data4 = .{ 0xad, 0xc8, 0xfb, 0xce, 0xa6, 0x0a, 0xe9, 0x2b },
+    };
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ITextAnalysisSource, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ITextAnalysisSource) callconv(.winapi) u32,
+        Release: *const fn (*ITextAnalysisSource) callconv(.winapi) u32,
+        GetTextAtPosition: *const fn (*ITextAnalysisSource, u32, *?[*]const u16, *u32) callconv(.winapi) HRESULT,
+        GetTextBeforePosition: *const fn (*ITextAnalysisSource, u32, *?[*]const u16, *u32) callconv(.winapi) HRESULT,
+        GetParagraphReadingDirection: *const fn (*ITextAnalysisSource) callconv(.winapi) u32,
+        GetLocaleName: *const fn (*ITextAnalysisSource, u32, *u32, *?[*:0]const u16) callconv(.winapi) HRESULT,
+        GetNumberSubstitution: *const fn (*ITextAnalysisSource, u32, *u32, *?*anyopaque) callconv(.winapi) HRESULT,
+    };
+};
+
+/// Implemented by us: DirectWrite reports analysis results through this
+/// interface. Embed as the first field of the implementing struct.
+pub const ITextAnalysisSink = extern struct {
+    vtable: *const VTable,
+
+    pub const iid: GUID = .{
+        .data1 = 0x5810cd44,
+        .data2 = 0x0ca0,
+        .data3 = 0x4701,
+        .data4 = .{ 0xb3, 0xfa, 0xbe, 0xc5, 0x18, 0x2a, 0xe4, 0xf6 },
+    };
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*ITextAnalysisSink, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*ITextAnalysisSink) callconv(.winapi) u32,
+        Release: *const fn (*ITextAnalysisSink) callconv(.winapi) u32,
+        SetScriptAnalysis: *const fn (*ITextAnalysisSink, u32, u32, *const SCRIPT_ANALYSIS) callconv(.winapi) HRESULT,
+        SetLineBreakpoints: *const fn (*ITextAnalysisSink, u32, u32, *const anyopaque) callconv(.winapi) HRESULT,
+        SetBidiLevel: *const fn (*ITextAnalysisSink, u32, u32, u8, u8) callconv(.winapi) HRESULT,
+        SetNumberSubstitution: *const fn (*ITextAnalysisSink, u32, u32, ?*anyopaque) callconv(.winapi) HRESULT,
+    };
 };
 
 pub extern "dwrite" fn DWriteCreateFactory(

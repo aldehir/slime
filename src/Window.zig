@@ -88,6 +88,9 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16) !*Window {
         .cols = grid_size.cols,
         .rows = grid_size.rows,
         .colors = default_colors,
+        // Mode 2027: cluster multi-codepoint graphemes (emoji sequences,
+        // combining marks) into one cell, as the Ghostty app does.
+        .default_modes = .{ .grapheme_cluster = true },
     });
     errdefer self.terminal.deinit(alloc);
     self.stream = self.terminal.vtStream();

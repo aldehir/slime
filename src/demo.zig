@@ -33,6 +33,9 @@ pub fn write(stream: anytype) void {
     );
     stream.nextSlice("The quick brown fox jumps over the lazy dog. 0123456789 {}[]()<>=!~@#$%^&*\r\n");
     stream.nextSlice("Ελληνικά  Кириллица  ±×÷≠≤≥  →⇒↔  ░▒▓█  ┌─┬─┐ │ │ │ └─┴─┘\r\n");
-    stream.nextSlice("Wide: 日本語 (needs font fallback)\r\n\r\n");
+    stream.nextSlice("Ligatures: => -> != === !== <= >= :: |> <!-- --> /* */ && || ++ www\r\n");
+    stream.nextSlice("Fallback: 日本語 한국어 ⇒ ✓ ✗ ★ ♥\r\n");
+    stream.nextSlice("Emoji: 😀 👍🏽 👨‍👩‍👧 🇯🇵 ❤️ ✅\r\n");
+    stream.nextSlice("Combining: e\u{301} n\u{303} a\u{308}\u{332}\r\n\r\n");
     stream.nextSlice("\x1b[32m~\x1b[0m $ ");
 }

@@ -38,12 +38,28 @@ pub fn init(
     );
     defer com.releaseOpt(&font);
 
+    return fromFont(font.?);
+}
+
+pub fn fromFont(font: *dwrite.IFont) com.Error!Face {
     var face: ?*dwrite.IFontFace = null;
-    try com.check(font.?.createFontFace(&face), "IDWriteFont::CreateFontFace");
+    try com.check(font.createFontFace(&face), "IDWriteFont::CreateFontFace");
 
     var metrics: dwrite.FONT_METRICS = undefined;
     face.?.getMetrics(&metrics);
     return .{ .face = face.?, .metrics = metrics };
+}
+
+/// The font's family name (first localized name), for logging.
+pub fn familyName(font: *dwrite.IFont, buf: []u16) []const u16 {
+    var family: ?*dwrite.IFontFamily = null;
+    if (font.getFontFamily(&family) < 0) return &.{};
+    defer com.releaseOpt(&family);
+    var names: ?*dwrite.ILocalizedStrings = null;
+    if (family.?.getFamilyNames(&names) < 0) return &.{};
+    defer com.releaseOpt(&names);
+    if (names.?.getString(0, buf) < 0) return &.{};
+    return std.mem.sliceTo(buf, 0);
 }
 
 pub fn deinit(self: *Face) void {

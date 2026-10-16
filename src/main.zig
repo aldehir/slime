@@ -2,6 +2,13 @@ const std = @import("std");
 const win32 = @import("win32/win32.zig");
 const Window = @import("Window.zig");
 
+pub const std_options: std.Options = .{
+    .log_scope_levels = &.{
+        // libghostty-vt logs every grapheme cluster it builds at debug.
+        .{ .scope = .terminal, .level = .info },
+    },
+};
+
 pub fn main(init: std.process.Init) !void {
     // Per-monitor v2 gives us WM_DPICHANGED and unscaled client sizes.
     // This should eventually move to the application manifest.

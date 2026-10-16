@@ -38,6 +38,21 @@ pub fn releaseOpt(ptr: anytype) void {
     ptr.* = null;
 }
 
+pub const S_OK: win32.HRESULT = 0;
+pub const E_NOINTERFACE: win32.HRESULT = @bitCast(@as(u32, 0x80004002));
+pub const E_OUTOFMEMORY: win32.HRESULT = @bitCast(@as(u32, 0x8007000E));
+
+pub const IID_IUnknown: win32.GUID = .{
+    .data1 = 0,
+    .data2 = 0,
+    .data3 = 0,
+    .data4 = .{ 0xc0, 0, 0, 0, 0, 0, 0, 0x46 },
+};
+
+pub fn guidEql(a: *const win32.GUID, b: *const win32.GUID) bool {
+    return std.mem.eql(u8, std.mem.asBytes(a), std.mem.asBytes(b));
+}
+
 pub const Error = error{HResult};
 
 /// Convert a failing HRESULT into an error, logging what failed.
