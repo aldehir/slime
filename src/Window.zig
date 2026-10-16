@@ -30,6 +30,14 @@ const icon_id = 1;
 
 /// Posted from a thread pool wait when the child process exits.
 const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
+/// Posted from the reader thread when the child sets the title.
+const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
+
+/// libghostty-vt's limit on a title, in bytes, which is at least as
+/// many UTF-16 units.
+const max_title_len = 1024;
+/// Room for the stats report after the title, in UTF-16 units.
+const max_stats_len = 160;
 
 const StreamHandler = @FieldType(ghostty_vt.TerminalStream, "handler");
 const MouseButton = ghostty_vt.input.MouseButton;
@@ -57,7 +65,17 @@ alloc: Allocator,
 /// Outlives the window.
 config: *const Config,
 hwnd: ?win32.HWND = null,
-title: [:0]const u16,
+/// Shown while the child hasn't set a title.
+app_title: [:0]const u16,
+/// The child's title (OSC 0/2). Empty for none.
+title_buf: [max_title_len]u16 = undefined,
+title_len: usize = 0,
+/// Set while a WM_APP_TITLE_CHANGED is queued, so a child that retitles
+/// rapidly posts one message rather than flooding the queue.
+title_pending: std.atomic.Value(bool) = .init(false),
+/// The last stats report, shown after the title.
+stats_text: [max_stats_len]u16 = undefined,
+stats_len: usize = 0,
 dpi: u32 = win32.USER_DEFAULT_SCREEN_DPI,
 
 grid: font.Grid,
@@ -169,7 +187,7 @@ pub fn create(
     self.* = .{
         .alloc = alloc,
         .config = config,
-        .title = title,
+        .app_title = title,
         .output_event = output_event,
         .hold_timer = hold_timer,
         .grid = undefined,
@@ -235,6 +253,7 @@ pub fn create(
     errdefer self.stream.deinit();
     self.stream.handler.effects.write_pty = &writePty;
     self.stream.handler.effects.device_attributes = &deviceAttributes;
+    self.stream.handler.effects.title_changed = &titleChanged;
     self.stream.handler.unknown_sequence = &unknownSequence;
 
     self.renderer = try Renderer.init(hwnd, size.width, size.height);
@@ -409,6 +428,16 @@ fn writePty(handler: *StreamHandler, data: []const u8) void {
     const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
     const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
     if (self.pty) |*pty| pty.write(data);
+}
+
+/// Stream effect for OSC 0/2. Runs on the reader thread with the
+/// terminal locked, so it posts to the UI thread rather than calling
+/// SetWindowTextW, which waits on it.
+fn titleChanged(handler: *StreamHandler) void {
+    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
+    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
+    if (self.title_pending.swap(true, .acq_rel)) return;
+    _ = win32.PostMessageW(self.hwnd.?, WM_APP_TITLE_CHANGED, 0, 0);
 }
 
 /// ConPTY asks for DA1 at startup to learn what the terminal supports.
@@ -1025,17 +1054,54 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
 fn showStats(self: *Window) void {
     var utf8: [160]u8 = undefined;
     const text = self.stats.report(&utf8);
+    self.stats_len = std.unicode.utf8ToUtf16Le(&self.stats_text, text) catch 0;
+    self.showTitle();
+}
 
-    var title: [256]u16 = undefined;
+/// Take the child's new title. Clears the pending flag before reading,
+/// so a change made after the read posts again.
+fn titleUpdate(self: *Window) void {
+    self.title_pending.store(false, .release);
+    self.lockTerminal();
+    self.title_len = titleToUtf16(&self.title_buf, self.terminal.getTitle() orelse "");
+    self.unlockTerminal();
+    self.showTitle();
+}
+
+/// Set the window text: the child's title or ours, then any stats.
+fn showTitle(self: *Window) void {
     const sep = std.unicode.utf8ToUtf16LeStringLiteral("  \u{2014}  ");
+    var text: [max_title_len + sep.len + max_stats_len + 1]u16 = undefined;
+    const title = if (self.title_len > 0) self.title_buf[0..self.title_len] else self.app_title;
+    const stats = self.stats_text[0..self.stats_len];
     var len: usize = 0;
-    for ([_][]const u16{ self.title, sep }) |part| {
-        @memcpy(title[len..][0..part.len], part);
+    for ([_][]const u16{ title, if (stats.len > 0) sep else &.{}, stats }) |part| {
+        @memcpy(text[len..][0..part.len], part);
         len += part.len;
     }
-    len += std.unicode.utf8ToUtf16Le(title[len .. title.len - 1], text) catch 0;
-    title[len] = 0;
-    _ = win32.SetWindowTextW(self.hwnd.?, title[0..len :0]);
+    text[len] = 0;
+    _ = win32.SetWindowTextW(self.hwnd.?, text[0..len :0]);
+}
+
+/// A title as UTF-16 in `out`, returning its length. libghostty-vt cuts
+/// long titles at a byte limit, so a codepoint split there is dropped.
+fn titleToUtf16(out: []u16, utf8: []const u8) usize {
+    const whole = utf8[0..@min(utf8.len, out.len)];
+    var end = whole.len;
+    while (end > 0 and whole.len - end < 4) : (end -= 1) {
+        if (std.unicode.utf8ToUtf16Le(out, whole[0..end])) |n| return n else |_| {}
+    }
+    return 0;
+}
+
+test titleToUtf16 {
+    var out: [8]u16 = undefined;
+    try std.testing.expectEqual(0, titleToUtf16(&out, ""));
+    const n = titleToUtf16(&out, "h\u{e9}");
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("h\u{e9}"), out[0..n]);
+    // A codepoint cut off after its first byte.
+    const cut = "ab\u{1f600}"[0..3];
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("ab"), out[0..titleToUtf16(&out, cut)]);
 }
 
 /// Fit the swap chain and terminal grid to the client area and redraw.
@@ -1155,6 +1221,11 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
         WM_APP_CHILD_EXITED => {
             _ = win32.DestroyWindow(hwnd);
+            return 0;
+        },
+
+        WM_APP_TITLE_CHANGED => {
+            self.titleUpdate();
             return 0;
         },
 

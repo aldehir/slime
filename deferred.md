@@ -46,8 +46,6 @@ wait until there is a proper design for it.
 
 ## Terminal and window
 
-- **Window title** from OSC 0/2. It must go through PostMessage: the
-  reader thread can't call SetWindowTextW.
 - **PSEUDOCONSOLE_INHERIT_CURSOR.** Skipped because the screen starts
   empty.
 
