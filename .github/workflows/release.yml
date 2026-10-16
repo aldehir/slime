@@ -1,0 +1,86 @@
+name: release
+
+# Pushing a v* tag builds, tests, and publishes a prerelease. A manual run
+# builds and tests only, and keeps the zip as a workflow artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.16.0
+  ZIG_SHA256: 68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Into tools\, where scripts/setup-msvc.ps1 expects it.
+      - name: Install Zig
+        run: |
+          $name = "zig-x86_64-windows-$env:ZIG_VERSION"
+          $zip = "$env:RUNNER_TEMP\$name.zip"
+          Invoke-WebRequest "https://ziglang.org/download/$env:ZIG_VERSION/$name.zip" -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:ZIG_SHA256) { throw "zig sha256 mismatch: $hash" }
+          Expand-Archive $zip -DestinationPath tools
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            zig-pkg
+            tools/conpty-*
+          key: deps-${{ hashFiles('build.zig', 'build.zig.zon', 'ghostty/build.zig.zon') }}
+
+      - name: Check tag matches build.zig.zon
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $zon = Select-String -Path build.zig.zon -Pattern '\.version = "([^"]+)"'
+          $version = $zon.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "tag $env:GITHUB_REF_NAME does not match build.zig.zon version $version"
+          }
+
+      - name: Test
+        run: |
+          . .\scripts\setup-msvc.ps1
+          zig build test
+
+      - name: Build
+        run: |
+          . .\scripts\setup-msvc.ps1
+          zig build -Doptimize=ReleaseFast
+
+      - name: Package
+        id: package
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $name = "slime-$version-windows-x86_64"
+          $stage = "$env:RUNNER_TEMP\$name"
+          Copy-Item zig-out\bin $stage -Recurse
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md $stage
+          New-Item -ItemType Directory dist | Out-Null
+          Move-Item "$stage\*.pdb" "dist\$name.pdb"
+          Compress-Archive $stage "dist\$name.zip"
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/* --prerelease --generate-notes --title "slime $env:GITHUB_REF_NAME"
