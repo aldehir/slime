@@ -5,6 +5,13 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ghostty = .{ .path = "ghostty" },
+        // The same iTerm2-Color-Schemes release, in Ghostty's theme
+        // format, as ghostty/build.zig.zon.
+        .iterm2_themes = .{
+            .url = "https://deps.files.ghostty.org/ghostty-themes-release-20261005-151109-31756e7.tgz",
+            .hash = "N-V-__8AADNBBQDD4MFOa3Y7R_A8PHIeWQ1IZdOiBFZS3nZ7",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

@@ -16,6 +16,7 @@ const input = @import("input.zig");
 const Pty = @import("Pty.zig");
 const clipboard = @import("clipboard.zig");
 const Stats = @import("Stats.zig");
+const Config = @import("Config.zig");
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
@@ -49,24 +50,9 @@ const cursor_hold_ms = 4;
 /// we reset it, Ghostty's `sync_reset_ms`.
 const sync_hold_ms = 1000;
 
-/// Characters that end a word for double-click selection, Ghostty's
-/// `selection-word-chars` default.
-const word_boundaries = [_]u21{ 0, ' ', '\t', '\'', '"', '\u{2502}', '`', '|', ':', ';', ',', '(', ')', '[', ']', '{', '}', '<', '>', '$' };
-
-const font_size_pt = 12;
-
-/// Space between the window edge and the grid, in 96-DPI pixels.
-const padding = 4;
-
-/// Ghostty's default colors. Programs can override these with OSC 10/11.
-const default_colors: ghostty_vt.Terminal.Colors = .{
-    .background = .init(.{ .r = 0x28, .g = 0x2c, .b = 0x34 }),
-    .foreground = .init(.{ .r = 0xff, .g = 0xff, .b = 0xff }),
-    .cursor = .unset,
-    .palette = .default,
-};
-
 alloc: Allocator,
+/// Outlives the window.
+config: *const Config,
 hwnd: ?win32.HWND = null,
 title: [:0]const u16,
 dpi: u32 = win32.USER_DEFAULT_SCREEN_DPI,
@@ -154,7 +140,13 @@ const Hold = enum {
 
 /// Create the window and run `command_line` (CreateProcessW syntax;
 /// modified in place) in it.
-pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: win32.LPWSTR) !*Window {
+pub fn create(
+    alloc: Allocator,
+    io: std.Io,
+    config: *const Config,
+    title: [:0]const u16,
+    command_line: win32.LPWSTR,
+) !*Window {
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
 
@@ -173,6 +165,7 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
     errdefer _ = win32.CloseHandle(hold_timer);
     self.* = .{
         .alloc = alloc,
+        .config = config,
         .title = title,
         .output_event = output_event,
         .hold_timer = hold_timer,
@@ -204,7 +197,7 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
     _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL));
 
     self.dpi = win32.GetDpiForWindow(hwnd);
-    self.grid = try .init(alloc, font_size_pt, self.dpi);
+    self.grid = try .init(alloc, config.@"font-family".items, config.@"font-size", self.dpi);
     errdefer self.grid.deinit();
 
     const size = self.clientSize();
@@ -212,7 +205,17 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
     self.terminal = try .init(io, alloc, .{
         .cols = grid_size.cols,
         .rows = grid_size.rows,
-        .colors = default_colors,
+        // Defaults that OSC 4/10/11/12 override and their resets return
+        // to. A cursor colored from its cell is resolved when drawing.
+        .colors = .{
+            .background = .init(config.background),
+            .foreground = .init(config.foreground),
+            .cursor = if (config.@"cursor-color") |c| switch (c) {
+                .color => |rgb| .init(rgb),
+                else => .unset,
+            } else .unset,
+            .palette = try .init(alloc, config.palette.colors),
+        },
         // Mode 2027: cluster multi-codepoint graphemes (emoji sequences,
         // combining marks) into one cell, as the Ghostty app does.
         .default_modes = .{ .grapheme_cluster = true },
@@ -730,7 +733,7 @@ fn selectionInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.L
             .ypos = @floatFromInt(pos.y),
             .max_distance = @floatFromInt(self.grid.metrics.cell_width),
             .repeat_interval = @as(u64, win32.GetDoubleClickTime()) * std.time.ns_per_ms,
-            .word_boundary_codepoints = &word_boundaries,
+            .word_boundary_codepoints = self.config.@"selection-word-chars".codepoints,
         }) catch |err| {
             log.err("selection failed: {}", .{err});
             return;
@@ -743,7 +746,7 @@ fn selectionInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.L
                 .xpos = @floatFromInt(pos.x),
                 .ypos = @floatFromInt(pos.y),
                 .rectangle = rectangleSelect(),
-                .word_boundary_codepoints = &word_boundaries,
+                .word_boundary_codepoints = self.config.@"selection-word-chars".codepoints,
                 .geometry = self.dragGeometry(),
             });
             self.updateAutoscroll();
@@ -770,7 +773,7 @@ fn autoscrollTick(self: *Window) void {
         .xpos = @floatFromInt(self.drag_pos.x),
         .ypos = @floatFromInt(self.drag_pos.y),
         .rectangle = rectangleSelect(),
-        .word_boundary_codepoints = &word_boundaries,
+        .word_boundary_codepoints = self.config.@"selection-word-chars".codepoints,
         .geometry = self.dragGeometry(),
     });
     self.updateAutoscroll();
@@ -801,7 +804,7 @@ fn dragGeometry(self: *const Window) ghostty_vt.SelectionGesture.Drag.Geometry {
     return .{
         .columns = self.terminal.cols,
         .cell_width = self.grid.metrics.cell_width,
-        .padding_left = self.paddingPx(),
+        .padding_left = self.paddingPx().left,
         .screen_height = self.clientSize().height,
     };
 }
@@ -810,9 +813,9 @@ fn dragGeometry(self: *const Window) ghostty_vt.SelectionGesture.Drag.Geometry {
 /// with the terminal locked.
 fn cellAt(self: *const Window, pos: win32.POINT) ghostty_vt.Coordinate {
     const m = self.grid.metrics;
-    const pad: i32 = @intCast(self.paddingPx());
-    const x = @divFloor(pos.x - pad, @as(i32, @intCast(m.cell_width)));
-    const y = @divFloor(pos.y - pad, @as(i32, @intCast(m.cell_height)));
+    const pad = self.paddingPx();
+    const x = @divFloor(pos.x - @as(i32, @intCast(pad.left)), @as(i32, @intCast(m.cell_width)));
+    const y = @divFloor(pos.y - @as(i32, @intCast(pad.top)), @as(i32, @intCast(m.cell_height)));
     return .{
         .x = @intCast(std.math.clamp(x, 0, @as(i32, self.terminal.cols) - 1)),
         .y = @intCast(std.math.clamp(y, 0, @as(i32, self.terminal.rows) - 1)),
@@ -948,25 +951,35 @@ fn surfaceSize(self: *const Window) @FieldType(MouseEncodeOptions, "size") {
         .screen = .{ .width = size.width, .height = size.height },
         .cell = .{ .width = m.cell_width, .height = m.cell_height },
         .padding = .{
-            .top = pad,
-            .left = pad,
-            .right = size.width -| pad -| @as(u32, self.terminal.cols) * m.cell_width,
-            .bottom = size.height -| pad -| @as(u32, self.terminal.rows) * m.cell_height,
+            .top = pad.top,
+            .left = pad.left,
+            .right = size.width -| pad.left -| @as(u32, self.terminal.cols) * m.cell_width,
+            .bottom = size.height -| pad.top -| @as(u32, self.terminal.rows) * m.cell_height,
         },
     };
 }
 
-fn paddingPx(self: *const Window) u32 {
-    return padding * self.dpi / win32.USER_DEFAULT_SCREEN_DPI;
+const PaddingPx = struct { left: u32, right: u32, top: u32, bottom: u32 };
+
+/// The configured padding, in points, as pixels at the current DPI.
+fn paddingPx(self: *const Window) PaddingPx {
+    const x = self.config.@"window-padding-x";
+    const y = self.config.@"window-padding-y";
+    return .{
+        .left = x.top_left * self.dpi / 72,
+        .right = x.bottom_right * self.dpi / 72,
+        .top = y.top_left * self.dpi / 72,
+        .bottom = y.bottom_right * self.dpi / 72,
+    };
 }
 
 /// The number of whole cells that fit in a client area.
 fn gridSize(self: *const Window, width: u32, height: u32) struct { cols: u16, rows: u16 } {
     const m = self.grid.metrics;
-    const pad = 2 * self.paddingPx();
+    const pad = self.paddingPx();
     return .{
-        .cols = @intCast(std.math.clamp((width -| pad) / m.cell_width, 1, std.math.maxInt(u16))),
-        .rows = @intCast(std.math.clamp((height -| pad) / m.cell_height, 1, std.math.maxInt(u16))),
+        .cols = @intCast(std.math.clamp((width -| pad.left -| pad.right) / m.cell_width, 1, std.math.maxInt(u16))),
+        .rows = @intCast(std.math.clamp((height -| pad.top -| pad.bottom) / m.cell_height, 1, std.math.maxInt(u16))),
     };
 }
 
@@ -990,10 +1003,15 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     try self.cells.build(self.alloc, &self.render_state, &self.grid, .{
         .focused = self.focused,
         .blink_visible = self.blink_visible,
+    }, .{
+        .cursor_color = self.config.@"cursor-color",
+        .cursor_text = self.config.@"cursor-text",
+        .selection_background = self.config.@"selection-background",
+        .selection_foreground = self.config.@"selection-foreground",
     });
     if (stats) t = self.stats.lap(.build, t);
-    const pad: f32 = @floatFromInt(self.paddingPx());
-    try r.draw(&self.cells, &self.grid.atlas, self.grid.metrics, .{ pad, pad });
+    const pad = self.paddingPx();
+    try r.draw(&self.cells, &self.grid.atlas, self.grid.metrics, .{ @floatFromInt(pad.left), @floatFromInt(pad.top) });
     if (stats) {
         _ = self.stats.lap(.draw, t);
         self.stats.frames += 1;

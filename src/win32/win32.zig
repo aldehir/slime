@@ -308,6 +308,13 @@ pub const ERROR_BROKEN_PIPE = 109;
 pub const CF_UNICODETEXT = 13;
 pub const GMEM_MOVEABLE = 0x0002;
 
+// Registry
+pub const HKEY = *opaque {};
+pub const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
+pub const RRF_RT_REG_DWORD = 0x00000010;
+
+pub extern "advapi32" fn RegGetValueW(HKEY, ?LPCWSTR, ?LPCWSTR, u32, ?*u32, ?*anyopaque, ?*u32) callconv(.winapi) i32;
+
 pub extern "kernel32" fn GetModuleHandleW(?LPCWSTR) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 pub extern "kernel32" fn QueryPerformanceCounter(*i64) callconv(.winapi) BOOL;

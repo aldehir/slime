@@ -109,7 +109,8 @@ face_for: std.AutoHashMapUnmanaged(FaceKey, FaceId) = .empty,
 /// Rasterized glyphs. Null means "nothing to draw" (blank glyph).
 glyphs: std.AutoHashMapUnmanaged(GlyphKey, ?Glyph) = .empty,
 
-pub fn init(alloc: Allocator, size_pt: f32, dpi: u32) !Grid {
+/// `families` are tried in order (UTF-8), then the defaults.
+pub fn init(alloc: Allocator, families: []const []const u8, size_pt: f32, dpi: u32) !Grid {
     var factory: ?*dwrite.IFactory2 = null;
     try com.check(
         dwrite.DWriteCreateFactory(dwrite.FACTORY_TYPE_SHARED, &dwrite.IFactory2.iid, @ptrCast(&factory)),
@@ -125,11 +126,8 @@ pub fn init(alloc: Allocator, size_pt: f32, dpi: u32) !Grid {
     try com.check(factory.?.getSystemFontFallback(&fallback), "IDWriteFactory2::GetSystemFontFallback");
     errdefer com.releaseOpt(&fallback);
 
-    const family = for (default_families) |name| {
-        var index: u32 = 0;
-        var exists: win32.BOOL = win32.FALSE;
-        if (collection.?.findFamilyName(name.ptr, &index, &exists) >= 0 and exists != win32.FALSE) break name;
-    } else return error.FontNotFound;
+    const family = try findFamily(alloc, collection.?, families);
+    errdefer alloc.free(family);
     log.info("using font family {f}", .{std.unicode.fmtUtf16Le(family)});
 
     var shaper: Shaper = try .init(alloc, factory.?);
@@ -170,7 +168,32 @@ pub fn deinit(self: *Grid) void {
     com.release(self.fallback);
     com.release(self.collection);
     com.release(self.factory);
+    self.alloc.free(self.family);
     self.* = undefined;
+}
+
+/// The first installed family of `families`, then of the defaults, as an
+/// owned UTF-16 string.
+fn findFamily(alloc: Allocator, collection: *dwrite.IFontCollection, families: []const []const u8) ![:0]const u16 {
+    for (families) |utf8| {
+        const name = std.unicode.utf8ToUtf16LeAllocZ(alloc, utf8) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        if (familyExists(collection, name)) return name;
+        alloc.free(name);
+        log.warn("font family \"{s}\" not found", .{utf8});
+    }
+    for (default_families) |name| {
+        if (familyExists(collection, name)) return alloc.dupeZ(u16, name);
+    }
+    return error.FontNotFound;
+}
+
+fn familyExists(collection: *dwrite.IFontCollection, name: [:0]const u16) bool {
+    var index: u32 = 0;
+    var exists: win32.BOOL = win32.FALSE;
+    return collection.findFamilyName(name.ptr, &index, &exists) >= 0 and exists != win32.FALSE;
 }
 
 fn deinitFaces(self: *Grid) void {

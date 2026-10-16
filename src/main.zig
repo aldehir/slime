@@ -1,6 +1,7 @@
 const std = @import("std");
 const win32 = @import("win32/win32.zig");
 const Window = @import("Window.zig");
+const Config = @import("Config.zig");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
@@ -14,12 +15,16 @@ pub fn main(init: std.process.Init) !void {
     // This should eventually move to the application manifest.
     _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    const command_line = try shellCommand(init.gpa);
+    var config = try loadConfig(init);
+    defer config.deinit();
+
+    const command_line = try shellCommand(init.gpa, config.command);
     defer init.gpa.free(command_line);
 
     const window = try Window.create(
         init.gpa,
         init.io,
+        &config,
         std.unicode.utf8ToUtf16LeStringLiteral("ghostty-win"),
         command_line,
     );
@@ -58,11 +63,50 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// Load the config from the default directory, with the bundled themes
+/// in `themes` next to the executable.
+fn loadConfig(init: std.process.Init) !Config {
+    const alloc = init.gpa;
+    const dir = try Config.defaultDir(alloc, init.environ_map);
+    defer if (dir) |d| alloc.free(d);
+    const exe_dir = std.process.executableDirPathAlloc(init.io, alloc) catch null;
+    defer if (exe_dir) |d| alloc.free(d);
+    return Config.load(alloc, init.io, .{
+        .dir = dir,
+        .resources_dir = exe_dir,
+        .light = appsUseLightTheme(),
+    });
+}
+
+/// Windows' app mode is light (Settings > Personalization > Colors).
+fn appsUseLightTheme() bool {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var value: u32 = 0;
+    var size: u32 = @sizeOf(u32);
+    const status = win32.RegGetValueW(
+        win32.HKEY_CURRENT_USER,
+        L("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+        L("AppsUseLightTheme"),
+        win32.RRF_RT_REG_DWORD,
+        null,
+        &value,
+        &size,
+    );
+    return status == 0 and value != 0;
+}
+
 /// The command to run in the terminal: our own command line after the
-/// program name, verbatim (`ghostty-win pwsh -NoLogo`), or %COMSPEC%.
-fn shellCommand(alloc: std.mem.Allocator) ![:0]u16 {
+/// program name, verbatim (`ghostty-win pwsh -NoLogo`), else the
+/// configured `command`, else %COMSPEC%.
+fn shellCommand(alloc: std.mem.Allocator, configured: ?[]const u8) ![:0]u16 {
     const args = argsAfterProgram(std.mem.span(win32.GetCommandLineW()));
     if (args.len > 0) return alloc.dupeZ(u16, args);
+    if (configured) |command| {
+        if (std.unicode.utf8ToUtf16LeAllocZ(alloc, command)) |cmd| return cmd else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => std.log.warn("command isn't valid UTF-8", .{}),
+        }
+    }
 
     var buf: [260]u16 = undefined;
     const n = win32.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("COMSPEC"), &buf, buf.len);
@@ -95,6 +139,7 @@ test argsAfterProgram {
 test {
     _ = win32;
     _ = Window;
+    _ = Config;
     _ = @import("font/font.zig");
     _ = @import("input.zig");
 }

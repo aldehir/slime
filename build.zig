@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     ) orelse 0);
     exe_mod.addOptions("build_options", options);
 
-    for ([_][]const u8{ "user32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler" }) |lib| {
+    for ([_][]const u8{ "user32", "advapi32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler" }) |lib| {
         exe_mod.linkSystemLibrary(lib, .{});
     }
 
@@ -65,6 +65,16 @@ pub fn build(b: *std.Build) void {
     exe.entry = .{ .symbol_name = "mainCRTStartup" };
     b.installArtifact(exe);
     installConpty(b);
+
+    // Themes for the `theme` config key, in `themes` next to the exe.
+    if (b.lazyDependency("iterm2_themes", .{})) |themes| {
+        b.installDirectory(.{
+            .source_dir = themes.path(""),
+            .install_dir = .bin,
+            .install_subdir = "themes",
+            .exclude_extensions = &.{".md"},
+        });
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

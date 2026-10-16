@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const font = @import("../font/font.zig");
+const TerminalColor = @import("../Config.zig").TerminalColor;
 
 const RenderState = ghostty_vt.RenderState;
 const RGB = ghostty_vt.color.RGB;
@@ -74,7 +75,14 @@ pub const Cells = struct {
 
     /// Rebuild everything from the render state. Rasterizes any glyphs
     /// not yet in the atlas.
-    pub fn build(self: *Cells, alloc: Allocator, state: *const RenderState, grid: *font.Grid, cursor: CursorOptions) !void {
+    pub fn build(
+        self: *Cells,
+        alloc: Allocator,
+        state: *const RenderState,
+        grid: *font.Grid,
+        cursor: CursorOptions,
+        config: ColorOptions,
+    ) !void {
         const m = grid.metrics;
         const colors = &state.colors;
 
@@ -86,7 +94,12 @@ pub const Cells = struct {
         self.instances.clearRetainingCapacity();
         grid.beginFrame();
 
-        const cursor_color = colors.cursor orelse colors.foreground;
+        // OSC 12 or a configured color, then one taken from the cursor's
+        // cell, which Ghostty reads from the cursor's pen style.
+        const cursor_color = colors.cursor orelse if (config.cursor_color) |c| color: {
+            const fg, const bg = cellColors(state.cursor.style, state.cursor.cell, colors);
+            break :color c.resolve(fg, bg);
+        } else colors.foreground;
         const cursor_style = cursorStyle(state, cursor);
         const cursor_pos = if (cursor_style != null) state.cursor.viewport else null;
 
@@ -110,12 +123,16 @@ pub const Cells = struct {
                 const x: u32 = @intCast(x_usize);
                 const style: ghostty_vt.Style = if (raw.hasStyling()) styles[x] else .{};
 
-                // Selected cells are drawn inverted, as Ghostty does
-                // without selection colors configured.
+                // Unconfigured selection colors are the default colors
+                // inverted, as in Ghostty.
                 const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
-                var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
-                var bg = style.bg(&raw, &colors.palette) orelse colors.background;
-                if (style.flags.inverse != selected) std.mem.swap(RGB, &fg, &bg);
+                var fg, var bg = cellColors(style, raw, colors);
+                if (selected) {
+                    const cell_fg = fg;
+                    const cell_bg = bg;
+                    bg = if (config.selection_background) |c| c.resolve(cell_fg, cell_bg) else colors.foreground;
+                    fg = if (config.selection_foreground) |c| c.resolve(cell_fg, cell_bg) else colors.background;
+                }
                 self.bg.items[y * self.cols + x] = pack(bg, 255);
 
                 self.row_text.items[x] = .{ .has_text = false, .face = 0, .color = 0 };
@@ -123,9 +140,10 @@ pub const Cells = struct {
                 const width: u32 = if (raw.wide == .wide) 2 else 1;
 
                 // Text under a block cursor takes the cell's background
-                // color so it stays readable.
+                // color so it stays readable, unless configured.
                 const under_cursor = cursor_x == x and cursor_style == .block;
-                const text_color = if (under_cursor) bg else fg;
+                const cursor_text = if (config.cursor_text) |c| c.resolve(fg, bg) else bg;
+                const text_color = if (under_cursor) cursor_text else fg;
                 const alpha: u8 = if (style.flags.faint) 128 else 255;
 
                 if (raw.hasText()) {
@@ -237,6 +255,23 @@ pub const CursorOptions = struct {
     /// The on phase of the blink. Ignored when the cursor doesn't blink.
     blink_visible: bool = true,
 };
+
+/// Configured colors for the cursor and selection. See the same-named
+/// `Config` keys.
+pub const ColorOptions = struct {
+    cursor_color: ?TerminalColor = null,
+    cursor_text: ?TerminalColor = null,
+    selection_background: ?TerminalColor = null,
+    selection_foreground: ?TerminalColor = null,
+};
+
+/// A cell's foreground and background, after inverse.
+fn cellColors(style: ghostty_vt.Style, raw: ghostty_vt.Cell, colors: *const RenderState.Colors) struct { RGB, RGB } {
+    var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
+    var bg = style.bg(&raw, &colors.palette) orelse colors.background;
+    if (style.flags.inverse) std.mem.swap(RGB, &fg, &bg);
+    return .{ fg, bg };
+}
 
 /// The cursor to draw, or null for none. The same priority as Ghostty's
 /// renderer: hidden by the terminal, then unfocused, then blink.

@@ -36,8 +36,14 @@ Other options: `-Dstats` (frame stats in the title; default on in Debug),
   SHA-256 pinned in `build.zig`). The build runs `scripts\fetch-conpty.ps1`
   when `tools\conpty-<ver>\` is missing, then installs `conpty.dll` and
   `x64\OpenConsole.exe` next to the exe. `zig fetch` can't unpack `.nupkg`.
-- `zig build run -- pwsh -NoLogo` runs that command; with no args the shell
-  is `%COMSPEC%`.
+- `zig build run -- pwsh -NoLogo` runs that command; with no args it's the
+  config's `command`, then `%COMSPEC%`.
+- Config lives in `%XDG_CONFIG_HOME%\ghostty-win\config.ghostty` (else
+  `%APPDATA%\ghostty-win\`). To test with your own config, point
+  `XDG_CONFIG_HOME` at a scratch dir rather than editing Alde's. Ghostty's
+  bundled themes (pinned in `build.zig.zon`) install to `zig-outin	hemes`.
+- This session's environment may carry `NO_COLOR=1`, which the children
+  of launched windows inherit; unset it when checking colors.
 
 ## Verifying changes
 
@@ -60,6 +66,7 @@ Other options: `-Dstats` (frame stats in the title; default on in Debug),
 
 ```
 src/main.zig            entry, message loop, std_options log levels, shell command line
+src/Config.zig          config file (Ghostty syntax and key names), themes, includes
 src/Window.zig          HWND + owns Terminal, stream, RenderState, font Grid, renderer,
                         Pty, reader thread; SRW lock guards terminal/stream
 src/Pty.zig             pipes + pseudoconsole + child process in a kill-on-close job

@@ -13,8 +13,8 @@ wait until there is a proper design for it.
   commands: unbracketed text with a newline, or any paste containing the
   bracketed-paste terminator `ESC [201~`. We paste without asking. The
   control-byte stripping in `encodePaste` still applies.
-- **Configuration.** Font, size, colors, padding, key bindings, word
-  boundary characters, and the shell are all constants in the source.
+- **Config errors on screen.** Unknown keys and bad values only go to
+  the log (Ghostty shows them in a banner).
 - **Context menu** (copy, paste, select all) on right-click.
 - **Scrollbar.**
 
@@ -45,8 +45,6 @@ wait until there is a proper design for it.
 - **Per-row dirty caching** in `cells.zig`. Every frame rebuilds every
   row, which costs more now that output streams continuously.
 - **Distinct underline styles** (double, curly, dotted, dashed).
-- **Selection colors.** Selected cells are inverted, Ghostty's behavior
-  without `selection-background`/`selection-foreground` set.
 
 ## Terminal and window
 
@@ -54,3 +52,19 @@ wait until there is a proper design for it.
   reader thread can't call SetWindowTextW.
 - **PSEUDOCONSOLE_INHERIT_CURSOR.** Skipped because the screen starts
   empty.
+
+## Configuration
+
+`Config.zig` covers fonts, colors, themes, padding, word characters, and
+the command, loaded once at startup.
+
+- **Reloading** while running. Colors can be swapped under the lock;
+  font changes need a new `Grid` and atlas.
+- **Following light/dark changes** live (`WM_SETTINGCHANGE` with
+  "ImmersiveColorSet"), and reporting them with mode 2031
+  (`CSI ?997;1n`/`2n`). The mode is read once at startup.
+- **Font fallback families.** Ghostty uses every `font-family` after the
+  first as a fallback ahead of the system's; we use the first one that's
+  installed and fall back through DirectWrite.
+- **Key bindings** (`keybind`).
+- **CLI overrides** (`--key=value`) and `+list-themes`.
