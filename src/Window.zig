@@ -32,6 +32,8 @@ const icon_id = 1;
 const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
 /// Posted from the reader thread when the child sets the title.
 const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
+/// Posted from the reader thread when the child writes the clipboard.
+const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
 
 /// libghostty-vt's limit on a title, in bytes, which is at least as
 /// many UTF-16 units.
@@ -73,6 +75,11 @@ title_len: usize = 0,
 /// Set while a WM_APP_TITLE_CHANGED is queued, so a child that retitles
 /// rapidly posts one message rather than flooding the queue.
 title_pending: std.atomic.Value(bool) = .init(false),
+/// A clipboard write from the child (OSC 52) for the UI thread to make.
+/// Writing on the reader thread could deadlock: emptying the clipboard
+/// sends a message to its previous owner, which is often us. Empty
+/// clears the clipboard. Guarded by `lock`.
+clipboard_write: ?[]u8 = null,
 /// The last stats report, shown after the title.
 stats_text: [max_stats_len]u16 = undefined,
 stats_len: usize = 0,
@@ -254,6 +261,8 @@ pub fn create(
     self.stream.handler.effects.write_pty = &writePty;
     self.stream.handler.effects.device_attributes = &deviceAttributes;
     self.stream.handler.effects.title_changed = &titleChanged;
+    self.stream.handler.effects.clipboard_write = &clipboardWrite;
+    self.stream.handler.effects.clipboard_read = &clipboardRead;
     self.stream.handler.unknown_sequence = &unknownSequence;
 
     self.renderer = try Renderer.init(hwnd, size.width, size.height);
@@ -299,6 +308,7 @@ pub fn destroy(self: *Window) void {
         self.terminal.deinit(self.alloc);
         self.grid.deinit();
     }
+    if (self.clipboard_write) |text| self.alloc.free(text);
     _ = win32.CloseHandle(self.output_event);
     _ = win32.CloseHandle(self.hold_timer);
     self.alloc.destroy(self);
@@ -438,6 +448,82 @@ fn titleChanged(handler: *StreamHandler) void {
     const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
     if (self.title_pending.swap(true, .acq_rel)) return;
     _ = win32.PostMessageW(self.hwnd.?, WM_APP_TITLE_CHANGED, 0, 0);
+}
+
+/// Stream effect for OSC 52 and OSC 5522 writes. Runs on the reader
+/// thread with the terminal locked, so it hands the text to the UI
+/// thread. A write that arrives before the last one is made replaces it.
+fn clipboardWrite(handler: *StreamHandler, write: ghostty_vt.clipboard.Write) void {
+    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
+    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
+    const access = self.config.@"clipboard-write";
+    if (access != .allow) {
+        log.info("denied a clipboard write (clipboard-write = {t})", .{access});
+        return write.reply(.denied);
+    }
+    // Windows has one clipboard, so there's no selection or primary.
+    if (write.location != .standard) return write.reply(.unsupported);
+
+    // Text is the only representation we keep. No contents clears.
+    const text: []const u8 = if (write.contents.len == 0) "" else for (write.contents) |c| {
+        if (ghostty_vt.clipboard.isTextMime(c.mime)) break c.data;
+    } else return write.reply(.unsupported);
+
+    const copy = self.alloc.dupe(u8, text) catch return write.reply(.io_error);
+    if (self.clipboard_write) |pending| {
+        self.alloc.free(pending);
+    } else {
+        _ = win32.PostMessageW(self.hwnd.?, WM_APP_CLIPBOARD_WRITE, 0, 0);
+    }
+    self.clipboard_write = copy;
+    write.reply(.{ .success = .{} });
+}
+
+/// Make the child's pending clipboard write.
+fn clipboardWriteFlush(self: *Window) void {
+    self.lockTerminal();
+    const pending = self.clipboard_write;
+    self.clipboard_write = null;
+    self.unlockTerminal();
+
+    const text = pending orelse return;
+    defer self.alloc.free(text);
+    const result = if (text.len == 0) clipboard.clear(self.hwnd.?) else clipboard.set(self.hwnd.?, text);
+    result catch |err| log.warn("clipboard write failed: {}", .{err});
+}
+
+/// Stream effect for OSC 52 and OSC 5522 reads. Runs on the reader
+/// thread with the terminal locked, which is safe for reading: unlike
+/// writing, it sends our window no messages.
+fn clipboardRead(handler: *StreamHandler, read: ghostty_vt.clipboard.Read) void {
+    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
+    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
+    const access = self.config.@"clipboard-read";
+    if (access != .allow) {
+        log.info("denied a clipboard read (clipboard-read = {t})", .{access});
+        return read.reply(.denied);
+    }
+    if (read.location != .standard) return read.reply(.unsupported);
+
+    const text = clipboard.get(self.alloc, null) catch |err| {
+        log.warn("clipboard read failed: {}", .{err});
+        return read.reply(.busy);
+    };
+    defer if (text) |t| self.alloc.free(t);
+
+    // The text, under each text type asked for.
+    var contents: [8]ghostty_vt.clipboard.Content = undefined;
+    var n: usize = 0;
+    if (text) |t| for (read.mimes) |mime| {
+        if (n == contents.len) break;
+        if (!ghostty_vt.clipboard.isTextMime(mime)) continue;
+        contents[n] = .{ .mime = mime, .data = t };
+        n += 1;
+    };
+    read.reply(.{ .success = .{
+        .contents = contents[0..n],
+        .available = if (text != null) &.{"text/plain"} else &.{},
+    } });
 }
 
 /// ConPTY asks for DA1 at startup to learn what the terminal supports.
@@ -1226,6 +1312,11 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
         WM_APP_TITLE_CHANGED => {
             self.titleUpdate();
+            return 0;
+        },
+
+        WM_APP_CLIPBOARD_WRITE => {
+            self.clipboardWriteFlush();
             return 0;
         },
 

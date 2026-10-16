@@ -9,6 +9,8 @@ We have no UI beyond the terminal grid yet (no menus, dialogs, toasts, or
 settings). Rather than piecemeal it with MessageBox and the like, these
 wait until there is a proper design for it.
 
+- **Clipboard access prompts.** `clipboard-read` and `clipboard-write`
+  accept `ask`, Ghostty's default for reads, but treat it as `deny`.
 - **Paste protection.** Ghostty asks before pasting text that could run
   commands: unbracketed text with a newline, or any paste containing the
   bracketed-paste terminator `ESC [201~`. We paste without asking. The
@@ -31,7 +33,9 @@ wait until there is a proper design for it.
   general (OSC 8 hyperlinks, regex links, ctrl+click to open).
 - **Ctrl+triple-click selects a command's output.** Needs shell
   integration (OSC 133).
-- **OSC 52** (programs reading and writing the clipboard).
+- **Kitty paste events** (mode 5522). Our paste encodes text itself
+  rather than going through libghostty-vt's `handler.paste`, so programs
+  that ask for paste events get plain pastes.
 - **Large pastes** are written to the pty on the UI thread, which blocks
   until the child reads them.
 

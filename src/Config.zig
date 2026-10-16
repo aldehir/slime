@@ -44,6 +44,12 @@ palette: Palette = .{},
 /// includes U+0000.
 @"selection-word-chars": WordChars = .{},
 
+/// Whether programs may read the clipboard (OSC 52, OSC 5522). `ask`,
+/// Ghostty's default, needs a prompt we don't have yet, so it denies.
+@"clipboard-read": ClipboardAccess = .ask,
+/// Whether programs may set the clipboard. `ask` denies, as for reads.
+@"clipboard-write": ClipboardAccess = .allow,
+
 /// The command to run, CreateProcessW syntax. Our own command line
 /// overrides it; with neither, %COMSPEC%.
 command: ?[]const u8 = null,
@@ -106,6 +112,16 @@ pub const Padding = struct {
 
     fn parseUnsigned(value: []const u8) !u32 {
         return std.fmt.parseInt(u32, std.mem.trim(u8, value, whitespace), 10);
+    }
+};
+
+pub const ClipboardAccess = enum {
+    allow,
+    deny,
+    ask,
+
+    fn parse(self: *ClipboardAccess, _: Allocator, value: []const u8) !void {
+        self.* = std.meta.stringToEnum(ClipboardAccess, value) orelse return error.InvalidValue;
     }
 };
 
@@ -398,12 +414,13 @@ test "empty value resets" {
     try std.testing.expectEqualStrings("B", c.@"font-family".items[0]);
 }
 
-test "padding, word chars, theme" {
+test "padding, word chars, theme, clipboard" {
     var c = try testConfig(
         \\window-padding-x = 2,4
         \\window-padding-y = 6
         \\selection-word-chars = \t;\u{2502}
         \\theme = light: Catppuccin Latte , dark:Catppuccin Mocha
+        \\clipboard-write = deny
     );
     defer c.deinit();
     try std.testing.expectEqual(Padding{ .top_left = 2, .bottom_right = 4 }, c.@"window-padding-x");
@@ -411,6 +428,8 @@ test "padding, word chars, theme" {
     try std.testing.expectEqualSlices(u21, &.{ 0, '\t', ';', 0x2502 }, c.@"selection-word-chars".codepoints);
     try std.testing.expectEqualStrings("Catppuccin Latte", c.theme.?.light);
     try std.testing.expectEqualStrings("Catppuccin Mocha", c.theme.?.dark);
+    try std.testing.expectEqual(.ask, c.@"clipboard-read");
+    try std.testing.expectEqual(.deny, c.@"clipboard-write");
 
     try std.testing.expectError(error.InvalidTheme, Theme.parse(c._arena.allocator(), "light:A"));
     const path = try Theme.parse(c._arena.allocator(), "C:\\themes\\mine");

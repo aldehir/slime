@@ -4,7 +4,9 @@
 const std = @import("std");
 const win32 = @import("win32/win32.zig");
 
-/// Replace the clipboard's contents with `text`.
+/// Replace the clipboard's contents with `text`. Emptying the clipboard
+/// sends WM_DESTROYCLIPBOARD to its previous owner, which is often our
+/// own window, so only call this from the UI thread.
 pub fn set(hwnd: win32.HWND, text: []const u8) !void {
     const newlines = std.mem.count(u8, text, "\n");
     const len = (std.unicode.calcUtf16LeLen(text) catch return error.InvalidUtf8) + newlines;
@@ -41,13 +43,23 @@ pub fn set(hwnd: win32.HWND, text: []const u8) !void {
     owned = false;
 }
 
+/// Empty the clipboard. Like `set`, this sends WM_DESTROYCLIPBOARD to
+/// the previous owner, so only call it from the UI thread.
+pub fn clear(hwnd: win32.HWND) !void {
+    if (win32.OpenClipboard(hwnd) == 0) return win32.lastError("OpenClipboard");
+    defer _ = win32.CloseClipboard();
+    if (win32.EmptyClipboard() == 0) return win32.lastError("EmptyClipboard");
+}
+
 /// Whether the clipboard holds text.
 pub fn hasText() bool {
     return win32.IsClipboardFormatAvailable(win32.CF_UNICODETEXT) != 0;
 }
 
 /// The clipboard's text, or null if it holds none. Owned by the caller.
-pub fn get(alloc: std.mem.Allocator, hwnd: win32.HWND) !?[]u8 {
+/// Safe off the UI thread with a null `hwnd`: reading sends our windows
+/// no messages.
+pub fn get(alloc: std.mem.Allocator, hwnd: ?win32.HWND) !?[]u8 {
     if (win32.OpenClipboard(hwnd) == 0) return win32.lastError("OpenClipboard");
     defer _ = win32.CloseClipboard();
     const mem = win32.GetClipboardData(win32.CF_UNICODETEXT) orelse return null;
