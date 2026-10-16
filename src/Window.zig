@@ -14,6 +14,8 @@ const win32 = @import("win32/win32.zig");
 const font = @import("font/font.zig");
 const input = @import("input.zig");
 const Pty = @import("Pty.zig");
+const Stats = @import("Stats.zig");
+const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
 
@@ -21,12 +23,15 @@ const log = std.log.scoped(.window);
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ghostty-win");
 
-/// Posted by the reader thread after it fed output to the terminal.
-const WM_APP_OUTPUT = win32.WM_APP + 0;
 /// Posted from a thread pool wait when the child process exits.
-const WM_APP_CHILD_EXITED = win32.WM_APP + 1;
+const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
 
 const StreamHandler = @FieldType(ghostty_vt.TerminalStream, "handler");
+
+const stats_timer_id = 1;
+/// Draws pending output while DefWindowProc's modal move/size loop runs
+/// instead of ours.
+const sizemove_timer_id = 2;
 
 const font_size_pt = 12;
 
@@ -43,6 +48,7 @@ const default_colors: ghostty_vt.Terminal.Colors = .{
 
 alloc: Allocator,
 hwnd: ?win32.HWND = null,
+title: [:0]const u16,
 dpi: u32 = win32.USER_DEFAULT_SCREEN_DPI,
 
 grid: font.Grid,
@@ -60,12 +66,17 @@ pty: ?Pty = null,
 reader: ?std.Thread = null,
 exit_wait: ?win32.HANDLE = null,
 
-/// Set while a WM_APP_OUTPUT is in the queue, so a fast producer posts
-/// one per frame rather than one per read.
-output_pending: std.atomic.Value(bool) = .init(false),
+/// Auto-reset event the reader thread sets after feeding output to the
+/// terminal. The message loop waits on it alongside messages and calls
+/// `drawOutput`. Not a posted message: those are retrieved before input
+/// and timers, so a steady stream of them starves the keyboard.
+output_event: win32.HANDLE,
 
 /// The first half of a surrogate pair from a lone WM_CHAR.
 high_surrogate: ?u16 = null,
+
+/// Only used with `-Dstats`.
+stats: Stats = .{},
 
 /// Create the window and run `command_line` (CreateProcessW syntax;
 /// modified in place) in it.
@@ -75,8 +86,13 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
 
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
+    const output_event = win32.CreateEventW(null, win32.FALSE, win32.FALSE, null) orelse
+        return win32.lastError("CreateEventW");
+    errdefer _ = win32.CloseHandle(output_event);
     self.* = .{
         .alloc = alloc,
+        .title = title,
+        .output_event = output_event,
         .grid = undefined,
         .terminal = undefined,
         .stream = undefined,
@@ -132,7 +148,7 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
 
     self.pty = try .spawn(command_line, grid_size.cols, grid_size.rows);
     errdefer self.stopPty();
-    self.reader = try std.Thread.spawn(.{}, readLoop, .{ self, hwnd });
+    self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
 
     var wait: win32.HANDLE = undefined;
     if (win32.RegisterWaitForSingleObject(
@@ -144,6 +160,11 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
         win32.WT_EXECUTEONLYONCE,
     ) == 0) return win32.lastError("RegisterWaitForSingleObject");
     self.exit_wait = wait;
+
+    if (build_options.stats) {
+        self.stats = .init();
+        _ = win32.SetTimer(hwnd, stats_timer_id, 1000, null);
+    }
 
     _ = win32.ShowWindow(hwnd, win32.SW_SHOWDEFAULT);
     return self;
@@ -161,7 +182,14 @@ pub fn destroy(self: *Window) void {
         self.terminal.deinit(self.alloc);
         self.grid.deinit();
     }
+    _ = win32.CloseHandle(self.output_event);
     self.alloc.destroy(self);
+}
+
+/// Draw output the reader fed since the last frame. Call when
+/// `output_event` is signaled, after handling all pending messages.
+pub fn drawOutput(self: *Window) void {
+    self.render();
 }
 
 /// Close the pseudoconsole, wait for the reader to drain it, and kill
@@ -190,7 +218,7 @@ fn unlockTerminal(self: *Window) void {
 
 /// Reader thread: feed child output to the terminal until EOF, which
 /// comes when the pseudoconsole is closed.
-fn readLoop(self: *Window, hwnd: win32.HWND) void {
+fn readLoop(self: *Window) void {
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
         const n = self.pty.?.read(&buf) catch break;
@@ -199,10 +227,8 @@ fn readLoop(self: *Window, hwnd: win32.HWND) void {
         self.lockTerminal();
         self.stream.nextSlice(buf[0..n]);
         self.unlockTerminal();
-
-        if (!self.output_pending.swap(true, .acq_rel)) {
-            _ = win32.PostMessageW(hwnd, WM_APP_OUTPUT, 0, 0);
-        }
+        if (build_options.stats) _ = self.stats.bytes.fetchAdd(n, .monotonic);
+        _ = win32.SetEvent(self.output_event);
     }
 }
 
@@ -314,14 +340,39 @@ fn render(self: *Window) void {
 }
 
 fn renderFallible(self: *Window, r: *Renderer) !void {
+    const stats = build_options.stats;
+    var t: i64 = if (stats) Stats.now() else 0;
     {
         self.lockTerminal();
         defer self.unlockTerminal();
         try self.render_state.update(self.alloc, &self.terminal);
     }
+    if (stats) t = self.stats.lap(.update, t);
     try self.cells.build(self.alloc, &self.render_state, &self.grid);
+    if (stats) t = self.stats.lap(.build, t);
     const pad: f32 = @floatFromInt(self.paddingPx());
     try r.draw(&self.cells, &self.grid.atlas, self.grid.metrics, .{ pad, pad });
+    if (stats) {
+        _ = self.stats.lap(.draw, t);
+        self.stats.frames += 1;
+    }
+}
+
+/// Show the last second's stats after the title.
+fn showStats(self: *Window) void {
+    var utf8: [160]u8 = undefined;
+    const text = self.stats.report(&utf8);
+
+    var title: [256]u16 = undefined;
+    const sep = std.unicode.utf8ToUtf16LeStringLiteral("  \u{2014}  ");
+    var len: usize = 0;
+    for ([_][]const u16{ self.title, sep }) |part| {
+        @memcpy(title[len..][0..part.len], part);
+        len += part.len;
+    }
+    len += std.unicode.utf8ToUtf16Le(title[len .. title.len - 1], text) catch 0;
+    title[len] = 0;
+    _ = win32.SetWindowTextW(self.hwnd.?, title[0..len :0]);
 }
 
 /// Fit the swap chain and terminal grid to the client area and redraw.
@@ -401,9 +452,24 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         // The swap chain covers the whole client area.
         win32.WM_ERASEBKGND => return 1,
 
-        WM_APP_OUTPUT => {
-            self.output_pending.store(false, .release);
-            self.render();
+        win32.WM_ENTERSIZEMOVE => {
+            _ = win32.SetTimer(hwnd, sizemove_timer_id, 16, null);
+            return 0;
+        },
+
+        win32.WM_EXITSIZEMOVE => {
+            _ = win32.KillTimer(hwnd, sizemove_timer_id);
+            return 0;
+        },
+
+        win32.WM_TIMER => {
+            switch (wparam) {
+                stats_timer_id => if (build_options.stats) self.showStats(),
+                sizemove_timer_id => if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) {
+                    self.render();
+                },
+                else => {},
+            }
             return 0;
         },
 

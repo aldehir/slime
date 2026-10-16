@@ -163,6 +163,10 @@ pub const WM_SYSKEYDOWN = 0x0104;
 pub const WM_SYSKEYUP = 0x0105;
 pub const WM_SYSCHAR = 0x0106;
 pub const WM_SYSDEADCHAR = 0x0107;
+pub const WM_QUIT = 0x0012;
+pub const WM_TIMER = 0x0113;
+pub const WM_ENTERSIZEMOVE = 0x0231;
+pub const WM_EXITSIZEMOVE = 0x0232;
 pub const WM_DPICHANGED = 0x02E0;
 pub const WM_APP = 0x8000;
 
@@ -184,6 +188,9 @@ pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 
 pub const PM_REMOVE = 0x0001;
+pub const QS_ALLINPUT = 0x04FF;
+pub const MWMO_INPUTAVAILABLE = 0x0004;
+pub const WAIT_OBJECT_0 = 0;
 pub const MAPVK_VK_TO_CHAR = 2;
 
 // Virtual keys
@@ -220,6 +227,11 @@ pub const ERROR_BROKEN_PIPE = 109;
 
 pub extern "kernel32" fn GetModuleHandleW(?LPCWSTR) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+pub extern "kernel32" fn QueryPerformanceCounter(*i64) callconv(.winapi) BOOL;
+pub extern "kernel32" fn QueryPerformanceFrequency(*i64) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CreateEventW(?*anyopaque, BOOL, BOOL, ?LPCWSTR) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn SetEvent(HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn WaitForSingleObject(HANDLE, u32) callconv(.winapi) u32;
 pub extern "kernel32" fn CloseHandle(HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreatePipe(*HANDLE, *HANDLE, ?*anyopaque, u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn ReadFile(HANDLE, [*]u8, u32, ?*u32, ?*anyopaque) callconv(.winapi) BOOL;
@@ -282,6 +294,10 @@ pub extern "user32" fn GetMessageW(*MSG, ?HWND, u32, u32) callconv(.winapi) BOOL
 pub extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) BOOL;
 pub extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostQuitMessage(i32) callconv(.winapi) void;
+pub extern "user32" fn MsgWaitForMultipleObjectsEx(u32, ?[*]const HANDLE, u32, u32, u32) callconv(.winapi) u32;
+pub extern "user32" fn KillTimer(?HWND, usize) callconv(.winapi) BOOL;
+pub extern "user32" fn SetTimer(?HWND, usize, u32, ?*const anyopaque) callconv(.winapi) usize;
+pub extern "user32" fn SetWindowTextW(HWND, LPCWSTR) callconv(.winapi) BOOL;
 pub extern "user32" fn PostMessageW(?HWND, u32, WPARAM, LPARAM) callconv(.winapi) BOOL;
 pub extern "user32" fn PeekMessageW(*MSG, ?HWND, u32, u32, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn GetKeyState(i32) callconv(.winapi) i16;

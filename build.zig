@@ -30,6 +30,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const options = b.addOptions();
+    options.addOption(bool, "stats", b.option(
+        bool,
+        "stats",
+        "Show frame timing and throughput in the window title (default: true in Debug)",
+    ) orelse (optimize == .Debug));
+    exe_mod.addOptions("build_options", options);
+
     for ([_][]const u8{ "user32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler" }) |lib| {
         exe_mod.linkSystemLibrary(lib, .{});
     }

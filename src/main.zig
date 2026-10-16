@@ -25,10 +25,25 @@ pub fn main(init: std.process.Init) !void {
     );
     defer window.destroy();
 
+    // Handle every pending message (input first) before drawing new
+    // output, so a flood of output can't delay keys. Present waits for
+    // vblank, which paces the loop while output streams.
+    const events = [_]win32.HANDLE{window.output_event};
     var msg: win32.MSG = undefined;
-    while (win32.GetMessageW(&msg, null, 0, 0) > 0) {
-        _ = win32.TranslateMessage(&msg);
-        _ = win32.DispatchMessageW(&msg);
+    while (true) {
+        const woke = win32.MsgWaitForMultipleObjectsEx(
+            events.len,
+            &events,
+            win32.INFINITE,
+            win32.QS_ALLINPUT,
+            win32.MWMO_INPUTAVAILABLE,
+        );
+        while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE) != 0) {
+            if (msg.message == win32.WM_QUIT) return;
+            _ = win32.TranslateMessage(&msg);
+            _ = win32.DispatchMessageW(&msg);
+        }
+        if (woke == win32.WAIT_OBJECT_0) window.drawOutput();
     }
 }
 
