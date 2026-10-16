@@ -9,6 +9,7 @@ pub fn main(init: std.process.Init) !void {
 
     const window = try Window.create(
         init.gpa,
+        init.io,
         std.unicode.utf8ToUtf16LeStringLiteral("ghostty-win"),
     );
     defer window.destroy();
@@ -23,4 +24,5 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = win32;
     _ = Window;
+    _ = @import("font/font.zig");
 }

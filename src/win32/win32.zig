@@ -6,6 +6,8 @@ const std = @import("std");
 pub const com = @import("com.zig");
 pub const dxgi = @import("dxgi.zig");
 pub const d3d11 = @import("d3d11.zig");
+pub const d3dcompiler = @import("d3dcompiler.zig");
+pub const dwrite = @import("dwrite.zig");
 
 pub const BOOL = i32;
 pub const TRUE: BOOL = 1;

@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    for ([_][]const u8{ "user32", "d3d11", "dxgi", "dwmapi" }) |lib| {
+    for ([_][]const u8{ "user32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler" }) |lib| {
         exe_mod.linkSystemLibrary(lib, .{});
     }
 
