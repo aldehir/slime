@@ -230,7 +230,9 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
     const px_changed = self.terminal.width_px != @as(u32, cols) * cell.width or
         self.terminal.height_px != @as(u32, rows) * cell.height;
     if (changed or px_changed) {
-        self.terminal.resize(self.alloc, .{
+        // Through the handler, which also sends the mode 2048 size
+        // report: a child that enabled it (nvim) ignores console resizes.
+        self.stream.handler.resize(.{
             .cols = cols,
             .rows = rows,
             .cell_size_px = cell,
@@ -269,9 +271,9 @@ fn fromHandler(handler: *StreamHandler) *Session {
     return @alignCast(@fieldParentPtr("stream", stream));
 }
 
-/// Stream effect for query replies (DSR, DECRQM, ...). Runs on the
-/// reader thread with the terminal locked, so it must not wait on the
-/// UI thread.
+/// Stream effect for query replies (DSR, DECRQM, ...) and mode 2048
+/// size reports. Runs with the terminal locked, usually on the reader
+/// thread, so it must not wait on the UI thread.
 fn writePty(handler: *StreamHandler, data: []const u8) void {
     const self = fromHandler(handler);
     if (self.pty) |*pty| pty.write(data);
