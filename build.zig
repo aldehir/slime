@@ -1,5 +1,13 @@
 const std = @import("std");
 
+/// The ConPTY we ship instead of the OS's inbox one: conpty.dll loads
+/// OpenConsole.exe from an arch subdirectory next to itself. NuGet serves
+/// the package as a .nupkg, which `zig fetch` doesn't recognize, so
+/// scripts/fetch-conpty.ps1 downloads it into tools/.
+const conpty_version = "1.25.260930003";
+const conpty_sha256 = "02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee";
+const conpty_dir = "tools/conpty-" ++ conpty_version;
+
 pub fn build(b: *std.Build) void {
     // Building libghostty-vt's C++ dependencies against MSVC needs the
     // environment from env.ps1.
@@ -43,6 +51,7 @@ pub fn build(b: *std.Build) void {
     // the regular `main` (and std.process.Init) in both modes.
     exe.entry = .{ .symbol_name = "mainCRTStartup" };
     b.installArtifact(exe);
+    installConpty(b);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -51,4 +60,22 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
+}
+
+fn installConpty(b: *std.Build) void {
+    const dll = b.addInstallBinFile(b.path(conpty_dir ++ "/conpty.dll"), "conpty.dll");
+    const host = b.addInstallBinFile(b.path(conpty_dir ++ "/OpenConsole.exe"), "x64/OpenConsole.exe");
+    b.getInstallStep().dependOn(&dll.step);
+    b.getInstallStep().dependOn(&host.step);
+
+    b.build_root.handle.access(b.graph.io, conpty_dir ++ "/conpty.dll", .{}) catch {
+        const fetch = b.addSystemCommand(&.{
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        });
+        fetch.addFileArg(b.path("scripts/fetch-conpty.ps1"));
+        fetch.addArgs(&.{ "-Version", conpty_version, "-Sha256", conpty_sha256, "-Out" });
+        fetch.addArg(b.pathFromRoot(conpty_dir));
+        dll.step.dependOn(&fetch.step);
+        host.step.dependOn(&fetch.step);
+    };
 }

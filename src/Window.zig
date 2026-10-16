@@ -1,6 +1,10 @@
 //! A top-level Win32 window showing one terminal. Heap allocated so that
 //! its address can be stored in the HWND's user data, and so the stream's
 //! pointer to `terminal` stays valid.
+//!
+//! A reader thread feeds the child's output to the stream; the UI thread
+//! renders and handles input. `lock` guards `terminal` and `stream`
+//! between them.
 const Window = @This();
 
 const std = @import("std");
@@ -8,13 +12,21 @@ const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const font = @import("font/font.zig");
+const input = @import("input.zig");
+const Pty = @import("Pty.zig");
 const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
-const demo = @import("demo.zig");
 
 const log = std.log.scoped(.window);
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ghostty-win");
+
+/// Posted by the reader thread after it fed output to the terminal.
+const WM_APP_OUTPUT = win32.WM_APP + 0;
+/// Posted from a thread pool wait when the child process exits.
+const WM_APP_CHILD_EXITED = win32.WM_APP + 1;
+
+const StreamHandler = @FieldType(ghostty_vt.TerminalStream, "handler");
 
 const font_size_pt = 12;
 
@@ -34,6 +46,7 @@ hwnd: ?win32.HWND = null,
 dpi: u32 = win32.USER_DEFAULT_SCREEN_DPI,
 
 grid: font.Grid,
+lock: win32.SRWLOCK = .{},
 terminal: ghostty_vt.Terminal,
 stream: ghostty_vt.TerminalStream,
 render_state: ghostty_vt.RenderState = .empty,
@@ -43,7 +56,20 @@ cells: Cells = .{},
 /// (WM_SIZE, etc.) arrive before everything else is ready.
 renderer: ?Renderer = null,
 
-pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16) !*Window {
+pty: ?Pty = null,
+reader: ?std.Thread = null,
+exit_wait: ?win32.HANDLE = null,
+
+/// Set while a WM_APP_OUTPUT is in the queue, so a fast producer posts
+/// one per frame rather than one per read.
+output_pending: std.atomic.Value(bool) = .init(false),
+
+/// The first half of a surrogate pair from a lone WM_CHAR.
+high_surrogate: ?u16 = null,
+
+/// Create the window and run `command_line` (CreateProcessW syntax;
+/// modified in place) in it.
+pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: win32.LPWSTR) !*Window {
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
 
@@ -95,9 +121,29 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16) !*Window {
     errdefer self.terminal.deinit(alloc);
     self.stream = self.terminal.vtStream();
     errdefer self.stream.deinit();
-    demo.write(&self.stream);
+    self.stream.handler.effects.write_pty = &writePty;
+    self.stream.handler.effects.device_attributes = &deviceAttributes;
 
     self.renderer = try Renderer.init(hwnd, size.width, size.height);
+    errdefer {
+        self.renderer.?.deinit();
+        self.renderer = null;
+    }
+
+    self.pty = try .spawn(command_line, grid_size.cols, grid_size.rows);
+    errdefer self.stopPty();
+    self.reader = try std.Thread.spawn(.{}, readLoop, .{ self, hwnd });
+
+    var wait: win32.HANDLE = undefined;
+    if (win32.RegisterWaitForSingleObject(
+        &wait,
+        self.pty.?.process,
+        onChildExited,
+        hwnd,
+        win32.INFINITE,
+        win32.WT_EXECUTEONLYONCE,
+    ) == 0) return win32.lastError("RegisterWaitForSingleObject");
+    self.exit_wait = wait;
 
     _ = win32.ShowWindow(hwnd, win32.SW_SHOWDEFAULT);
     return self;
@@ -106,6 +152,7 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16) !*Window {
 /// Free the window. The HWND must already be destroyed (the message
 /// loop has exited).
 pub fn destroy(self: *Window) void {
+    self.stopPty();
     if (self.renderer) |*r| {
         r.deinit();
         self.cells.deinit(self.alloc);
@@ -115,6 +162,125 @@ pub fn destroy(self: *Window) void {
         self.grid.deinit();
     }
     self.alloc.destroy(self);
+}
+
+/// Close the pseudoconsole, wait for the reader to drain it, and kill
+/// whatever is left of the child's process tree.
+fn stopPty(self: *Window) void {
+    if (self.exit_wait) |wait| {
+        // INVALID_HANDLE_VALUE: wait for a running callback to finish.
+        _ = win32.UnregisterWaitEx(wait, win32.INVALID_HANDLE_VALUE);
+        self.exit_wait = null;
+    }
+    const pty = &(self.pty orelse return);
+    pty.close();
+    if (self.reader) |t| t.join();
+    self.reader = null;
+    pty.deinit();
+    self.pty = null;
+}
+
+fn lockTerminal(self: *Window) void {
+    win32.AcquireSRWLockExclusive(&self.lock);
+}
+
+fn unlockTerminal(self: *Window) void {
+    win32.ReleaseSRWLockExclusive(&self.lock);
+}
+
+/// Reader thread: feed child output to the terminal until EOF, which
+/// comes when the pseudoconsole is closed.
+fn readLoop(self: *Window, hwnd: win32.HWND) void {
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = self.pty.?.read(&buf) catch break;
+        if (n == 0) break;
+
+        self.lockTerminal();
+        self.stream.nextSlice(buf[0..n]);
+        self.unlockTerminal();
+
+        if (!self.output_pending.swap(true, .acq_rel)) {
+            _ = win32.PostMessageW(hwnd, WM_APP_OUTPUT, 0, 0);
+        }
+    }
+}
+
+fn onChildExited(ctx: ?*anyopaque, _: u8) callconv(.winapi) void {
+    _ = win32.PostMessageW(@ptrCast(ctx), WM_APP_CHILD_EXITED, 0, 0);
+}
+
+/// Stream effect for query replies (DSR, DECRQM, ...). Runs on the
+/// reader thread with the terminal locked, so it must not wait on the
+/// UI thread.
+fn writePty(handler: *StreamHandler, data: []const u8) void {
+    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
+    const self: *Window = @fieldParentPtr("stream", stream);
+    if (self.pty) |*pty| pty.write(data);
+}
+
+/// ConPTY asks for DA1 at startup to learn what the terminal supports.
+fn deviceAttributes(_: *StreamHandler) ghostty_vt.device_attributes.Attributes {
+    return .{};
+}
+
+/// Encode a key message and send it to the child.
+fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+    // TranslateMessage already posted the WM_(SYS)CHAR / WM_(SYS)DEADCHAR
+    // messages this key produced. Take them so the key and its text are
+    // encoded together, as one event.
+    var utf16: [16]u16 = undefined;
+    var len: usize = 0;
+    var composing = false;
+    if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) {
+        var m: win32.MSG = undefined;
+        while (len < utf16.len) {
+            if (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) == 0 and
+                win32.PeekMessageW(&m, self.hwnd, win32.WM_SYSCHAR, win32.WM_SYSDEADCHAR, win32.PM_REMOVE) == 0) break;
+            if (m.message == win32.WM_DEADCHAR or m.message == win32.WM_SYSDEADCHAR) {
+                composing = true;
+            } else {
+                utf16[len] = @truncate(m.wParam);
+                len += 1;
+            }
+        }
+    }
+    var utf8: [64]u8 = undefined;
+    const text_len = std.unicode.utf16LeToUtf8(&utf8, utf16[0..len]) catch 0;
+
+    const event = input.keyEvent(msg, wparam, lparam, utf8[0..text_len], composing);
+    self.lockTerminal();
+    const opts: ghostty_vt.input.KeyEncodeOptions = .fromTerminal(&self.terminal);
+    self.unlockTerminal();
+
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    ghostty_vt.input.encodeKey(&w, event, opts) catch |err| {
+        log.warn("key encode failed: {}", .{err});
+        return;
+    };
+    if (self.pty) |*pty| pty.write(w.buffered());
+}
+
+/// Send text from a WM_CHAR that no key message claimed: IME commits,
+/// alt+numpad codes, and VK_PACKET input from SendInput.
+fn charInput(self: *Window, unit: u16) void {
+    var units: [2]u16 = undefined;
+    const pair: []const u16 = if (std.unicode.utf16IsHighSurrogate(unit)) {
+        self.high_surrogate = unit;
+        return;
+    } else if (std.unicode.utf16IsLowSurrogate(unit)) pair: {
+        units = .{ self.high_surrogate orelse return, unit };
+        break :pair &units;
+    } else pair: {
+        units[0] = unit;
+        break :pair units[0..1];
+    };
+    self.high_surrogate = null;
+
+    var utf8: [8]u8 = undefined;
+    const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
+    if (self.pty) |*pty| pty.write(utf8[0..len]);
 }
 
 const ClientSize = struct { width: u32, height: u32 };
@@ -148,7 +314,11 @@ fn render(self: *Window) void {
 }
 
 fn renderFallible(self: *Window, r: *Renderer) !void {
-    try self.render_state.update(self.alloc, &self.terminal);
+    {
+        self.lockTerminal();
+        defer self.unlockTerminal();
+        try self.render_state.update(self.alloc, &self.terminal);
+    }
     try self.cells.build(self.alloc, &self.render_state, &self.grid);
     const pad: f32 = @floatFromInt(self.paddingPx());
     try r.draw(&self.cells, &self.grid.atlas, self.grid.metrics, .{ pad, pad });
@@ -166,7 +336,9 @@ fn layout(self: *Window) void {
     };
 
     const grid_size = self.gridSize(size.width, size.height);
-    if (grid_size.cols != self.terminal.cols or grid_size.rows != self.terminal.rows) {
+    self.lockTerminal();
+    const changed = grid_size.cols != self.terminal.cols or grid_size.rows != self.terminal.rows;
+    if (changed) {
         self.terminal.resize(self.alloc, .{
             .cols = grid_size.cols,
             .rows = grid_size.rows,
@@ -176,6 +348,10 @@ fn layout(self: *Window) void {
             },
         }) catch |err| log.err("terminal resize failed: {}", .{err});
     }
+    self.unlockTerminal();
+
+    // After the terminal, so ConPTY's redraw lands on the new grid.
+    if (changed) if (self.pty) |*pty| pty.resize(grid_size.cols, grid_size.rows);
 
     // Render synchronously so live resize doesn't show stale frames.
     self.render();
@@ -224,6 +400,39 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
         // The swap chain covers the whole client area.
         win32.WM_ERASEBKGND => return 1,
+
+        WM_APP_OUTPUT => {
+            self.output_pending.store(false, .release);
+            self.render();
+            return 0;
+        },
+
+        WM_APP_CHILD_EXITED => {
+            _ = win32.DestroyWindow(hwnd);
+            return 0;
+        },
+
+        win32.WM_KEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP => {
+            switch (wparam) {
+                // The text arrives as WM_CHAR.
+                win32.VK_PACKET, win32.VK_PROCESSKEY => {},
+                // Keep alt+F4.
+                win32.VK_F4 => if (msg == win32.WM_SYSKEYDOWN and win32.GetKeyState(win32.VK_MENU) < 0) {
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                } else self.keyInput(msg, wparam, lparam),
+                else => self.keyInput(msg, wparam, lparam),
+            }
+            // Not passing WM_SYSKEYUP on also keeps a lone alt from
+            // entering menu mode.
+            return 0;
+        },
+
+        win32.WM_CHAR, win32.WM_SYSCHAR => {
+            self.charInput(@truncate(wparam));
+            return 0;
+        },
+
+        win32.WM_DEADCHAR, win32.WM_SYSDEADCHAR => return 0,
 
         win32.WM_DPICHANGED => {
             const rect: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));

@@ -1,0 +1,226 @@
+//! Win32 keyboard messages to libghostty-vt key events, which its
+//! encoder turns into the bytes a program expects (legacy, xterm
+//! modifyOtherKeys, or Kitty protocol, depending on terminal modes).
+
+const std = @import("std");
+const ghostty_vt = @import("ghostty-vt");
+const win32 = @import("win32/win32.zig");
+
+const Key = ghostty_vt.input.Key;
+const KeyEvent = ghostty_vt.input.KeyEvent;
+const Mods = ghostty_vt.input.KeyMods;
+
+/// Build the event for a WM_(SYS)KEYDOWN or WM_(SYS)KEYUP. `text` is the
+/// UTF-8 the key produced (from the WM_(SYS)CHAR messages TranslateMessage
+/// posted for it) and `composing` is set if it produced a dead key.
+pub fn keyEvent(
+    msg: u32,
+    wparam: win32.WPARAM,
+    lparam: win32.LPARAM,
+    text: []const u8,
+    composing: bool,
+) KeyEvent {
+    const flags: usize = @bitCast(lparam);
+    const vk: u32 = @truncate(wparam);
+    const release = msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP;
+    const mods = currentMods();
+
+    var event: KeyEvent = .{
+        .action = if (release) .release else if (flags & (1 << 30) != 0) .repeat else .press,
+        .key = keyFromScancode(@truncate(flags >> 16), flags & (1 << 24) != 0, vk),
+        .mods = mods,
+        .composing = composing,
+        .unshifted_codepoint = unshiftedCodepoint(vk),
+    };
+
+    // Windows applies ctrl to the text (ctrl+c gives 0x03). The encoder
+    // derives control codes from the key itself, so drop those.
+    if (text.len > 0 and !(text.len == 1 and std.ascii.isControl(text[0]))) {
+        event.utf8 = text;
+        // AltGr arrives as ctrl+alt; when it produced text, it's consumed.
+        const altgr = mods.ctrl and mods.alt;
+        event.consumed_mods = .{ .shift = mods.shift, .ctrl = altgr, .alt = altgr };
+    }
+    return event;
+}
+
+fn currentMods() Mods {
+    return .{
+        .shift = down(win32.VK_SHIFT),
+        .ctrl = down(win32.VK_CONTROL),
+        .alt = down(win32.VK_MENU),
+        .super = down(win32.VK_LWIN) or down(win32.VK_RWIN),
+        .caps_lock = toggled(win32.VK_CAPITAL),
+        .num_lock = toggled(win32.VK_NUMLOCK),
+        .sides = .{
+            .shift = if (down(win32.VK_RSHIFT)) .right else .left,
+            .ctrl = if (down(win32.VK_RCONTROL)) .right else .left,
+            .alt = if (down(win32.VK_RMENU)) .right else .left,
+            .super = if (down(win32.VK_RWIN)) .right else .left,
+        },
+    };
+}
+
+fn down(vk: i32) bool {
+    return win32.GetKeyState(vk) < 0;
+}
+
+fn toggled(vk: i32) bool {
+    return win32.GetKeyState(vk) & 1 != 0;
+}
+
+/// The character the key produces with no modifiers, in the current
+/// layout. Used for Kitty protocol key codes and ctrl sequences.
+fn unshiftedCodepoint(vk: u32) u21 {
+    // The high bit marks dead keys.
+    const c = win32.MapVirtualKeyW(vk, win32.MAPVK_VK_TO_CHAR) & 0x7FFF_FFFF;
+    if (c < 0x80) return std.ascii.toLower(@intCast(c));
+    return std.math.cast(u21, c) orelse 0;
+}
+
+/// Map a set 1 scancode (lParam bits 16-24) to the physical key. The
+/// table follows the Windows column of Chromium's DOM code table.
+fn keyFromScancode(scancode: u8, extended: bool, vk: u32) Key {
+    if (extended) return switch (scancode) {
+        0x1C => .numpad_enter,
+        0x1D => .control_right,
+        0x35 => .numpad_divide,
+        0x37 => .print_screen,
+        0x38 => .alt_right,
+        0x45 => .num_lock,
+        0x47 => .home,
+        0x48 => .arrow_up,
+        0x49 => .page_up,
+        0x4B => .arrow_left,
+        0x4D => .arrow_right,
+        0x4F => .end,
+        0x50 => .arrow_down,
+        0x51 => .page_down,
+        0x52 => .insert,
+        0x53 => .delete,
+        0x5B => .meta_left,
+        0x5C => .meta_right,
+        0x5D => .context_menu,
+        else => .unidentified,
+    };
+
+    // With num lock off, the numpad digits send navigation keys from the
+    // same scancodes.
+    const numpad_digit = (vk >= win32.VK_NUMPAD0 and vk <= win32.VK_NUMPAD9) or vk == win32.VK_DECIMAL;
+
+    return switch (scancode) {
+        0x01 => .escape,
+        0x02 => .digit_1,
+        0x03 => .digit_2,
+        0x04 => .digit_3,
+        0x05 => .digit_4,
+        0x06 => .digit_5,
+        0x07 => .digit_6,
+        0x08 => .digit_7,
+        0x09 => .digit_8,
+        0x0A => .digit_9,
+        0x0B => .digit_0,
+        0x0C => .minus,
+        0x0D => .equal,
+        0x0E => .backspace,
+        0x0F => .tab,
+        0x10 => .key_q,
+        0x11 => .key_w,
+        0x12 => .key_e,
+        0x13 => .key_r,
+        0x14 => .key_t,
+        0x15 => .key_y,
+        0x16 => .key_u,
+        0x17 => .key_i,
+        0x18 => .key_o,
+        0x19 => .key_p,
+        0x1A => .bracket_left,
+        0x1B => .bracket_right,
+        0x1C => .enter,
+        0x1D => .control_left,
+        0x1E => .key_a,
+        0x1F => .key_s,
+        0x20 => .key_d,
+        0x21 => .key_f,
+        0x22 => .key_g,
+        0x23 => .key_h,
+        0x24 => .key_j,
+        0x25 => .key_k,
+        0x26 => .key_l,
+        0x27 => .semicolon,
+        0x28 => .quote,
+        0x29 => .backquote,
+        0x2A => .shift_left,
+        0x2B => .backslash,
+        0x2C => .key_z,
+        0x2D => .key_x,
+        0x2E => .key_c,
+        0x2F => .key_v,
+        0x30 => .key_b,
+        0x31 => .key_n,
+        0x32 => .key_m,
+        0x33 => .comma,
+        0x34 => .period,
+        0x35 => .slash,
+        0x36 => .shift_right,
+        0x37 => .numpad_multiply,
+        0x38 => .alt_left,
+        0x39 => .space,
+        0x3A => .caps_lock,
+        0x3B => .f1,
+        0x3C => .f2,
+        0x3D => .f3,
+        0x3E => .f4,
+        0x3F => .f5,
+        0x40 => .f6,
+        0x41 => .f7,
+        0x42 => .f8,
+        0x43 => .f9,
+        0x44 => .f10,
+        0x45 => .pause,
+        0x46 => .scroll_lock,
+        0x47 => if (numpad_digit) .numpad_7 else .numpad_home,
+        0x48 => if (numpad_digit) .numpad_8 else .numpad_up,
+        0x49 => if (numpad_digit) .numpad_9 else .numpad_page_up,
+        0x4A => .numpad_subtract,
+        0x4B => if (numpad_digit) .numpad_4 else .numpad_left,
+        0x4C => if (numpad_digit) .numpad_5 else .numpad_begin,
+        0x4D => if (numpad_digit) .numpad_6 else .numpad_right,
+        0x4E => .numpad_add,
+        0x4F => if (numpad_digit) .numpad_1 else .numpad_end,
+        0x50 => if (numpad_digit) .numpad_2 else .numpad_down,
+        0x51 => if (numpad_digit) .numpad_3 else .numpad_page_down,
+        0x52 => if (numpad_digit) .numpad_0 else .numpad_insert,
+        0x53 => if (numpad_digit) .numpad_decimal else .numpad_delete,
+        0x56 => .intl_backslash,
+        0x57 => .f11,
+        0x58 => .f12,
+        0x59 => .numpad_equal,
+        0x64 => .f13,
+        0x65 => .f14,
+        0x66 => .f15,
+        0x67 => .f16,
+        0x68 => .f17,
+        0x69 => .f18,
+        0x6A => .f19,
+        0x6B => .f20,
+        0x6C => .f21,
+        0x6D => .f22,
+        0x6E => .f23,
+        0x70 => .kana_mode,
+        0x73 => .intl_ro,
+        0x76 => .f24,
+        0x79 => .convert,
+        0x7B => .non_convert,
+        0x7D => .intl_yen,
+        0x7E => .numpad_comma,
+        else => .unidentified,
+    };
+}
+
+test keyFromScancode {
+    try std.testing.expectEqual(Key.key_c, keyFromScancode(0x2E, false, 'C'));
+    try std.testing.expectEqual(Key.arrow_up, keyFromScancode(0x48, true, 0x26));
+    try std.testing.expectEqual(Key.numpad_8, keyFromScancode(0x48, false, win32.VK_NUMPAD0 + 8));
+    try std.testing.expectEqual(Key.numpad_up, keyFromScancode(0x48, false, 0x26));
+}
