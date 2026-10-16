@@ -102,15 +102,19 @@ pub const Cells = struct {
             const styles = cells.items(.style);
             const graphemes = cells.items(.grapheme);
             const cursor_x: ?u32 = if (cursor_pos) |pos| (if (pos.y == y) pos.x else null) else null;
+            const selection = rows.items(.selection)[y];
 
             // Pass 1: colors, decorations, and each cell's face.
             for (raws[0..self.cols], 0..) |raw, x_usize| {
                 const x: u32 = @intCast(x_usize);
                 const style: ghostty_vt.Style = if (raw.hasStyling()) styles[x] else .{};
 
+                // Selected cells are drawn inverted, as Ghostty does
+                // without selection colors configured.
+                const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
                 var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
                 var bg = style.bg(&raw, &colors.palette) orelse colors.background;
-                if (style.flags.inverse) std.mem.swap(RGB, &fg, &bg);
+                if (style.flags.inverse != selected) std.mem.swap(RGB, &fg, &bg);
                 self.bg.items[y * self.cols + x] = pack(bg, 255);
 
                 self.row_text.items[x] = .{ .has_text = false, .face = 0, .color = 0 };

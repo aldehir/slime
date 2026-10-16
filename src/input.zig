@@ -46,6 +46,12 @@ pub fn keyEvent(
     return event;
 }
 
+/// Whether a key message is for shift, ctrl, alt, or a Windows key.
+pub fn isModifier(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
+    const flags: usize = @bitCast(lparam);
+    return keyFromScancode(@truncate(flags >> 16), flags & (1 << 24) != 0, @truncate(wparam)).modifier();
+}
+
 /// The button a WM_*BUTTONDOWN/UP message is about, and whether it was
 /// pressed. Null for other messages.
 pub fn mouseButton(msg: u32, wparam: win32.WPARAM) ?struct { MouseButton, bool } {
@@ -143,7 +149,8 @@ pub fn controlKeyState(enhanced: bool) u32 {
     return state;
 }
 
-fn currentMods() Mods {
+/// The modifiers held now, as of the message being handled.
+pub fn currentMods() Mods {
     return .{
         .shift = down(win32.VK_SHIFT),
         .ctrl = down(win32.VK_CONTROL),

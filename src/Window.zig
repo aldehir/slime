@@ -14,6 +14,7 @@ const win32 = @import("win32/win32.zig");
 const font = @import("font/font.zig");
 const input = @import("input.zig");
 const Pty = @import("Pty.zig");
+const clipboard = @import("clipboard.zig");
 const Stats = @import("Stats.zig");
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
@@ -36,6 +37,12 @@ const stats_timer_id = 1;
 /// Draws pending output while DefWindowProc's modal move/size loop runs
 /// instead of ours.
 const sizemove_timer_id = 2;
+/// Scrolls the viewport while a selection drag is above or below it.
+const autoscroll_timer_id = 3;
+
+/// Characters that end a word for double-click selection, Ghostty's
+/// `selection-word-chars` default.
+const word_boundaries = [_]u21{ 0, ' ', '\t', '\'', '"', '\u{2502}', '`', '|', ':', ';', ',', '(', ')', '[', ']', '{', '}', '<', '>', '$' };
 
 const font_size_pt = 12;
 
@@ -95,6 +102,21 @@ mouse_cell: ?ghostty_vt.Coordinate = null,
 /// Wheel rotation not yet turned into scrolling, vertical then
 /// horizontal, in 1/WHEEL_DELTA notches times the lines per notch.
 wheel_remainder: [2]i32 = .{ 0, 0 },
+
+/// Click, drag, and multi-click state for selecting text with the left
+/// button. Guarded by `lock`.
+selection: ghostty_vt.SelectionGesture = .init,
+
+/// A left button drag is selecting text rather than being reported.
+selecting: bool = false,
+
+/// Where the selection drag last was, in client coordinates, for
+/// autoscroll ticks.
+drag_pos: win32.POINT = .{ .x = 0, .y = 0 },
+
+/// The virtual key of the last key binding run, so its release isn't
+/// sent to the child either.
+bound_key: ?u32 = null,
 
 /// Only used with `-Dstats`.
 stats: Stats = .{},
@@ -204,6 +226,7 @@ pub fn destroy(self: *Window) void {
         r.deinit();
         self.cells.deinit(self.alloc);
         self.render_state.deinit(self.alloc);
+        self.selection.deinit(&self.terminal);
         self.stream.deinit();
         self.terminal.deinit(self.alloc);
         self.grid.deinit();
@@ -287,7 +310,7 @@ fn onChildExited(ctx: ?*anyopaque, _: u8) callconv(.winapi) void {
 /// UI thread.
 fn writePty(handler: *StreamHandler, data: []const u8) void {
     const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
-    const self: *Window = @fieldParentPtr("stream", stream);
+    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
     if (self.pty) |*pty| pty.write(data);
 }
 
@@ -301,7 +324,7 @@ fn deviceAttributes(_: *StreamHandler) ghostty_vt.device_attributes.Attributes {
 /// with the terminal locked.
 fn unknownSequence(handler: *StreamHandler, seq: StreamHandler.UnknownSequence) void {
     const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
-    const self: *Window = @fieldParentPtr("stream", stream);
+    const self: *Window = @alignCast(@fieldParentPtr("stream", stream));
     switch (seq) {
         .mode => |m| if (m.mode == 9001 and !m.ansi) {
             self.win32_input = m.enabled;
@@ -356,8 +379,57 @@ fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM)
         w.writeByte(utf8[0]) catch unreachable;
     }
     if (w.buffered().len == 0) return;
-    if (event.action != .release) self.scrollToBottom();
+    if (event.action != .release and !event.key.modifier()) self.typed();
     if (self.pty) |*pty| pty.write(w.buffered());
+}
+
+/// Run the key binding a key press triggers, Ghostty's defaults for
+/// copying: ctrl+shift+c when there is a selection, and ctrl+insert.
+/// Returns true if the key is consumed, which also holds for the release
+/// of a key that ran a binding.
+fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
+    const vk: u32 = @truncate(wparam);
+    if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) {
+        if (self.bound_key != vk) return false;
+        self.bound_key = null;
+        return true;
+    }
+
+    const mods = input.currentMods();
+    if (mods.alt or mods.super or !mods.ctrl) return false;
+    if (mods.shift and vk == 'C') {
+        if (!self.copySelection()) return false;
+    } else if (!mods.shift and vk == win32.VK_INSERT) {
+        _ = self.copySelection();
+    } else return false;
+
+    // Drop the text TranslateMessage posted for the key (ctrl+shift+c
+    // gives 0x03).
+    var m: win32.MSG = undefined;
+    while (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) != 0) {}
+    self.bound_key = vk;
+    return true;
+}
+
+/// Copy the selected text to the clipboard. Returns false if nothing is
+/// selected.
+fn copySelection(self: *Window) bool {
+    self.lockTerminal();
+    const screen = self.terminal.screens.active;
+    const sel = screen.selection orelse {
+        self.unlockTerminal();
+        return false;
+    };
+    const text = screen.selectionString(self.alloc, .{ .sel = sel });
+    self.unlockTerminal();
+
+    const utf8 = text catch |err| {
+        log.err("selection to text failed: {}", .{err});
+        return true;
+    };
+    defer self.alloc.free(utf8);
+    clipboard.set(self.hwnd.?, utf8) catch |err| log.err("copy failed: {}", .{err});
+    return true;
 }
 
 /// Send text from a WM_CHAR that no key message claimed: IME commits,
@@ -374,7 +446,7 @@ fn charInput(self: *Window, unit: u16) void {
         for ([_]bool{ true, false }) |down| {
             (input.Win32KeyEvent{ .char = unit, .down = down }).encode(&w) catch unreachable;
         }
-        self.scrollToBottom();
+        self.typed();
         if (self.pty) |*pty| pty.write(w.buffered());
         return;
     }
@@ -394,7 +466,7 @@ fn charInput(self: *Window, unit: u16) void {
 
     var utf8: [8]u8 = undefined;
     const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
-    self.scrollToBottom();
+    self.typed();
     if (self.pty) |*pty| pty.write(utf8[0..len]);
 }
 
@@ -409,15 +481,21 @@ fn win32KeyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     for (text) |unit| {
         input.Win32KeyEvent.fromKey(msg, wparam, lparam, unit).encode(&w) catch unreachable;
     }
-    if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.scrollToBottom();
+    if ((msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) and !input.isModifier(wparam, lparam)) self.typed();
     if (self.pty) |*pty| pty.write(w.buffered());
 }
 
-/// Bring the viewport back from scrollback, as typing does.
-fn scrollToBottom(self: *Window) void {
+/// Drop the selection and bring the viewport back from scrollback, as
+/// typing does.
+fn typed(self: *Window) void {
     self.lockTerminal();
     defer self.unlockTerminal();
-    if (self.terminal.screens.active.pages.viewport == .active) return;
+    const screen = self.terminal.screens.active;
+    if (screen.selection != null) {
+        screen.clearSelection();
+        self.dirty = true;
+    }
+    if (screen.pages.viewport == .active) return;
     self.terminal.scrollViewport(.bottom);
     self.dirty = true;
 }
@@ -440,6 +518,18 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     }
 
     self.lockTerminal();
+    // Shift selects even when the child asks for mouse events.
+    if (!self.selecting and button == .left and action == .press) {
+        if (self.terminal.flags.mouse_event != .none and wparam & win32.MK_SHIFT == 0) {
+            self.selection.reset(&self.terminal);
+        } else {
+            self.selecting = true;
+        }
+    }
+    if (self.selecting) {
+        defer self.unlockTerminal();
+        return self.selectionInput(msg, wparam, lparam);
+    }
     var opts: MouseEncodeOptions = .fromTerminal(&self.terminal, self.surfaceSize());
     self.unlockTerminal();
     opts.any_button_pressed = held;
@@ -453,6 +543,124 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             .y = @floatFromInt(win32.yLparam(lparam)),
         },
     }, opts);
+}
+
+/// Start, extend, or finish a selection with the left button: a click
+/// clears it, a drag selects cells (a rectangle with ctrl+alt), and
+/// double and triple clicks select words and lines. Call with the
+/// terminal locked.
+fn selectionInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+    const t = &self.terminal;
+    const pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+    const pin = t.screens.active.pages.pin(.{ .viewport = self.cellAt(pos) }) orelse return;
+    const sel: ?ghostty_vt.Selection = switch (msg) {
+        win32.WM_LBUTTONDOWN => self.selection.press(t, .{
+            .time = messageTime(),
+            .pin = pin,
+            .xpos = @floatFromInt(pos.x),
+            .ypos = @floatFromInt(pos.y),
+            .max_distance = @floatFromInt(self.grid.metrics.cell_width),
+            .repeat_interval = @as(u64, win32.GetDoubleClickTime()) * std.time.ns_per_ms,
+            .word_boundary_codepoints = &word_boundaries,
+        }) catch |err| {
+            log.err("selection failed: {}", .{err});
+            return;
+        },
+        win32.WM_MOUSEMOVE => sel: {
+            if (wparam & win32.MK_LBUTTON == 0) return;
+            self.drag_pos = pos;
+            const sel = self.selection.drag(t, .{
+                .pin = pin,
+                .xpos = @floatFromInt(pos.x),
+                .ypos = @floatFromInt(pos.y),
+                .rectangle = rectangleSelect(),
+                .word_boundary_codepoints = &word_boundaries,
+                .geometry = self.dragGeometry(),
+            });
+            self.updateAutoscroll();
+            break :sel sel;
+        },
+        win32.WM_LBUTTONUP => {
+            self.endSelection(pin);
+            return;
+        },
+        else => return,
+    };
+    t.screens.active.select(sel) catch |err| log.err("selection failed: {}", .{err});
+    self.dirty = true;
+}
+
+/// Scroll the viewport one row toward a selection drag above or below
+/// it, and extend the selection there.
+fn autoscrollTick(self: *Window) void {
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    const t = &self.terminal;
+    const sel = self.selection.autoscrollTick(t, .{
+        .viewport = self.cellAt(self.drag_pos),
+        .xpos = @floatFromInt(self.drag_pos.x),
+        .ypos = @floatFromInt(self.drag_pos.y),
+        .rectangle = rectangleSelect(),
+        .word_boundary_codepoints = &word_boundaries,
+        .geometry = self.dragGeometry(),
+    });
+    self.updateAutoscroll();
+    // A reset gesture (the screen switched) leaves the selection alone.
+    if (self.selection.left_click_count == 0) return;
+    t.screens.active.select(sel) catch |err| log.err("selection failed: {}", .{err});
+    self.dirty = true;
+}
+
+/// Finish a selection drag, at `pin` if the button was released over a
+/// cell. Call with the terminal locked.
+fn endSelection(self: *Window, pin: ?ghostty_vt.Pin) void {
+    self.selection.release(&self.terminal, .{ .pin = pin });
+    self.selecting = false;
+    self.updateAutoscroll();
+}
+
+/// Run the autoscroll timer while the drag asks for it.
+fn updateAutoscroll(self: *Window) void {
+    if (self.selection.left_drag_autoscroll == .none) {
+        _ = win32.KillTimer(self.hwnd, autoscroll_timer_id);
+    } else {
+        _ = win32.SetTimer(self.hwnd, autoscroll_timer_id, 15, null);
+    }
+}
+
+fn dragGeometry(self: *const Window) ghostty_vt.SelectionGesture.Drag.Geometry {
+    return .{
+        .columns = self.terminal.cols,
+        .cell_width = self.grid.metrics.cell_width,
+        .padding_left = self.paddingPx(),
+        .screen_height = self.clientSize().height,
+    };
+}
+
+/// The viewport cell under a client position, clamped to the grid. Call
+/// with the terminal locked.
+fn cellAt(self: *const Window, pos: win32.POINT) ghostty_vt.Coordinate {
+    const m = self.grid.metrics;
+    const pad: i32 = @intCast(self.paddingPx());
+    const x = @divFloor(pos.x - pad, @as(i32, @intCast(m.cell_width)));
+    const y = @divFloor(pos.y - pad, @as(i32, @intCast(m.cell_height)));
+    return .{
+        .x = @intCast(std.math.clamp(x, 0, @as(i32, self.terminal.cols) - 1)),
+        .y = @intCast(std.math.clamp(y, 0, @as(i32, self.terminal.rows) - 1)),
+    };
+}
+
+/// Ctrl+alt drags select a rectangle, as in Ghostty on Linux.
+fn rectangleSelect() bool {
+    const mods = input.currentMods();
+    return mods.ctrl and mods.alt;
+}
+
+/// When the message being handled was posted, for telling double clicks
+/// apart. GetMessageTime is milliseconds since boot, wrapping at 2^32.
+fn messageTime() std.Io.Timestamp {
+    const ms: u32 = @bitCast(win32.GetMessageTime());
+    return .{ .nanoseconds = @as(i96, ms) * std.time.ns_per_ms };
 }
 
 /// Scroll with the wheel: report wheel buttons if the child asked for
@@ -733,6 +941,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         win32.WM_TIMER => {
             switch (wparam) {
                 stats_timer_id => if (build_options.stats) self.showStats(),
+                autoscroll_timer_id => self.autoscrollTick(),
                 sizemove_timer_id => {
                     if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.dirty = true;
                     if (self.dirty) self.render();
@@ -748,6 +957,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_KEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP => {
+            if (self.keyBinding(msg, wparam)) return 0;
             switch (wparam) {
                 // The text arrives as WM_CHAR.
                 win32.VK_PACKET, win32.VK_PROCESSKEY => {},
@@ -785,6 +995,16 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP => {
             self.mouseInput(msg, wparam, lparam);
             return win32.TRUE;
+        },
+
+        // Losing the capture mid-drag (alt+tab, a modal window) ends it.
+        win32.WM_CAPTURECHANGED => {
+            if (self.selecting and lparam != @as(isize, @bitCast(@intFromPtr(hwnd)))) {
+                self.lockTerminal();
+                defer self.unlockTerminal();
+                self.endSelection(null);
+            }
+            return 0;
         },
 
         win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {

@@ -194,6 +194,7 @@ pub const WM_MOUSEWHEEL = 0x020A;
 pub const WM_XBUTTONDOWN = 0x020B;
 pub const WM_XBUTTONUP = 0x020C;
 pub const WM_MOUSEHWHEEL = 0x020E;
+pub const WM_CAPTURECHANGED = 0x0215;
 pub const WM_DPICHANGED = 0x02E0;
 pub const WM_APP = 0x8000;
 
@@ -266,6 +267,7 @@ pub const VK_SHIFT = 0x10;
 pub const VK_CONTROL = 0x11;
 pub const VK_MENU = 0x12;
 pub const VK_CAPITAL = 0x14;
+pub const VK_INSERT = 0x2D;
 pub const VK_LWIN = 0x5B;
 pub const VK_RWIN = 0x5C;
 pub const VK_NUMPAD0 = 0x60;
@@ -295,6 +297,10 @@ pub const INFINITE: u32 = 0xFFFFFFFF;
 pub const LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
 
 pub const ERROR_BROKEN_PIPE = 109;
+
+// Clipboard
+pub const CF_UNICODETEXT = 13;
+pub const GMEM_MOVEABLE = 0x0002;
 
 pub extern "kernel32" fn GetModuleHandleW(?LPCWSTR) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn GetLastError() callconv(.winapi) u32;
@@ -337,6 +343,10 @@ pub extern "kernel32" fn RegisterWaitForSingleObject(*HANDLE, HANDLE, WAITORTIME
 pub extern "kernel32" fn UnregisterWaitEx(HANDLE, ?HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn AcquireSRWLockExclusive(*SRWLOCK) callconv(.winapi) void;
 pub extern "kernel32" fn ReleaseSRWLockExclusive(*SRWLOCK) callconv(.winapi) void;
+pub extern "kernel32" fn GlobalAlloc(u32, usize) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn GlobalLock(HANDLE) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn GlobalUnlock(HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GlobalFree(HANDLE) callconv(.winapi) ?HANDLE;
 
 pub extern "user32" fn SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetDpiForWindow(HWND) callconv(.winapi) u32;
@@ -381,6 +391,12 @@ pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn SetCursor(?HCURSOR) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn SystemParametersInfoW(u32, u32, ?*anyopaque, u32) callconv(.winapi) BOOL;
+pub extern "user32" fn GetMessageTime() callconv(.winapi) i32;
+pub extern "user32" fn GetDoubleClickTime() callconv(.winapi) u32;
+pub extern "user32" fn OpenClipboard(?HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
+pub extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
+pub extern "user32" fn SetClipboardData(u32, ?HANDLE) callconv(.winapi) ?HANDLE;
 
 pub extern "dwmapi" fn DwmGetCompositionTimingInfo(?HWND, *DWM_TIMING_INFO) callconv(.winapi) HRESULT;
 pub extern "dwmapi" fn DwmSetWindowAttribute(HWND, u32, *const anyopaque, u32) callconv(.winapi) HRESULT;

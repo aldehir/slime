@@ -64,6 +64,7 @@ src/Window.zig          HWND + owns Terminal, stream, RenderState, font Grid, re
                         Pty, reader thread; SRW lock guards terminal/stream
 src/Pty.zig             pipes + pseudoconsole + child process in a kill-on-close job
 src/input.zig           Win32 key messages -> libghostty-vt KeyEvent (scancode table)
+src/clipboard.zig       UTF-8 <-> CF_UNICODETEXT (LF <-> CRLF)
 src/renderer/cells.zig  RenderState -> per-cell bg colors + instanced quads (API agnostic)
 src/renderer/D3D11.zig  swap chain, pipeline, buffer/atlas upload, draw
 src/renderer/shaders.hlsl  compiled at runtime with d3dcompiler_47
