@@ -147,6 +147,7 @@ test {
     _ = Window;
     _ = Config;
     _ = @import("Session.zig");
+    _ = @import("SshConnection.zig");
     _ = @import("chrome/Chrome.zig");
     _ = @import("chrome/sidebar.zig");
     _ = @import("chrome/theme.zig");

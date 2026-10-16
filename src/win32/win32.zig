@@ -106,6 +106,12 @@ pub const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
     SchedulingClass: u32 = 0,
 };
 
+pub const SECURITY_ATTRIBUTES = extern struct {
+    nLength: u32 = @sizeOf(SECURITY_ATTRIBUTES),
+    lpSecurityDescriptor: ?*anyopaque = null,
+    bInheritHandle: BOOL = FALSE,
+};
+
 pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
     BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION = .{},
     IoInfo: [6]u64 = @splat(0),
@@ -277,6 +283,7 @@ pub const PM_REMOVE = 0x0001;
 pub const QS_ALLINPUT = 0x04FF;
 pub const MWMO_INPUTAVAILABLE = 0x0004;
 pub const WAIT_OBJECT_0 = 0;
+pub const WAIT_TIMEOUT = 0x102;
 pub const CREATE_WAITABLE_TIMER_MANUAL_RESET = 0x00000001;
 pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
 pub const TIMER_ALL_ACCESS = 0x001F0003;
@@ -341,7 +348,13 @@ pub const STARTF_USESTDHANDLES = 0x00000100;
 pub const CREATE_SUSPENDED = 0x00000004;
 pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
 pub const EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+pub const CREATE_NO_WINDOW = 0x08000000;
 pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016;
+pub const PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
+pub const HANDLE_FLAG_INHERIT = 0x00000001;
+pub const DUPLICATE_CLOSE_SOURCE = 0x00000001;
+pub const DUPLICATE_SAME_ACCESS = 0x00000002;
+pub const STD_ERROR_HANDLE: u32 = @bitCast(@as(i32, -12));
 pub const JobObjectExtendedLimitInformation = 9;
 pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
 pub const WT_EXECUTEONLYONCE = 0x00000008;
@@ -395,6 +408,11 @@ pub extern "kernel32" fn CreateProcessW(
     lpStartupInfo: *STARTUPINFOEXW,
     lpProcessInformation: *PROCESS_INFORMATION,
 ) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+pub extern "kernel32" fn DuplicateHandle(HANDLE, HANDLE, HANDLE, *HANDLE, u32, BOOL, u32) callconv(.winapi) BOOL;
+pub extern "kernel32" fn SetHandleInformation(HANDLE, u32, u32) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetStdHandle(u32) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn GetModuleFileNameW(?HMODULE, [*]u16, u32) callconv(.winapi) u32;
 pub extern "kernel32" fn ResumeThread(HANDLE) callconv(.winapi) u32;
 pub extern "kernel32" fn CreateJobObjectW(?*anyopaque, ?LPCWSTR) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn SetInformationJobObject(HANDLE, i32, *const anyopaque, u32) callconv(.winapi) BOOL;

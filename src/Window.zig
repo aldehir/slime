@@ -19,6 +19,7 @@ const clipboard = @import("clipboard.zig");
 const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
+const SshConnection = @import("SshConnection.zig");
 const Chrome = @import("chrome/Chrome.zig");
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
@@ -31,8 +32,9 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("slime");
 /// The icon resource in src/slime.rc.
 const icon_id = 1;
 
-/// Posted from a thread pool wait when a session's child exits. WPARAM
-/// is the session's ID, as for the messages below.
+/// Posted from a thread pool wait when a session's child exits, or from
+/// its reader thread when an SSH session's channel ends. WPARAM is the
+/// session's ID, as for the messages below.
 pub const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
 /// Posted from a reader thread when the child sets the title.
 pub const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
@@ -261,12 +263,42 @@ fn sessionIndex(self: *const Window, id: u32) ?usize {
     return null;
 }
 
-/// Start a session running the window's command, and show it.
+/// Start a session and show it. One opened from an SSH session joins its
+/// connection, in the directory the shell last reported (OSC 7), without
+/// logging in again. Otherwise it runs the window's command, which may
+/// be an `ssh://` URL for a new connection.
 fn spawnSession(self: *Window) !void {
     try self.sessions.ensureUnusedCapacity(self.alloc, 1);
     try self.view_sessions.ensureTotalCapacity(self.alloc, self.sessions.items.len + 1);
     const grid_size = self.gridSize();
-    const s = try Session.create(self, self.next_session_id, self.command_line, grid_size.cols, grid_size.rows);
+    // Channel IDs are session IDs, and the helper takes 0 to mean the
+    // connection.
+    if (self.next_session_id == 0) self.next_session_id = 1;
+
+    var cwd_buf: [4096]u8 = undefined;
+    var new_conn: ?*SshConnection = null;
+    const launch: Session.Launch = launch: {
+        if (self.sessions.items.len > 0) {
+            const active = self.activeSession();
+            if (active.sshConnection()) |conn| if (conn.isAlive()) break :launch .{ .ssh = .{
+                .conn = conn,
+                .title = active.default_title,
+                .cwd = active.pwd(&cwd_buf),
+            } };
+        }
+        const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
+        if (std.mem.startsWith(u16, self.command_line, ssh_scheme)) {
+            const dest = try std.unicode.utf16LeToUtf8Alloc(self.alloc, self.command_line);
+            defer self.alloc.free(dest);
+            new_conn = try SshConnection.spawn(self.alloc, dest);
+            break :launch .{ .ssh = .{ .conn = new_conn.?, .title = self.command_line[ssh_scheme.len..] } };
+        }
+        break :launch .{ .command = self.command_line };
+    };
+    const s = Session.create(self, self.next_session_id, launch, grid_size.cols, grid_size.rows) catch |err| {
+        if (new_conn) |conn| conn.shutdownIfUnused();
+        return err;
+    };
     self.next_session_id +%= 1;
     self.sessions.appendAssumeCapacity(s);
     if (self.sessions.items.len > 1) self.activate(self.sessions.items.len - 1);
@@ -994,7 +1026,16 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         WM_APP_CHILD_EXITED => {
-            if (self.sessionIndex(@intCast(wparam))) |i| self.closeSession(i);
+            const i = self.sessionIndex(@intCast(wparam)) orelse return 0;
+            const s = self.sessions.items[i];
+            // A failed SSH channel (login, connection, or open) stays to
+            // say why. A shell that exited closes like a local one.
+            if (s.sshEnding()) |ending| if (!ending.exited) {
+                s.showEnded(ending.text());
+                self.dirty = true;
+                return 0;
+            };
+            self.closeSession(i);
             return 0;
         },
 
@@ -1014,6 +1055,16 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
         win32.WM_KEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP => {
             if (self.keyBinding(msg, wparam)) return 0;
+            if (self.activeSession().ended) {
+                if ((msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) and !input.isModifier(wparam, lparam)) {
+                    // Drop the key's text, which would otherwise go to
+                    // the session shown next.
+                    var m: win32.MSG = undefined;
+                    while (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) != 0) {}
+                    self.closeSession(self.active);
+                }
+                return 0;
+            }
             switch (wparam) {
                 // The text arrives as WM_CHAR.
                 win32.VK_PACKET, win32.VK_PROCESSKEY => {},

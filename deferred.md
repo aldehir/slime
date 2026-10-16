@@ -98,6 +98,30 @@ Images placed at the cursor are drawn, in kitty's three z layers.
 - **PSEUDOCONSOLE_INHERIT_CURSOR.** Skipped because the screen starts
   empty.
 
+## SSH
+
+`command = ssh://[user@]host[:port]` (or `slime ssh://...`) runs sessions
+through `slime-ssh.exe` (ssh/), one connection shared by every session
+opened from one of its sessions.
+
+- **A way to pick a host** other than the command: a connection list or
+  palette in the chrome, and a binding for a local session while an SSH
+  one is active.
+- **The sidebar groups SSH sessions under "Local".** They could group by
+  connection.
+- **`~/.ssh/config`**: `Host` aliases, `User`, `Port`, `IdentityFile`,
+  `ProxyJump`, `ServerAliveInterval`. The helper takes only what's in
+  the URL, plus its own flags.
+- **Keepalives.** A dead connection with no traffic isn't noticed until
+  TCP gives up.
+- **Pixel sizes in `pty-req` and `window-change`.** Only cells are sent;
+  mode 2048 reports still carry pixels in-band.
+- **Ghostty's terminfo on the remote.** `TERM` is `xterm-256color`.
+- **Structured prompts** (host keys, passwords, Duo) in the chrome. They
+  are text in the session for now; the protocol reserves a message.
+- **Agent forwarding, port forwarding, SFTP.**
+- **Helper logs in GUI builds** go nowhere: there is no stderr to pass.
+
 ## Configuration
 
 `Config.zig` covers fonts, colors, themes, padding, word characters, and

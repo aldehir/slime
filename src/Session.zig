@@ -14,6 +14,7 @@ const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const input = @import("input.zig");
 const Pty = @import("Pty.zig");
+const SshConnection = @import("SshConnection.zig");
 const clipboard = @import("clipboard.zig");
 const build_options = @import("build_options");
 const Window = @import("Window.zig");
@@ -61,9 +62,13 @@ cells: Cells = .{},
 images: Images = .{},
 textures: Renderer.ImageTextures = .{},
 
-pty: ?Pty = null,
+transport: ?Transport = null,
 reader: ?std.Thread = null,
 exit_wait: ?win32.HANDLE = null,
+
+/// The SSH channel failed, and the session stays to say why until a key
+/// closes it. UI thread only.
+ended: bool = false,
 
 /// Output arrived that the window hasn't drawn. Set by the reader thread.
 unseen: std.atomic.Value(bool) = .init(false),
@@ -97,14 +102,58 @@ selecting: bool = false,
 /// Where the selection drag last was, for autoscroll ticks.
 drag_pos: win32.POINT = .{ .x = 0, .y = 0 },
 
-/// Start `command_line` (CreateProcessW syntax) in a new session with a
-/// grid of `cols` x `rows`.
-pub fn create(window: *Window, id: u32, command_line: []const u16, cols: u16, rows: u16) !*Session {
+/// What a session talks to.
+const Transport = union(enum) {
+    /// A local child in a pseudoconsole.
+    conpty: Pty,
+    /// A remote shell on an SSH connection.
+    ssh: *SshConnection.Channel,
+
+    fn read(self: *Transport, buf: []u8) !usize {
+        return switch (self.*) {
+            .conpty => |*pty| pty.read(buf),
+            .ssh => |ch| ch.read(buf),
+        };
+    }
+
+    fn write(self: *Transport, data: []const u8) void {
+        switch (self.*) {
+            .conpty => |*pty| pty.write(data),
+            .ssh => |ch| ch.write(data),
+        }
+    }
+
+    fn resize(self: *Transport, cols: u16, rows: u16) void {
+        switch (self.*) {
+            .conpty => |*pty| pty.resize(cols, rows),
+            .ssh => |ch| ch.resize(cols, rows),
+        }
+    }
+};
+
+/// What a new session starts.
+pub const Launch = union(enum) {
+    /// A command line, CreateProcessW syntax.
+    command: []const u16,
+    /// A shell on `conn`, in `cwd` if set, titled `title` until it sets
+    /// its own.
+    ssh: struct {
+        conn: *SshConnection,
+        title: []const u16,
+        cwd: ?[]const u8 = null,
+    },
+};
+
+/// Start `launch` in a new session with a grid of `cols` x `rows`.
+pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*Session {
     const alloc = window.alloc;
     const config = window.config;
     const self = try alloc.create(Session);
     errdefer alloc.destroy(self);
-    const default_title = try alloc.dupe(u16, programName(command_line));
+    const default_title = try alloc.dupe(u16, switch (launch) {
+        .command => |command_line| programName(command_line),
+        .ssh => |ssh| ssh.title,
+    });
     errdefer alloc.free(default_title);
     self.* = .{
         .window = window,
@@ -157,17 +206,27 @@ pub fn create(window: *Window, id: u32, command_line: []const u16, cols: u16, ro
     self.stream.handler.effects.clipboard_read = &clipboardRead;
     self.stream.handler.unknown_sequence = &unknownSequence;
 
-    // CreateProcessW may modify the command line.
-    const cmd = try alloc.dupeZ(u16, command_line);
-    defer alloc.free(cmd);
-    self.pty = try .spawn(cmd, cols, rows);
-    errdefer self.stopPty();
+    switch (launch) {
+        .command => |command_line| {
+            // CreateProcessW may modify the command line.
+            const cmd = try alloc.dupeZ(u16, command_line);
+            defer alloc.free(cmd);
+            self.transport = .{ .conpty = try .spawn(cmd, cols, rows) };
+        },
+        .ssh => |ssh| self.transport = .{ .ssh = try ssh.conn.open(id, cols, rows, ssh.cwd) },
+    }
+    errdefer self.stopTransport();
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
 
+    // An SSH channel has no process here; its reader reports the end.
+    const pty = switch (self.transport.?) {
+        .conpty => |*pty| pty,
+        .ssh => return self,
+    };
     var wait: win32.HANDLE = undefined;
     if (win32.RegisterWaitForSingleObject(
         &wait,
-        self.pty.?.process,
+        pty.process,
         onChildExited,
         self,
         win32.INFINITE,
@@ -179,7 +238,7 @@ pub fn create(window: *Window, id: u32, command_line: []const u16, cols: u16, ro
 
 pub fn destroy(self: *Session) void {
     const alloc = self.alloc;
-    self.stopPty();
+    self.stopTransport();
     self.textures.deinit(alloc);
     self.cells.deinit(alloc);
     self.images.deinit(alloc);
@@ -192,20 +251,62 @@ pub fn destroy(self: *Session) void {
     alloc.destroy(self);
 }
 
-/// Close the pseudoconsole, wait for the reader to drain it, and kill
-/// whatever is left of the child's process tree.
-fn stopPty(self: *Session) void {
+/// Close the pseudoconsole or channel and wait for the reader to drain
+/// it. Kills whatever is left of a local child's process tree.
+fn stopTransport(self: *Session) void {
     if (self.exit_wait) |wait| {
         // INVALID_HANDLE_VALUE: wait for a running callback to finish.
         _ = win32.UnregisterWaitEx(wait, win32.INVALID_HANDLE_VALUE);
         self.exit_wait = null;
     }
-    const pty = &(self.pty orelse return);
-    pty.close();
+    const transport = &(self.transport orelse return);
+    switch (transport.*) {
+        .conpty => |*pty| pty.close(),
+        .ssh => |ch| ch.close(),
+    }
     if (self.reader) |t| t.join();
     self.reader = null;
-    pty.deinit();
-    self.pty = null;
+    switch (transport.*) {
+        .conpty => |*pty| pty.deinit(),
+        .ssh => |ch| ch.deinit(),
+    }
+    self.transport = null;
+}
+
+/// The SSH connection the session's shell runs on, if it's remote.
+pub fn sshConnection(self: *const Session) ?*SshConnection {
+    return switch (self.transport orelse return null) {
+        .conpty => null,
+        .ssh => |ch| ch.conn,
+    };
+}
+
+/// How the session's SSH channel ended, once it has. UI thread only,
+/// after WM_APP_CHILD_EXITED.
+pub fn sshEnding(self: *const Session) ?*const SshConnection.Ending {
+    return switch (self.transport orelse return null) {
+        .conpty => null,
+        .ssh => |ch| &ch.ending,
+    };
+}
+
+/// Keep the session after its SSH channel failed, saying why. Any key
+/// then closes it.
+pub fn showEnded(self: *Session, why: []const u8) void {
+    self.ended = true;
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    self.stream.nextSlice("\r\n\x1b[0m[");
+    self.stream.nextSlice(why);
+    self.stream.nextSlice(". Press any key to close.]\r\n");
+    self.unseen.store(true, .release);
+}
+
+/// The directory the shell last reported (OSC 7), decoded into `buf`.
+pub fn pwd(self: *Session, buf: []u8) ?[]const u8 {
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    return SshConnection.pwdFromUrl(buf, self.terminal.getPwd() orelse return null);
 }
 
 pub fn lockTerminal(self: *Session) void {
@@ -241,15 +342,15 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
     self.unlockTerminal();
 
     // After the terminal, so ConPTY's redraw lands on the new grid.
-    if (changed) if (self.pty) |*pty| pty.resize(cols, rows);
+    if (changed) if (self.transport) |*t| t.resize(cols, rows);
 }
 
 /// Reader thread: feed child output to the terminal until EOF, which
-/// comes when the pseudoconsole is closed.
+/// comes when the pseudoconsole or the SSH channel is closed.
 fn readLoop(self: *Session) void {
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = self.pty.?.read(&buf) catch break;
+        const n = self.transport.?.read(&buf) catch break;
         if (n == 0) break;
 
         self.lockTerminal();
@@ -259,6 +360,23 @@ fn readLoop(self: *Session) void {
         self.unseen.store(true, .release);
         _ = win32.SetEvent(self.window.output_event);
     }
+    self.channelEnded();
+}
+
+/// Send input (keys, pastes, query replies) to the child.
+fn writeChild(self: *Session, data: []const u8) void {
+    if (self.transport) |*t| t.write(data);
+}
+
+/// Reader thread, after an SSH channel's output ends: report it once the
+/// control thread knows how it ended, which the helper sends first.
+fn channelEnded(self: *Session) void {
+    const ch = switch (self.transport.?) {
+        .conpty => return,
+        .ssh => |ch| ch,
+    };
+    ch.waitEnded(5000);
+    _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
 }
 
 fn onChildExited(ctx: ?*anyopaque, _: u8) callconv(.winapi) void {
@@ -276,7 +394,7 @@ fn fromHandler(handler: *StreamHandler) *Session {
 /// thread, so it must not wait on the UI thread.
 fn writePty(handler: *StreamHandler, data: []const u8) void {
     const self = fromHandler(handler);
-    if (self.pty) |*pty| pty.write(data);
+    self.writeChild(data);
 }
 
 /// Stream effect for OSC 0/2. Runs on the reader thread with the
@@ -438,7 +556,7 @@ pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     }
     if (w.buffered().len == 0) return;
     if (event.action != .release and !event.key.modifier()) self.typed();
-    if (self.pty) |*pty| pty.write(w.buffered());
+    self.writeChild(w.buffered());
 }
 
 /// Copy the selected text to the clipboard. Returns false if nothing is
@@ -479,7 +597,7 @@ pub fn paste(self: *Session) void {
     self.unlockTerminal();
     self.typed();
     const parts = ghostty_vt.input.encodePaste(text, opts);
-    if (self.pty) |*pty| for (parts) |part| pty.write(part);
+    for (parts) |part| self.writeChild(part);
 }
 
 /// Send text from a WM_CHAR that no key message claimed: IME commits,
@@ -497,7 +615,7 @@ pub fn charInput(self: *Session, unit: u16) void {
             (input.Win32KeyEvent{ .char = unit, .down = down }).encode(&w) catch unreachable;
         }
         self.typed();
-        if (self.pty) |*pty| pty.write(w.buffered());
+        self.writeChild(w.buffered());
         return;
     }
 
@@ -517,7 +635,7 @@ pub fn charInput(self: *Session, unit: u16) void {
     var utf8: [8]u8 = undefined;
     const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
     self.typed();
-    if (self.pty) |*pty| pty.write(utf8[0..len]);
+    self.writeChild(utf8[0..len]);
 }
 
 /// Send a key in win32-input-mode: one event per UTF-16 unit of text it
@@ -534,7 +652,7 @@ fn win32KeyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.L
         input.Win32KeyEvent.fromKey(msg, wparam, lparam, unit).encode(&w) catch unreachable;
     }
     if ((msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) and !input.isModifier(wparam, lparam)) self.typed();
-    if (self.pty) |*pty| pty.write(w.buffered());
+    self.writeChild(w.buffered());
 }
 
 /// Drop the selection, bring the viewport back from scrollback, and show
@@ -564,7 +682,7 @@ pub fn reportFocus(self: *Session, focused: bool) void {
     var buf: [ghostty_vt.input.max_focus_encode_size]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     ghostty_vt.input.encodeFocus(&w, if (focused) .gained else .lost) catch unreachable;
-    if (self.pty) |*pty| pty.write(w.buffered());
+    self.writeChild(w.buffered());
 }
 
 /// Report a mouse button press or release, or motion, to the child if it
@@ -780,7 +898,7 @@ pub fn mouseWheel(self: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POI
             (if (up) "\x1bOA" else "\x1bOB")
         else
             (if (up) "\x1b[A" else "\x1b[B");
-        if (self.pty) |*pty| for (0..count) |_| pty.write(seq);
+        for (0..count) |_| self.writeChild(seq);
     } else {
         const delta: isize = @intCast(count);
         self.lockTerminal();
@@ -798,7 +916,7 @@ fn mouseReport(self: *Session, event: MouseEvent, opts: MouseEncodeOptions) void
         return;
     };
     if (w.buffered().len == 0) return;
-    if (self.pty) |*pty| pty.write(w.buffered());
+    self.writeChild(w.buffered());
 }
 
 /// The terminal area as the mouse encoder sees it, to map positions to

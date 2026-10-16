@@ -87,6 +87,7 @@ pub fn build(b: *std.Build) void {
     exe.entry = .{ .symbol_name = "mainCRTStartup" };
     b.installArtifact(exe);
     installConpty(b);
+    if (b.option(bool, "ssh", "Build the slime-ssh helper (needs Go; default: true)") orelse true) installSshHelper(b);
 
     // Themes for the `theme` config key, in `themes` next to the exe.
     if (b.lazyDependency("iterm2_themes", .{})) |themes| {
@@ -133,6 +134,25 @@ fn renderIcon(b: *std.Build) Icon {
     const ico = run.addOutputFileArg("slime.ico");
     const png_dir = run.addOutputDirectoryArg("png");
     return .{ .ico = ico, .png_dir = png_dir };
+}
+
+/// slime-ssh.exe, next to the exe, for `ssh://` commands. Go caches its
+/// own builds, so this runs `go build` every time rather than tracking
+/// the sources. Without Go it warns and leaves the helper out.
+fn installSshHelper(b: *std.Build) void {
+    const go = b.findProgram(&.{"go"}, &.{}) catch {
+        std.log.warn("go not found; building without slime-ssh (ssh:// commands won't work)", .{});
+        return;
+    };
+    const build_helper = b.addSystemCommand(&.{ go, "build", "-trimpath", "-ldflags=-s -w", "-o" });
+    const out = build_helper.addOutputFileArg("slime-ssh.exe");
+    build_helper.addArg("./cmd/slime-ssh");
+    build_helper.setCwd(b.path("ssh"));
+    build_helper.setEnvironmentVariable("GOOS", "windows");
+    build_helper.setEnvironmentVariable("GOARCH", "amd64");
+    build_helper.setEnvironmentVariable("CGO_ENABLED", "0");
+    build_helper.has_side_effects = true;
+    b.getInstallStep().dependOn(&b.addInstallBinFile(out, "slime-ssh.exe").step);
 }
 
 fn installConpty(b: *std.Build) void {
