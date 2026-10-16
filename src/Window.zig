@@ -44,7 +44,7 @@ const blink_timer_id = 4;
 
 /// How long a frame waits for a cursor that output just hid to come
 /// back. See `updateHold`.
-const cursor_hold_ms = 8;
+const cursor_hold_ms = 4;
 /// How long synchronized output (mode 2026) can hold frames back before
 /// we reset it, Ghostty's `sync_reset_ms`.
 const sync_hold_ms = 1000;
