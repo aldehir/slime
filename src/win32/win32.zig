@@ -250,6 +250,17 @@ pub const WHEEL_DELTA = 120;
 pub const WHEEL_PAGESCROLL: u32 = 0xFFFFFFFF;
 pub const SPI_GETWHEELSCROLLLINES = 0x0068;
 
+// KEY_EVENT_RECORD.dwControlKeyState
+pub const RIGHT_ALT_PRESSED = 0x0001;
+pub const LEFT_ALT_PRESSED = 0x0002;
+pub const RIGHT_CTRL_PRESSED = 0x0004;
+pub const LEFT_CTRL_PRESSED = 0x0008;
+pub const SHIFT_PRESSED = 0x0010;
+pub const NUMLOCK_ON = 0x0020;
+pub const SCROLLLOCK_ON = 0x0040;
+pub const CAPSLOCK_ON = 0x0080;
+pub const ENHANCED_KEY = 0x0100;
+
 // Virtual keys
 pub const VK_SHIFT = 0x10;
 pub const VK_CONTROL = 0x11;
@@ -262,6 +273,9 @@ pub const VK_NUMPAD9 = 0x69;
 pub const VK_DECIMAL = 0x6E;
 pub const VK_F4 = 0x73;
 pub const VK_NUMLOCK = 0x90;
+pub const VK_SCROLL = 0x91;
+pub const VK_LCONTROL = 0xA2;
+pub const VK_LMENU = 0xA4;
 pub const VK_RSHIFT = 0xA1;
 pub const VK_RCONTROL = 0xA3;
 pub const VK_RMENU = 0xA5;

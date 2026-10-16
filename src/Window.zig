@@ -82,6 +82,12 @@ dirty: bool = false,
 /// The first half of a surrogate pair from a lone WM_CHAR.
 high_surrogate: ?u16 = null,
 
+/// win32-input-mode (mode 9001): send keys as Win32 key events. Whoever
+/// is on the other end of the VT stream asks for it, which in practice
+/// is a ConPTY (ours, or a remote Windows host's), so it follows the
+/// stream rather than the transport. Guarded by `lock`.
+win32_input: bool = false,
+
 /// The cell the last mouse event was reported in, so motion within one
 /// cell is reported once.
 mouse_cell: ?ghostty_vt.Coordinate = null,
@@ -158,6 +164,7 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
     errdefer self.stream.deinit();
     self.stream.handler.effects.write_pty = &writePty;
     self.stream.handler.effects.device_attributes = &deviceAttributes;
+    self.stream.handler.unknown_sequence = &unknownSequence;
 
     self.renderer = try Renderer.init(hwnd, size.width, size.height);
     errdefer {
@@ -290,6 +297,19 @@ fn deviceAttributes(_: *StreamHandler) ghostty_vt.device_attributes.Attributes {
 }
 
 /// Encode a key message and send it to the child.
+/// Track the modes libghostty-vt leaves to us. Runs on the reader thread
+/// with the terminal locked.
+fn unknownSequence(handler: *StreamHandler, seq: StreamHandler.UnknownSequence) void {
+    const stream: *ghostty_vt.TerminalStream = @fieldParentPtr("handler", handler);
+    const self: *Window = @fieldParentPtr("stream", stream);
+    switch (seq) {
+        .mode => |m| if (m.mode == 9001 and !m.ansi) {
+            self.win32_input = m.enabled;
+        },
+        else => {},
+    }
+}
+
 fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
     // TranslateMessage already posted the WM_(SYS)CHAR / WM_(SYS)DEADCHAR
     // messages this key produced. Take them so the key and its text are
@@ -310,13 +330,15 @@ fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM)
             }
         }
     }
-    var utf8: [64]u8 = undefined;
-    const text_len = std.unicode.utf16LeToUtf8(&utf8, utf16[0..len]) catch 0;
-
-    const event = input.keyEvent(msg, wparam, lparam, utf8[0..text_len], composing);
     self.lockTerminal();
+    const win32_input = self.win32_input;
     const opts: ghostty_vt.input.KeyEncodeOptions = .fromTerminal(&self.terminal);
     self.unlockTerminal();
+    if (win32_input) return self.win32KeyInput(msg, wparam, lparam, utf16[0..len]);
+
+    var utf8: [64]u8 = undefined;
+    const text_len = std.unicode.utf16LeToUtf8(&utf8, utf16[0..len]) catch 0;
+    const event = input.keyEvent(msg, wparam, lparam, utf8[0..text_len], composing);
 
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -324,6 +346,15 @@ fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM)
         log.warn("key encode failed: {}", .{err});
         return;
     };
+    // Following fixterms, the legacy encoder leaves ctrl+[, ctrl+i, and
+    // ctrl+m to CSI u, which it only emits with the key's plain text, so
+    // they encode to nothing. Send the C0 byte Windows produced (ESC,
+    // TAB, CR), as xterm and Windows Terminal do.
+    if (w.buffered().len == 0 and event.action != .release and
+        text_len == 1 and std.ascii.isControl(utf8[0]))
+    {
+        w.writeByte(utf8[0]) catch unreachable;
+    }
     if (w.buffered().len == 0) return;
     if (event.action != .release) self.scrollToBottom();
     if (self.pty) |*pty| pty.write(w.buffered());
@@ -332,6 +363,22 @@ fn keyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM)
 /// Send text from a WM_CHAR that no key message claimed: IME commits,
 /// alt+numpad codes, and VK_PACKET input from SendInput.
 fn charInput(self: *Window, unit: u16) void {
+    self.lockTerminal();
+    const win32_input = self.win32_input;
+    self.unlockTerminal();
+    if (win32_input) {
+        // A press and release of no key, carrying the text. Surrogate
+        // halves go as they come; the console pairs them.
+        var buf: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for ([_]bool{ true, false }) |down| {
+            (input.Win32KeyEvent{ .char = unit, .down = down }).encode(&w) catch unreachable;
+        }
+        self.scrollToBottom();
+        if (self.pty) |*pty| pty.write(w.buffered());
+        return;
+    }
+
     var units: [2]u16 = undefined;
     const pair: []const u16 = if (std.unicode.utf16IsHighSurrogate(unit)) {
         self.high_surrogate = unit;
@@ -349,6 +396,21 @@ fn charInput(self: *Window, unit: u16) void {
     const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
     self.scrollToBottom();
     if (self.pty) |*pty| pty.write(utf8[0..len]);
+}
+
+/// Send a key in win32-input-mode: one event per UTF-16 unit of text it
+/// produced, or one with no text.
+fn win32KeyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM, text: []const u16) void {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    if (text.len == 0) {
+        input.Win32KeyEvent.fromKey(msg, wparam, lparam, 0).encode(&w) catch unreachable;
+    }
+    for (text) |unit| {
+        input.Win32KeyEvent.fromKey(msg, wparam, lparam, unit).encode(&w) catch unreachable;
+    }
+    if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.scrollToBottom();
+    if (self.pty) |*pty| pty.write(w.buffered());
 }
 
 /// Bring the viewport back from scrollback, as typing does.

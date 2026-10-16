@@ -88,6 +88,61 @@ pub fn mouseMods(wparam: win32.WPARAM) Mods {
     };
 }
 
+/// One Win32 key event for win32-input-mode (mode 9001), which ConPTY
+/// asks for so it can hand console programs the exact KEY_EVENT_RECORD
+/// instead of guessing one from VT input:
+/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`.
+pub const Win32KeyEvent = struct {
+    vk: u16 = 0,
+    scancode: u16 = 0,
+    /// UTF-16 code unit the key produced, or 0.
+    char: u16 = 0,
+    down: bool,
+    control_state: u32 = 0,
+    repeat: u16 = 1,
+
+    /// The event for a WM_(SYS)KEYDOWN or WM_(SYS)KEYUP. `char` is one
+    /// unit of the text it produced.
+    pub fn fromKey(msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM, char: u16) Win32KeyEvent {
+        const flags: usize = @bitCast(lparam);
+        return .{
+            .vk = @truncate(wparam),
+            .scancode = @truncate((flags >> 16) & 0xFF),
+            .char = char,
+            .down = msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN,
+            .control_state = controlKeyState(flags & (1 << 24) != 0),
+            .repeat = @max(win32.loword(lparam), 1),
+        };
+    }
+
+    pub fn encode(self: Win32KeyEvent, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("\x1b[{d};{d};{d};{d};{d};{d}_", .{
+            self.vk,
+            self.scancode,
+            self.char,
+            @intFromBool(self.down),
+            self.control_state,
+            self.repeat,
+        });
+    }
+};
+
+/// The current modifiers and lock keys as KEY_EVENT_RECORD's
+/// dwControlKeyState.
+pub fn controlKeyState(enhanced: bool) u32 {
+    var state: u32 = 0;
+    if (down(win32.VK_RMENU)) state |= win32.RIGHT_ALT_PRESSED;
+    if (down(win32.VK_LMENU)) state |= win32.LEFT_ALT_PRESSED;
+    if (down(win32.VK_RCONTROL)) state |= win32.RIGHT_CTRL_PRESSED;
+    if (down(win32.VK_LCONTROL)) state |= win32.LEFT_CTRL_PRESSED;
+    if (down(win32.VK_SHIFT)) state |= win32.SHIFT_PRESSED;
+    if (toggled(win32.VK_NUMLOCK)) state |= win32.NUMLOCK_ON;
+    if (toggled(win32.VK_SCROLL)) state |= win32.SCROLLLOCK_ON;
+    if (toggled(win32.VK_CAPITAL)) state |= win32.CAPSLOCK_ON;
+    if (enhanced) state |= win32.ENHANCED_KEY;
+    return state;
+}
+
 fn currentMods() Mods {
     return .{
         .shift = down(win32.VK_SHIFT),
@@ -267,4 +322,18 @@ test keyFromScancode {
     try std.testing.expectEqual(Key.arrow_up, keyFromScancode(0x48, true, 0x26));
     try std.testing.expectEqual(Key.numpad_8, keyFromScancode(0x48, false, win32.VK_NUMPAD0 + 8));
     try std.testing.expectEqual(Key.numpad_up, keyFromScancode(0x48, false, 0x26));
+}
+
+test Win32KeyEvent {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // ctrl+[ on a US layout: VK_OEM_4, scancode 0x1A, ESC, left ctrl.
+    try (Win32KeyEvent{
+        .vk = 0xDB,
+        .scancode = 0x1A,
+        .char = 0x1B,
+        .down = true,
+        .control_state = win32.LEFT_CTRL_PRESSED,
+    }).encode(&w);
+    try std.testing.expectEqualStrings("\x1b[219;26;27;1;8;1_", w.buffered());
 }

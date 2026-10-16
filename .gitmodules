@@ -1,3 +1,4 @@
 [submodule "ghostty"]
 	path = ghostty
-	url = https://github.com/ghostty-org/ghostty.git
+	url = https://github.com/aldehir/ghostty.git
+	branch = vt-unknown-modes
