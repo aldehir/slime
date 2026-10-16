@@ -109,6 +109,7 @@ faces: std.ArrayList(Face) = .empty,
 
 shaper: Shaper,
 size_pt: f32,
+dpi: u32,
 em_px: f32,
 metrics: Metrics,
 atlas: Atlas,
@@ -155,6 +156,7 @@ pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt:
         .family = family,
         .shaper = shaper,
         .size_pt = size_pt,
+        .dpi = dpi,
         .em_px = undefined,
         .metrics = undefined,
         .atlas = atlas,
@@ -166,7 +168,7 @@ pub fn init(alloc: Allocator, io: std.Io, families: []const []const u8, size_pt:
         self.faces.appendAssumeCapacity(try .init(collection.?, family, style.weight(), style.fontStyle()));
     }
 
-    self.setDpi(dpi);
+    self.resize();
     return self;
 }
 
@@ -212,16 +214,27 @@ fn deinitFaces(self: *Grid) void {
     self.faces.deinit(self.alloc);
 }
 
-/// Recompute metrics for a new DPI and drop everything size dependent.
-/// Face assignments stay valid: they don't depend on size.
 pub fn setDpi(self: *Grid, dpi: u32) void {
-    self.em_px = self.size_pt * @as(f32, @floatFromInt(dpi)) / 72.0;
+    self.dpi = dpi;
+    self.resize();
+}
+
+pub fn setSize(self: *Grid, size_pt: f32) void {
+    self.size_pt = size_pt;
+    self.resize();
+}
+
+/// Recompute metrics for a new size or DPI and drop everything size
+/// dependent. Face assignments stay valid: they don't depend on size.
+fn resize(self: *Grid) void {
+    self.em_px = self.size_pt * @as(f32, @floatFromInt(self.dpi)) / 72.0;
     self.metrics = self.computeMetrics();
     self.glyphs.clearRetainingCapacity();
     self.atlas.reset();
     self.shaper.reset();
-    log.info("dpi={d} em={d:.2}px cell={d}x{d}", .{
-        dpi,
+    log.info("size={d}pt dpi={d} em={d:.2}px cell={d}x{d}", .{
+        self.size_pt,
+        self.dpi,
         self.em_px,
         self.metrics.cell_width,
         self.metrics.cell_height,

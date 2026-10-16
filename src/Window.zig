@@ -14,6 +14,7 @@ const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const font = @import("font/font.zig");
 const input = @import("input.zig");
+const binding = @import("binding.zig");
 const clipboard = @import("clipboard.zig");
 const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
@@ -419,11 +420,7 @@ fn holdExpired(self: *Window) void {
     self.hold = .none;
 }
 
-/// Run the key binding a key press triggers, Ghostty's defaults where it
-/// has them: copy with ctrl+shift+c (when there is a selection) or
-/// ctrl+insert, paste with ctrl+shift+v (when the clipboard has text) or
-/// shift+insert, a new session with ctrl+shift+t, close it with
-/// ctrl+shift+w, and switch with ctrl+(shift+)tab or ctrl+page up/down.
+/// Run the key binding a key press triggers (see `binding.defaults`).
 /// Returns true if the key is consumed, which also holds for the release
 /// of a key that ran a binding.
 fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
@@ -434,28 +431,8 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
         return true;
     }
 
-    const mods = input.currentMods();
-    if (mods.alt or mods.super) return false;
-    const s = self.activeSession();
-    const ctrl_shift = mods.ctrl and mods.shift;
-    if (ctrl_shift and vk == 'C') {
-        if (!s.copySelection()) return false;
-    } else if (mods.ctrl and !mods.shift and vk == win32.VK_INSERT) {
-        _ = s.copySelection();
-    } else if (ctrl_shift and vk == 'V') {
-        if (!clipboard.hasText()) return false;
-        s.paste();
-    } else if (!mods.ctrl and mods.shift and vk == win32.VK_INSERT) {
-        s.paste();
-    } else if (ctrl_shift and vk == 'T') {
-        self.newSession();
-    } else if (ctrl_shift and vk == 'W') {
-        self.closeSession(self.active);
-    } else if (mods.ctrl and vk == win32.VK_TAB) {
-        self.cycle(!mods.shift);
-    } else if (mods.ctrl and !mods.shift and (vk == win32.VK_NEXT or vk == win32.VK_PRIOR)) {
-        self.cycle(vk == win32.VK_NEXT);
-    } else return false;
+    const b = binding.find(&binding.defaults, vk, input.currentMods()) orelse return false;
+    if (!self.runAction(b.action) and b.performable) return false;
 
     // Drop the text TranslateMessage posted for the key (ctrl+shift+c
     // gives 0x03).
@@ -463,6 +440,36 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
     while (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) != 0) {}
     self.bound_key = vk;
     return true;
+}
+
+/// Returns false if the action couldn't run: copy with no selection,
+/// paste with no text on the clipboard.
+fn runAction(self: *Window, action: binding.Action) bool {
+    const s = self.activeSession();
+    switch (action) {
+        .copy_to_clipboard => return s.copySelection(),
+        .paste_from_clipboard => {
+            if (!clipboard.hasText()) return false;
+            s.paste();
+        },
+        .new_tab => self.newSession(),
+        .close_surface => self.closeSession(self.active),
+        .next_tab => self.cycle(true),
+        .previous_tab => self.cycle(false),
+        .increase_font_size => |pt| self.setFontSize(self.grid.size_pt + pt),
+        .decrease_font_size => |pt| self.setFontSize(self.grid.size_pt - pt),
+        .reset_font_size => self.setFontSize(self.config.@"font-size"),
+    }
+    return true;
+}
+
+/// Change every session's font size, keeping the window's size: the grid
+/// gains or loses cells instead.
+fn setFontSize(self: *Window, size_pt: f32) void {
+    const size = std.math.clamp(size_pt, 1, 255);
+    if (size == self.grid.size_pt) return;
+    self.grid.setSize(size);
+    self.layout();
 }
 
 /// Track keyboard focus: the cursor blinks only while focused and is a

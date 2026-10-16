@@ -331,6 +331,8 @@ pub const VK_LMENU = 0xA4;
 pub const VK_RSHIFT = 0xA1;
 pub const VK_RCONTROL = 0xA3;
 pub const VK_RMENU = 0xA5;
+pub const VK_OEM_PLUS = 0xBB;
+pub const VK_OEM_MINUS = 0xBD;
 pub const VK_PROCESSKEY = 0xE5;
 pub const VK_PACKET = 0xE7;
 

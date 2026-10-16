@@ -100,5 +100,8 @@ the command, loaded once at startup.
 - **Font fallback families.** Ghostty uses every `font-family` after the
   first as a fallback ahead of the system's; we use the first one that's
   installed and fall back through DirectWrite.
-- **Key bindings** (`keybind`).
+- **Key binding config** (`keybind`). `binding.zig` has the actions,
+  under Ghostty's names, and the default table a parsed `keybind` would
+  extend or override. Triggers are virtual keys only, not Ghostty's
+  physical keys, and there are no sequences (`a>b`) or `unbind`.
 - **CLI overrides** (`--key=value`) and `+list-themes`.

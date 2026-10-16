@@ -153,4 +153,5 @@ test {
     _ = @import("renderer/Painter.zig");
     _ = @import("font/font.zig");
     _ = @import("input.zig");
+    _ = @import("binding.zig");
 }
