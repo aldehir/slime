@@ -44,7 +44,6 @@ wait until there is a proper design for it.
 - **Gamma and contrast** tuning for text.
 - **Per-row dirty caching** in `cells.zig`. Every frame rebuilds every
   row, which costs more now that output streams continuously.
-- **Synchronized output** (mode 2026): hold rendering while it's set.
 - **Distinct underline styles** (double, curly, dotted, dashed).
 - **Selection colors.** Selected cells are inverted, Ghostty's behavior
   without `selection-background`/`selection-foreground` set.
@@ -53,6 +52,5 @@ wait until there is a proper design for it.
 
 - **Window title** from OSC 0/2. It must go through PostMessage: the
   reader thread can't call SetWindowTextW.
-- **Focus events** (mode 1004).
 - **PSEUDOCONSOLE_INHERIT_CURSOR.** Skipped because the screen starts
   empty.

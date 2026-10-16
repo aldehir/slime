@@ -74,7 +74,7 @@ pub const Cells = struct {
 
     /// Rebuild everything from the render state. Rasterizes any glyphs
     /// not yet in the atlas.
-    pub fn build(self: *Cells, alloc: Allocator, state: *const RenderState, grid: *font.Grid) !void {
+    pub fn build(self: *Cells, alloc: Allocator, state: *const RenderState, grid: *font.Grid, cursor: CursorOptions) !void {
         const m = grid.metrics;
         const colors = &state.colors;
 
@@ -87,10 +87,11 @@ pub const Cells = struct {
         grid.beginFrame();
 
         const cursor_color = colors.cursor orelse colors.foreground;
-        const cursor_pos = if (state.cursor.visible) state.cursor.viewport else null;
+        const cursor_style = cursorStyle(state, cursor);
+        const cursor_pos = if (cursor_style != null) state.cursor.viewport else null;
 
         // A block cursor goes under the text, so it's drawn first.
-        if (cursor_pos) |pos| if (state.cursor.visual_style == .block) {
+        if (cursor_pos) |pos| if (cursor_style == .block) {
             try self.instances.append(alloc, rect(m, pos.x, pos.y, 0, m.cell_width, m.cell_height, cursor_color));
         };
 
@@ -123,7 +124,7 @@ pub const Cells = struct {
 
                 // Text under a block cursor takes the cell's background
                 // color so it stays readable.
-                const under_cursor = cursor_x == x and state.cursor.visual_style == .block;
+                const under_cursor = cursor_x == x and cursor_style == .block;
                 const text_color = if (under_cursor) bg else fg;
                 const alpha: u8 = if (style.flags.faint) 128 else 255;
 
@@ -200,7 +201,7 @@ pub const Cells = struct {
         // Non-block cursors go over the text.
         if (cursor_pos) |pos| {
             const thick = @max(1, m.underline_thickness);
-            switch (state.cursor.visual_style) {
+            switch (cursor_style.?) {
                 .block => {},
                 .bar => try self.instances.append(alloc, rect(m, pos.x, pos.y, 0, @max(1, m.cell_width / 8), m.cell_height, cursor_color)),
                 .underline => try self.instances.append(alloc, rect(m, pos.x, pos.y, m.cell_height - thick, m.cell_width, thick, cursor_color)),
@@ -228,6 +229,23 @@ pub const Cells = struct {
         };
     }
 };
+
+/// Window state that decides how the cursor is drawn.
+pub const CursorOptions = struct {
+    /// Unfocused windows show a hollow block that doesn't blink.
+    focused: bool = true,
+    /// The on phase of the blink. Ignored when the cursor doesn't blink.
+    blink_visible: bool = true,
+};
+
+/// The cursor to draw, or null for none. The same priority as Ghostty's
+/// renderer: hidden by the terminal, then unfocused, then blink.
+fn cursorStyle(state: *const RenderState, opts: CursorOptions) ?ghostty_vt.CursorStyle {
+    if (state.cursor.viewport == null or !state.cursor.visible) return null;
+    if (!opts.focused) return .block_hollow;
+    if (state.cursor.blinking and !opts.blink_visible) return null;
+    return state.cursor.visual_style;
+}
 
 /// A solid rectangle within cell (x, y), `dy` pixels below its top.
 fn rect(m: font.Grid.Metrics, x: u32, y: u32, dy: u32, w: u32, h: u32, color: RGB) Instance {

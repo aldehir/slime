@@ -166,6 +166,8 @@ pub const CREATESTRUCTW = extern struct {
 pub const WM_CREATE = 0x0001;
 pub const WM_DESTROY = 0x0002;
 pub const WM_SIZE = 0x0005;
+pub const WM_SETFOCUS = 0x0007;
+pub const WM_KILLFOCUS = 0x0008;
 pub const WM_PAINT = 0x000F;
 pub const WM_CLOSE = 0x0010;
 pub const WM_ERASEBKGND = 0x0014;
@@ -401,6 +403,7 @@ pub extern "user32" fn SetCursor(?HCURSOR) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn SystemParametersInfoW(u32, u32, ?*anyopaque, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn GetMessageTime() callconv(.winapi) i32;
 pub extern "user32" fn GetDoubleClickTime() callconv(.winapi) u32;
+pub extern "user32" fn GetCaretBlinkTime() callconv(.winapi) u32;
 pub extern "user32" fn OpenClipboard(?HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
 pub extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;

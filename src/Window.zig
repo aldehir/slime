@@ -39,6 +39,15 @@ const stats_timer_id = 1;
 const sizemove_timer_id = 2;
 /// Scrolls the viewport while a selection drag is above or below it.
 const autoscroll_timer_id = 3;
+/// Blinks the cursor while the window has focus.
+const blink_timer_id = 4;
+
+/// How long a frame waits for a cursor that output just hid to come
+/// back. See `updateHold`.
+const cursor_hold_ms = 8;
+/// How long synchronized output (mode 2026) can hold frames back before
+/// we reset it, Ghostty's `sync_reset_ms`.
+const sync_hold_ms = 1000;
 
 /// Characters that end a word for double-click selection, Ghostty's
 /// `selection-word-chars` default.
@@ -86,6 +95,20 @@ output_event: win32.HANDLE,
 /// The terminal changed since the last frame. UI thread only.
 dirty: bool = false,
 
+/// Why frames are being held back, if they are. `hold_timer` fires when
+/// the hold runs out. UI thread only.
+hold: Hold = .none,
+hold_timer: win32.HANDLE,
+
+/// The last frame showed the terminal's cursor (blinking aside).
+cursor_shown: bool = false,
+
+/// The window has keyboard focus.
+focused: bool = false,
+
+/// The on phase of the cursor blink.
+blink_visible: bool = true,
+
 /// The first half of a surrogate pair from a lone WM_CHAR.
 high_surrogate: ?u16 = null,
 
@@ -121,6 +144,14 @@ bound_key: ?u32 = null,
 /// Only used with `-Dstats`.
 stats: Stats = .{},
 
+const Hold = enum {
+    none,
+    /// The cursor the last frame showed was hidden.
+    cursor,
+    /// Synchronized output (mode 2026) is set.
+    sync,
+};
+
 /// Create the window and run `command_line` (CreateProcessW syntax;
 /// modified in place) in it.
 pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: win32.LPWSTR) !*Window {
@@ -132,10 +163,19 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
     const output_event = win32.CreateEventW(null, win32.FALSE, win32.FALSE, null) orelse
         return win32.lastError("CreateEventW");
     errdefer _ = win32.CloseHandle(output_event);
+    // Manual reset, so a hold that ran out stays due until it's handled.
+    const hold_timer = win32.CreateWaitableTimerExW(
+        null,
+        null,
+        win32.CREATE_WAITABLE_TIMER_MANUAL_RESET | win32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        win32.TIMER_ALL_ACCESS,
+    ) orelse return win32.lastError("CreateWaitableTimerExW");
+    errdefer _ = win32.CloseHandle(hold_timer);
     self.* = .{
         .alloc = alloc,
         .title = title,
         .output_event = output_event,
+        .hold_timer = hold_timer,
         .grid = undefined,
         .terminal = undefined,
         .stream = undefined,
@@ -176,6 +216,9 @@ pub fn create(alloc: Allocator, io: std.Io, title: [:0]const u16, command_line: 
         // Mode 2027: cluster multi-codepoint graphemes (emoji sequences,
         // combining marks) into one cell, as the Ghostty app does.
         .default_modes = .{ .grapheme_cluster = true },
+        // Null blinks, as Ghostty does by default, including after a
+        // DECSCUSR 0, RIS, or DECSTR. Mode 12 and DECSCUSR change it.
+        .default_cursor_blink = null,
     });
     errdefer self.terminal.deinit(alloc);
     // An arrow until the child asks for another shape with OSC 22. An
@@ -232,6 +275,7 @@ pub fn destroy(self: *Window) void {
         self.grid.deinit();
     }
     _ = win32.CloseHandle(self.output_event);
+    _ = win32.CloseHandle(self.hold_timer);
     self.alloc.destroy(self);
 }
 
@@ -241,6 +285,7 @@ pub fn destroy(self: *Window) void {
 /// once per display refresh, and right away when the terminal was idle.
 pub fn outputArrived(self: *Window) void {
     self.dirty = true;
+    self.updateHold();
 }
 
 pub fn needsFrame(self: *const Window) bool {
@@ -248,10 +293,12 @@ pub fn needsFrame(self: *const Window) bool {
 }
 
 pub fn frameGate(self: *const Window) win32.HANDLE {
+    if (self.hold != .none) return self.hold_timer;
     return self.renderer.?.frameGate();
 }
 
 pub fn frameGateFired(self: *Window, gate: win32.HANDLE) void {
+    if (gate == self.hold_timer) return self.holdExpired();
     const r = &self.renderer.?;
     // The pace timer only moves us on to waiting for the swap chain.
     if (gate != r.frame_waitable) return;
@@ -259,6 +306,50 @@ pub fn frameGateFired(self: *Window, gate: win32.HANDLE) void {
     // A synchronous render (resize, WM_PAINT) may have drawn it already;
     // the acquired frame then waits for the next change.
     if (self.dirty) self.render();
+}
+
+/// Hold frames back while the child is partway through an update: while
+/// synchronized output (mode 2026) is set, and briefly after it hides
+/// the cursor the last frame showed. ConPTY passes console writes on as
+/// they're made, so PSReadLine's `?25l`, line redraw, and `?25h` often
+/// arrive in separate reads; drawing between them flashes a frame
+/// without the cursor on every key.
+fn updateHold(self: *Window) void {
+    self.lockTerminal();
+    const sync = self.terminal.modes.get(.synchronized_output);
+    const cursor_hidden = !self.terminal.modes.get(.cursor_visible);
+    self.unlockTerminal();
+
+    const hold: Hold = if (sync) .sync else if (cursor_hidden and self.cursor_shown) .cursor else .none;
+    if (hold == self.hold) return;
+    self.hold = hold;
+    const ms: i64 = switch (hold) {
+        .none => return,
+        .cursor => cursor_hold_ms,
+        .sync => sync_hold_ms,
+    };
+    // Negative due times are relative, in 100 ns units. Setting the timer
+    // also unsignals it.
+    const due = -ms * 10_000;
+    _ = win32.SetWaitableTimer(self.hold_timer, &due, 0, null, null, win32.FALSE);
+}
+
+/// Draw the held frame anyway.
+fn holdExpired(self: *Window) void {
+    // The timer may have been set again since it fired.
+    if (win32.WaitForSingleObject(self.hold_timer, 0) != win32.WAIT_OBJECT_0) return;
+    switch (self.hold) {
+        .none => {},
+        .cursor => self.cursor_shown = false,
+        // Ghostty resets the mode too, so a child that never ends its
+        // update can't freeze the screen.
+        .sync => {
+            self.lockTerminal();
+            self.terminal.modes.set(.synchronized_output, false);
+            self.unlockTerminal();
+        },
+    }
+    self.hold = .none;
 }
 
 /// Close the pseudoconsole, wait for the reader to drain it, and kill
@@ -513,9 +604,10 @@ fn win32KeyInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     if (self.pty) |*pty| pty.write(w.buffered());
 }
 
-/// Drop the selection and bring the viewport back from scrollback, as
-/// typing does.
+/// Drop the selection, bring the viewport back from scrollback, and show
+/// the cursor, as typing does.
 fn typed(self: *Window) void {
+    self.resetBlink();
     self.lockTerminal();
     defer self.unlockTerminal();
     const screen = self.terminal.screens.active;
@@ -526,6 +618,55 @@ fn typed(self: *Window) void {
     if (screen.pages.viewport == .active) return;
     self.terminal.scrollViewport(.bottom);
     self.dirty = true;
+}
+
+/// Track keyboard focus: the cursor blinks only while focused and is a
+/// hollow block otherwise, and the child hears about it if it asked for
+/// focus events (mode 1004). ConPTY always asks, and passes them on to
+/// console programs as FOCUS_EVENT records.
+fn setFocus(self: *Window, focused: bool) void {
+    if (self.focused == focused) return;
+    self.focused = focused;
+    self.dirty = true;
+    if (focused) {
+        self.resetBlink();
+    } else {
+        _ = win32.KillTimer(self.hwnd, blink_timer_id);
+    }
+
+    self.lockTerminal();
+    const report = self.terminal.modes.get(.focus_event);
+    self.unlockTerminal();
+    if (!report) return;
+    var buf: [ghostty_vt.input.max_focus_encode_size]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    ghostty_vt.input.encodeFocus(&w, if (focused) .gained else .lost) catch unreachable;
+    if (self.pty) |*pty| pty.write(w.buffered());
+}
+
+/// Start the blink over in its on phase. Blinking follows the system's
+/// caret blink rate, and is off when the user turned caret blinking off.
+fn resetBlink(self: *Window) void {
+    if (!self.blink_visible) {
+        self.blink_visible = true;
+        self.dirty = true;
+    }
+    if (!self.focused) return;
+    const ms = win32.GetCaretBlinkTime();
+    if (ms == 0 or ms == win32.INFINITE) {
+        _ = win32.KillTimer(self.hwnd, blink_timer_id);
+    } else {
+        // Setting an existing timer restarts it.
+        _ = win32.SetTimer(self.hwnd, blink_timer_id, ms, null);
+    }
+}
+
+fn blinkTick(self: *Window) void {
+    self.blink_visible = !self.blink_visible;
+    // Only redraw if the last frame's cursor blinks. One that starts
+    // blinking later picks up the phase from here.
+    const cursor = self.render_state.cursor;
+    if (cursor.visible and cursor.blinking) self.dirty = true;
 }
 
 /// Report a mouse button press or release, or motion, to the child if it
@@ -845,7 +986,11 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         try self.render_state.update(self.alloc, &self.terminal);
     }
     if (stats) t = self.stats.lap(.update, t);
-    try self.cells.build(self.alloc, &self.render_state, &self.grid);
+    self.cursor_shown = self.render_state.cursor.visible;
+    try self.cells.build(self.alloc, &self.render_state, &self.grid, .{
+        .focused = self.focused,
+        .blink_visible = self.blink_visible,
+    });
     if (stats) t = self.stats.lap(.build, t);
     const pad: f32 = @floatFromInt(self.paddingPx());
     try r.draw(&self.cells, &self.grid.atlas, self.grid.metrics, .{ pad, pad });
@@ -970,12 +1115,18 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             switch (wparam) {
                 stats_timer_id => if (build_options.stats) self.showStats(),
                 autoscroll_timer_id => self.autoscrollTick(),
+                blink_timer_id => self.blinkTick(),
                 sizemove_timer_id => {
                     if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.dirty = true;
                     if (self.dirty) self.render();
                 },
                 else => {},
             }
+            return 0;
+        },
+
+        win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
+            if (self.renderer != null) self.setFocus(msg == win32.WM_SETFOCUS);
             return 0;
         },
 
