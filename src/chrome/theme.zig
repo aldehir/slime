@@ -39,8 +39,18 @@ pub const Theme = struct {
     text_inactive: Color,
 
     accent: Color,
+    accent_hover: Color,
+    /// Text on the accent.
+    on_accent: Color,
     /// Selected text in a field.
     selection: Color,
+    /// Errors and warnings.
+    danger: Color,
+    /// Over a terminal behind a dialog.
+    scrim: Color,
+    /// A dialog, raised from the terminal, and its edge.
+    dialog: Color,
+    dialog_outline: Color,
 
     pub fn init(bg: RGB, fg: RGB) Theme {
         const b = toColor(bg);
@@ -70,7 +80,14 @@ pub const Theme = struct {
             .text_muted = mix(ground, f, 0.58),
             .text_inactive = mix(ground, f, 0.42),
             .accent = accent,
+            .accent_hover = mix(accent, extreme, 0.15),
+            // White on the light accent reads, on the dark one it doesn't.
+            .on_accent = if (light) .{ 1, 1, 1, 1 } else Painter.rgb(0x0b1a2b),
             .selection = withAlpha(accent, 0.35),
+            .danger = Painter.rgb(if (light) 0xc4314b else 0xf0848f),
+            .scrim = .{ 0.05, 0.05, 0.08, if (light) 0.25 else 0.45 },
+            .dialog = mix(b, f, if (light) 0.03 else 0.06),
+            .dialog_outline = mix(b, f, 0.13),
         };
     }
 };

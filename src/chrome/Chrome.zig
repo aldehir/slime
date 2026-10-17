@@ -16,6 +16,8 @@ const dwrite = win32.dwrite;
 const Painter = @import("../renderer/Painter.zig");
 pub const Theme = @import("theme.zig").Theme;
 pub const TextField = @import("TextField.zig");
+pub const Dialog = @import("Dialog.zig");
+const modal = @import("modal.zig");
 
 pub const Rect = Painter.Rect;
 pub const Color = Painter.Color;
@@ -63,6 +65,10 @@ pub const Hit = union(enum) {
     session: usize,
     close_session: usize,
     terminal,
+    /// The terminal area under a dialog, away from its controls.
+    dialog,
+    dialog_button: usize,
+    dialog_field: usize,
 
     pub fn eql(a: Hit, b: Hit) bool {
         return std.meta.eql(a, b);
@@ -80,6 +86,10 @@ pub const View = struct {
     connect: ?*const TextField = null,
     /// The on phase of the caret's blink, while focused.
     caret_visible: bool = false,
+    /// The active session's dialog, over its terminal.
+    dialog: ?*const Dialog = null,
+    /// Steps of the dialog's spinner.
+    spinner: u32 = 0,
     /// The window has keyboard focus.
     focused: bool,
     maximized: bool,
@@ -193,7 +203,10 @@ pub fn layout(self: *const Chrome, width: f32, height: f32) Layout {
 }
 
 pub fn hitTest(self: *const Chrome, l: *const Layout, view: *const View, x: f32, y: f32) Hit {
-    if (l.terminal.contains(x, y)) return .terminal;
+    if (l.terminal.contains(x, y)) {
+        if (view.dialog) |d| return modal.hitTest(self, l.terminal, d, x, y);
+        return .terminal;
+    }
     if (l.close.contains(x, y)) return .close;
     if (l.maximize.contains(x, y)) return .maximize;
     if (l.minimize.contains(x, y)) return .minimize;
@@ -236,6 +249,12 @@ pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const Vi
     switch (self.mode) {
         inline else => |m| Impl(m).paint(self, p, l, view),
     }
+    if (view.dialog) |d| modal.paint(self, p, l.terminal, d, .{
+        .focused = view.focused,
+        .caret_visible = view.caret_visible,
+        .spinner = view.spinner,
+        .terminal_bg = view.terminal_bg,
+    });
     if (l.corner > 0) p.cornerMask(l.terminal.x, l.terminal.y, l.corner, self.theme.ground);
     p.appIcon(l.icon);
     self.paintToggle(p, l, view);
@@ -306,6 +325,43 @@ fn paintCaptionButtons(self: *const Chrome, p: *Painter, l: *const Layout, view:
     }
 }
 
+pub const EditTextOptions = struct {
+    caret: bool,
+    /// Dots for the text, for passwords.
+    mask: bool = false,
+    color: ?Color = null,
+};
+
+/// A text field's text in `inner`, scrolled to keep the caret in view,
+/// with its selection behind it and the caret if `opts.caret`.
+pub fn paintEditText(self: *const Chrome, p: *Painter, inner: Rect, field: *const TextField, opts: EditTextOptions) void {
+    var dots: [TextField.max_len]u16 = undefined;
+    const text = if (opts.mask) dots: {
+        @memset(dots[0..field.len], 0x25CF);
+        break :dots dots[0..field.len];
+    } else field.text();
+    const font = self.fonts.body;
+
+    const caret_x = self.fonts.measure(text[0..field.caret], font);
+    // Room for the caret at the right edge.
+    const scroll = @max(0, caret_x - (inner.w - self.stroke()));
+    const x = inner.x - scroll;
+    p.pushClip(inner);
+    defer p.popClip();
+    const sel = field.selection();
+    if (sel.start != sel.end) {
+        const x0 = x + self.fonts.measure(text[0..sel.start], font);
+        const x1 = x + self.fonts.measure(text[0..sel.end], font);
+        p.fill(.{ .x = @round(x0), .y = inner.y + self.px(7), .w = @round(x1) - @round(x0), .h = inner.h - self.px(14) }, self.theme.selection);
+    }
+    // Laid out wider than it is, so it's never trimmed.
+    p.text(text, font, .{ .x = x, .y = inner.y, .w = self.fonts.measure(text, font) + inner.w, .h = inner.h }, opts.color orelse self.theme.text);
+    if (opts.caret) {
+        const cx = crisp(x + caret_x, self.stroke());
+        p.line(cx, inner.y + self.px(8), cx, inner.bottom() - self.px(8), self.stroke(), self.theme.text_strong);
+    }
+}
+
 /// The width of icon strokes.
 pub fn stroke(self: *const Chrome) f32 {
     return @max(1, @round(self.scale));
@@ -340,6 +396,15 @@ pub const Fonts = struct {
     hint: *dwrite.ITextFormat,
     /// Numbers that change in place, like the stats.
     mono: *dwrite.ITextFormat,
+    /// A dialog's title.
+    heading: *dwrite.ITextFormat,
+    /// Paragraphs, wrapped, from the top.
+    prose: *dwrite.ITextFormat,
+    /// Paths and fingerprints, wrapped anywhere they must be.
+    mono_prose: *dwrite.ITextFormat,
+    /// Button labels, centered.
+    button: *dwrite.ITextFormat,
+    button_strong: *dwrite.ITextFormat,
 
     const L = std.unicode.utf8ToUtf16LeStringLiteral;
     const ui_families = [_][:0]const u16{ L("Segoe UI Variable Text"), L("Segoe UI") };
@@ -358,27 +423,33 @@ pub const Fonts = struct {
 
         var self: Fonts = undefined;
         self.factory = f;
+        const one_line: ?u32 = null;
         const specs = .{
-            .{ "body", ui, dwrite.FONT_WEIGHT.NORMAL, 13, dwrite.TEXT_ALIGNMENT_LEADING },
-            .{ "body_strong", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 13, dwrite.TEXT_ALIGNMENT_LEADING },
-            .{ "title", ui, dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_CENTER },
-            .{ "section", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 11, dwrite.TEXT_ALIGNMENT_LEADING },
-            .{ "hint", ui, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_CENTER },
-            .{ "mono", mono, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_LEADING },
+            .{ "body", ui, dwrite.FONT_WEIGHT.NORMAL, 13, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
+            .{ "body_strong", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 13, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
+            .{ "title", ui, dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_CENTER, one_line },
+            .{ "section", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 11, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
+            .{ "hint", ui, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_CENTER, one_line },
+            .{ "mono", mono, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
+            .{ "heading", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 15, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
+            .{ "prose", ui, dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_LEADING, @as(?u32, dwrite.WORD_WRAPPING_WRAP) },
+            .{ "mono_prose", mono, dwrite.FONT_WEIGHT.NORMAL, 12, dwrite.TEXT_ALIGNMENT_LEADING, @as(?u32, dwrite.WORD_WRAPPING_EMERGENCY_BREAK) },
+            .{ "button", ui, dwrite.FONT_WEIGHT.NORMAL, 13, dwrite.TEXT_ALIGNMENT_CENTER, one_line },
+            .{ "button_strong", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 13, dwrite.TEXT_ALIGNMENT_CENTER, one_line },
         };
         var made: usize = 0;
         errdefer inline for (specs, 0..) |spec, i| {
             if (i < made) com.release(@field(self, spec[0]));
         };
         inline for (specs) |spec| {
-            @field(self, spec[0]) = try createFormat(f, spec[1], spec[2], spec[3] * scale, spec[4]);
+            @field(self, spec[0]) = try createFormat(f, spec[1], spec[2], spec[3] * scale, spec[4], spec[5]);
             made += 1;
         }
         return self;
     }
 
     fn deinit(self: *Fonts) void {
-        inline for (.{ "body", "body_strong", "title", "section", "hint", "mono" }) |name| com.release(@field(self, name));
+        inline for (.{ "body", "body_strong", "title", "section", "hint", "mono", "heading", "prose", "mono_prose", "button", "button_strong" }) |name| com.release(@field(self, name));
         com.release(self.factory);
         self.* = undefined;
     }
@@ -396,14 +467,17 @@ pub const Fonts = struct {
         return families[families.len - 1];
     }
 
-    fn createFormat(factory: *dwrite.IFactory2, family: [:0]const u16, weight: dwrite.FONT_WEIGHT, size: f32, alignment: u32) !*dwrite.ITextFormat {
+    /// One line, centered vertically and trimmed with an ellipsis, or
+    /// with `wrap`, lines from the top.
+    fn createFormat(factory: *dwrite.IFactory2, family: [:0]const u16, weight: dwrite.FONT_WEIGHT, size: f32, alignment: u32, wrap: ?u32) !*dwrite.ITextFormat {
         var format: ?*dwrite.ITextFormat = null;
         try com.check(factory.createTextFormat(family.ptr, weight, size, &format), "IDWriteFactory::CreateTextFormat");
         errdefer com.releaseOpt(&format);
         const f = format.?;
         try com.check(f.setTextAlignment(alignment), "IDWriteTextFormat::SetTextAlignment");
-        try com.check(f.setParagraphAlignment(dwrite.PARAGRAPH_ALIGNMENT_CENTER), "IDWriteTextFormat::SetParagraphAlignment");
-        try com.check(f.setWordWrapping(dwrite.WORD_WRAPPING_NO_WRAP), "IDWriteTextFormat::SetWordWrapping");
+        try com.check(f.setParagraphAlignment(if (wrap != null) dwrite.PARAGRAPH_ALIGNMENT_NEAR else dwrite.PARAGRAPH_ALIGNMENT_CENTER), "IDWriteTextFormat::SetParagraphAlignment");
+        try com.check(f.setWordWrapping(wrap orelse dwrite.WORD_WRAPPING_NO_WRAP), "IDWriteTextFormat::SetWordWrapping");
+        if (wrap != null) return f;
         var sign: ?*dwrite.IInlineObject = null;
         try com.check(factory.createEllipsisTrimmingSign(f, &sign), "IDWriteFactory::CreateEllipsisTrimmingSign");
         defer com.releaseOpt(&sign);
@@ -413,18 +487,32 @@ pub const Fonts = struct {
 
     /// The width of `text` laid out in `format`, in pixels.
     pub fn measure(self: *const Fonts, text: []const u16, format: *dwrite.ITextFormat) f32 {
+        const m = self.layoutMetrics(text, format, unbounded) orelse return 0;
+        return m.widthIncludingTrailingWhitespace;
+    }
+
+    /// The height of `text` wrapped to `width` in a wrapping `format`, in
+    /// whole pixels.
+    pub fn measureHeight(self: *const Fonts, text: []const u16, format: *dwrite.ITextFormat, width: f32) f32 {
+        if (text.len == 0) return 0;
+        const m = self.layoutMetrics(text, format, @max(1, width)) orelse return 0;
+        return @ceil(m.height);
+    }
+
+    // DirectWrite rejects infinite and huge bounds.
+    const unbounded = 100_000;
+
+    fn layoutMetrics(self: *const Fonts, text: []const u16, format: *dwrite.ITextFormat, width: f32) ?dwrite.TEXT_METRICS {
         var text_layout: ?*dwrite.ITextLayout = null;
-        // DirectWrite rejects infinite and huge bounds.
-        const unbounded = 100_000;
-        const hr = self.factory.createTextLayout(text, format, unbounded, unbounded, &text_layout);
+        const hr = self.factory.createTextLayout(text, format, width, unbounded, &text_layout);
         if (hr < 0) {
             com.check(hr, "IDWriteFactory::CreateTextLayout") catch {};
-            return 0;
+            return null;
         }
         defer com.releaseOpt(&text_layout);
-        var metrics: dwrite.TEXT_METRICS = undefined;
-        if (text_layout.?.getMetrics(&metrics) < 0) return 0;
-        return metrics.widthIncludingTrailingWhitespace;
+        var m: dwrite.TEXT_METRICS = undefined;
+        if (text_layout.?.getMetrics(&m) < 0) return null;
+        return m;
     }
 };
 

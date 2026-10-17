@@ -180,6 +180,7 @@ test {
     _ = @import("chrome/Chrome.zig");
     _ = @import("chrome/sidebar.zig");
     _ = @import("chrome/TextField.zig");
+    _ = @import("chrome/Dialog.zig");
     _ = @import("chrome/theme.zig");
     _ = @import("renderer/Painter.zig");
     _ = @import("font/font.zig");

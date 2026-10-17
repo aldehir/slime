@@ -21,6 +21,7 @@ const Config = @import("Config.zig");
 const Session = @import("Session.zig");
 const SshConnection = @import("SshConnection.zig");
 const Hosts = @import("Hosts.zig");
+const Login = @import("Login.zig");
 const Chrome = @import("chrome/Chrome.zig");
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
@@ -41,6 +42,10 @@ pub const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
 pub const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
 /// Posted from a reader thread when the child writes the clipboard.
 pub const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
+/// Posted from an SSH connection's reader thread when logging in has
+/// something to show. WPARAM is the channel (session) ID, or 0 once
+/// logged in.
+pub const WM_APP_SSH_LOGIN = win32.WM_APP + 3;
 
 /// Room for the stats report, in UTF-16 units.
 const max_stats_len = 160;
@@ -53,6 +58,9 @@ const sizemove_timer_id = 2;
 pub const autoscroll_timer_id = 3;
 /// Blinks the cursor while the window has focus.
 const blink_timer_id = 4;
+/// Steps a login dialog's spinner while it waits.
+const spinner_timer_id = 5;
+const spinner_ms = 100;
 
 /// How long a frame waits for a cursor that output just hid to come
 /// back. See `updateHold`.
@@ -127,6 +135,10 @@ blink_visible: bool = true,
 /// The host being typed after "Connect" was clicked. Takes the keyboard
 /// while set.
 connect_field: ?Chrome.TextField = null,
+
+/// The spinner's timer is running, and its step.
+spinning: bool = false,
+spinner_step: u32 = 0,
 
 /// The virtual key of the last key binding run, so its release isn't
 /// sent to the child either.
@@ -309,7 +321,7 @@ fn spawnSession(self: *Window, target: Target) !void {
     const conn: ?*SshConnection = switch (target) {
         .command => null,
         .host => |h| self.hostConnection(h) orelse conn: {
-            new_conn = try SshConnection.spawn(self.alloc, self.hosts.items.items[h]);
+            new_conn = try SshConnection.spawn(self.alloc, self.hosts.items.items[h], .{ .hwnd = self.hwnd.?, .msg = WM_APP_SSH_LOGIN });
             break :conn new_conn;
         },
     };
@@ -445,6 +457,7 @@ fn activated(self: *Window) void {
     self.hold = .none;
     self.cursor_shown = false;
     self.resetBlink();
+    self.updateSpinner();
     self.showTitle();
     self.dirty = true;
 }
@@ -669,46 +682,59 @@ fn submitConnect(self: *Window) void {
 /// doesn't take.
 fn connectKey(self: *Window, vk: u32) bool {
     const field = &(self.connect_field orelse return false);
-    const ctrl = win32.GetKeyState(win32.VK_CONTROL) < 0;
-    const shift = win32.GetKeyState(win32.VK_SHIFT) < 0;
     switch (vk) {
         win32.VK_RETURN => self.submitConnect(),
         win32.VK_ESCAPE => self.cancelConnect(),
+        else => if (!self.editKey(field, vk, true)) return false,
+    }
+    self.keyHandled();
+    return true;
+}
+
+/// Edit `field` for an editing key, as Windows edit controls do.
+/// `copyable` is false for passwords. Returns false for other keys.
+fn editKey(self: *Window, field: *Chrome.TextField, vk: u32, copyable: bool) bool {
+    const ctrl = win32.GetKeyState(win32.VK_CONTROL) < 0;
+    const shift = win32.GetKeyState(win32.VK_SHIFT) < 0;
+    switch (vk) {
         win32.VK_LEFT => field.press(.left, ctrl, shift),
         win32.VK_RIGHT => field.press(.right, ctrl, shift),
         win32.VK_HOME => field.press(.home, ctrl, shift),
         win32.VK_END => field.press(.end, ctrl, shift),
         win32.VK_BACK => field.press(.backspace, ctrl, false),
-        win32.VK_DELETE => if (shift) self.connectCopy(true) else field.press(.delete, ctrl, false),
-        win32.VK_INSERT => if (ctrl) self.connectCopy(false) else if (shift) self.connectPaste() else return false,
+        win32.VK_DELETE => if (shift) self.fieldCopy(field, true, copyable) else field.press(.delete, ctrl, false),
+        win32.VK_INSERT => if (ctrl) self.fieldCopy(field, false, copyable) else if (shift) self.fieldPaste(field) else return false,
         'A' => if (ctrl) field.press(.select_all, false, false) else return false,
-        'C' => if (ctrl) self.connectCopy(false) else return false,
-        'X' => if (ctrl) self.connectCopy(true) else return false,
-        'V' => if (ctrl) self.connectPaste() else return false,
+        'C' => if (ctrl) self.fieldCopy(field, false, copyable) else return false,
+        'X' => if (ctrl) self.fieldCopy(field, true, copyable) else return false,
+        'V' => if (ctrl) self.fieldPaste(field) else return false,
         else => return false,
     }
-    // Drop the key's text (Enter's CR would reach the new session).
+    return true;
+}
+
+/// After a field took a key: drop its text (Enter's CR would reach the
+/// session next), and show the change.
+fn keyHandled(self: *Window) void {
     var m: win32.MSG = undefined;
     while (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) != 0) {}
     self.resetBlink();
     self.dirty = true;
-    return true;
 }
 
-/// Copy the field's selection, cutting it if `cut`.
-fn connectCopy(self: *Window, cut: bool) void {
-    const field = &(self.connect_field orelse return);
+/// Copy `field`'s selection, cutting it if `cut`. A password's isn't
+/// copied, or cut.
+fn fieldCopy(self: *Window, field: *Chrome.TextField, cut: bool, copyable: bool) void {
     const units = field.selected();
-    if (units.len == 0) return;
+    if (units.len == 0 or !copyable) return;
     const text = std.unicode.utf16LeToUtf8Alloc(self.alloc, units) catch return;
     defer self.alloc.free(text);
     clipboard.set(self.hwnd.?, text) catch |err| return log.warn("copy failed: {}", .{err});
     if (cut) field.press(.delete, false, false);
 }
 
-/// Paste the clipboard's first line into the field.
-fn connectPaste(self: *Window) void {
-    const field = &(self.connect_field orelse return);
+/// Paste the clipboard's first line into `field`.
+fn fieldPaste(self: *Window, field: *Chrome.TextField) void {
     const text = (clipboard.get(self.alloc, self.hwnd) catch |err| return log.warn("paste failed: {}", .{err})) orelse return;
     defer self.alloc.free(text);
     var lines = std.mem.splitScalar(u8, std.mem.trim(u8, text, " \t\r\n"), '\n');
@@ -716,6 +742,110 @@ fn connectPaste(self: *Window) void {
     const units = std.unicode.utf8ToUtf16LeAlloc(self.alloc, line) catch return;
     defer self.alloc.free(units);
     field.insert(units);
+}
+
+/// The active session's login dialog, which has the keyboard unless the
+/// host field does.
+fn activeLogin(self: *const Window) ?*Login {
+    if (self.connect_field != null) return null;
+    return self.activeSession().login;
+}
+
+/// A key down for the active session's login dialog. Returns false for
+/// keys it doesn't take.
+fn loginKey(self: *Window, vk: u32) bool {
+    const login = self.activeLogin() orelse return false;
+    const d = &login.dialog;
+    switch (vk) {
+        win32.VK_RETURN => if (d.defaultAction()) |action| self.loginAction(action),
+        win32.VK_ESCAPE => self.loginAction(d.escapeAction()),
+        // Ctrl+Tab still switches sessions.
+        win32.VK_TAB => if (win32.GetKeyState(win32.VK_CONTROL) < 0)
+            return false
+        else
+            d.cycleFocus(win32.GetKeyState(win32.VK_SHIFT) >= 0),
+        else => {
+            const field = d.focused() orelse return false;
+            if (!self.editKey(field, vk, d.fields[d.focus].echo)) return false;
+        },
+    }
+    self.keyHandled();
+    return true;
+}
+
+/// Act on a login dialog's button for the active session.
+fn loginAction(self: *Window, action: Chrome.Dialog.Action) void {
+    const s = self.activeSession();
+    const login = s.login orelse return;
+    const conn = s.sshConnection() orelse return;
+    switch (action) {
+        .accept, .skip => {
+            var buf: [Chrome.Dialog.max_fields][]const u16 = undefined;
+            const choice: SshConnection.Choice = if (action == .accept) .accept else .skip;
+            conn.sendAnswer(s.id, choice, login.answers(&buf)) catch |err| log.warn("answering failed: {}", .{err});
+            login.answered();
+        },
+        .cancel => {
+            // A prompt takes it as its answer; while the server works on
+            // one, it gives up on logging in.
+            conn.sendAnswer(s.id, .cancel, &.{}) catch {};
+            self.closeLogin(s);
+        },
+        .close => self.closeLogin(s),
+    }
+    self.updateSpinner();
+    self.dirty = true;
+}
+
+fn closeLogin(self: *Window, s: *Session) void {
+    const login = s.login orelse return;
+    login.destroy();
+    s.login = null;
+    _ = self.chrome.setHover(.none);
+    self.updateSpinner();
+    self.dirty = true;
+}
+
+/// The helper asked or reported something while logging in (WPARAM is
+/// the channel, 0 when it logged in).
+fn loginChanged(self: *Window, id: u32) void {
+    defer self.updateSpinner();
+    self.dirty = true;
+    if (id == 0) {
+        // Logged in: nothing more to show.
+        for (self.sessions.items) |s| {
+            const conn = s.sshConnection() orelse continue;
+            if (s.login != null and conn.isConnected()) self.closeLogin(s);
+        }
+        return;
+    }
+    const s = self.sessions.items[self.sessionIndex(id) orelse return];
+    const conn = s.sshConnection() orelse return;
+    var taken = conn.takeLogin();
+    defer taken.deinit(conn.alloc);
+    if (taken.prompt == null and taken.info == null) return;
+    const login = s.login orelse login: {
+        s.login = Login.create(self.alloc, conn.label()) catch return;
+        break :login s.login.?;
+    };
+    if (taken.info) |text| login.info(text);
+    if (taken.prompt) |prompt| {
+        login.ask(prompt);
+        taken.prompt = null;
+    }
+    if (s == self.activeSession()) self.resetBlink();
+}
+
+/// Run the spinner's timer while the active session's dialog waits.
+fn updateSpinner(self: *Window) void {
+    const waiting = if (self.activeSession().login) |l| l.dialog.state == .waiting else false;
+    if (waiting == self.spinning) return;
+    self.spinning = waiting;
+    if (waiting) {
+        _ = win32.SetTimer(self.hwnd, spinner_timer_id, spinner_ms, null);
+    } else {
+        _ = win32.KillTimer(self.hwnd, spinner_timer_id);
+    }
 }
 
 /// The chrome's view of the window's state.
@@ -743,6 +873,8 @@ fn view(self: *Window) Chrome.View {
         .sessions = self.view_sessions.items,
         .connect = if (self.connect_field) |*f| f else null,
         .caret_visible = self.blink_visible,
+        .dialog = if (self.activeSession().login) |l| &l.dialog else null,
+        .spinner = self.spinner_step,
         .active = self.active,
         .focused = self.focused,
         .maximized = win32.IsZoomed(self.hwnd.?) != 0,
@@ -849,6 +981,18 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
         .new_session => |g| self.newSessionIn(g),
         .forget_host => |g| self.forgetHost(g),
         .connect => self.startConnect(),
+        .dialog_button => |i| {
+            const d = &(self.activeSession().login orelse return).dialog;
+            var buf: [Chrome.Dialog.max_buttons]Chrome.Dialog.Button = undefined;
+            const buttons = d.buttons(&buf);
+            if (i < buttons.len and !buttons[i].disabled) self.loginAction(buttons[i].action);
+        },
+        .dialog_field => |i| {
+            const d = &(self.activeSession().login orelse return).dialog;
+            d.focus = i;
+            self.resetBlink();
+            self.dirty = true;
+        },
         .close_session => |i| self.closeSession(i),
         else => {},
     }
@@ -983,8 +1127,8 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     if (stats) t = self.stats.lap(.update, t);
     self.cursor_shown = s.render_state.cursor.visible;
     try s.cells.build(self.alloc, &s.render_state, &self.grid, .{
-        // The host field has the keyboard while it's open.
-        .focused = self.focused and self.connect_field == null,
+        // The host field or a login dialog has the keyboard while open.
+        .focused = self.focused and self.connect_field == null and s.login == null,
         .blink_visible = self.blink_visible,
     }, .{
         .cursor_color = self.config.@"cursor-color",
@@ -1206,6 +1350,10 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 stats_timer_id => if (build_options.stats) self.showStats(),
                 autoscroll_timer_id => self.activeSession().autoscrollTick(),
                 blink_timer_id => self.blinkTick(),
+                spinner_timer_id => {
+                    self.spinner_step +%= 1;
+                    self.dirty = true;
+                },
                 sizemove_timer_id => {
                     if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.outputArrived();
                     if (self.dirty) self.render();
@@ -1226,11 +1374,22 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             // A failed SSH channel (login, connection, or open) stays to
             // say why. A shell that exited closes like a local one.
             if (s.sshEnding()) |ending| if (!ending.exited) {
+                if (s.login) |login| {
+                    // Cancelling closed the dialog already, so this is
+                    // the server's doing.
+                    login.fail(ending.text());
+                    self.updateSpinner();
+                }
                 s.showEnded(ending.text());
                 self.dirty = true;
                 return 0;
             };
             self.closeSession(i);
+            return 0;
+        },
+
+        WM_APP_SSH_LOGIN => {
+            self.loginChanged(@intCast(wparam));
             return 0;
         },
 
@@ -1249,8 +1408,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_KEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP => {
-            if (self.connect_field != null) {
-                if (msg == win32.WM_KEYDOWN and self.connectKey(@truncate(wparam))) return 0;
+            if (self.connect_field != null or self.activeLogin() != null) {
+                if (msg == win32.WM_KEYDOWN and (self.connectKey(@truncate(wparam)) or self.loginKey(@truncate(wparam)))) return 0;
                 if (self.keyBinding(msg, wparam)) return 0;
                 // Keep alt+F4; the session gets nothing.
                 if (msg == win32.WM_SYSKEYDOWN and wparam == win32.VK_F4) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -1282,12 +1441,13 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_CHAR, win32.WM_SYSCHAR => {
-            if (self.connect_field) |*field| {
-                if (msg == win32.WM_CHAR) {
-                    field.insert(&.{@truncate(wparam)});
+            const field: ?*Chrome.TextField = if (self.connect_field) |*f| f else if (self.activeLogin()) |l| l.dialog.focused() else null;
+            if (field != null or self.activeLogin() != null) {
+                if (msg == win32.WM_CHAR) if (field) |f| {
+                    f.insert(&.{@truncate(wparam)});
                     self.resetBlink();
                     self.dirty = true;
-                }
+                };
                 return 0;
             }
             self.activeSession().charInput(@truncate(wparam));
@@ -1350,7 +1510,9 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             _ = win32.GetCursorPos(&pos);
             _ = win32.ScreenToClient(hwnd, &pos);
             var cursor = win32.IDC_ARROW;
-            if (self.mouse_in_terminal or self.hitAt(pos) == .terminal) {
+            const hit = self.hitAt(pos);
+            if (hit == .dialog_field) cursor = win32.IDC_IBEAM;
+            if (self.mouse_in_terminal or hit == .terminal) {
                 const s = self.activeSession();
                 s.lockTerminal();
                 const shape = s.terminal.mouse_shape;

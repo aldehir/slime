@@ -16,6 +16,8 @@ const log = std.log.scoped(.ssh);
 
 /// ssh/internal/proto's Version.
 const protocol_version = 1;
+/// proto.FeaturePrompts: login questions come as prompts for a dialog.
+const feature_prompts: u32 = 1 << 0;
 const max_frame = 1 << 20;
 /// Long enough for long-path-aware installs.
 const max_path = 32 * 1024;
@@ -26,18 +28,23 @@ const MsgType = enum(u8) {
     open = 2,
     resize = 3,
     close = 4,
+    answer = 5,
     hello_reply = 65,
     connected = 66,
     opened = 67,
     exit = 68,
     @"error" = 69,
     disconnected = 70,
+    prompt = 71,
+    info = 72,
     _,
 };
 
 alloc: Allocator,
 /// What the helper was given, like `ssh://user@host`. Owned.
 destination: []const u16,
+/// Told when logging in has something to show (`takeLogin`).
+notify: Notify,
 process: win32.HANDLE,
 job: win32.HANDLE,
 /// Our ends of the helper's stdin and stdout.
@@ -52,8 +59,107 @@ channels: std.ArrayList(*Channel) = .empty,
 /// disconnects or exits, after which every channel has ended.
 alive: bool = true,
 
+/// What the helper last asked or reported while logging in, for the
+/// window to take. Guarded by `lock`.
+login: Login = .{},
+/// Logged in. Guarded by `lock`.
+connected: bool = false,
+
 /// Channels opened and not yet released. UI thread only.
 refs: u32 = 0,
+
+/// A window message posted from the reader thread when `login` or
+/// `connected` changes. WPARAM is the channel ID, 0 for the connection.
+pub const Notify = struct {
+    hwnd: win32.HWND,
+    msg: u32,
+};
+
+/// Logging in's latest, taken at once by `takeLogin`.
+pub const Login = struct {
+    /// The channel it's on: the one connecting.
+    channel: u32 = 0,
+    prompt: ?*Prompt = null,
+    /// A status line from the server. Owned, in the connection's
+    /// allocator.
+    info: ?[]const u16 = null,
+
+    pub fn deinit(self: *Login, alloc: Allocator) void {
+        if (self.prompt) |p| p.destroy();
+        if (self.info) |i| alloc.free(i);
+        self.* = .{};
+    }
+};
+
+/// A question while logging in (proto.Prompt), its text in UTF-16 for
+/// the chrome.
+pub const Prompt = struct {
+    arena: std.heap.ArenaAllocator,
+    kind: Kind,
+    title: []const u16,
+    /// The body.
+    text: []const u16,
+    /// For a monospace box: a key's path, fingerprints.
+    detail: []const u16,
+    /// Why the last answer didn't work.
+    err: []const u16,
+    questions: []const Question,
+
+    pub const Kind = enum(u8) {
+        password = 1,
+        passphrase = 2,
+        interactive = 3,
+        unknown_host = 4,
+        changed_host = 5,
+        _,
+    };
+
+    /// A field. `label` may run over several lines; the last names the
+    /// field.
+    pub const Question = struct {
+        label: []const u16,
+        echo: bool,
+    };
+
+    /// More than any login asks at once.
+    pub const max_questions = 8;
+
+    fn parse(gpa: Allocator, payload: []const u8) !*Prompt {
+        const self = try gpa.create(Prompt);
+        errdefer gpa.destroy(self);
+        self.arena = .init(gpa);
+        errdefer self.arena.deinit();
+        const a = self.arena.allocator();
+        var r: Reader = .{ .buf = payload };
+        self.kind = @enumFromInt(try r.readU8());
+        self.title = try toUtf16(a, try r.readStr());
+        self.text = try toUtf16(a, try r.readStr());
+        self.detail = try toUtf16(a, try r.readStr());
+        self.err = try toUtf16(a, try r.readStr());
+        const n = try r.readU32();
+        if (n > max_questions) return error.TooManyQuestions;
+        const questions = try a.alloc(Question, n);
+        for (questions) |*q| q.* = .{
+            .label = try toUtf16(a, try r.readStr()),
+            .echo = try r.readU8() != 0,
+        };
+        self.questions = questions;
+        return self;
+    }
+
+    pub fn destroy(self: *Prompt) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// The button a prompt was answered with (proto.Choice).
+pub const Choice = enum(u8) {
+    cancel = 0,
+    accept = 1,
+    skip = 2,
+};
 
 pub const Channel = struct {
     conn: *SshConnection,
@@ -138,7 +244,7 @@ pub const Ending = struct {
 
 /// Run the helper, which connects to `destination` (`ssh://...`, or
 /// whatever slime-ssh takes) once the first channel opens.
-pub fn spawn(alloc: Allocator, destination: []const u16) !*SshConnection {
+pub fn spawn(alloc: Allocator, destination: []const u16, notify: Notify) !*SshConnection {
     if (std.mem.indexOfAny(u16, destination, std.unicode.utf8ToUtf16LeStringLiteral("\" \t")) != null) return error.BadDestination;
 
     var exe_buf: [max_path]u16 = undefined;
@@ -246,6 +352,7 @@ pub fn spawn(alloc: Allocator, destination: []const u16) !*SshConnection {
     self.* = .{
         .alloc = alloc,
         .destination = owned_destination,
+        .notify = notify,
         .process = pi.hProcess,
         .job = job,
         .control_in = stdin_write,
@@ -253,6 +360,7 @@ pub fn spawn(alloc: Allocator, destination: []const u16) !*SshConnection {
     };
     var hello: Payload = .{};
     hello.putU32(protocol_version);
+    hello.putU32(feature_prompts);
     try self.send(.hello, 0, hello.bytes());
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
     log.info("started slime-ssh for {f}", .{std.unicode.fmtUtf16Le(destination)});
@@ -384,8 +492,44 @@ pub fn shutdownIfUnused(self: *SshConnection) void {
     _ = win32.CloseHandle(self.control_out);
     _ = win32.CloseHandle(self.process);
     self.channels.deinit(self.alloc);
+    self.login.deinit(self.alloc);
     self.alloc.free(self.destination);
     self.alloc.destroy(self);
+}
+
+/// Take what logging in last asked or reported, which the caller then
+/// owns (`Login.deinit` with this connection's allocator). UI thread
+/// only.
+pub fn takeLogin(self: *SshConnection) Login {
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    const login = self.login;
+    self.login = .{};
+    return login;
+}
+
+/// Logged in, so new channels open without asking anything.
+pub fn isConnected(self: *SshConnection) bool {
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    return self.connected;
+}
+
+/// Reply to the prompt on channel `id`, one answer per question. A
+/// cancel with no prompt waiting gives up on logging in. UI thread
+/// only.
+pub fn sendAnswer(self: *SshConnection, id: u32, choice: Choice, answers: []const []const u16) !void {
+    var p: Payload = .{};
+    p.putU8(@intFromEnum(choice));
+    p.putU32(@intCast(answers.len));
+    for (answers) |units| {
+        // A field holds at most 256 units, at most 3 bytes each.
+        var buf: [1024]u8 = undefined;
+        const n = std.unicode.utf16LeToUtf8(&buf, units) catch 0;
+        p.putStr(buf[0..n]);
+    }
+    if (p.overflow) return error.NameTooLong;
+    try self.send(.answer, id, p.bytes());
 }
 
 /// Send a control message. UI thread only.
@@ -476,7 +620,31 @@ fn handle(self: *SshConnection, f: Frame) !void {
                 return error.VersionMismatch;
             }
         },
-        .connected => log.info("connected", .{}),
+        .connected => {
+            log.info("connected", .{});
+            win32.AcquireSRWLockExclusive(&self.lock);
+            self.connected = true;
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            self.post(0);
+        },
+        .prompt => {
+            const prompt = try Prompt.parse(self.alloc, f.payload);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            if (self.login.prompt) |old| old.destroy();
+            self.login.prompt = prompt;
+            self.login.channel = f.id;
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            self.post(f.id);
+        },
+        .info => {
+            const text = try toUtf16(self.alloc, try r.readStr());
+            win32.AcquireSRWLockExclusive(&self.lock);
+            if (self.login.info) |old| self.alloc.free(old);
+            self.login.info = text;
+            self.login.channel = f.id;
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            self.post(f.id);
+        },
         .opened => {},
         .exit => {
             const status: i32 = @bitCast(try r.readU32());
@@ -498,6 +666,23 @@ fn handle(self: *SshConnection, f: Frame) !void {
         },
         else => log.warn("unexpected message {d} from slime-ssh", .{@intFromEnum(f.type)}),
     }
+}
+
+fn post(self: *SshConnection, id: u32) void {
+    _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, id, 0);
+}
+
+/// `s` as UTF-16, or its bytes as Latin-1 if it isn't UTF-8, rather
+/// than nothing.
+fn toUtf16(a: Allocator, s: []const u8) ![]const u16 {
+    return std.unicode.utf8ToUtf16LeAlloc(a, s) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            const out = try a.alloc(u16, s.len);
+            for (out, s) |*o, b| o.* = b;
+            return out;
+        },
+    };
 }
 
 fn end(self: *SshConnection, id: u32, exited: bool, text: []const u8) void {
@@ -557,6 +742,10 @@ const Payload = struct {
         self.len += data.len;
     }
 
+    fn putU8(self: *Payload, v: u8) void {
+        self.put(&.{v});
+    }
+
     fn putU16(self: *Payload, v: u16) void {
         var b: [2]u8 = undefined;
         std.mem.writeInt(u16, &b, v, .little);
@@ -591,6 +780,10 @@ const Reader = struct {
         const b = self.buf[0..n];
         self.buf = self.buf[n..];
         return b;
+    }
+
+    fn readU8(self: *Reader) !u8 {
+        return (try self.take(1))[0];
     }
 
     fn readU32(self: *Reader) !u32 {
@@ -647,6 +840,21 @@ test Reader {
     try std.testing.expectError(error.Truncated, r.readU32());
     var bad: Reader = .{ .buf = &.{ 9, 0, 0, 0, 'x' } };
     try std.testing.expectError(error.Truncated, bad.readStr());
+}
+
+test "prompts parse as the Go side sends them" {
+    // ssh/internal/proto Prompt{Kind: PromptPassword, Title: "T",
+    // Questions: [{Label: "pw: "}]}.
+    const payload = [_]u8{1} ++ [_]u8{ 1, 0, 0, 0, 'T' } ++ [_]u8{0} ** 12 ++ [_]u8{ 1, 0, 0, 0 } ++
+        [_]u8{ 4, 0, 0, 0, 'p', 'w', ':', ' ', 0 };
+    const p = try Prompt.parse(std.testing.allocator, &payload);
+    defer p.destroy();
+    try std.testing.expectEqual(Prompt.Kind.password, p.kind);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("T"), p.title);
+    try std.testing.expectEqual(@as(usize, 1), p.questions.len);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("pw: "), p.questions[0].label);
+    try std.testing.expect(!p.questions[0].echo);
+    try std.testing.expectError(error.Truncated, Prompt.parse(std.testing.allocator, payload[0..20]));
 }
 
 test pwdFromUrl {

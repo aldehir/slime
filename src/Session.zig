@@ -15,6 +15,7 @@ const win32 = @import("win32/win32.zig");
 const input = @import("input.zig");
 const Pty = @import("Pty.zig");
 const SshConnection = @import("SshConnection.zig");
+const Login = @import("Login.zig");
 const clipboard = @import("clipboard.zig");
 const build_options = @import("build_options");
 const Window = @import("Window.zig");
@@ -69,6 +70,11 @@ exit_wait: ?win32.HANDLE = null,
 /// The SSH channel failed, and the session stays to say why until a key
 /// closes it. UI thread only.
 ended: bool = false,
+
+/// Logging in to the SSH host, while there's something to show: a
+/// question, the server working on an answer, or why it failed. Shown
+/// as a dialog over the terminal. UI thread only.
+login: ?*Login = null,
 
 /// Output arrived that the window hasn't drawn. Set by the reader thread.
 unseen: std.atomic.Value(bool) = .init(false),
@@ -238,6 +244,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
 
 pub fn destroy(self: *Session) void {
     const alloc = self.alloc;
+    if (self.login) |l| l.destroy();
     self.stopTransport();
     self.textures.deinit(alloc);
     self.cells.deinit(alloc);

@@ -142,28 +142,8 @@ fn paintField(c: *const Chrome, p: *Painter, r: Rect, field: *const Chrome.TextF
     p.strokeRounded(r.inset(c.stroke() / 2, c.stroke() / 2), radius, c.stroke(), c.theme.accent);
 
     const inner = r.inset(c.px(10), 0);
-    const text = field.text();
-    const font = c.fonts.body;
-    if (text.len == 0) p.text(L("user@host:port"), font, inner, c.theme.text_inactive);
-
-    const caret_x = c.fonts.measure(text[0..field.caret], font);
-    // Room for the caret at the right edge.
-    const scroll = @max(0, caret_x - (inner.w - c.stroke()));
-    const x = inner.x - scroll;
-    p.pushClip(inner.inset(0, -r.h));
-    defer p.popClip();
-    const sel = field.selection();
-    if (sel.start != sel.end) {
-        const x0 = x + c.fonts.measure(text[0..sel.start], font);
-        const x1 = x + c.fonts.measure(text[0..sel.end], font);
-        p.fill(.{ .x = @round(x0), .y = r.y + c.px(7), .w = @round(x1) - @round(x0), .h = r.h - c.px(14) }, c.theme.selection);
-    }
-    // Laid out wider than it is, so it's never trimmed.
-    p.text(text, font, .{ .x = x, .y = r.y, .w = c.fonts.measure(text, font) + inner.w, .h = r.h }, c.theme.text);
-    if (caret) {
-        const cx = Chrome.crisp(x + caret_x, c.stroke());
-        p.line(cx, r.y + c.px(8), cx, r.bottom() - c.px(8), c.stroke(), c.theme.text_strong);
-    }
+    if (field.len == 0) p.text(L("user@host:port"), c.fonts.body, inner, c.theme.text_inactive);
+    c.paintEditText(p, inner, field, .{ .caret = caret });
 }
 
 fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.View.Group) void {

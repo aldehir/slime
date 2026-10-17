@@ -117,11 +117,11 @@ that shows on hover.
 - **IME composition in text fields.** Committed text arrives as
   WM_CHAR, but the candidate window isn't placed at the caret.
 - **The Connect field's key** to open it from the keyboard.
-- **Prompts in a dialog.** Fill in `TypePrompt` as a list of questions
-  (label, echo) plus kind, title and instruction, answered or cancelled,
-  covering passwords, passphrases, keyboard-interactive, and host keys.
-  Shown as a modal over the pending session's terminal area, not the
-  whole window. They're text in the session for now.
+- **Login dialog keyboard reach.** Tab moves between fields but not to
+  the buttons, which only Enter (the primary one), Escape, and the mouse
+  press. A keyboard-interactive round past eight questions is cut short.
+- **Notices during login** (`Warning: Permanently added ...`, banners)
+  still print in the session's terminal, behind the dialog.
 - **Logging in, in the header.** A host shows `+` from the moment its
   helper starts, before it's logged in. Sessions left from a dead
   connection aren't dimmed.
