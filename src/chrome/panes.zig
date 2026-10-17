@@ -22,7 +22,7 @@ const Pane = Chrome.View.Pane;
 pub const gap = 10;
 /// The title strip's height.
 pub const title_height = 30;
-const button_size = 24;
+const button_size = 20;
 /// Between the last icon and the pane's right edge.
 const margin = 3;
 /// Before the title, and the focus dot before it.
@@ -90,9 +90,9 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
                 .hover => 1,
                 .pressed => pressed,
             };
-            // Each spans 18 of its 24 units: 13 DIPs in this box, whose
+            // Each spans 18 of its 24 units: 10 DIPs in this box, whose
             // odd size centers the split's middle line on a pixel.
-            const size = c.px(17);
+            const size = c.px(13);
             c.drawIcon(p, switch (b) {
                 .split_right => .columns_2,
                 .split_down => .rows_2,

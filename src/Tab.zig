@@ -22,6 +22,8 @@ focus: *Session,
 /// The pane filling the tab while it's zoomed. The others keep their
 /// sizes, out of sight.
 zoom: ?*Session = null,
+/// Its panes aren't listed under it in the sidebar.
+folded: bool = false,
 /// Between panes, from the last `place`.
 dividers: std.ArrayList(Divider) = .empty,
 

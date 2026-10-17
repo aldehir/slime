@@ -21,8 +21,6 @@ pub const Theme = struct {
     surface_hover: Color,
     /// A list row under the mouse.
     row_hover: Color,
-    /// The active session's row.
-    row_selected: Color,
     /// Icon buttons under the mouse, and while pressed.
     button_hover: Color,
     button_pressed: Color,
@@ -46,6 +44,9 @@ pub const Theme = struct {
     selection: Color,
     /// Errors and warnings.
     danger: Color,
+    /// A program waiting on the user, and one that finished.
+    warning: Color,
+    success: Color,
     /// Over a terminal behind a dialog.
     scrim: Color,
     /// A dialog, raised from the terminal, and its edge.
@@ -71,7 +72,6 @@ pub const Theme = struct {
             .surface = mix(ground, f, 0.07),
             .surface_hover = mix(ground, f, 0.11),
             .row_hover = mix(ground, f, 0.05),
-            .row_selected = mix(ground, f, 0.10),
             .button_hover = withAlpha(f, 0.08),
             .button_pressed = withAlpha(f, 0.05),
             .close_hover = Painter.rgb(0xc42b1c),
@@ -88,6 +88,8 @@ pub const Theme = struct {
             .on_accent = if (light) .{ 1, 1, 1, 1 } else Painter.rgb(0x0b1a2b),
             .selection = withAlpha(accent, 0.35),
             .danger = Painter.rgb(if (light) 0xc4314b else 0xf0848f),
+            .warning = Painter.rgb(if (light) 0xb7791f else 0xe0af68),
+            .success = Painter.rgb(if (light) 0x2f855a else 0x9ece6a),
             .scrim = .{ 0.05, 0.05, 0.08, if (light) 0.25 else 0.45 },
             .dialog = mix(b, f, if (light) 0.03 else 0.06),
             .dialog_outline = mix(b, f, 0.13),

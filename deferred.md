@@ -7,7 +7,10 @@ item out when it's done.
 
 The window draws its own title bar and session list (`src/chrome/`) with
 Direct2D over the terminal. The list has two layouts behind the title
-bar's toggle: a sidebar, which is done, and tabs, which isn't.
+bar's toggle: a sidebar, which is done, and tabs, which isn't. The
+sidebar is a tree: each tab's row folds open to a row per pane, with what
+its programs report doing (OSC 7501, `src/ProgramStatus.zig`), which
+slimed keeps while no window is attached.
 
 - **Tabs in the title bar.** `chrome/tabs.zig` lays out the title bar
   alone; the tabs (titles, close buttons, overflow) aren't drawn.
@@ -23,6 +26,13 @@ bar's toggle: a sidebar, which is done, and tabs, which isn't.
   switching between a light/dark theme pair waits on following the
   system's mode live (see Configuration).
 - **Remembering the layout** (sidebar or tabs) and the sidebar width.
+  Folding a tab's panes isn't remembered either, nor kept by slimed.
+- **Pane rows have no close button**; a pane closes from its terminal.
+- **Program status shows only its state.** A report's message, title,
+  progress, and kind (what a blocked program needs) aren't shown, say in
+  a tooltip; nor are records other than the most pressing, and `done`
+  stays until the program replaces or clears it, with no notion of the
+  user having seen it.
 
 ## Needs app chrome
 

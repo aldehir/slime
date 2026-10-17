@@ -18,10 +18,13 @@ pub const TEXT_ANTIALIAS_MODE_GRAYSCALE: u32 = 2;
 pub const TEXT_ANTIALIAS_MODE_ALIASED: u32 = 3;
 pub const DRAW_TEXT_OPTIONS_CLIP: u32 = 0x2;
 pub const FIGURE_BEGIN_FILLED: u32 = 0;
+pub const FIGURE_BEGIN_HOLLOW: u32 = 1;
+pub const FIGURE_END_OPEN: u32 = 0;
 pub const FIGURE_END_CLOSED: u32 = 1;
 pub const SWEEP_DIRECTION_COUNTER_CLOCKWISE: u32 = 0;
 pub const SWEEP_DIRECTION_CLOCKWISE: u32 = 1;
 pub const ARC_SIZE_SMALL: u32 = 0;
+pub const ARC_SIZE_LARGE: u32 = 1;
 pub const ANTIALIAS_MODE_PER_PRIMITIVE: u32 = 0;
 pub const INTERPOLATION_MODE_HIGH_QUALITY_CUBIC: u32 = 5;
 pub const LAYER_OPTIONS1_NONE: u32 = 0;
@@ -141,6 +144,10 @@ pub const IDeviceContext = extern struct {
 
     pub fn fillEllipse(self: *IDeviceContext, ellipse: *const ELLIPSE, brush: *ISolidColorBrush) void {
         com.call(self, 21, fn (*const ELLIPSE, *ISolidColorBrush) void, .{ ellipse, brush });
+    }
+
+    pub fn drawGeometry(self: *IDeviceContext, geometry: *IPathGeometry, brush: *ISolidColorBrush, width: f32) void {
+        com.call(self, 22, fn (*IPathGeometry, *ISolidColorBrush, f32, ?*anyopaque) void, .{ geometry, brush, width, null });
     }
 
     pub fn fillGeometry(self: *IDeviceContext, geometry: *IPathGeometry, brush: *ISolidColorBrush) void {

@@ -189,7 +189,16 @@ func TestCallbackLayouts(t *testing.T) {
 	size := types["GhosttySizeReportSize"]
 	seq := types["GhosttyTerminalUnknownSequence"]
 	mode := types["GhosttyTerminalUnknownModeSequence"]
+	status := types["GhosttyTerminalProgramStatus"]
+	prompt := types["GhosttyTerminalSemanticPrompt"]
+	str := types["GhosttyString"]
 	checkLayout(t, []layoutCheck{
+		{"status state", status.Fields["state"].Offset, statusOffState},
+		{"status progress", status.Fields["progress"].Offset, statusOffProgress},
+		{"status id", status.Fields["id"].Offset, statusOffID},
+		{"string ptr", str.Fields["ptr"].Offset, 0},
+		{"string len", str.Fields["len"].Offset, 4},
+		{"prompt kind", prompt.Fields["kind"].Offset, promptOffKind},
 		{"unknown value", seq.Fields["value"].Offset, unknownOffMode},
 		{"unknown mode.mode", unknownOffMode + mode.Fields["mode"].Offset, unknownOffMode},
 		{"unknown mode.ansi", unknownOffMode + mode.Fields["ansi"].Offset, unknownOffANSI},
@@ -468,4 +477,22 @@ func TestIdleMemory(t *testing.T) {
 	t.Logf("idle terminal: %d KiB linear memory", term.mem.Size()/1024)
 	term.Write(benchStream())
 	t.Logf("after 1 MiB of output: %d KiB", term.mem.Size()/1024)
+}
+
+// TestProgramStatus checks OSC 7501 reports and new prompts come through
+// in order.
+func TestProgramStatus(t *testing.T) {
+	term := newTerm(t, 20, 4)
+	var got []string
+	term.SetEvents(Events{
+		ProgramStatus: func(s Status) { got = append(got, fmt.Sprintf("%d:%d:%s", s.State, s.Progress, s.ID)) },
+		PromptStart:   func() { got = append(got, "prompt") },
+	})
+	if _, err := term.Write([]byte("\x1b]7501;state=working:progress=40:id=a/b\x1b\\\x1b]133;A\x07\x1b]7501;state=done\x07")); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"1:40:a/b", "prompt", "2:-1:"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
 }

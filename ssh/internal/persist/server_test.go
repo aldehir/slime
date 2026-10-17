@@ -355,7 +355,7 @@ func TestWireRoundTrip(t *testing.T) {
 			Panes:      []PaneInfo{{ID: 3, Tab: 2, Command: "c", Title: "t", Pwd: "p", Cols: 80, Rows: 24, Created: 1700000000000, PID: 5}},
 		},
 		&Workspace{Tag: 6, ID: 9, Name: "main", Tabs: tabs},
-		&Attached{Tag: 7, SnapshotLen: 1234, Modes: []Mode{{9001, false, true}, {4, true, false}}, Command: "pwsh -NoLogo"},
+		&Attached{Tag: 7, SnapshotLen: 1234, Modes: []Mode{{9001, false, true}, {4, true, false}}, Command: "pwsh -NoLogo", Status: []StatusRecord{{"", 1, 40}, {"deploy/eu", 3, -1}}},
 		&Snapshot{Data: []byte("GHOSTSNP")},
 		&Output{Data: []byte("\x1b[31mred")},
 		&Exit{Status: 0xc000013a},

@@ -72,6 +72,10 @@ pub const Hit = union(enum) {
     connect,
     tab: usize,
     close_tab: usize,
+    /// Tab `i`'s fold arrow.
+    fold: usize,
+    /// A pane's row in the sidebar.
+    tab_pane: struct { tab: usize, pane: usize },
     /// Pane `i` of `View.panes`, away from its buttons.
     terminal: usize,
     /// Pane `i`'s title strip, away from its buttons, which drags it.
@@ -147,6 +151,21 @@ pub const View = struct {
         title: []const u16,
         /// Output arrived while it wasn't shown.
         activity: bool,
+        /// Its panes, in layout order, listed under it unless `folded`.
+        panes: []const TabPane = &.{},
+        folded: bool = false,
+        /// The pane in `panes` with focus.
+        focus: usize = 0,
+    };
+
+    pub const TabPane = struct {
+        title: []const u16,
+        /// The most pressing thing its programs report, if any.
+        status: ?Status = null,
+        /// Output arrived while it wasn't shown.
+        activity: bool = false,
+
+        pub const Status = @import("../ProgramStatus.zig").State;
     };
 
     pub const Pane = struct {

@@ -17,6 +17,7 @@ const Pty = @import("Pty.zig");
 const SshConnection = @import("SshConnection.zig");
 const Slimed = @import("Slimed.zig");
 const Login = @import("Login.zig");
+const ProgramStatus = @import("ProgramStatus.zig");
 const clipboard = @import("clipboard.zig");
 const build_options = @import("build_options");
 const Window = @import("Window.zig");
@@ -103,6 +104,13 @@ high_surrogate: ?u16 = null,
 /// is a ConPTY (ours, or a remote Windows host's), so it follows the
 /// stream rather than the transport. Guarded by `lock`.
 win32_input: bool = false,
+
+/// What programs in the session report doing (OSC 7501). Guarded by
+/// `lock`.
+program_status: ProgramStatus = .{},
+/// `program_status` changed since the window last looked. Set by the
+/// reader thread.
+status_changed: std.atomic.Value(bool) = .init(false),
 
 /// The cell the last mouse event was reported in, so motion within one
 /// cell is reported once.
@@ -211,6 +219,10 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
             .compress_history = true,
         });
         self.win32_input = arrival.win32_input;
+        for (arrival.status) |rec| {
+            const state = std.enums.fromInt(ProgramStatus.State, rec.state) orelse continue;
+            self.program_status.restore(rec.id, state, rec.progress);
+        }
     }
 
     self.terminal = if (restored) |*d| d.toOwned() else try .init(window.io, alloc, .{
@@ -256,6 +268,9 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     self.stream.handler.effects.clipboard_write = &clipboardWrite;
     self.stream.handler.effects.clipboard_read = &clipboardRead;
     self.stream.handler.unknown_sequence = &unknownSequence;
+    // Also makes the terminal answer the protocol's support query.
+    self.stream.handler.effects.program_status = &programStatus;
+    self.stream.handler.effects.semantic_prompt = &semanticPrompt;
     // The snapshot was cut inside an escape sequence or codepoint: feed
     // its start so the live output continues it. Replies it causes go
     // nowhere, as the transport isn't set yet; the daemon answered.
@@ -650,6 +665,32 @@ fn clipboardRead(handler: *StreamHandler, read: ghostty_vt.clipboard.Read) void 
         .contents = contents[0..n],
         .available = if (text != null) &.{"text/plain"} else &.{},
     } });
+}
+
+/// Stream effect for program status reports (OSC 7501), and for a full
+/// reset, which clears them. Runs on the reader thread with the terminal
+/// locked.
+fn programStatus(handler: *StreamHandler, report: ghostty_vt.osc.Command.ProgramStatus.Report) void {
+    const self = fromHandler(handler);
+    self.program_status.report(report);
+    self.status_changed.store(true, .release);
+}
+
+/// Stream effect for shell integration (OSC 133): a new prompt means the
+/// last command's program is gone, and with it its work in progress.
+/// Runs on the reader thread with the terminal locked.
+fn semanticPrompt(handler: *StreamHandler, event: ghostty_vt.SemanticPrompt) void {
+    if (event.kind != .prompt_start) return;
+    const self = fromHandler(handler);
+    self.program_status.promptStarted();
+    self.status_changed.store(true, .release);
+}
+
+/// The most pressing thing its programs report, for the sidebar.
+pub fn statusSummary(self: *Session) ?ProgramStatus.Summary {
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    return self.program_status.summary();
 }
 
 /// ConPTY asks for DA1 at startup to learn what the terminal supports.

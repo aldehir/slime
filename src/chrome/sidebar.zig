@@ -1,8 +1,12 @@
 //! Tabs in a sidebar under the title bar, grouped by where they run:
 //! Local, then each remembered SSH host. A group's header has a button
 //! that opens another tab there, connecting first if the host isn't
-//! connected; a host with no tabs can be forgotten. A "Connect" button at the bottom turns
-//! into a field for a host to connect to.
+//! connected; a host with no tabs can be forgotten. A "Connect" button at
+//! the bottom turns into a field for a host to connect to.
+//!
+//! Each tab's row folds open to its panes, each a row of its own with
+//! what its programs report doing (OSC 7501): working, waiting on the
+//! user, done, or failed.
 
 const std = @import("std");
 const Chrome = @import("Chrome.zig");
@@ -20,7 +24,13 @@ const pad_top = 4;
 const section_gap = 10;
 const header_height = 28;
 const row_height = 30;
-const row_gap = 4;
+const row_gap = 2;
+/// A pane's row, under its tab's.
+const pane_height = 28;
+/// How far pane rows are indented: past the tab's fold arrow.
+const pane_indent = 26;
+/// The fold arrow's column at a tab row's left.
+const fold_width = 18;
 /// Rows' close buttons and headers' new tab buttons, in one column.
 const button_size = 20;
 const connect_height = 32;
@@ -51,7 +61,13 @@ pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.Vi
                 .{ .forget_host = g }
             else
                 .{ .header = g },
-            .row => |i| if (on_button) .{ .close_tab = i } else .{ .tab = i },
+            .tab => |i| if (on_button)
+                .{ .close_tab = i }
+            else if (x < item.rect.x + c.px(fold_width))
+                .{ .fold = i }
+            else
+                .{ .tab = i },
+            .pane => |pn| .{ .tab_pane = .{ .tab = pn.tab, .pane = pn.pane } },
         };
     }
     return .none;
@@ -69,7 +85,8 @@ pub fn buttonRect(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome
                 .forget_host => |h| if (h == g) return forgetButton(c, item.rect),
                 else => {},
             },
-            .row => |i| if (hit == .close_tab and hit.close_tab == i) return rowButton(c, item.rect),
+            .tab => |i| if (hit == .close_tab and hit.close_tab == i) return rowButton(c, item.rect),
+            .pane => {},
         }
     }
     return null;
@@ -88,7 +105,8 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
         if (item.rect.y >= rows.bottom()) break;
         switch (item.part) {
             .header => |g| paintHeader(c, p, item.rect, g, view.groups[g]),
-            .row => |i| paintRow(c, p, item.rect, i, view.tabs[i], i == view.active),
+            .tab => |i| paintTab(c, p, item.rect, i, view.tabs[i], i == view.active, view.spinner),
+            .pane => |pn| paintPane(c, p, item.rect, pn.tab, pn.pane, view),
         }
     }
     p.popClip();
@@ -235,31 +253,32 @@ fn upper(buf: []u16, text: []const u16) []const u16 {
     return buf[0..n];
 }
 
-fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, tab: Chrome.View.Tab, active: bool) void {
+fn paintTab(c: *const Chrome, p: *Painter, r: Rect, i: usize, tab: Chrome.View.Tab, active: bool, step: u32) void {
     const close_hovered = c.hover.eql(.{ .close_tab = i });
-    const hovered = close_hovered or c.hover.eql(.{ .tab = i });
-    const radius = c.px(6);
-    if (active) {
-        p.fillRounded(r, radius, c.theme.row_selected);
-    } else if (hovered) {
-        p.fillRounded(r, radius, c.theme.row_hover);
-    }
+    const hovered = close_hovered or c.hover.eql(.{ .tab = i }) or c.hover.eql(.{ .fold = i });
+    // The active tab is told by its brighter text alone.
+    if (hovered) p.fillRounded(r, c.px(6), c.theme.row_hover);
 
+    paintFold(c, p, .{ .x = r.x, .y = r.y, .w = c.px(fold_width), .h = r.h }, tab.folded, if (c.hover.eql(.{ .fold = i })) c.theme.text_strong else c.theme.text_muted);
+    // Lucide's panels-top-left spans 18 of its 24 units: 12 DIPs here.
     const icon = c.px(16);
-    const icon_color = if (active) c.theme.text else c.theme.text_muted;
-    c.drawIcon(p, .terminal, .{ .x = r.x + c.px(10), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, icon_color);
+    const icon_color = if (active) c.theme.text_strong else c.theme.text_muted;
+    c.drawIcon(p, .panels_top_left, .{ .x = r.x + c.px(fold_width), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, icon_color);
 
     const close = rowButton(c, r);
-    const text_x = r.x + c.px(34);
-    const text_right = if (hovered or active or tab.activity) close.x - c.px(4) else r.right() - c.px(8);
+    const text_x = r.x + c.px(fold_width + 24);
+    // Folded, its panes' most pressing status stands in for theirs.
+    const folded_status: ?Chrome.View.TabPane = if (tab.folded) mostPressing(tab.panes) else null;
+    const text_right = if (hovered or tab.activity or folded_status != null) close.x - c.px(4) else r.right() - c.px(8);
     const text_rect: Rect = .{ .x = text_x, .y = r.y, .w = @max(0, text_right - text_x), .h = r.h };
     if (active) {
         p.text(tab.title, c.fonts.body_strong, text_rect, c.theme.text_strong);
     } else {
-        p.text(tab.title, c.fonts.body, text_rect, c.theme.text);
+        p.text(tab.title, c.fonts.body, text_rect, c.theme.text_muted);
     }
 
-    if (hovered or active) {
+    if (!hovered) if (folded_status) |pane| return paintStatus(c, p, close, pane, step);
+    if (hovered) {
         if (close_hovered) p.fillRounded(close, c.px(4), switch (c.buttonState(.{ .close_tab = i })) {
             .pressed => c.theme.button_pressed,
             else => c.theme.button_hover,
@@ -269,6 +288,92 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, tab: Chrome.View.T
         c.drawIcon(p, .x, close.center(g, g), if (close_hovered) c.theme.text_strong else c.theme.text_muted);
     } else if (tab.activity) {
         p.dot(close.x + close.w / 2, close.y + close.h / 2, c.px(3), c.theme.accent);
+    }
+}
+
+/// The pane with the most pressing status: waiting on the user, then
+/// failed, working, and done. Null if none has a status worth showing.
+fn mostPressing(panes: []const Chrome.View.TabPane) ?Chrome.View.TabPane {
+    var best: ?Chrome.View.TabPane = null;
+    var best_rank: u8 = 0;
+    for (panes) |pane| {
+        const r: u8 = switch (pane.status orelse continue) {
+            .idle => continue,
+            .done => 1,
+            .working => 2,
+            .failed => 3,
+            .blocked => 4,
+        };
+        if (r > best_rank) {
+            best = pane;
+            best_rank = r;
+        }
+    }
+    return best;
+}
+
+/// A fold arrow, centered in `area`: down while open, right while folded.
+fn paintFold(c: *const Chrome, p: *Painter, area: Rect, folded: bool, color: Chrome.Color) void {
+    const h = c.px(3);
+    const cx = @round(area.x + area.w / 2);
+    const cy = @round(area.y + area.h / 2);
+    const w = c.stroke();
+    if (folded) {
+        p.line(cx - h / 2, cy - h, cx + h / 2, cy, w, color);
+        p.line(cx + h / 2, cy, cx - h / 2, cy + h, w, color);
+    } else {
+        p.line(cx - h, cy - h / 2, cx, cy + h / 2, w, color);
+        p.line(cx, cy + h / 2, cx + h, cy - h / 2, w, color);
+    }
+}
+
+/// Pane `j` of tab `i`, under its tab with a guide line down from it, and
+/// what its programs report at its right.
+fn paintPane(c: *const Chrome, p: *Painter, r: Rect, i: usize, j: usize, view: *const Chrome.View) void {
+    const tab = view.tabs[i];
+    const pane = tab.panes[j];
+    const hit: Hit = .{ .tab_pane = .{ .tab = i, .pane = j } };
+    if (c.hover.eql(hit)) p.fillRounded(r, c.px(6), c.theme.row_hover);
+    const guide_x = Chrome.crisp(r.x + c.px(fold_width / 2) + c.px(1), c.stroke());
+    const last = j + 1 == tab.panes.len;
+    p.line(guide_x, r.y, guide_x, if (last) r.y + r.h / 2 else r.bottom(), c.stroke(), c.theme.outline);
+
+    const focused = i == view.active and j == tab.focus;
+    const icon = c.px(14);
+    const x = r.x + c.px(pane_indent);
+    c.drawIcon(p, .terminal, .{ .x = x, .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, if (focused) c.theme.accent else c.theme.text_muted);
+    const slot = rowButton(c, r);
+    const text_x = x + c.px(22);
+    const text_rect: Rect = .{ .x = text_x, .y = r.y, .w = @max(0, slot.x - c.px(4) - text_x), .h = r.h };
+    p.text(pane.title, c.fonts.body, text_rect, if (focused) c.theme.text_strong else c.theme.text_muted);
+    paintStatus(c, p, slot, pane, view.spinner);
+}
+
+/// What a pane's programs report, in the square `slot`: a turning arc
+/// while working, a glowing dot while waiting on the user, a check when
+/// done, a cross when failed. Unreported output while it wasn't shown is
+/// a small dot.
+fn paintStatus(c: *const Chrome, p: *Painter, slot: Rect, pane: Chrome.View.TabPane, step: u32) void {
+    const cx = slot.x + slot.w / 2;
+    const cy = slot.y + slot.h / 2;
+    const status = pane.status orelse {
+        if (pane.activity) p.dot(cx, cy, c.px(3), c.theme.accent);
+        return;
+    };
+    switch (status) {
+        .idle => {},
+        .working => {
+            const turn = @as(f32, @floatFromInt(step % 12)) * (std.math.tau / 12.0);
+            p.arc(cx, cy, c.px(5), turn, std.math.tau * 0.72, c.px(1.5), c.theme.accent);
+        },
+        .blocked => {
+            const w = c.theme.warning;
+            p.dot(cx, cy, c.px(6), .{ w[0], w[1], w[2], 0.22 });
+            p.dot(cx, cy, c.px(3.5), w);
+        },
+        // Lucide's check and x span 16 and 12 of their 24 units.
+        .done => c.drawIcon(p, .check, slot.center(c.px(15), c.px(15)), c.theme.success),
+        .failed => c.drawIcon(p, .x, slot.center(c.px(16), c.px(16)), c.theme.danger),
     }
 }
 
@@ -283,53 +388,78 @@ fn rowButton(c: *const Chrome, row: Rect) Rect {
     };
 }
 
-/// The list's parts from the top: each group's header, then its rows.
+/// The list's parts from the top: each group's header, then its tabs'
+/// rows, each followed by its panes' unless folded.
 const Walk = struct {
     groups: []const Chrome.View.Group,
+    tabs: []const Chrome.View.Tab,
     x: f32,
     w: f32,
     /// The top of the next part.
     y: f32,
     header_h: f32,
     row_h: f32,
+    pane_h: f32,
     row_gap: f32,
     section_gap: f32,
     group: usize = 0,
-    /// Parts given out of the current group, its header first.
+    /// Tabs given out of the current group, after its header.
     in_group: usize = 0,
+    header_done: bool = false,
     tab: usize = 0,
+    /// The next pane of the last tab given out, while it's open.
+    pane: ?usize = null,
 
     const Item = struct {
-        part: union(enum) { header: usize, row: usize },
+        part: union(enum) {
+            header: usize,
+            tab: usize,
+            pane: struct { tab: usize, pane: usize },
+        },
         rect: Rect,
     };
 
     fn init(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.View) Walk {
         return .{
             .groups = view.groups,
+            .tabs = view.tabs,
             .x = l.list.x + c.px(pad_x),
             .w = @max(0, l.list.w - 2 * c.px(pad_x)),
             .y = l.list.y + c.px(pad_top),
             .header_h = c.px(header_height),
             .row_h = c.px(row_height),
+            .pane_h = c.px(pane_height),
             .row_gap = c.px(row_gap),
             .section_gap = c.px(section_gap),
         };
     }
 
     fn next(self: *Walk) ?Item {
+        if (self.pane) |j| {
+            const t = self.tab - 1;
+            if (t < self.tabs.len and j < self.tabs[t].panes.len) {
+                self.pane = j + 1;
+                return .{ .part = .{ .pane = .{ .tab = t, .pane = j } }, .rect = self.take(self.pane_h, 0) };
+            }
+            self.pane = null;
+            self.y += self.row_gap;
+        }
         while (self.group < self.groups.len) {
-            if (self.in_group == 0) {
-                self.in_group = 1;
+            if (!self.header_done) {
+                self.header_done = true;
                 return .{ .part = .{ .header = self.group }, .rect = self.take(self.header_h, 0) };
             }
-            if (self.in_group <= self.groups[self.group].tabs) {
+            if (self.in_group < self.groups[self.group].tabs) {
                 self.in_group += 1;
                 self.tab += 1;
-                return .{ .part = .{ .row = self.tab - 1 }, .rect = self.take(self.row_h, self.row_gap) };
+                const t = self.tab - 1;
+                const open = t < self.tabs.len and !self.tabs[t].folded;
+                if (open) self.pane = 0;
+                return .{ .part = .{ .tab = t }, .rect = self.take(self.row_h, if (open) 0 else self.row_gap) };
             }
             self.group += 1;
             self.in_group = 0;
+            self.header_done = false;
             self.y += self.section_gap;
         }
         return null;
@@ -351,7 +481,10 @@ test "groups, rows, and their buttons" {
             .{ .label = &.{}, .tabs = 2, .kind = .connected },
             .{ .label = &.{}, .tabs = 0, .kind = .disconnected },
         },
-        .tabs = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = false } },
+        .tabs = &.{
+            .{ .title = &.{}, .activity = false, .panes = &.{.{ .title = &.{} }}, .folded = true },
+            .{ .title = &.{}, .activity = false, .panes = &.{ .{ .title = &.{} }, .{ .title = &.{}, .status = .working } } },
+        },
         .active = 0,
         .focused = true,
         .maximized = false,
@@ -364,8 +497,14 @@ test "groups, rows, and their buttons" {
     const remote = walk.next().?;
     try std.testing.expectEqual(@as(usize, 1), remote.part.header);
     try std.testing.expect(remote.rect.y > local.rect.bottom());
-    _ = walk.next().?;
+    // The first tab is folded; the second lists its two panes.
+    try std.testing.expectEqual(@as(usize, 0), walk.next().?.part.tab);
     const second = walk.next().?.rect;
+    const pane = walk.next().?;
+    try std.testing.expectEqual(@as(usize, 1), pane.part.pane.tab);
+    try std.testing.expectEqual(@as(usize, 0), pane.part.pane.pane);
+    try std.testing.expectEqual(second.bottom(), pane.rect.y);
+    try std.testing.expectEqual(@as(usize, 1), walk.next().?.part.pane.pane);
     const forgotten = walk.next().?;
     try std.testing.expectEqual(@as(usize, 2), forgotten.part.header);
     try std.testing.expect(walk.next() == null);
@@ -373,7 +512,9 @@ test "groups, rows, and their buttons" {
     try std.testing.expectEqual(l.list.bottom() - pad_bottom, connect.bottom());
     try std.testing.expectEqual(Hit.connect, c.hitTest(&l, &view, connect.x + 1, connect.y + 1));
 
-    try std.testing.expectEqual(Hit{ .tab = 1 }, c.hitTest(&l, &view, second.x + 2, second.y + 2));
+    try std.testing.expectEqual(Hit{ .fold = 1 }, c.hitTest(&l, &view, second.x + 2, second.y + 2));
+    try std.testing.expectEqual(Hit{ .tab = 1 }, c.hitTest(&l, &view, second.x + fold_width + 10, second.y + 2));
+    try std.testing.expectEqual(Hit{ .tab_pane = .{ .tab = 1, .pane = 0 } }, c.hitTest(&l, &view, pane.rect.x + 40, pane.rect.y + 2));
     const close = rowButton(&c, second);
     try std.testing.expectEqual(Hit{ .close_tab = 1 }, c.hitTest(&l, &view, close.x + 1, close.y + 1));
     const plus = rowButton(&c, remote.rect);
@@ -385,5 +526,5 @@ test "groups, rows, and their buttons" {
     const forget = forgetButton(&c, forgotten.rect);
     try std.testing.expectEqual(Hit{ .forget_host = 2 }, c.hitTest(&l, &view, forget.x + 1, forget.y + 1));
     // Between groups.
-    try std.testing.expectEqual(Hit.none, c.hitTest(&l, &view, second.x + 2, second.bottom() + 5));
+    try std.testing.expectEqual(Hit.none, c.hitTest(&l, &view, second.x + 2, forgotten.rect.y - 5));
 }

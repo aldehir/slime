@@ -27,6 +27,36 @@ type Events struct {
 	// doesn't implement, in order: ConPTY's win32-input-mode (DEC 9001),
 	// for one. ansi is false for DEC private modes (CSI ?).
 	UnknownMode func(mode uint16, ansi, enabled bool)
+
+	// ProgramStatus reports each program status report (OSC 7501),
+	// already checked against the protocol, and PromptStart each new
+	// shell prompt (OSC 133 A), which ends what the last command
+	// reported. Both arrive in the order the output had them. A full
+	// reset reports StatusClear with no id.
+	ProgramStatus func(s Status)
+	PromptStart   func()
+}
+
+// StatusState is a program status report's state, numbered as
+// GhosttyProgramStatusState.
+type StatusState uint8
+
+const (
+	StatusIdle StatusState = iota
+	StatusWorking
+	StatusDone
+	StatusBlocked
+	StatusError
+	StatusClear
+)
+
+// Status is one program status report: the record it sets (ID, empty
+// for the program itself) and what it says. Progress is 0 to 100, or -1
+// when the report has none.
+type Status struct {
+	State    StatusState
+	Progress int8
+	ID       string
 }
 
 // Mode is a set or reset of a mode libghostty-vt doesn't implement.
@@ -50,6 +80,8 @@ var callbacks = []struct {
 	{"device_attributes", 8, 2},
 	{"size", 6, 2},
 	{"unknown_sequence", 35, 3},
+	{"semantic_prompt", 42, 3},
+	{"program_status", 46, 3},
 }
 
 const optUserdata = 0
@@ -63,6 +95,17 @@ const (
 	unknownOffEnabled = 11
 )
 
+// GhosttyTerminalProgramStatus and GhosttyTerminalSemanticPrompt, wasm32
+// layout (TestCallbackLayouts): only what slimed reads.
+const (
+	statusOffState    = 4
+	statusOffProgress = 12
+	statusOffID       = 16 // a GhosttyString: pointer, then length
+
+	promptOffKind   = 4
+	promptKindStart = 1
+)
+
 // pending is what callbacks recorded during one Write.
 type pending struct {
 	reply []byte
@@ -70,6 +113,9 @@ type pending struct {
 	title bool
 	pwd   bool
 	modes []Mode
+	// Program status reports and new prompts, in order; a nil status is
+	// a prompt.
+	status []*Status
 }
 
 // Primary and secondary device attributes, as slime answers them:
@@ -156,6 +202,34 @@ func (r *Runtime) hostModule(ctx context.Context) error {
 			enabled, _ := t.mem.ReadByte(seq + unknownOffEnabled)
 			t.pend.modes = append(t.pend.modes, Mode{mode, ansi != 0, enabled != 0})
 		}).Export("unknown_sequence")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _, ud, ev uint32) {
+			t := r.lookup(ud)
+			if t == nil {
+				return
+			}
+			if kind, _ := t.mem.ReadUint32Le(ev + promptOffKind); kind == promptKindStart {
+				t.pend.status = append(t.pend.status, nil)
+			}
+		}).Export("semantic_prompt")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _, ud, rep uint32) {
+			t := r.lookup(ud)
+			if t == nil {
+				return
+			}
+			state, _ := t.mem.ReadUint32Le(rep + statusOffState)
+			progress, _ := t.mem.ReadByte(rep + statusOffProgress)
+			ptr, _ := t.mem.ReadUint32Le(rep + statusOffID)
+			n, _ := t.mem.ReadUint32Le(rep + statusOffID + 4)
+			id := ""
+			if n > 0 {
+				if b, ok := t.mem.Read(ptr, n); ok {
+					id = string(b)
+				}
+			}
+			t.pend.status = append(t.pend.status, &Status{State: StatusState(state), Progress: int8(progress), ID: id})
+		}).Export("program_status")
 	_, err := b.Instantiate(ctx)
 	return err
 }
@@ -212,7 +286,16 @@ func (t *Terminal) termSetValue(opt, v uint64) error {
 // deliver hands what the last Write's callbacks recorded to the handlers.
 func (t *Terminal) deliver() {
 	p := t.pend
-	t.pend = pending{reply: p.reply[:0], modes: p.modes[:0]}
+	t.pend = pending{reply: p.reply[:0], modes: p.modes[:0], status: p.status[:0]}
+	for _, s := range p.status {
+		if s == nil {
+			if t.events.PromptStart != nil {
+				t.events.PromptStart()
+			}
+		} else if t.events.ProgramStatus != nil {
+			t.events.ProgramStatus(*s)
+		}
+	}
 	for _, m := range p.modes {
 		if t.events.UnknownMode != nil {
 			t.events.UnknownMode(m.Mode, m.ANSI, m.Enabled)
@@ -255,7 +338,7 @@ func trampoline(module string) []byte {
 	types = append(types, 0x60, 4, i32, i32, i32, i32, 0) // write_pty
 	types = append(types, 0x60, 2, i32, i32, 0)           // bell, title, pwd
 	types = append(types, 0x60, 3, i32, i32, i32, 1, i32) // DA, size
-	types = append(types, 0x60, 3, i32, i32, i32, 0)      // unknown_sequence
+	types = append(types, 0x60, 3, i32, i32, i32, 0)      // unknown_sequence, semantic_prompt, program_status
 	types = append(types, 0x60, 0, byte(n))               // install
 	for range n {
 		types = append(types, i32)

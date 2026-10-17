@@ -178,6 +178,7 @@ test {
     _ = @import("Session.zig");
     _ = @import("Slimed.zig");
     _ = @import("Tab.zig");
+    _ = @import("ProgramStatus.zig");
     _ = @import("SshConnection.zig");
     _ = @import("chrome/Chrome.zig");
     _ = @import("chrome/sidebar.zig");

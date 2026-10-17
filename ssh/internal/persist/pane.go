@@ -26,6 +26,7 @@ type Pane struct {
 	client *conn
 	size   Size
 	modes  []Mode // the unknown modes seen, in their current state
+	status programStatus
 	done   bool
 }
 
@@ -48,7 +49,9 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 				pn.pty.Write(b)
 			}
 		},
-		UnknownMode: pn.setMode,
+		UnknownMode:   pn.setMode,
+		ProgramStatus: pn.status.report,
+		PromptStart:   pn.status.promptStarted,
 	})
 	return pn
 }
@@ -140,6 +143,7 @@ func (p *Pane) snapshotTo(c *conn, tag uint32) error {
 		SnapshotLen: uint32(len(snap)),
 		Modes:       append([]Mode(nil), p.modes...),
 		Command:     p.command,
+		Status:      p.status.records(),
 	})
 	for len(snap) > 0 {
 		n := min(len(snap), SnapshotChunk)

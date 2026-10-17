@@ -256,6 +256,18 @@ type Attached struct {
 	Modes       []Mode
 	// Command is what the pane runs, for a client that didn't start it.
 	Command string
+	// Status is what the pane's programs report doing (OSC 7501), which
+	// a snapshot doesn't carry, oldest update first.
+	Status []StatusRecord
+}
+
+// StatusRecord is one program status record: its id (empty for the
+// program itself), state (vt.StatusState: idle, working, done, blocked,
+// or error), and progress (0 to 100, or -1 for none).
+type StatusRecord struct {
+	ID       string
+	State    uint8
+	Progress int8
 }
 
 type Mode struct {
@@ -528,6 +540,12 @@ func (m *Attached) encode(e *encoder) {
 		e.bool(md.Enabled)
 	}
 	e.str(m.Command)
+	e.u32(uint32(len(m.Status)))
+	for _, r := range m.Status {
+		e.str(r.ID)
+		e.u8(r.State)
+		e.u8(uint8(r.Progress))
+	}
 }
 
 func (m *Attached) decode(d *decoder) {
@@ -539,6 +557,11 @@ func (m *Attached) decode(d *decoder) {
 		m.Modes[i] = Mode{Mode: d.u16(), ANSI: d.bool(), Enabled: d.bool()}
 	}
 	m.Command = d.str()
+	n = d.count(6)
+	m.Status = make([]StatusRecord, n)
+	for i := range m.Status {
+		m.Status[i] = StatusRecord{ID: d.str(), State: d.u8(), Progress: int8(d.u8())}
+	}
 }
 
 func (m *Snapshot) encode(e *encoder) { e.raw(m.Data) }

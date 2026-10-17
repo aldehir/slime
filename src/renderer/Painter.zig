@@ -146,6 +146,30 @@ pub fn dot(self: *Painter, cx: f32, cy: f32, radius: f32, c: Color) void {
     self.ctx.fillEllipse(&.{ .point = .{ .x = cx, .y = cy }, .radiusX = radius, .radiusY = radius }, self.color(c));
 }
 
+/// Stroke an arc of the circle at (`cx`, `cy`) with radius `r`, from
+/// `start` radians clockwise through `sweep` (under a full turn), `width`
+/// thick.
+pub fn arc(self: *Painter, cx: f32, cy: f32, r: f32, start: f32, sweep: f32, width: f32, c: Color) void {
+    var geometry: ?*d2d1.IPathGeometry = null;
+    com.check(self.factory.createPathGeometry(&geometry), "ID2D1Factory::CreatePathGeometry") catch return;
+    defer com.releaseOpt(&geometry);
+    var sink: ?*d2d1.IGeometrySink = null;
+    com.check(geometry.?.open(&sink), "ID2D1PathGeometry::Open") catch return;
+    defer com.releaseOpt(&sink);
+
+    const end = start + sweep;
+    sink.?.beginFigure(.{ .x = cx + r * @cos(start), .y = cy + r * @sin(start) }, d2d1.FIGURE_BEGIN_HOLLOW);
+    sink.?.addArc(&.{
+        .point = .{ .x = cx + r * @cos(end), .y = cy + r * @sin(end) },
+        .size = .{ .width = r, .height = r },
+        .sweepDirection = d2d1.SWEEP_DIRECTION_CLOCKWISE,
+        .arcSize = if (sweep > std.math.pi) d2d1.ARC_SIZE_LARGE else d2d1.ARC_SIZE_SMALL,
+    });
+    sink.?.endFigure(d2d1.FIGURE_END_OPEN);
+    com.check(sink.?.close(), "ID2D1GeometrySink::Close") catch return;
+    self.ctx.drawGeometry(geometry.?, self.color(c), width);
+}
+
 /// Draw text laid out by `format` (alignment, trimming) in `r`, clipped
 /// to it.
 pub fn text(self: *Painter, str: []const u16, format: *dwrite.ITextFormat, r: Rect, c: Color) void {

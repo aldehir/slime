@@ -132,14 +132,33 @@ pub const Arrival = struct {
     command: []const u16,
     /// win32-input-mode, which a snapshot doesn't carry.
     win32_input: bool,
+    /// What its programs report doing (OSC 7501), which a snapshot
+    /// doesn't carry either, oldest update first. Owned.
+    status: []StatusRecord,
     /// From our own TabNew or Split, so the window shows it.
     requested: bool,
 
     pub fn deinit(self: *Arrival, alloc: Allocator) void {
         alloc.free(self.snapshot);
         alloc.free(self.command);
+        freeStatus(alloc, self.status);
     }
 };
+
+/// A program status record as the daemon keeps it (wire.go's
+/// StatusRecord). `state` numbers as `ProgramStatus.State`.
+pub const StatusRecord = struct {
+    /// Owned.
+    id: []const u8,
+    state: u8,
+    /// 0 to 100, or null for none.
+    progress: ?u8,
+};
+
+fn freeStatus(alloc: Allocator, status: []StatusRecord) void {
+    for (status) |r| alloc.free(r.id);
+    alloc.free(status);
+}
 
 /// The way a split lays out its children (layout.go's Axis).
 pub const Axis = enum(u8) {
@@ -205,13 +224,17 @@ const Pending = struct {
     output: std.ArrayList(u8) = .empty,
     command: []const u16 = &.{},
     win32_input: bool = false,
+    status: []StatusRecord = &.{},
     /// Handed to `arrivals` already.
     arrived: bool = false,
 
     fn deinit(self: *Pending, alloc: Allocator) void {
         self.snapshot.deinit(alloc);
         self.output.deinit(alloc);
-        if (!self.arrived) alloc.free(self.command);
+        if (!self.arrived) {
+            alloc.free(self.command);
+            freeStatus(alloc, self.status);
+        }
     }
 };
 
@@ -552,7 +575,9 @@ fn handle(self: *Slimed, f: Frame) !u32 {
             }
             const command = toUtf16(self.alloc, r.readStr() catch "") catch return error.OutOfMemory;
             errdefer self.alloc.free(command);
-            var pend: Pending = .{ .want = len, .command = command, .win32_input = win32_input };
+            const status = try readStatus(self.alloc, &r);
+            errdefer freeStatus(self.alloc, status);
+            var pend: Pending = .{ .want = len, .command = command, .win32_input = win32_input, .status = status };
             try pend.snapshot.ensureTotalCapacityPrecise(self.alloc, len);
             const gop = try self.panes.getOrPut(self.alloc, f.id);
             if (gop.found_existing) switch (gop.value_ptr.*) {
@@ -638,6 +663,7 @@ fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
                 .snapshot = snapshot,
                 .command = pend.command,
                 .win32_input = pend.win32_input,
+                .status = pend.status,
                 .requested = requested,
             });
             pend.arrived = true;
@@ -647,6 +673,28 @@ fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
     self.structure = st;
     if (self.reader != null) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
     return t;
+}
+
+/// An Attached message's status records, at its end. A daemon too old to
+/// send them sends none.
+fn readStatus(a: Allocator, r: *Reader) ![]StatusRecord {
+    const n = r.readU32() catch return &.{};
+    if (n > r.buf.len / 6) return error.Truncated;
+    const out = try a.alloc(StatusRecord, n);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |rec| a.free(rec.id);
+        a.free(out);
+    }
+    for (out) |*rec| {
+        const id = try a.dupe(u8, try r.readStr());
+        errdefer a.free(id);
+        const state = try r.readU8();
+        const progress = try r.readU8();
+        rec.* = .{ .id = id, .state = state, .progress = if (progress <= 100) progress else null };
+        made += 1;
+    }
+    return out;
 }
 
 /// The tabs of a Workspace message, read from its tag on.

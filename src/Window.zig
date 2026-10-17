@@ -119,6 +119,7 @@ active: usize = 0,
 next_session_id: u32 = 1,
 /// Scratch for `view`, with room for every group.
 view_tabs: std.ArrayList(Chrome.View.Tab) = .empty,
+view_tab_panes: std.ArrayList(Chrome.View.TabPane) = .empty,
 view_groups: std.ArrayList(Chrome.View.Group) = .empty,
 view_panes: std.ArrayList(Chrome.View.Pane) = .empty,
 view_dividers: std.ArrayList(Chrome.Rect) = .empty,
@@ -334,6 +335,7 @@ pub fn destroy(self: *Window) void {
     // window.
     if (self.slimed) |conn| conn.deinit();
     self.view_tabs.deinit(self.alloc);
+    self.view_tab_panes.deinit(self.alloc);
     self.view_groups.deinit(self.alloc);
     self.view_panes.deinit(self.alloc);
     self.view_dividers.deinit(self.alloc);
@@ -879,6 +881,17 @@ fn shownPane(self: *const Window, i: usize) ?*Session {
     return if (i < self.shown.items.len) self.shown.items[i] else null;
 }
 
+/// Show tab `i` and give its pane `j` (in layout order) the keys.
+fn showPane(self: *Window, i: usize, j: usize) void {
+    if (i >= self.tabs.items.len) return;
+    self.activate(i);
+    var it = self.activeTab().iterator();
+    var n: usize = 0;
+    while (it.next()) |s| : (n += 1) {
+        if (n == j) return self.focusPane(s);
+    }
+}
+
 /// Give the active tab's pane `s` the keys.
 fn focusPane(self: *Window, s: *Session) void {
     const t = self.activeTab();
@@ -992,9 +1005,11 @@ fn cycle(self: *Window, forward: bool) void {
 /// once per display refresh, and right away when the terminal was idle.
 pub fn outputArrived(self: *Window) void {
     const quiet = win32.GetTickCount64() < self.quiet_until;
+    var status_changed = false;
     for (self.tabs.items, 0..) |t, i| {
         var it = t.iterator();
         while (it.next()) |s| {
+            if (s.status_changed.swap(false, .acq_rel)) status_changed = true;
             if (!s.unseen.swap(false, .acq_rel)) continue;
             if (i == self.active) {
                 if (!t.shows(s)) continue;
@@ -1005,6 +1020,10 @@ pub fn outputArrived(self: *Window) void {
                 self.dirty = true;
             }
         }
+    }
+    if (status_changed) {
+        self.dirty = true;
+        self.updateSpinner();
     }
 }
 
@@ -1364,8 +1383,10 @@ fn loginChanged(self: *Window, id: u32) void {
 }
 
 /// Run the spinner's timer while the active session's dialog waits.
+/// Run the spinner's timer while the active session's dialog waits, or a
+/// pane is working.
 fn updateSpinner(self: *Window) void {
-    const waiting = if (self.activeSession().login) |l| l.dialog.state == .waiting else false;
+    const waiting = if (self.activeSession().login) |l| l.dialog.state == .waiting else self.anyWorking();
     if (waiting == self.spinning) return;
     self.spinning = waiting;
     if (waiting) {
@@ -1375,11 +1396,24 @@ fn updateSpinner(self: *Window) void {
     }
 }
 
+/// A pane reports work in progress, which the sidebar shows turning.
+fn anyWorking(self: *Window) bool {
+    for (self.tabs.items) |t| {
+        var it = t.iterator();
+        while (it.next()) |s| {
+            const summary = s.statusSummary() orelse continue;
+            if (summary.state == .working) return true;
+        }
+    }
+    return false;
+}
+
 /// The chrome's view of the window's state.
 fn view(self: *Window) Chrome.View {
     // `reserveGroups` keeps room for every group. The rest is grown here,
     // and left out if that fails.
     self.view_tabs.clearRetainingCapacity();
+    self.view_tab_panes.clearRetainingCapacity();
     self.view_groups.clearRetainingCapacity();
     self.view_panes.clearRetainingCapacity();
     self.view_dividers.clearRetainingCapacity();
@@ -1394,8 +1428,31 @@ fn view(self: *Window) Chrome.View {
         });
     }
     for (self.tabs.items) |t| {
-        self.view_tabs.append(self.alloc, .{ .title = t.focus.title(), .activity = t.activity() }) catch break;
+        const first = self.view_tab_panes.items.len;
+        var focus: usize = 0;
+        var pi = t.iterator();
+        while (pi.next()) |s| {
+            if (s == t.focus) focus = self.view_tab_panes.items.len - first;
+            self.view_tab_panes.append(self.alloc, .{
+                .title = s.title(),
+                .status = if (s.statusSummary()) |summary| summary.state else null,
+                .activity = s.activity,
+            }) catch break;
+        }
+        self.view_tabs.append(self.alloc, .{
+            .title = t.focus.title(),
+            .activity = t.activity(),
+            .folded = t.folded,
+            .focus = focus,
+        }) catch break;
         self.view_groups.items[self.groupOf(t)].tabs += 1;
+    }
+    // Each tab's panes, now that growing the list can't move them.
+    var start: usize = 0;
+    for (self.view_tabs.items, self.tabs.items[0..self.view_tabs.items.len]) |*vt, t| {
+        const n = @min(t.count(), self.view_tab_panes.items.len - start);
+        vt.panes = self.view_tab_panes.items[start..][0..n];
+        start += n;
     }
     const tab = self.activeTab();
     const several = tab.count() > 1;
@@ -1548,6 +1605,7 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             _ = win32.SetCapture(self.hwnd.?);
             // Rows switch on press, as tabs do.
             if (hit == .tab) self.activate(hit.tab);
+            if (hit == .tab_pane) self.showPane(hit.tab_pane.tab, hit.tab_pane.pane);
         },
         win32.WM_LBUTTONUP => {
             const pressed = self.chrome.pressed;
@@ -1593,6 +1651,12 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             self.dirty = true;
         },
         .close_tab => |i| self.closeTab(i),
+        .fold => |i| if (i < self.tabs.items.len) {
+            const t = self.tabs.items[i];
+            t.folded = !t.folded;
+            _ = self.chrome.setHover(.none);
+            self.dirty = true;
+        },
         .split_right => |i| self.splitPane(i, .right),
         .split_down => |i| self.splitPane(i, .down),
         .zoom => |i| self.toggleZoom(i),
