@@ -51,8 +51,13 @@ pub const Hit = union(enum) {
     maximize,
     close,
     toggle_mode,
-    /// The button that opens a session in group `i`.
+    /// Group `i`'s header, away from its buttons.
+    header: usize,
+    /// The button that opens a session in group `i`, connecting first
+    /// if it's a host that isn't connected.
     new_session: usize,
+    /// The button that removes host group `i` from the list.
+    forget_host: usize,
     /// The button that connects to a host, or its field.
     connect,
     session: usize,
@@ -88,6 +93,15 @@ pub const View = struct {
         label: []const u16,
         /// How many of `sessions` are in it.
         sessions: usize,
+        kind: Kind,
+
+        pub const Kind = enum {
+            local,
+            /// A host with a live connection, which new sessions join.
+            connected,
+            /// A remembered host that new sessions connect to.
+            disconnected,
+        };
     };
 
     pub const Session = struct {
@@ -417,7 +431,7 @@ pub const Fonts = struct {
 test "layout and hit testing" {
     var chrome: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: View = .{
-        .groups = &.{.{ .label = &.{}, .sessions = 2 }},
+        .groups = &.{.{ .label = &.{}, .sessions = 2, .kind = .local }},
         .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = true } },
         .active = 0,
         .focused = true,

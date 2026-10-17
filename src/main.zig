@@ -4,6 +4,7 @@ const wuffs = @import("wuffs");
 const win32 = @import("win32/win32.zig");
 const Window = @import("Window.zig");
 const Config = @import("Config.zig");
+const Hosts = @import("Hosts.zig");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
@@ -18,8 +19,12 @@ pub fn main(init: std.process.Init) !void {
     _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ghostty_vt.sys.decode_png = &decodePng;
 
-    var config = try loadConfig(init);
+    const config_dir = try Config.defaultDir(init.gpa, init.environ_map);
+    defer if (config_dir) |d| init.gpa.free(d);
+    var config = try loadConfig(init, config_dir);
     defer config.deinit();
+    var hosts: Hosts = try .load(init.gpa, init.io, config_dir);
+    defer hosts.deinit();
 
     const command_line = try shellCommand(init.gpa, config.command);
     defer init.gpa.free(command_line);
@@ -30,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
         try init.gpa.dupeZ(u16, command_line);
     defer init.gpa.free(local_command);
 
-    const window = try Window.create(init.gpa, init.io, &config, command_line, local_command);
+    const window = try Window.create(init.gpa, init.io, &config, &hosts, command_line, local_command);
     defer window.destroy();
 
     // Handle every pending message (input first) before drawing, so a
@@ -77,10 +82,8 @@ fn decodePng(alloc: std.mem.Allocator, data: []const u8) ghostty_vt.sys.DecodeEr
 
 /// Load the config from the default directory, with the bundled themes
 /// in `themes` next to the executable.
-fn loadConfig(init: std.process.Init) !Config {
+fn loadConfig(init: std.process.Init, dir: ?[]const u8) !Config {
     const alloc = init.gpa;
-    const dir = try Config.defaultDir(alloc, init.environ_map);
-    defer if (dir) |d| alloc.free(d);
     const exe_dir = std.process.executableDirPathAlloc(init.io, alloc) catch null;
     defer if (exe_dir) |d| alloc.free(d);
     return Config.load(alloc, init.io, .{
@@ -171,6 +174,7 @@ test {
     _ = win32;
     _ = Window;
     _ = Config;
+    _ = @import("Hosts.zig");
     _ = @import("Session.zig");
     _ = @import("SshConnection.zig");
     _ = @import("chrome/Chrome.zig");

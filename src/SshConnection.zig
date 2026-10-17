@@ -271,8 +271,13 @@ fn helperPath(buf: *[max_path]u16) ![]const u16 {
 
 /// The destination without its `ssh://`, for showing.
 pub fn label(self: *const SshConnection) []const u16 {
+    return labelFor(self.destination);
+}
+
+/// `destination` without its `ssh://`.
+pub fn labelFor(destination: []const u16) []const u16 {
     const scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
-    return if (std.mem.startsWith(u16, self.destination, scheme)) self.destination[scheme.len..] else self.destination;
+    return if (std.mem.startsWith(u16, destination, scheme)) destination[scheme.len..] else destination;
 }
 
 /// The helper is running, so channels opened on it can work.

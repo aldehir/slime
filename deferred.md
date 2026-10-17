@@ -104,11 +104,13 @@ Images placed at the cursor are drawn, in kitty's three z layers.
 through `slime-ssh.exe` (ssh/), one connection shared by every session
 opened from one of its sessions.
 
-The sidebar groups sessions by connection, under a header per host whose
-`+` opens another channel (or reconnects, if the connection is gone).
+The sidebar lists every host connected to before (`hosts` in the config
+directory), grouping sessions under them. A host's header button
+connects (a plug) or, once connected, opens another channel on the
+connection (`+`). A host with no sessions can be forgotten with the ×
+that shows on hover.
 
-- **Recent hosts** under the Connect field, to click instead of typing.
-  Needs somewhere to keep them.
+- **Reordering hosts.** They're listed in the order first connected to.
 - **The mouse in text fields** (`chrome/TextField.zig`): clicking to
   place the caret, dragging to select, double-click for a word. Only
   the keyboard edits them.
@@ -120,11 +122,9 @@ The sidebar groups sessions by connection, under a header per host whose
   covering passwords, passphrases, keyboard-interactive, and host keys.
   Shown as a modal over the pending session's terminal area, not the
   whole window. They're text in the session for now.
-- **Connection state in its header**: connecting, and disconnected with
-  a reconnect button. A dead connection's group looks like a live one,
-  and its `+` makes a new group to the same host.
-- **Group labels** that tell apart two connections to one host, by
-  user or port.
+- **Logging in, in the header.** A host shows `+` from the moment its
+  helper starts, before it's logged in. Sessions left from a dead
+  connection aren't dimmed.
 - **The new session key hint** went with the "New session" button.
   Ctrl+Shift+T opens one in the active session's group.
 - **`~/.ssh/config`**: `Host` aliases, `User`, `Port`, `IdentityFile`,

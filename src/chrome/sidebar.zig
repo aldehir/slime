@@ -1,6 +1,7 @@
 //! Sessions in a sidebar under the title bar, grouped by where they run:
-//! Local, then each SSH connection. A group's header has a button that
-//! opens another session there. A "Connect" button at the bottom turns
+//! Local, then each remembered SSH host. A group's header has a button
+//! that opens another session there, connecting first if the host isn't
+//! connected; a host with no sessions can be forgotten. A "Connect" button at the bottom turns
 //! into a field for a host to connect to.
 
 const std = @import("std");
@@ -46,7 +47,12 @@ pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.Vi
         if (!item.rect.contains(x, y)) continue;
         const on_button = rowButton(c, item.rect).contains(x, y);
         return switch (item.part) {
-            .header => |g| if (on_button) .{ .new_session = g } else .none,
+            .header => |g| if (on_button)
+                .{ .new_session = g }
+            else if (forgettable(view.groups[g]) and forgetButton(c, item.rect).contains(x, y))
+                .{ .forget_host = g }
+            else
+                .{ .header = g },
             .row => |i| if (on_button) .{ .close_session = i } else .{ .session = i },
         };
     }
@@ -164,19 +170,59 @@ fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.V
     const button = rowButton(c, r);
     const hit: Hit = .{ .new_session = g };
     const hovered = c.hover.eql(hit);
-    if (hovered) p.fillRounded(button, c.px(4), switch (c.buttonState(hit)) {
+    paintIconButton(c, p, button, hit);
+    const color = if (hovered) c.theme.text_strong else c.theme.text_muted;
+    if (group.kind == .disconnected) {
+        // Lucide's plug spans 16 of its 24 units; this box puts its
+        // prongs on pixel centers.
+        c.drawIcon(p, .plug, button, color);
+    } else {
+        // Lucide's plus spans 14 of its 24 units: 10 DIPs in this box,
+        // whose odd size centers the lines on pixels.
+        const icon = c.px(17);
+        c.drawIcon(p, .plus, button.center(icon, icon), color);
+    }
+
+    var label_right = button.x - c.px(4);
+    const show_forget = forgettable(group) and switch (c.hover) {
+        .header, .new_session, .forget_host => |h| h == g,
+        else => false,
+    };
+    if (show_forget) {
+        const forget = forgetButton(c, r);
+        const forget_hit: Hit = .{ .forget_host = g };
+        paintIconButton(c, p, forget, forget_hit);
+        // Lucide's x spans 12 of its 24 units: 8 DIPs in this box.
+        const icon = c.px(16);
+        c.drawIcon(p, .x, forget.center(icon, icon), if (c.hover.eql(forget_hit)) c.theme.text_strong else c.theme.text_muted);
+        label_right = forget.x - c.px(4);
+    }
+
+    const label_x = r.x + c.px(2);
+    const label: Rect = .{ .x = label_x, .y = r.y, .w = @max(0, label_right - label_x), .h = r.h };
+    var buf: [256]u16 = undefined;
+    p.text(upper(&buf, group.label), c.fonts.section, label, c.theme.text_muted);
+}
+
+/// A small button's background under the mouse.
+fn paintIconButton(c: *const Chrome, p: *Painter, r: Rect, hit: Hit) void {
+    if (!c.hover.eql(hit)) return;
+    p.fillRounded(r, c.px(4), switch (c.buttonState(hit)) {
         .pressed => c.theme.button_pressed,
         else => c.theme.button_hover,
     });
-    // Lucide's plus spans 14 of its 24 units: 10 DIPs in this box, whose
-    // odd size centers the lines on pixels.
-    const icon = c.px(17);
-    c.drawIcon(p, .plus, button.center(icon, icon), if (hovered) c.theme.text_strong else c.theme.text_muted);
+}
 
-    const label_x = r.x + c.px(2);
-    const label: Rect = .{ .x = label_x, .y = r.y, .w = @max(0, button.x - c.px(4) - label_x), .h = r.h };
-    var buf: [256]u16 = undefined;
-    p.text(upper(&buf, group.label), c.fonts.section, label, c.theme.text_muted);
+/// A host with no sessions, which can be dropped from the list.
+fn forgettable(group: Chrome.View.Group) bool {
+    return group.kind != .local and group.sessions == 0;
+}
+
+/// The button left of a header's new session button.
+fn forgetButton(c: *const Chrome, header: Rect) Rect {
+    var r = rowButton(c, header);
+    r.x -= r.w + c.px(2);
+    return r;
 }
 
 /// `text` in capitals, as section headers are, cut to fit `buf`. Only
@@ -300,7 +346,11 @@ const Walk = struct {
 test "groups, rows, and their buttons" {
     const c: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: Chrome.View = .{
-        .groups = &.{ .{ .label = &.{}, .sessions = 0 }, .{ .label = &.{}, .sessions = 2 } },
+        .groups = &.{
+            .{ .label = &.{}, .sessions = 0, .kind = .local },
+            .{ .label = &.{}, .sessions = 2, .kind = .connected },
+            .{ .label = &.{}, .sessions = 0, .kind = .disconnected },
+        },
         .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = false } },
         .active = 0,
         .focused = true,
@@ -316,6 +366,8 @@ test "groups, rows, and their buttons" {
     try std.testing.expect(remote.rect.y > local.rect.bottom());
     _ = walk.next().?;
     const second = walk.next().?.rect;
+    const forgotten = walk.next().?;
+    try std.testing.expectEqual(@as(usize, 2), forgotten.part.header);
     try std.testing.expect(walk.next() == null);
     const connect = connectRect(&c, &l);
     try std.testing.expectEqual(l.list.bottom() - pad_bottom, connect.bottom());
@@ -326,7 +378,12 @@ test "groups, rows, and their buttons" {
     try std.testing.expectEqual(Hit{ .close_session = 1 }, c.hitTest(&l, &view, close.x + 1, close.y + 1));
     const plus = rowButton(&c, remote.rect);
     try std.testing.expectEqual(Hit{ .new_session = 1 }, c.hitTest(&l, &view, plus.x + 1, plus.y + 1));
-    try std.testing.expectEqual(Hit.none, c.hitTest(&l, &view, remote.rect.x + 2, remote.rect.y + 2));
-    // Below the last row.
+    try std.testing.expectEqual(Hit{ .header = 1 }, c.hitTest(&l, &view, remote.rect.x + 2, remote.rect.y + 2));
+    // Only a host with no sessions can be forgotten.
+    const keep = forgetButton(&c, remote.rect);
+    try std.testing.expectEqual(Hit{ .header = 1 }, c.hitTest(&l, &view, keep.x + 1, keep.y + 1));
+    const forget = forgetButton(&c, forgotten.rect);
+    try std.testing.expectEqual(Hit{ .forget_host = 2 }, c.hitTest(&l, &view, forget.x + 1, forget.y + 1));
+    // Between groups.
     try std.testing.expectEqual(Hit.none, c.hitTest(&l, &view, second.x + 2, second.bottom() + 5));
 }

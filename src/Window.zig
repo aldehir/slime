@@ -20,6 +20,7 @@ const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
 const SshConnection = @import("SshConnection.zig");
+const Hosts = @import("Hosts.zig");
 const Chrome = @import("chrome/Chrome.zig");
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
@@ -70,6 +71,8 @@ config: *const Config,
 /// What local sessions run, in CreateProcessW syntax. Outlives the
 /// window.
 local_command: []const u16,
+/// The SSH hosts the sidebar lists. Outlives the window.
+hosts: *Hosts,
 hwnd: ?win32.HWND = null,
 /// The last stats report, which the chrome shows.
 stats_text: [max_stats_len]u16 = undefined,
@@ -155,9 +158,9 @@ const Hold = enum {
 };
 
 /// Create the window with one session running `command_line`
-/// (CreateProcessW syntax, or an `ssh://` URL). Local sessions opened
-/// later run `local_command`.
-pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line: []const u16, local_command: []const u16) !*Window {
+/// (CreateProcessW syntax, or an `ssh://` URL, which is remembered in
+/// `hosts`). Local sessions opened later run `local_command`.
+pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts, command_line: []const u16, local_command: []const u16) !*Window {
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
 
@@ -179,6 +182,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line:
         .io = io,
         .config = config,
         .local_command = local_command,
+        .hosts = hosts,
         .output_event = output_event,
         .hold_timer = hold_timer,
         .grid = undefined,
@@ -224,9 +228,10 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line:
         self.renderer = null;
     }
 
+    try self.reserveGroups();
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     if (std.mem.startsWith(u16, command_line, ssh_scheme)) {
-        try self.spawnSession(.{ .destination = command_line });
+        try self.spawnSession(.{ .host = try hosts.add(command_line) });
     } else {
         try self.spawnSession(.{ .command = command_line });
     }
@@ -282,11 +287,9 @@ fn sessionIndex(self: *const Window, id: u32) ?usize {
 const Target = union(enum) {
     /// A command line on this machine, CreateProcessW syntax.
     command: []const u16,
-    /// A shell on a connection, or on a new one to the same place if
-    /// it's gone.
-    connection: *SshConnection,
-    /// A shell on a new connection to an `ssh://` URL.
-    destination: []const u16,
+    /// A shell on remembered host `i`: on a live connection its sessions
+    /// use, else a new one.
+    host: usize,
 };
 
 /// Start a session on `target`, at the end of its group, and show it.
@@ -296,8 +299,7 @@ const Target = union(enum) {
 fn spawnSession(self: *Window, target: Target) !void {
     try self.sessions.ensureUnusedCapacity(self.alloc, 1);
     try self.view_sessions.ensureTotalCapacity(self.alloc, self.sessions.items.len + 1);
-    // At worst every session has a group of its own, besides Local.
-    try self.view_groups.ensureTotalCapacity(self.alloc, self.sessions.items.len + 2);
+    try self.reserveGroups();
     const grid_size = self.gridSize();
     // Channel IDs are session IDs, and the helper takes 0 to mean the
     // connection.
@@ -306,12 +308,8 @@ fn spawnSession(self: *Window, target: Target) !void {
     var new_conn: ?*SshConnection = null;
     const conn: ?*SshConnection = switch (target) {
         .command => null,
-        .connection => |c| if (c.isAlive()) c else conn: {
-            new_conn = try SshConnection.spawn(self.alloc, c.destination);
-            break :conn new_conn;
-        },
-        .destination => |d| conn: {
-            new_conn = try SshConnection.spawn(self.alloc, d);
+        .host => |h| self.hostConnection(h) orelse conn: {
+            new_conn = try SshConnection.spawn(self.alloc, self.hosts.items.items[h]);
             break :conn new_conn;
         },
     };
@@ -330,7 +328,7 @@ fn spawnSession(self: *Window, target: Target) !void {
     };
     self.next_session_id +%= 1;
 
-    const at = self.groupEnd(conn);
+    const at = self.groupEnd(self.groupOf(s));
     self.sessions.insertAssumeCapacity(at, s);
     if (self.sessions.items.len == 1) return;
     // The rows from `at` on moved down.
@@ -340,40 +338,61 @@ fn spawnSession(self: *Window, target: Target) !void {
     self.activate(at);
 }
 
-/// Where a session on `conn` (null for local) joins its group: after
-/// the group's last, else where a new group goes, local ones first.
-fn groupEnd(self: *const Window, conn: ?*SshConnection) usize {
-    var i = self.sessions.items.len;
-    while (i > 0) : (i -= 1) {
-        if (self.sessions.items[i - 1].sshConnection() == conn) return i;
-    }
-    return if (conn == null) 0 else self.sessions.items.len;
+/// Room in `view`'s scratch for Local and every host.
+fn reserveGroups(self: *Window) !void {
+    try self.view_groups.ensureTotalCapacity(self.alloc, 1 + self.hosts.items.items.len);
 }
 
-/// The connection behind the sidebar's group `g`, grouped as `view`
-/// does: null for Local, which is group 0.
-fn groupConnection(self: *const Window, g: usize) ?*SshConnection {
-    var group: usize = 0;
-    var conn: ?*SshConnection = null;
+/// The sidebar group `s` is listed in: 0 for Local, else 1 plus its
+/// host's index. Sessions are kept in group order.
+fn groupOf(self: *const Window, s: *const Session) usize {
+    const conn = s.sshConnection() orelse return 0;
+    // A host isn't forgotten while sessions use it.
+    return 1 + (self.hosts.indexOf(conn.destination) orelse return 0);
+}
+
+/// Where a session in group `g` goes: after the group's last.
+fn groupEnd(self: *const Window, g: usize) usize {
+    var i: usize = 0;
+    while (i < self.sessions.items.len and self.groupOf(self.sessions.items[i]) <= g) i += 1;
+    return i;
+}
+
+/// A live connection to host `h` that its sessions use, the active
+/// session's if it's one.
+fn hostConnection(self: *const Window, h: usize) ?*SshConnection {
+    if (self.sessions.items.len > 0) {
+        const active = self.activeSession();
+        if (self.groupOf(active) == h + 1) if (active.sshConnection()) |c| if (c.isAlive()) return c;
+    }
     for (self.sessions.items) |s| {
-        const c = s.sshConnection();
-        if (c == conn) continue;
-        conn = c;
-        group += 1;
-        if (group == g) return c;
+        if (self.groupOf(s) != h + 1) continue;
+        if (s.sshConnection()) |c| if (c.isAlive()) return c;
     }
     return null;
 }
 
 /// A session in the active session's group.
 fn newSession(self: *Window) void {
-    self.newSessionOn(self.activeSession().sshConnection());
+    self.newSessionIn(self.groupOf(self.activeSession()));
 }
 
-/// A session on `conn`, or a local one.
-fn newSessionOn(self: *Window, conn: ?*SshConnection) void {
-    const target: Target = if (conn) |c| .{ .connection = c } else .{ .command = self.local_command };
+/// A session in sidebar group `g`: a local one, or one on a host.
+fn newSessionIn(self: *Window, g: usize) void {
+    const target: Target = if (g == 0) .{ .command = self.local_command } else .{ .host = g - 1 };
     self.spawnSession(target) catch |err| log.err("new session failed: {}", .{err});
+}
+
+/// Drop the host behind group `g` from the sidebar, if no session uses
+/// it.
+fn forgetHost(self: *Window, g: usize) void {
+    if (g == 0 or g > self.hosts.items.items.len) return;
+    for (self.sessions.items) |s| {
+        if (self.groupOf(s) == g) return;
+    }
+    self.hosts.remove(g - 1);
+    _ = self.chrome.setHover(.none);
+    self.dirty = true;
 }
 
 /// Close session `i`, killing what runs in it. Closing the last one
@@ -639,8 +658,9 @@ fn submitConnect(self: *Window) void {
         @memcpy(buf[scheme.len..][0..host.len], host);
         break :dest buf[0 .. scheme.len + host.len];
     };
-    if (dest.len > scheme.len) {
-        self.spawnSession(.{ .destination = dest }) catch |err| log.err("connect failed: {}", .{err});
+    if (dest.len > scheme.len) connect: {
+        const h = self.hosts.add(dest) catch |err| break :connect log.err("connect failed: {}", .{err});
+        self.spawnSession(.{ .host = h }) catch |err| log.err("connect failed: {}", .{err});
     }
     self.cancelConnect();
 }
@@ -700,19 +720,21 @@ fn connectPaste(self: *Window) void {
 
 /// The chrome's view of the window's state.
 fn view(self: *Window) Chrome.View {
-    // `spawnSession` keeps room for every session and group.
+    // `spawnSession` and `reserveGroups` keep room for every session and
+    // group.
     self.view_sessions.clearRetainingCapacity();
     self.view_groups.clearRetainingCapacity();
-    // Local is always listed, for its button. Sessions are kept grouped.
-    self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .sessions = 0 });
-    var conn: ?*SshConnection = null;
+    // Local is always listed, for its button, then every host.
+    self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .sessions = 0, .kind = .local });
+    for (self.hosts.items.items, 0..) |dest, h| {
+        self.view_groups.appendAssumeCapacity(.{
+            .label = SshConnection.labelFor(dest),
+            .sessions = 0,
+            .kind = if (self.hostConnection(h) != null) .connected else .disconnected,
+        });
+    }
     for (self.sessions.items) |s| {
-        const c = s.sshConnection();
-        if (c != conn) {
-            conn = c;
-            self.view_groups.appendAssumeCapacity(.{ .label = c.?.label(), .sessions = 0 });
-        }
-        self.view_groups.items[self.view_groups.items.len - 1].sessions += 1;
+        self.view_groups.items[self.groupOf(s)].sessions += 1;
         self.view_sessions.appendAssumeCapacity(.{ .title = s.title(), .activity = s.activity });
     }
     const bg = self.activeSession().cells.default_bg;
@@ -824,7 +846,8 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             self.chrome.toggleMode();
             self.layout();
         },
-        .new_session => |g| self.newSessionOn(self.groupConnection(g)),
+        .new_session => |g| self.newSessionIn(g),
+        .forget_host => |g| self.forgetHost(g),
         .connect => self.startConnect(),
         .close_session => |i| self.closeSession(i),
         else => {},
