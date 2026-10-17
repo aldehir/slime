@@ -1527,18 +1527,18 @@ pub fn terminalSize(self: *const Window) ClientSize {
 
 pub const PaddingPx = struct { left: u32, right: u32, top: u32, bottom: u32 };
 
-/// The space around the grid in the terminal area: the configured
-/// padding, in points, as pixels at the current DPI, plus the chrome's
-/// inset at the left and top.
+/// The space around the grid in a pane: the configured padding, in
+/// points, as pixels at the current DPI, plus the chrome's inset on every
+/// side.
 pub fn paddingPx(self: *const Window) PaddingPx {
     const x = self.config.@"window-padding-x";
     const y = self.config.@"window-padding-y";
     const inset: u32 = @intFromFloat(self.chrome_layout.inset);
     return .{
         .left = x.top_left * self.dpi / 72 + inset,
-        .right = x.bottom_right * self.dpi / 72,
+        .right = x.bottom_right * self.dpi / 72 + inset,
         .top = y.top_left * self.dpi / 72 + inset,
-        .bottom = y.bottom_right * self.dpi / 72,
+        .bottom = y.bottom_right * self.dpi / 72 + inset,
     };
 }
 
@@ -1654,7 +1654,9 @@ fn updateLayout(self: *Window, size: ClientSize) void {
 }
 
 /// Place tab `t`'s panes in the terminal area and fit their grids to
-/// them. Each pane is padded as the whole area is (`paddingPx`).
+/// them. Each pane is padded by `paddingPx`, and the grid is centered in
+/// what's left, so the part of a cell that doesn't fit is split between
+/// opposite edges rather than all at the right and bottom.
 fn layoutTab(self: *Window, t: *Tab) void {
     t.place(self.alloc, self.chrome.paneArea(&self.chrome_layout), self.chrome.paneGap()) catch |err| log.err("laying out panes failed: {}", .{err});
     const pad = self.paddingPx();
@@ -1662,13 +1664,19 @@ fn layoutTab(self: *Window, t: *Tab) void {
     var it = t.iterator();
     while (it.next()) |s| {
         if (!t.shows(s)) continue;
-        s.pad = pad;
-        const w: u32 = @intFromFloat(s.rect.w);
-        const h: u32 = @intFromFloat(s.rect.h);
-        s.resize(
-            @intCast(std.math.clamp((w -| s.pad.left -| s.pad.right) / m.cell_width, 1, std.math.maxInt(u16))),
-            @intCast(std.math.clamp((h -| s.pad.top -| s.pad.bottom) / m.cell_height, 1, std.math.maxInt(u16))),
-        );
+        const w = @as(u32, @intFromFloat(s.rect.w)) -| pad.left -| pad.right;
+        const h = @as(u32, @intFromFloat(s.rect.h)) -| pad.top -| pad.bottom;
+        const cols: u16 = @intCast(std.math.clamp(w / m.cell_width, 1, std.math.maxInt(u16)));
+        const rows: u16 = @intCast(std.math.clamp(h / m.cell_height, 1, std.math.maxInt(u16)));
+        const spare_x = w -| @as(u32, cols) * m.cell_width;
+        const spare_y = h -| @as(u32, rows) * m.cell_height;
+        s.pad = .{
+            .left = pad.left + spare_x / 2,
+            .right = pad.right + spare_x - spare_x / 2,
+            .top = pad.top + spare_y / 2,
+            .bottom = pad.bottom + spare_y - spare_y / 2,
+        };
+        s.resize(cols, rows);
     }
 }
 
