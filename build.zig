@@ -176,8 +176,8 @@ fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
 }
 
 /// The Go helpers, next to the exe: slimed.exe, which runs every
-/// session, and slime-ssh.exe for SSH hosts. slime-ssh carries slimed for
-/// Linux, to install on hosts it connects to. Go caches its own builds,
+/// session, and slime-ssh.exe for SSH hosts, with slimed for Linux in
+/// `remote/` to install on hosts. Go caches its own builds,
 /// so this runs `go build` every time rather than tracking the sources.
 /// Without Go it warns and leaves them out, unless `-Dssh=true` asked for
 /// them.
@@ -209,15 +209,51 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
         copy.addCopyFileToSource(prefix.path(b, b.fmt("lib/{s}", .{t.lib})), b.fmt("ssh/internal/vt/lib/{s}/libghostty-vt.a", .{t.go}));
     }
     goBuild(b, go, "slimed").step.dependOn(&copy.step);
+    installRemote(b, go, &copy.step);
+    _ = goBuild(b, go, "slime-ssh");
+}
 
-    // slime-pack builds slimed for each Linux target into
-    // ssh/internal/payload/bin, which slime-ssh embeds.
-    const pack = b.addSystemCommand(&.{ go, "run", "./cmd/slime-pack" });
-    pack.setCwd(b.path("ssh"));
-    pack.setEnvironmentVariable("ZIG", b.graph.zig_exe);
-    pack.has_side_effects = true;
-    pack.step.dependOn(&copy.step);
-    goBuild(b, go, "slime-ssh").step.dependOn(&pack.step);
+/// The systems slimed is built for to install on SSH hosts, with the
+/// `zig cc` target cgo compiles for each.
+const remote_targets = [_]struct { os: []const u8, arch: []const u8, zig: []const u8 }{
+    .{ .os = "linux", .arch = "amd64", .zig = "x86_64-linux-musl" },
+};
+
+/// slimed for each of `remote_targets`, as files in `remote/` next to the
+/// exe (ssh/internal/remote): `go build` for the target, then
+/// src/build/pack.zig gzips them and writes the manifest. Linked fully
+/// static against musl, so it runs whatever the host's libc, and stripped
+/// by the C linker too: -s alone leaves the Zig library's debug info.
+fn installRemote(b: *std.Build, go: []const u8, libs: *std.Build.Step) void {
+    const tool = b.addExecutable(.{
+        .name = "pack",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/pack.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const pack = b.addRunArtifact(tool);
+    const dir = pack.addOutputDirectoryArg("remote");
+    for (remote_targets) |t| {
+        const run = b.addSystemCommand(&.{ go, "build", "-trimpath", "-ldflags=-s -w -linkmode external -extldflags '-static -s'", "-o" });
+        const exe = run.addOutputFileArg(b.fmt("slimed-{s}-{s}", .{ t.os, t.arch }));
+        run.addArg("./cmd/slimed");
+        run.setCwd(b.path("ssh"));
+        run.setEnvironmentVariable("GOOS", t.os);
+        run.setEnvironmentVariable("GOARCH", t.arch);
+        run.setEnvironmentVariable("CGO_ENABLED", "1");
+        run.setEnvironmentVariable("CC", b.fmt("\"{s}\" cc -target {s}", .{ b.graph.zig_exe, t.zig }));
+        run.has_side_effects = true;
+        run.step.dependOn(libs);
+        pack.addArgs(&.{ t.os, t.arch });
+        pack.addFileArg(exe);
+    }
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = dir,
+        .install_dir = .bin,
+        .install_subdir = "remote",
+    }).step);
 }
 
 /// `go build` of ssh/cmd/`name`, installed as `name`.exe.

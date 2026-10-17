@@ -39,7 +39,7 @@ func (e *deniedError) Error() string {
 // x/crypto runs its own loop with this as the AuthCallback, which lets
 // one method name ("publickey") come up more than once.
 type authenticator struct {
-	ui   asker
+	ui   Asker
 	dest Destination
 	// passwords counts password prompts, to say when one is a retry.
 	passwords int
@@ -54,7 +54,7 @@ type authenticator struct {
 }
 
 // identitiesOnly leaves out agent keys that aren't among keys.
-func newAuthenticator(ui asker, dest Destination, agentSigners []ssh.Signer, keys []*keyFile, identitiesOnly bool) *authenticator {
+func newAuthenticator(ui Asker, dest Destination, agentSigners []ssh.Signer, keys []*keyFile, identitiesOnly bool) *authenticator {
 	a := &authenticator{ui: ui, dest: dest}
 
 	// Keys that need no prompt go together; each locked key is its own
@@ -81,7 +81,7 @@ func newAuthenticator(ui asker, dest Destination, agentSigners []ssh.Signer, key
 		a.add("publickey", ssh.PublicKeys(plain...))
 	}
 	for _, k := range locked {
-		k.ask = func(q *question) (proto.Answer, error) {
+		k.ask = func(q *Query) (proto.Answer, error) {
 			q.Title = "Unlock key for " + dest.Host
 			return a.ask(q)
 		}
@@ -123,12 +123,12 @@ func (a *authenticator) callback(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, er
 }
 
 // ask asks the user, noting when they give up.
-func (a *authenticator) ask(q *question) (proto.Answer, error) {
-	ans, err := a.ui.ask(q)
+func (a *authenticator) ask(q *Query) (proto.Answer, error) {
+	ans, err := a.ui.Ask(q)
 	if err == nil && ans.Choice == proto.ChoiceCancel {
-		err = errCancelled
+		err = ErrCancelled
 	}
-	if errors.Is(err, prompt.ErrInterrupted) || errors.Is(err, io.EOF) || errors.Is(err, errCancelled) {
+	if errors.Is(err, prompt.ErrInterrupted) || errors.Is(err, io.EOF) || errors.Is(err, ErrCancelled) {
 		a.abort = err
 	}
 	return ans, err
@@ -145,7 +145,7 @@ func (a *authenticator) interactive(name, instruction string, questions []string
 	}
 	if len(questions) == 0 {
 		if len(lines) > 0 {
-			a.ui.info(strings.Join(lines, "\n"))
+			a.ui.Info(strings.Join(lines, "\n"))
 		}
 		return nil, nil
 	}
@@ -155,13 +155,13 @@ func (a *authenticator) interactive(name, instruction string, questions []string
 	if title == "" {
 		title = "Sign in to " + a.dest.Host
 	}
-	q := &question{
+	q := &Query{
 		Prompt: proto.Prompt{
 			Kind:  proto.PromptInteractive,
 			Title: title,
 			Text:  strings.TrimRight(instruction, "\r\n"),
 		},
-		termText: strings.Join(lines, "\n"),
+		TermText: strings.Join(lines, "\n"),
 	}
 	for i, text := range questions {
 		q.Questions = append(q.Questions, proto.Question{Label: text, Echo: echos[i]})
@@ -174,7 +174,7 @@ func (a *authenticator) interactive(name, instruction string, questions []string
 }
 
 func (a *authenticator) password() (string, error) {
-	q := &question{Prompt: proto.Prompt{
+	q := &Query{Prompt: proto.Prompt{
 		Kind:      proto.PromptPassword,
 		Title:     "Sign in to " + a.dest.Host,
 		Questions: []proto.Question{{Label: fmt.Sprintf("%s@%s's password: ", a.dest.User, a.dest.Host)}},
@@ -200,7 +200,7 @@ type keyFile struct {
 	pub     ssh.PublicKey
 	signer  ssh.Signer
 	pubOnly bool
-	ask     func(q *question) (proto.Answer, error)
+	ask     func(q *Query) (proto.Answer, error)
 }
 
 // loadKeyFile reads path. A missing file is (nil, nil): the defaults
@@ -265,13 +265,13 @@ func (k *keyFile) unlock() error {
 	if err != nil {
 		return err
 	}
-	q := &question{
+	q := &Query{
 		Prompt: proto.Prompt{
 			Kind:      proto.PromptPassphrase,
 			Detail:    k.path,
 			Questions: []proto.Question{{Label: "Passphrase"}},
 		},
-		terminal: []string{fmt.Sprintf("Enter passphrase for key '%s': ", k.path)},
+		Terminal: []string{fmt.Sprintf("Enter passphrase for key '%s': ", k.path)},
 	}
 	for range 3 {
 		ans, err := k.ask(q)
@@ -288,7 +288,7 @@ func (k *keyFile) unlock() error {
 			return nil
 		}
 		q.Error = "Bad passphrase, try again."
-		q.terminal[0] = fmt.Sprintf("Bad passphrase, try again for '%s': ", k.path)
+		q.Terminal[0] = fmt.Sprintf("Bad passphrase, try again for '%s': ", k.path)
 	}
 	return fmt.Errorf("%s: bad passphrase", k.path)
 }

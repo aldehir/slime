@@ -237,7 +237,7 @@ and replaces them.
   it, not the window's.
 - **Only Linux hosts on x86-64.** Others get a tab saying slimed can't
   run there: slimed would need libghostty-vt built for them with Zig,
-  and slime-pack doesn't carry them.
+  and `remote/` carries none.
 - **Nothing shows while a host's slimed starts.** The stand-in is blank
   between logging in and the panes coming, which on a first install
   includes sending about 3 MiB.

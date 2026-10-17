@@ -45,6 +45,7 @@ type Server struct {
 	tabs       map[uint32]*tab
 	panes      map[uint32]*Pane
 	conns      map[*conn]struct{}
+	hosts      hostTable
 	idleT      *time.Timer
 	idleC      chan struct{} // closed when the idle timer fires
 }
@@ -54,9 +55,11 @@ type Options struct {
 	// Spawn starts a pane's child; pty.Start if nil.
 	Spawn func(pty.Options) (pty.Pty, error)
 	Log   *slog.Logger
-	// Idle is how long Serve waits with no workspaces and no clients
-	// before returning. Zero waits forever.
+	// Idle is how long Serve waits with no workspaces, no clients, and
+	// no hosts before returning. Zero waits forever.
 	Idle time.Duration
+	// Hosts configures connecting to SSH hosts (Windows).
+	Hosts HostOptions
 }
 
 // defaultSize is a pane's size when nothing says otherwise.
@@ -78,6 +81,7 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		tabs:       map[uint32]*tab{},
 		panes:      map[uint32]*Pane{},
 		conns:      map[*conn]struct{}{},
+		hosts:      newHostTable(opts.Hosts),
 		idleC:      make(chan struct{}),
 	}
 	// The snapshot envelope: 8 bytes of magic, then a u16 version.
@@ -127,13 +131,13 @@ func (s *Server) checkIdleLocked() {
 	if s.idle == 0 {
 		return
 	}
-	idle := len(s.workspaces) == 0 && len(s.panes) == 0 && len(s.conns) == 0
+	idle := s.idleLocked()
 	switch {
 	case idle && s.idleT == nil:
 		s.idleT = time.AfterFunc(s.idle, func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			if s.idleT != nil && len(s.workspaces) == 0 && len(s.panes) == 0 && len(s.conns) == 0 {
+			if s.idleT != nil && s.idleLocked() {
 				close(s.idleC)
 			}
 		})
@@ -143,10 +147,25 @@ func (s *Server) checkIdleLocked() {
 	}
 }
 
+// idleLocked says whether nothing keeps the daemon alive.
+func (s *Server) idleLocked() bool {
+	return len(s.workspaces) == 0 && len(s.panes) == 0 && len(s.conns) == 0 && s.hostsActiveLocked() == 0
+}
+
 func (s *Server) handle(rw io.ReadWriteCloser) {
-	c := newConn(rw, s.log)
 	r := NewReader(rw)
-	if !s.handshake(c, r) {
+	f, err := r.Read()
+	if err != nil {
+		rw.Close()
+		return
+	}
+	m, err := Decode(f)
+	if b, ok := m.(*Bridge); ok && err == nil {
+		s.bridge(rw, r, f.ID, b)
+		return
+	}
+	c := newConn(rw, s.log)
+	if !s.handshake(c, m, err) {
 		c.closeAfterFlush()
 		return
 	}
@@ -161,6 +180,7 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 			s.releaseLocked(ws, "")
 		}
 		delete(s.conns, c)
+		s.hostClientGoneLocked(c)
 		s.checkIdleLocked()
 		s.mu.Unlock()
 	}()
@@ -184,12 +204,9 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 	}
 }
 
-func (s *Server) handshake(c *conn, r *Reader) bool {
-	f, err := r.Read()
-	if err != nil {
-		return false
-	}
-	m, err := Decode(f)
+// handshake answers the first frame, decoded as m (or err), which must
+// be a Hello.
+func (s *Server) handshake(c *conn, m Message, err error) bool {
 	hello, ok := m.(*Hello)
 	if err != nil || !ok {
 		c.sendForce(0, &Error{Message: "expected hello"})
@@ -272,8 +289,25 @@ func (s *Server) dispatch(c *conn, id uint32, m Message) {
 		}
 		fail(m.Tag, p.peek(c, m.Tag))
 	default:
-		s.log.Warn("unexpected message", "type", m.Type())
+		if !s.hostDispatch(c, id, m) {
+			s.log.Warn("unexpected message", "type", m.Type())
+		}
 	}
+}
+
+// writeError writes an Error straight to a connection that has no conn
+// yet, and closes it once the client has hung up or a moment has
+// passed: closing with its Hello unread would reset a TCP connection
+// and lose the Error.
+func writeError(rw io.ReadWriteCloser, msg string) {
+	if b, err := Encode(0, &Error{Message: msg}); err == nil {
+		rw.Write(b)
+	}
+	if c, ok := rw.(net.Conn); ok {
+		c.SetReadDeadline(time.Now().Add(time.Second))
+		io.Copy(io.Discard, c)
+	}
+	rw.Close()
 }
 
 func (s *Server) pane(id uint32) *Pane {

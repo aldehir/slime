@@ -10,8 +10,8 @@ import (
 
 // The wire protocol between slime and slimed. Frames are slime-ssh's
 // (internal/proto): a little-endian u32 length of what follows, a u8
-// type, a u32 pane id (0 when the message isn't about one pane), and a
-// payload of fixed-size integers and strings (u32 length + bytes).
+// type, a u32 pane id (0 when the message isn't about one pane; a host
+// id in the messages about one host), and a payload of fixed-size integers and strings (u32 length + bytes).
 // Decoders ignore bytes after the fields they know, so a later version
 // can append fields.
 //
@@ -60,6 +60,11 @@ const (
 	TypePeek            Type = 17
 	TypeAck             Type = 18
 	TypeEvent           Type = 19
+	TypeHostConnect     Type = 20
+	TypeHostAnswer      Type = 21
+	TypeHostDisconnect  Type = 22
+	TypeHostList        Type = 23
+	TypeBridge          Type = 24
 )
 
 // Daemon to client.
@@ -78,6 +83,9 @@ const (
 	TypeCopied     Type = 76
 	TypeNotice     Type = 77
 	TypeImage      Type = 78
+	TypeHosts      Type = 79
+	TypeHostState  Type = 80
+	TypePrompt     Type = 81
 )
 
 var (
@@ -231,6 +239,141 @@ type Ack struct{ Seq uint32 }
 // client: a key, mouse, wheel, paste, focus change, or copy, encoded as
 // ssh/internal/vt/event.zig lays out.
 type Event struct{ Data []byte }
+
+// Hosts: SSH hosts the daemon connects to, on Windows. The frame's id
+// field carries the host's id in the messages about one host; a host's
+// id is stable for its destination while the daemon lives, so a window
+// can group by it across reconnects. A client reaches a connected
+// host's daemon through a second connection to the pipe whose first
+// frame is Bridge.
+
+// HostConnect logs in to Dest (ssh://[user@]host[:port], [user@]host,
+// or a Host alias), puts slimed there, and reports with HostState; the
+// one that answers carries Tag. A host already connected or connecting
+// answers at once with its state. Prompts while logging in go to the
+// sender only; if it hangs up, logging in is cancelled.
+type HostConnect struct {
+	Tag  uint32
+	Dest string
+}
+
+// HostAnswer replies to the last Prompt for the host in the frame's id:
+// the button pressed, and one answer per question. A cancel with no
+// Prompt waiting gives up on logging in.
+type HostAnswer struct {
+	Choice  Choice
+	Answers []string
+}
+
+// Choice is the button a Prompt was answered with.
+type Choice uint8
+
+const (
+	// ChoiceCancel gives up: on logging in for most prompts, on the
+	// host for host key prompts.
+	ChoiceCancel Choice = iota
+	// ChoiceAccept submits the answers, or trusts the host key.
+	ChoiceAccept
+	// ChoiceSkip moves on without this key (passphrase prompts).
+	ChoiceSkip
+)
+
+// HostDisconnect hangs up on the host in the frame's id, ending its
+// bridges, or gives up on logging in to it.
+type HostDisconnect struct{}
+
+// HostList asks for the hosts; the reply is Hosts.
+type HostList struct{}
+
+// Bridge, as a connection's first frame instead of Hello, splices the
+// connection to `slimed connect` on the host in the frame's id: every
+// frame after it goes to the host's daemon, and its replies come back.
+// Term is the TERM for panes it starts (xterm-ghostty falls back where
+// the host lacks it). A bridge that can't be served gets Error and the
+// connection closes; one that is gets nothing from the local daemon, so
+// the client sends Hello right after Bridge and reads the host daemon's
+// HelloReply.
+type Bridge struct{ Term string }
+
+// Hosts answers HostList with every host the daemon knows.
+type Hosts struct{ Hosts []HostInfo }
+
+type HostInfo struct {
+	ID    uint32
+	Dest  string
+	State HostStatus
+	Text  string
+}
+
+// HostState reports a host's state to every client, as it changes; Tag
+// is set on the one answering a HostConnect. Text is a status line
+// while connecting (the server's, or ours: "installing slimed"), or why
+// it failed, was lost, or went.
+type HostState struct {
+	Tag   uint32
+	Dest  string
+	State HostStatus
+	Text  string
+}
+
+type HostStatus uint8
+
+func (s HostStatus) String() string {
+	switch s {
+	case HostConnecting:
+		return "connecting"
+	case HostConnected:
+		return "connected"
+	case HostFailed:
+		return "failed"
+	case HostLost:
+		return "lost"
+	case HostGone:
+		return "gone"
+	}
+	return fmt.Sprintf("state %d", uint8(s))
+}
+
+const (
+	// HostConnecting: logging in or installing slimed.
+	HostConnecting HostStatus = iota + 1
+	HostConnected
+	// HostFailed: logging in or installing didn't work.
+	HostFailed
+	// HostLost: the connection dropped.
+	HostLost
+	// HostGone: disconnected on request.
+	HostGone
+)
+
+// Prompt asks the client whose HostConnect is logging in to the host in
+// the frame's id something: a password, a passphrase, a
+// keyboard-interactive round, or whether to trust a host key (no
+// questions; Accept trusts it). Text is the body, Detail is shown in a
+// monospace box (a key's path, fingerprints), and Error says why the
+// last answer didn't work. The reply is HostAnswer.
+type Prompt struct {
+	Kind                       PromptKind
+	Title, Text, Detail, Error string
+	Questions                  []Question
+}
+
+type PromptKind uint8
+
+const (
+	PromptPassword PromptKind = iota + 1
+	PromptPassphrase
+	PromptInteractive
+	PromptUnknownHost
+	PromptChangedHost
+)
+
+// Question is one field to fill in. Label may run over several lines,
+// as keyboard-interactive prompts do; its last line names the field.
+type Question struct {
+	Label string
+	Echo  bool
+}
 
 // Draw is a frame of the pane in the frame's id: what to draw, encoded
 // as ssh/internal/vt/frame.zig lays out. Seq counts the pane's frames to
@@ -430,6 +573,14 @@ func (*Draw) Type() Type            { return TypeDraw }
 func (*Copied) Type() Type          { return TypeCopied }
 func (*Notice) Type() Type          { return TypeNotice }
 func (*Image) Type() Type           { return TypeImage }
+func (*HostConnect) Type() Type     { return TypeHostConnect }
+func (*HostAnswer) Type() Type      { return TypeHostAnswer }
+func (*HostDisconnect) Type() Type  { return TypeHostDisconnect }
+func (*HostList) Type() Type        { return TypeHostList }
+func (*Bridge) Type() Type          { return TypeBridge }
+func (*Hosts) Type() Type           { return TypeHosts }
+func (*HostState) Type() Type       { return TypeHostState }
+func (*Prompt) Type() Type          { return TypePrompt }
 
 func (m *Hello) encode(e *encoder) {
 	e.u32(m.Version)
@@ -771,6 +922,104 @@ func (m *Created) decode(d *decoder) {
 	m.Pane = d.u32()
 }
 
+func (m *HostConnect) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Dest)
+}
+
+func (m *HostConnect) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Dest = d.str()
+}
+
+func (m *HostAnswer) encode(e *encoder) {
+	e.u8(uint8(m.Choice))
+	e.u32(uint32(len(m.Answers)))
+	for _, a := range m.Answers {
+		e.str(a)
+	}
+}
+
+func (m *HostAnswer) decode(d *decoder) {
+	m.Choice = Choice(d.u8())
+	n := d.count(4)
+	m.Answers = make([]string, n)
+	for i := range m.Answers {
+		m.Answers[i] = d.str()
+	}
+}
+
+func (*HostDisconnect) encode(*encoder) {}
+func (*HostDisconnect) decode(*decoder) {}
+
+func (*HostList) encode(*encoder) {}
+func (*HostList) decode(*decoder) {}
+
+func (m *Bridge) encode(e *encoder) { e.str(m.Term) }
+func (m *Bridge) decode(d *decoder) { m.Term = d.str() }
+
+func (m *Hosts) encode(e *encoder) {
+	e.u32(uint32(len(m.Hosts)))
+	for _, h := range m.Hosts {
+		e.u32(h.ID)
+		e.str(h.Dest)
+		e.u8(uint8(h.State))
+		e.str(h.Text)
+	}
+}
+
+func (m *Hosts) decode(d *decoder) {
+	n := d.count(4 + 4 + 1 + 4)
+	m.Hosts = make([]HostInfo, n)
+	for i := range m.Hosts {
+		h := &m.Hosts[i]
+		h.ID = d.u32()
+		h.Dest = d.str()
+		h.State = HostStatus(d.u8())
+		h.Text = d.str()
+	}
+}
+
+func (m *HostState) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Dest)
+	e.u8(uint8(m.State))
+	e.str(m.Text)
+}
+
+func (m *HostState) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Dest = d.str()
+	m.State = HostStatus(d.u8())
+	m.Text = d.str()
+}
+
+func (m *Prompt) encode(e *encoder) {
+	e.u8(uint8(m.Kind))
+	e.str(m.Title)
+	e.str(m.Text)
+	e.str(m.Detail)
+	e.str(m.Error)
+	e.u32(uint32(len(m.Questions)))
+	for _, q := range m.Questions {
+		e.str(q.Label)
+		e.bool(q.Echo)
+	}
+}
+
+func (m *Prompt) decode(d *decoder) {
+	m.Kind = PromptKind(d.u8())
+	m.Title = d.str()
+	m.Text = d.str()
+	m.Detail = d.str()
+	m.Error = d.str()
+	n := d.count(5)
+	m.Questions = make([]Question, n)
+	for i := range m.Questions {
+		m.Questions[i] = Question{Label: d.str(), Echo: d.bool()}
+	}
+}
+
 // Decode turns a frame's payload into its message. Byte payloads alias
 // the frame's.
 func Decode(f Frame) (Message, error) {
@@ -854,6 +1103,22 @@ func newMessage(t Type) Message {
 		return new(Notice)
 	case TypeImage:
 		return new(Image)
+	case TypeHostConnect:
+		return new(HostConnect)
+	case TypeHostAnswer:
+		return new(HostAnswer)
+	case TypeHostDisconnect:
+		return new(HostDisconnect)
+	case TypeHostList:
+		return new(HostList)
+	case TypeBridge:
+		return new(Bridge)
+	case TypeHosts:
+		return new(Hosts)
+	case TypeHostState:
+		return new(HostState)
+	case TypePrompt:
+		return new(Prompt)
 	}
 	return nil
 }
@@ -875,6 +1140,10 @@ func Encode(id uint32, m Message) ([]byte, error) {
 type Reader struct{ r *bufio.Reader }
 
 func NewReader(r io.Reader) *Reader { return &Reader{r: bufio.NewReaderSize(r, 64<<10)} }
+
+// stream is the rest of the input, starting with what's buffered, for
+// splicing it elsewhere.
+func (r *Reader) stream() io.Reader { return r.r }
 
 // Read returns the next frame. It returns io.EOF only at a frame
 // boundary; a stream that ends mid-frame is io.ErrUnexpectedEOF.

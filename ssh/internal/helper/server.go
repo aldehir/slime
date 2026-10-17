@@ -1,27 +1,27 @@
-// Package helper is slime-ssh's core: it holds one SSH connection and
-// serves its session channels to slime, with the control protocol on
-// one pair of streams and each channel's bytes on its own pipes.
+// Package helper is the SSH side of slime: logging in to hosts (Dial),
+// running slimed on them, and, for slime-ssh while it lasts, serving a
+// connection's session channels over the control protocol (Serve).
 package helper
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"maps"
-	"net"
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/aldehir/slime/ssh/internal/prompt"
 	"github.com/aldehir/slime/ssh/internal/proto"
+	"github.com/aldehir/slime/ssh/internal/remote"
 	"github.com/aldehir/slime/ssh/internal/terminfo"
 )
 
@@ -61,6 +61,9 @@ type Options struct {
 
 	// DialAgent connects to an SSH agent. Nil means no agent.
 	DialAgent func() (io.ReadWriteCloser, error)
+	// Remote holds the builds of slimed to install on hosts. Nil means
+	// the ones beside the executable (remote.Beside).
+	Remote *remote.Manifest
 	// OpenPipes turns the handle values in an Open into the channel's
 	// pipes: the user's input to read and the remote's output to
 	// write. Nil means they are Windows handles in this process.
@@ -86,6 +89,7 @@ const (
 	stateClosing
 )
 
+// Server serves one connection's channels to slime (slime-ssh).
 type Server struct {
 	opts Options
 	w    *proto.Writer
@@ -100,25 +104,12 @@ type Server struct {
 	// answers takes slime's Answer to the Prompt shown, while there is
 	// one.
 	answers chan proto.Answer
-	netConn net.Conn
-	client  *ssh.Client
+	// cancel gives up on logging in, while that's under way.
+	cancel context.CancelFunc
+	conn   *Conn
 	// ghosttyTerm is set when the host has xterm-ghostty, so channels
 	// that ask for it get it.
 	ghosttyTerm bool
-	// slimedExe is where slimed is on the host, once it's been found or
-	// installed there.
-	slimedExe string
-	// jumps carry client, first hop first.
-	jumps []*ssh.Client
-	// connDone is closed when client.Wait returns, with connErr.
-	connDone chan struct{}
-	connErr  error
-	// connLost is set with connErr when the connection ended without
-	// our closing it.
-	connLost bool
-	// closedByUs is set before we close client, so watch can tell our
-	// close from the remote's: through a jump host both end in EOF.
-	closedByUs atomic.Bool
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -140,8 +131,9 @@ type channel struct {
 	//
 	// size is the latest size slime gave.
 	size winSize
-	// sess is set once the remote has a pty.
+	// sess is set once the remote has a pty; sl once slimed runs.
 	sess *ssh.Session
+	sl   *Slimed
 	// closed is set when slime closes the channel; it no longer wants
 	// to hear about it.
 	closed bool
@@ -165,7 +157,6 @@ func Serve(opts Options, in io.Reader, out io.Writer) error {
 		w:        w,
 		features: features,
 		channels: map[uint32]*channel{},
-		connDone: make(chan struct{}),
 		done:     make(chan struct{}),
 	}
 	frames := make(chan proto.Frame)
@@ -316,7 +307,7 @@ func (s *Server) add(ch *channel) {
 	case stateConnecting:
 		s.pending = append(s.pending, ch)
 	case stateConnected:
-		go s.start(s.client, ch)
+		go s.start(ch)
 	}
 }
 
@@ -356,7 +347,7 @@ func (s *Server) close(id uint32) {
 	// While connecting, the only channel that isn't pending is the one
 	// prompting.
 	authenticating := s.state == stateConnecting
-	sess := ch.sess
+	sess, sl := ch.sess, ch.sl
 	s.mu.Unlock()
 
 	switch {
@@ -366,6 +357,8 @@ func (s *Server) close(id uint32) {
 		// Wait in start returns and drops the channel. Without a
 		// session yet, start sees closed and stops.
 		sess.Close()
+	case sl != nil:
+		sl.Close()
 	}
 }
 
@@ -407,7 +400,7 @@ func (s *Server) removePending(ch *channel) {
 // connect dials and authenticates, asking in slime's dialog or on ch's
 // terminal, then starts every channel opened meanwhile.
 func (s *Server) connect(ch *channel) {
-	var a asker
+	var a Asker
 	switch {
 	case ch.slimed:
 		// Its pipes aren't a terminal to print notices in.
@@ -417,26 +410,37 @@ func (s *Server) connect(ch *channel) {
 	default:
 		a = termAsker{prompt.New(ch.input, ch.out)}
 	}
-	client, err := s.dial(a)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.mu.Lock()
+	if s.state == stateClosing {
+		s.mu.Unlock()
+		return
+	}
+	s.cancel = cancel
+	s.mu.Unlock()
+
+	conn, err := Dial(ctx, s.opts, a)
 	// Before any shell starts, so they all get the same TERM.
-	ghosttyTerm := err == nil && ch.term == terminfo.Name && installTerminfo(client)
+	ghosttyTerm := err == nil && ch.term == terminfo.Name && conn.InstallTerminfo()
 
 	s.mu.Lock()
 	if err != nil || s.state == stateClosing {
 		cancelled := ch.closed || s.state == stateClosing
 		s.mu.Unlock()
-		if client != nil {
-			client.Close()
+		if conn != nil {
+			conn.Close()
 		}
 		if cancelled {
 			s.finish(nil, "cancelled")
 			return
 		}
 		// slime shows the reason in the channel's terminal.
-		s.finish(fmt.Errorf("connecting to %s: %w", s.opts.Dest.Addr(), err), failReason(err))
+		s.finish(fmt.Errorf("connecting to %s: %w", s.opts.Dest.Addr(), err), FailReason(err))
 		return
 	}
-	s.client = client
+	s.conn = conn
+	s.cancel = nil
 	s.ghosttyTerm = ghosttyTerm
 	s.state = stateConnected
 	start := append([]*channel{ch}, s.pending...)
@@ -446,150 +450,20 @@ func (s *Server) connect(ch *channel) {
 	log.Printf("connected to %s", s.opts.Dest.Addr())
 	s.send(0, &proto.Connected{})
 	for _, c := range start {
-		go s.start(client, c)
+		go s.start(c)
 	}
-	go s.watch(client)
-	if s.opts.KeepaliveInterval > 0 {
-		go s.keepalive(client)
-	}
-}
-
-// dial connects and logs in to each jump host in turn, and through them
-// to the destination, asking through a.
-func (s *Server) dial(a asker) (*ssh.Client, error) {
-	hops := append(slices.Clone(s.opts.Jumps), Hop{
-		Dest:           s.opts.Dest,
-		Identities:     s.opts.Identities,
-		IdentitiesOnly: s.opts.IdentitiesOnly,
-	})
-	signers, closeAgent := agentSigners(s.opts.DialAgent)
-	defer closeAgent()
-
-	var jumps []*ssh.Client
-	closeJumps := func() {
-		for i := len(jumps) - 1; i >= 0; i-- {
-			jumps[i].Close()
-		}
-	}
-	for i, hop := range hops {
-		addr := hop.Dest.Addr()
-		var conn net.Conn
-		var err error
-		if i == 0 {
-			dialer := net.Dialer{Timeout: s.opts.ConnectTimeout}
-			if conn, err = dialer.Dial("tcp", addr); err != nil {
-				return nil, err
-			}
-			// Closing the first hop's connection cancels everything.
-			s.mu.Lock()
-			if s.state == stateClosing {
-				s.mu.Unlock()
-				conn.Close()
-				return nil, errors.New("cancelled")
-			}
-			s.netConn = conn
-			s.mu.Unlock()
-		} else if conn, err = jumps[i-1].Dial("tcp", addr); err != nil {
-			closeJumps()
-			return nil, fmt.Errorf("jump host %s can't reach %s: %w", hops[i-1].Dest.Host, addr, err)
-		}
-
-		client, err := s.login(conn, hop, signers, a)
-		if err != nil {
-			conn.Close()
-			closeJumps()
-			if i < len(hops)-1 {
-				return nil, &jumpError{host: hop.Dest.Host, err: err}
-			}
-			return nil, err
-		}
-		if i == len(hops)-1 {
-			s.mu.Lock()
-			s.jumps = jumps
-			s.mu.Unlock()
-			return client, nil
-		}
-		jumps = append(jumps, client)
-	}
-	panic("unreachable")
-}
-
-// login checks hop's host key and logs in over conn.
-func (s *Server) login(conn net.Conn, hop Hop, agentSigners []ssh.Signer, a asker) (*ssh.Client, error) {
-	addr := hop.Dest.Addr()
-	hk := &hostKeys{
-		files:  s.opts.KnownHosts,
-		global: s.opts.GlobalKnownHosts,
-		strict: s.opts.StrictHostKeyChecking,
-		hash:   s.opts.HashKnownHosts,
-		ui:     a,
-	}
-	check, algos, err := hk.callback(addr)
-	if err != nil {
-		return nil, err
-	}
-	auth := newAuthenticator(a, hop.Dest, agentSigners, loadKeys(hop.Identities), hop.IdentitiesOnly)
-	config := &ssh.ClientConfig{
-		User:              hop.Dest.User,
-		AuthCallback:      auth.callback,
-		HostKeyCallback:   check,
-		HostKeyAlgorithms: algos,
-		BannerCallback: func(msg string) error {
-			a.print(msg)
-			return nil
-		},
-	}
-	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.NewClient(c, chans, reqs), nil
-}
-
-// keepalive asks the server for a reply every KeepaliveInterval, as
-// ssh's ServerAliveInterval does, and drops the connection when
-// KeepaliveCountMax go unanswered. Any reply counts, even a refusal.
-func (s *Server) keepalive(client *ssh.Client) {
-	limit := max(s.opts.KeepaliveCountMax, 1)
-	t := time.NewTicker(s.opts.KeepaliveInterval)
-	defer t.Stop()
-	var waiting atomic.Bool
-	var missed atomic.Int32
-	for {
-		select {
-		case <-s.done:
-			return
-		case <-s.connDone:
-			return
-		case <-t.C:
-		}
-		if waiting.Load() {
-			if int(missed.Add(1)) >= limit {
-				reason := fmt.Sprintf("Timeout, server %s not responding", s.opts.Dest.Host)
-				s.finish(errors.New(reason), reason)
-				return
-			}
-			continue
-		}
-		waiting.Store(true)
-		go func() {
-			if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err == nil {
-				missed.Store(0)
-				waiting.Store(false)
-			}
-		}()
-	}
+	go s.watch(conn)
 }
 
 // start opens ch's session channel with a pty and a shell, then copies
 // input to it until the remote command ends; or for a slimed channel,
 // bridges it to slimed.
-func (s *Server) start(client *ssh.Client, ch *channel) {
+func (s *Server) start(ch *channel) {
 	if ch.slimed {
-		s.startSlimed(client, ch)
+		s.startSlimed(ch)
 		return
 	}
-	sess, err := client.NewSession()
+	sess, err := s.conn.Client().NewSession()
 	if err != nil {
 		s.fail(ch, err)
 		return
@@ -659,7 +533,19 @@ func (s *Server) start(client *ssh.Client, ch *channel) {
 		stdin.Close()
 	}()
 
-	exit, ok := exitMessage(sess.Wait())
+	err = sess.Wait()
+	exit, ok := exitMessage(err)
+	var missing *ssh.ExitMissingError
+	if errors.As(err, &missing) {
+		// A dropped connection closes its channels just before Wait
+		// returns; give it a moment to show, so the drop is reported
+		// rather than an exit.
+		select {
+		case <-s.conn.Done():
+			ok = false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 	s.mu.Lock()
 	closed := ch.closed
 	s.mu.Unlock()
@@ -667,10 +553,12 @@ func (s *Server) start(client *ssh.Client, ch *channel) {
 		s.send(ch.id, exit)
 	}
 	s.drop(ch)
-	// Otherwise the connection failed, and watch reports that.
-	if ok || closed {
-		s.finishIfIdle()
+	if !ok && !closed {
+		// The connection failed; once it has ended, finishIfIdle says
+		// why.
+		<-s.conn.Done()
 	}
+	s.finishIfIdle()
 }
 
 // fail reports that ch couldn't start and drops it.
@@ -707,7 +595,7 @@ func (s *Server) dropLocked(ch *channel) {
 func (s *Server) finishIfIdle() {
 	s.mu.Lock()
 	idle := s.state == stateConnected && len(s.channels) == 0
-	client := s.client
+	conn := s.conn
 	s.mu.Unlock()
 	if !idle {
 		return
@@ -716,69 +604,28 @@ func (s *Server) finishIfIdle() {
 	// and, through a jump host, ends in the same EOF as our own close.
 	// Give it a moment to show before taking the end for ours.
 	select {
-	case <-s.connDone:
+	case <-conn.Done():
 	case <-time.After(100 * time.Millisecond):
-		s.closedByUs.Store(true)
-		client.Close()
-		<-s.connDone
+		conn.Close()
 	}
-	if s.connLost {
-		s.finish(s.connErr, connReason(s.connErr))
+	if err := conn.Wait(); err != nil {
+		s.finish(err, LostReason(err))
 		return
 	}
 	s.finish(nil, "")
 }
 
 // watch reports the connection failing.
-func (s *Server) watch(client *ssh.Client) {
-	s.connErr = client.Wait()
-	s.connLost = !s.closedByUs.Load()
-	close(s.connDone)
+func (s *Server) watch(conn *Conn) {
+	err := conn.Wait()
 	s.mu.Lock()
 	closing := s.state == stateClosing || len(s.channels) == 0
 	s.mu.Unlock()
 	// Otherwise finishIfIdle or finish closed it and decides.
-	if closing || !s.connLost {
+	if closing || err == nil {
 		return
 	}
-	s.finish(s.connErr, connReason(s.connErr))
-}
-
-// jumpError is failing to log in to a jump host.
-type jumpError struct {
-	host string
-	err  error
-}
-
-func (e *jumpError) Error() string { return "jump host " + e.host + ": " + e.err.Error() }
-func (e *jumpError) Unwrap() error { return e.err }
-
-// failReason says why connecting failed, without x/crypto's "ssh:
-// handshake failed:" wrapping where ours says it better.
-func failReason(err error) string {
-	var jump *jumpError
-	if errors.As(err, &jump) {
-		return "jump host " + jump.host + ": " + failReason(jump.err)
-	}
-	var denied *deniedError
-	switch {
-	case errors.As(err, &denied):
-		return denied.Error()
-	case errors.Is(err, errHostKeyRejected):
-		return errHostKeyRejected.Error()
-	case errors.Is(err, prompt.ErrInterrupted):
-		return "interrupted"
-	case errors.Is(err, errCancelled):
-		return "cancelled"
-	}
-	return err.Error()
-}
-
-func connReason(err error) string {
-	if err == nil || errors.Is(err, io.EOF) {
-		return "connection closed by remote host"
-	}
-	return err.Error()
+	s.finish(err, LostReason(err))
 }
 
 // finish shuts down, once: it tells slime why if reason is set, ends
@@ -793,7 +640,7 @@ func (s *Server) finish(err error, reason string) {
 		}
 		s.channels = map[uint32]*channel{}
 		s.pending = nil
-		client, jumps, conn := s.client, s.jumps, s.netConn
+		conn, cancel := s.conn, s.cancel
 		s.mu.Unlock()
 
 		if reason != "" {
@@ -804,13 +651,10 @@ func (s *Server) finish(err error, reason string) {
 			ch.out.Close()
 			ch.in.Close()
 		}
-		s.closedByUs.Store(true)
-		if client != nil {
-			client.Close()
-			for i := len(jumps) - 1; i >= 0; i-- {
-				jumps[i].Close()
-			}
-		} else if conn != nil {
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
 			conn.Close()
 		}
 		s.err = err

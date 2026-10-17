@@ -389,6 +389,14 @@ func TestWireRoundTrip(t *testing.T) {
 		&Created{Tag: 9, WS: 9, Tab: 2, Pane: 3},
 		&Draw{Seq: 4, Data: []byte{1, 2, 3}},
 		&Image{ID: 7, Generation: 1 << 40, Width: 2, Height: 3, Total: 10, Offset: 4, Data: []byte{9, 8, 7}},
+		&HostConnect{Tag: 10, Dest: "ssh://alde@dev1:2222"},
+		&HostAnswer{Choice: ChoiceAccept, Answers: []string{"hunter2", ""}},
+		&HostDisconnect{},
+		&HostList{},
+		&Bridge{Term: "xterm-ghostty"},
+		&Hosts{Hosts: []HostInfo{{ID: 11, Dest: "dev1", State: HostConnected}, {ID: 12, Dest: "dev2", State: HostFailed, Text: "Permission denied"}}},
+		&HostState{Tag: 13, Dest: "dev1", State: HostConnecting, Text: "installing slimed"},
+		&Prompt{Kind: PromptInteractive, Title: "Sign in", Text: "body", Detail: "SHA256:x", Error: "try again", Questions: []Question{{Label: "Password: "}, {Label: "Code: ", Echo: true}}},
 	}
 	var stream bytes.Buffer
 	for i, m := range msgs {
@@ -435,6 +443,10 @@ func normalize(m Message) Message {
 	case *Attached:
 		if len(m.Modes) == 0 {
 			m.Modes = nil
+		}
+	case *HostAnswer:
+		if len(m.Answers) == 0 {
+			m.Answers = nil
 		}
 	}
 	return m

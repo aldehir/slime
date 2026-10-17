@@ -5,12 +5,13 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/aldehir/slime/ssh/internal/payload"
 	"github.com/aldehir/slime/ssh/internal/proto"
+	"github.com/aldehir/slime/ssh/internal/remote"
 	"github.com/aldehir/slime/ssh/internal/sshtest"
 )
 
@@ -102,9 +103,19 @@ func (h *harness) openSlimedPipes(id uint32, termName string) (*io.PipeWriter, *
 	return inW, outR
 }
 
+// testRemote is the manifest zig build wrote, or an empty one when it
+// hasn't.
+var testRemote = sync.OnceValue(func() *remote.Manifest {
+	m, err := remote.Load(filepath.Join("..", "..", "..", "zig-out", "bin", remote.Dir))
+	if err != nil {
+		return &remote.Manifest{}
+	}
+	return m
+})
+
 func needPayload(t *testing.T) {
-	if _, ok := payload.For("linux", "amd64"); !ok {
-		t.Skip("no slimed build to install (go run ./cmd/slime-pack)")
+	if _, ok := testRemote().For("linux", "amd64"); !ok {
+		t.Skip("no slimed build to install (zig build writes zig-out/bin/remote)")
 	}
 }
 
@@ -123,7 +134,7 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 
 	sl.typ("hello slimed")
 	sl.expect(t, "hello slimed")
-	build, _ := payload.For("linux", "amd64")
+	build, _ := testRemote().For("linux", "amd64")
 	exe := "/home/alde/.cache/slime/slimed-" + build.ID
 	host.mu.Lock()
 	got, ok := host.installed[exe]
@@ -155,7 +166,7 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 
 func TestSlimedFoundNotInstalled(t *testing.T) {
 	needPayload(t)
-	build, _ := payload.For("linux", "amd64")
+	build, _ := testRemote().For("linux", "amd64")
 	exe := "/home/alde/.cache/slime/slimed-" + build.ID
 	host := &fakeHost{uname: "Linux x86_64", installed: map[string][]byte{exe: nil}}
 	srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
@@ -179,7 +190,7 @@ func TestSlimedUnsupportedFallsBack(t *testing.T) {
 		name, uname, installErr, want string
 	}{
 		{"os", "FreeBSD amd64", "", "slimed doesn't run on FreeBSD amd64"},
-		{"no build", "Darwin arm64", "", "carries no slimed for darwin/arm64"},
+		{"no build", "Darwin arm64", "", "no build of slimed for darwin/arm64"},
 		{"install", "Linux x86_64", "sh: gzip: not found", "installing slimed: sh: gzip: not found"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

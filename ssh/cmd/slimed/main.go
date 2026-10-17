@@ -45,6 +45,7 @@ func newCommand() *cobra.Command {
 	}
 	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
 		splitCommand(), attachCommand(), peekCommand(), killCommand())
+	root.AddCommand(hostCommands()...)
 	return root
 }
 

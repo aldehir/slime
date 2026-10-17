@@ -11,9 +11,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/aldehir/slime/ssh/internal/payload"
 	"github.com/aldehir/slime/ssh/internal/proto"
-	"github.com/aldehir/slime/ssh/internal/terminfo"
+	"github.com/aldehir/slime/ssh/internal/remote"
 )
 
 // Setting slimed up on a host runs these, each under the user's login
@@ -38,71 +37,177 @@ const (
 	slimedInstallTimeout = 2 * time.Minute
 )
 
-// startSlimed runs slimed on the host, installing it first if the host
-// lacks this build, and bridges ch's pipes to `slimed connect` until one
-// end hangs up.
-func (s *Server) startSlimed(client *ssh.Client, ch *channel) {
-	exe, err := s.ensureSlimed(client)
-	if err != nil {
-		s.slimedFailed(ch, err)
-		return
-	}
-	sess, err := client.NewSession()
-	if err != nil {
-		s.slimedFailed(ch, err)
-		return
+// EnsureSlimed returns the path to our build of slimed on the host,
+// installing it if it isn't there yet. Progress, if any, is reported
+// through status: "installing slimed".
+func (c *Conn) EnsureSlimed(status func(string)) (string, error) {
+	c.mu.Lock()
+	exe := c.slimedExe
+	c.mu.Unlock()
+	if exe != "" {
+		return exe, nil
 	}
 
-	s.mu.Lock()
-	if ch.closed || s.state == stateClosing {
-		s.mu.Unlock()
+	out, err := run(c.client, shCommand(slimedProbe), nil, slimedProbeTimeout)
+	if err != nil {
+		return "", fmt.Errorf("looking for slimed: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return "", fmt.Errorf("looking for slimed: unexpected answer %q", out)
+	}
+	goos, goarch, ok := goPlatform(lines[0])
+	if !ok {
+		return "", fmt.Errorf("slimed doesn't run on %s", strings.TrimSpace(lines[0]))
+	}
+	builds := c.opts.Remote
+	if builds == nil {
+		if builds, err = remote.Beside(); err != nil {
+			return "", fmt.Errorf("looking for builds of slimed: %w", err)
+		}
+	}
+	build, ok := builds.For(goos, goarch)
+	if !ok {
+		return "", fmt.Errorf("no build of slimed for %s/%s", goos, goarch)
+	}
+	name := "slimed-" + build.ID
+	exe = strings.TrimSpace(lines[1]) + "/" + name
+	installed := false
+	for _, l := range lines[2:] {
+		installed = installed || strings.TrimSpace(l) == name
+	}
+	if !installed {
+		log.Printf("installing slimed (%s/%s, %d KiB) as %s", goos, goarch, build.Size>>10, exe)
+		if status != nil {
+			status("installing slimed")
+		}
+		gz, err := build.Open()
+		if err != nil {
+			return "", fmt.Errorf("installing slimed: %w", err)
+		}
+		_, err = run(c.client, shCommand(slimedInstall, exe), gz, slimedInstallTimeout)
+		gz.Close()
+		if err != nil {
+			return "", fmt.Errorf("installing slimed: %w", err)
+		}
+	}
+	c.mu.Lock()
+	c.slimedExe = exe
+	c.mu.Unlock()
+	return exe, nil
+}
+
+// Slimed is `slimed connect` running on the host, bridging a stream to
+// the host's daemon.
+type Slimed struct {
+	sess   *ssh.Session
+	stderr tail
+}
+
+// SlimedError is slimed on the host ending with a failure: it couldn't
+// start the daemon, say. Why is its last line of stderr, under its own
+// "slimed: ".
+type SlimedError struct{ Why string }
+
+func (e *SlimedError) Error() string { return e.Why }
+
+// StartSlimed runs slimed on the host, installing it first if the host
+// lacks this build, with stdin and stdout as its streams: what stdin
+// gives goes to the host's daemon, and the daemon's replies to stdout.
+// Panes it starts get Term (see Conn.Term).
+func (c *Conn) StartSlimed(term string, stdin io.Reader, stdout io.Writer, status func(string)) (*Slimed, error) {
+	exe, err := c.EnsureSlimed(status)
+	if err != nil {
+		return nil, err
+	}
+	sess, err := c.client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	s := &Slimed{sess: sess}
+	sess.Stdin = stdin
+	sess.Stdout = stdout
+	sess.Stderr = &s.stderr
+	if err := sess.Start(shCommand(slimedConnect, exe, c.Term(term))); err != nil {
 		sess.Close()
+		return nil, fmt.Errorf("starting slimed: %w", err)
+	}
+	return s, nil
+}
+
+// Wait waits for slimed to end: nil when it exited cleanly (the other
+// end hung up), a SlimedError when it failed, or the connection's error
+// when that ended first.
+func (s *Slimed) Wait() error {
+	err := s.sess.Wait()
+	exit, ok := exitMessage(err)
+	var missing *ssh.ExitMissingError
+	switch {
+	case !ok, errors.As(err, &missing):
+		// The channel closed without a status: the connection failed.
+		return err
+	case exit.Status == 0:
+		return nil
+	}
+	why := s.stderr.String(exit)
+	if !strings.HasPrefix(why, "slimed: ") {
+		why = "slimed: " + why
+	}
+	return &SlimedError{Why: why}
+}
+
+// Close ends the session; Wait returns.
+func (s *Slimed) Close() error { return s.sess.Close() }
+
+// startSlimed is Serve's slimed channel: it runs slimed on the host and
+// bridges ch's pipes to it until one end hangs up.
+func (s *Server) startSlimed(ch *channel) {
+	s.mu.Lock()
+	closed := ch.closed || s.state == stateClosing
+	s.mu.Unlock()
+	if closed {
 		s.drop(ch)
 		s.finishIfIdle()
 		return
 	}
-	ch.sess = sess
-	term := ch.term
-	if term == terminfo.Name && !s.ghosttyTerm {
-		term = terminfo.Fallback
-	}
-	s.mu.Unlock()
-
-	var stderr tail
-	sess.Stdin = ch.input
-	sess.Stdout = ch.out
-	sess.Stderr = &stderr
-	if err := sess.Start(shCommand(slimedConnect, exe, term)); err != nil {
-		sess.Close()
-		s.slimedFailed(ch, fmt.Errorf("starting slimed: %w", err))
+	sl, err := s.conn.StartSlimed(ch.term, ch.input, ch.out, nil)
+	if err != nil {
+		s.slimedFailed(ch, err)
 		return
 	}
-	log.Printf("channel %d: slimed %s", ch.id, exe)
+	s.mu.Lock()
+	if ch.closed || s.state == stateClosing {
+		s.mu.Unlock()
+		sl.Close()
+		s.drop(ch)
+		s.finishIfIdle()
+		return
+	}
+	ch.sl = sl
+	s.mu.Unlock()
+	log.Printf("channel %d: slimed", ch.id)
 	s.send(ch.id, &proto.Opened{})
 
-	err = sess.Wait()
+	err = sl.Wait()
 	s.mu.Lock()
-	closed := ch.closed
+	closed = ch.closed
 	s.mu.Unlock()
-	exit, ok := exitMessage(err)
-	if ok && !closed {
-		if exit.Status != 0 {
-			// Its stderr says why, under its own "slimed: ": it couldn't
-			// start the daemon, say.
-			why := stderr.String(exit)
-			if !strings.HasPrefix(why, "slimed: ") {
-				why = "slimed: " + why
-			}
-			s.send(ch.id, &proto.Error{Message: why})
+	var failed *SlimedError
+	ended := err == nil || errors.As(err, &failed)
+	if ended && !closed {
+		if failed != nil {
+			s.send(ch.id, &proto.Error{Message: failed.Why})
 		} else {
-			s.send(ch.id, exit)
+			s.send(ch.id, &proto.Exit{Status: 0})
 		}
 	}
 	s.drop(ch)
-	// Otherwise the connection failed, and watch reports that.
-	if ok || closed {
-		s.finishIfIdle()
+	if !ended && !closed {
+		// The connection failed; once it has ended, finishIfIdle says
+		// why.
+		<-s.conn.Done()
 	}
+	s.finishIfIdle()
 }
 
 // slimedFailed reports that slimed couldn't start for ch and drops it.
@@ -123,50 +228,6 @@ func (s *Server) slimedFailed(ch *channel, err error) {
 	if closed {
 		s.finishIfIdle()
 	}
-}
-
-// ensureSlimed returns the path to this slime-ssh's build of slimed on
-// the host, installing it if it isn't there yet.
-func (s *Server) ensureSlimed(client *ssh.Client) (string, error) {
-	s.mu.Lock()
-	exe := s.slimedExe
-	s.mu.Unlock()
-	if exe != "" {
-		return exe, nil
-	}
-
-	out, err := run(client, shCommand(slimedProbe), nil, slimedProbeTimeout)
-	if err != nil {
-		return "", fmt.Errorf("looking for slimed: %w", err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) < 2 {
-		return "", fmt.Errorf("looking for slimed: unexpected answer %q", out)
-	}
-	goos, goarch, ok := goPlatform(lines[0])
-	if !ok {
-		return "", fmt.Errorf("slimed doesn't run on %s", strings.TrimSpace(lines[0]))
-	}
-	build, ok := payload.For(goos, goarch)
-	if !ok {
-		return "", fmt.Errorf("this slime-ssh carries no slimed for %s/%s", goos, goarch)
-	}
-	name := "slimed-" + build.ID
-	exe = strings.TrimSpace(lines[1]) + "/" + name
-	installed := false
-	for _, l := range lines[2:] {
-		installed = installed || strings.TrimSpace(l) == name
-	}
-	if !installed {
-		log.Printf("installing slimed (%s/%s, %d KiB) as %s", goos, goarch, len(build.Gz)>>10, exe)
-		if _, err := run(client, shCommand(slimedInstall, exe), build.Gz, slimedInstallTimeout); err != nil {
-			return "", fmt.Errorf("installing slimed: %w", err)
-		}
-	}
-	s.mu.Lock()
-	s.slimedExe = exe
-	s.mu.Unlock()
-	return exe, nil
 }
 
 // goPlatform maps `uname -sm` to Go's names for it.
@@ -197,7 +258,7 @@ func goPlatform(uname string) (goos, goarch string, ok bool) {
 // run runs command on the host with stdin, and returns its stdout. It
 // fails if the command does, saying what it wrote to stderr, or if it
 // takes longer than timeout.
-func run(client *ssh.Client, command string, stdin []byte, timeout time.Duration) ([]byte, error) {
+func run(client *ssh.Client, command string, stdin io.Reader, timeout time.Duration) ([]byte, error) {
 	sess, err := client.NewSession()
 	if err != nil {
 		return nil, err
@@ -208,7 +269,7 @@ func run(client *ssh.Client, command string, stdin []byte, timeout time.Duration
 	sess.Stdout = &stdout
 	sess.Stderr = &stderr
 	if stdin != nil {
-		sess.Stdin = bytes.NewReader(stdin)
+		sess.Stdin = stdin
 	}
 	if err := sess.Start(command); err != nil {
 		return nil, err

@@ -104,7 +104,7 @@ the Go standard library and the modules below, unmodified. `slimed`
 also links libghostty-vt (above) as a static library, with the C
 runtime Zig provides for each target: MinGW-w64's on Windows, musl on
 Linux (see below).
-`slime-ssh.exe` carries builds of `slimed` for Linux, which it installs
+Builds of `slimed` for Linux sit beside them in `remote/`, to install
 on SSH hosts.
 
 The Go standard library, [golang.org/x/crypto](https://go.googlesource.com/crypto),

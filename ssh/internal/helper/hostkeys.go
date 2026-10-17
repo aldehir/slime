@@ -32,7 +32,7 @@ type hostKeys struct {
 	// "accept-new", or "no".
 	strict string
 	hash   bool
-	ui     asker
+	ui     Asker
 }
 
 // callback returns the check for addr and the host key algorithms to
@@ -81,7 +81,7 @@ func (h *hostKeys) callback(addr string) (ssh.HostKeyCallback, []string, error) 
 func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 	switch h.strict {
 	case "yes":
-		h.ui.print(fmt.Sprintf("No %s host key is known for %s and you have requested strict checking.\nHost key verification failed.\n",
+		h.ui.Print(fmt.Sprintf("No %s host key is known for %s and you have requested strict checking.\nHost key verification failed.\n",
 			keyName(key), displayHost(hostname)))
 		return errHostKeyRejected
 	case "accept-new", "no":
@@ -90,8 +90,8 @@ func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 	}
 
 	fp := ssh.FingerprintSHA256(key)
-	if h.ui.dialog() {
-		q := &question{Prompt: proto.Prompt{
+	if h.ui.Dialog() {
+		q := &Query{Prompt: proto.Prompt{
 			Kind:   proto.PromptUnknownHost,
 			Title:  "First connection to " + displayHost(hostname),
 			Text:   "slime hasn't seen this host's key before. If you can, check the fingerprint against one from the server's admin before trusting it.",
@@ -100,7 +100,7 @@ func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 		if len(h.files) > 0 {
 			q.Text += "\n\nTrusting it adds the key to " + h.files[0] + "."
 		}
-		ans, err := h.ui.ask(q)
+		ans, err := h.ui.Ask(q)
 		if err != nil {
 			return err
 		}
@@ -110,11 +110,11 @@ func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 		h.add(hostname, key)
 		return nil
 	}
-	h.ui.print(fmt.Sprintf("The authenticity of host '%s' can't be established.\n%s key fingerprint is %s.\n",
+	h.ui.Print(fmt.Sprintf("The authenticity of host '%s' can't be established.\n%s key fingerprint is %s.\n",
 		displayHost(hostname), keyName(key), fp))
 	q := "Are you sure you want to continue connecting (yes/no/[fingerprint])? "
 	for {
-		ans, err := h.ui.ask(&question{Prompt: proto.Prompt{Questions: []proto.Question{{Label: q, Echo: true}}}})
+		ans, err := h.ui.Ask(&Query{Prompt: proto.Prompt{Questions: []proto.Question{{Label: q, Echo: true}}}})
 		if err != nil {
 			return err
 		}
@@ -123,7 +123,7 @@ func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 			h.add(hostname, key)
 			return nil
 		case "no":
-			h.ui.print("Host key verification failed.\n")
+			h.ui.Print("Host key verification failed.\n")
 			return errHostKeyRejected
 		}
 		q = "Please type 'yes', 'no' or the fingerprint: "
@@ -136,10 +136,10 @@ func (h *hostKeys) add(hostname string, key ssh.PublicKey) {
 		return
 	}
 	if err := appendKnownHost(h.files[0], hostname, key, h.hash); err != nil {
-		h.ui.print(fmt.Sprintf("Failed to add the host to the list of known hosts (%s): %v\n", h.files[0], err))
+		h.ui.Print(fmt.Sprintf("Failed to add the host to the list of known hosts (%s): %v\n", h.files[0], err))
 		return
 	}
-	h.ui.print(fmt.Sprintf("Warning: Permanently added '%s' (%s) to the list of known hosts.\n",
+	h.ui.Print(fmt.Sprintf("Warning: Permanently added '%s' (%s) to the list of known hosts.\n",
 		displayHost(hostname), keyName(key)))
 }
 
@@ -147,11 +147,11 @@ func (h *hostKeys) add(hostname string, key ssh.PublicKey) {
 // dialog lets the user connect anyway, this once: known_hosts is left
 // alone, so it asks again next time.
 func (h *hostKeys) changed(hostname string, key ssh.PublicKey, known knownhosts.KnownKey) error {
-	if !h.ui.dialog() {
+	if !h.ui.Dialog() {
 		h.warnChanged(hostname, key, known)
 		return errHostKeyRejected
 	}
-	q := &question{Prompt: proto.Prompt{
+	q := &Query{Prompt: proto.Prompt{
 		Kind:  proto.PromptChangedHost,
 		Title: displayHost(hostname) + "'s host key has changed",
 		Text:  "Someone could be intercepting the connection, or the server may have been reinstalled. Only connect if you know why it changed.",
@@ -159,7 +159,7 @@ func (h *hostKeys) changed(hostname string, key ssh.PublicKey, known knownhosts.
 			known.Filename, known.Line, keyName(known.Key), ssh.FingerprintSHA256(known.Key),
 			keyName(key), ssh.FingerprintSHA256(key)),
 	}}
-	ans, err := h.ui.ask(q)
+	ans, err := h.ui.Ask(q)
 	if err != nil {
 		return err
 	}
@@ -171,7 +171,7 @@ func (h *hostKeys) changed(hostname string, key ssh.PublicKey, known knownhosts.
 }
 
 func (h *hostKeys) warnChanged(hostname string, key ssh.PublicKey, known knownhosts.KnownKey) {
-	h.ui.print(fmt.Sprintf(`@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+	h.ui.Print(fmt.Sprintf(`@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!

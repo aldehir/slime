@@ -90,6 +90,7 @@ func startHarness(t *testing.T, srv *sshtest.Server, knownHosts string, features
 	opts := Options{
 		Dest:       Destination{User: "alde", Host: "127.0.0.1", Port: srv.Port()},
 		KnownHosts: []string{knownHosts},
+		Remote:     testRemote(),
 		OpenPipes:  h.openPipes,
 	}
 	for _, mod := range mods {

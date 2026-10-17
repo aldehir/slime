@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aldehir/slime/ssh/internal/payload"
 	"github.com/aldehir/slime/ssh/internal/persist"
 	"github.com/aldehir/slime/ssh/internal/proto"
 	"github.com/aldehir/slime/ssh/internal/sshtest"
@@ -93,7 +92,7 @@ func TestSlimedOnLinux(t *testing.T) {
 
 	c := dialSlimed(t, srv, kh)
 	t.Cleanup(func() { syscall.Kill(int(c.Hello.PID), syscall.SIGKILL) })
-	build, _ := payload.For("linux", "amd64")
+	build, _ := testRemote().For("linux", "amd64")
 	if _, err := os.Stat(filepath.Join(home, ".cache", "slime", "slimed-"+build.ID)); err != nil {
 		t.Fatalf("not installed: %v", err)
 	}

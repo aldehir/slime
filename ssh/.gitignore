@@ -1,3 +1,2 @@
 *.exe
 /internal/vt/lib/
-/internal/payload/bin/*.gz
