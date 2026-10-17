@@ -75,12 +75,14 @@ workspace: u32 = 0,
 /// Tags for requests. UI thread only.
 next_tag: u32 = 0,
 
-/// Guards `panes`, `arrivals`, `requested`, and `lost`, and is held while
-/// calling a sink, so a session can't go while one runs.
+/// Guards `panes`, `arrivals`, `structure`, `requested`, and `lost`, and
+/// is held while calling a sink, so a session can't go while one runs.
 lock: win32.SRWLOCK = .{},
 panes: std.AutoHashMapUnmanaged(u32, Slot) = .empty,
 arrivals: std.ArrayList(Arrival) = .empty,
-/// Tags of our own TabNew requests, so their panes can be shown.
+structure: ?*Structure = null,
+/// Tags of our own TabNew and Split requests, so their panes can be
+/// shown.
 requested: std.ArrayList(u32) = .empty,
 /// The connection ended; every live pane was told why.
 lost: bool = false,
@@ -93,7 +95,6 @@ pub const Notify = struct {
     msg: u32,
 };
 
-/// A grid size and its cell size in pixels.
 /// A tab's space in pixels, which its layout's shares divide, and the
 /// cell size for panes that haven't said their own (each pane can have
 /// its own font).
@@ -104,6 +105,7 @@ pub const Area = struct {
     cell_height: u32,
 };
 
+/// A grid size and its cell size in pixels.
 pub const Size = struct {
     cols: u16,
     rows: u16,
@@ -130,12 +132,63 @@ pub const Arrival = struct {
     command: []const u16,
     /// win32-input-mode, which a snapshot doesn't carry.
     win32_input: bool,
-    /// From our own TabNew, so the window shows it.
+    /// From our own TabNew or Split, so the window shows it.
     requested: bool,
 
     pub fn deinit(self: *Arrival, alloc: Allocator) void {
         alloc.free(self.snapshot);
         alloc.free(self.command);
+    }
+};
+
+/// The way a split lays out its children (layout.go's Axis).
+pub const Axis = enum(u8) {
+    /// Left to right, sharing the width.
+    row = 1,
+    /// Top to bottom, sharing the height.
+    column = 2,
+};
+
+/// Where a split puts the new pane beside the old (layout.go's Direction).
+pub const Direction = enum(u8) { right = 1, down = 2, left = 3, up = 4 };
+
+/// A tab's layout tree, as the daemon sends it.
+pub const Node = union(enum) {
+    pane: u32,
+    split: struct { axis: Axis, children: []Child },
+};
+
+pub const Child = struct {
+    /// Basis points of the split's space.
+    share: u16,
+    node: Node,
+};
+
+/// The workspace's tabs, from its last Workspace message, in its order.
+pub const Structure = struct {
+    arena: std.heap.ArenaAllocator,
+    tabs: []const TabLayout,
+
+    pub const TabLayout = struct { id: u32, root: Node };
+
+    fn destroy(self: *Structure, alloc: Allocator) void {
+        self.arena.deinit();
+        alloc.destroy(self);
+    }
+};
+
+/// What came since the UI thread last looked (`take`).
+pub const Taken = struct {
+    /// Panes whose snapshots are in, for sessions to adopt or release.
+    arrivals: []Arrival,
+    /// The tabs as they are now, if they changed. Every pane in them is
+    /// live or among `arrivals`.
+    structure: ?*Structure,
+
+    pub fn deinit(self: *Taken, alloc: Allocator) void {
+        for (self.arrivals) |*a| a.deinit(alloc);
+        alloc.free(self.arrivals);
+        if (self.structure) |st| st.destroy(alloc);
     }
 };
 
@@ -247,14 +300,19 @@ fn freeState(self: *Slimed) void {
     for (self.arrivals.items) |*a| a.deinit(self.alloc);
     self.arrivals.deinit(self.alloc);
     self.requested.deinit(self.alloc);
+    if (self.structure) |st| st.destroy(self.alloc);
 }
 
-/// Take the panes waiting for sessions; the caller owns them
-/// (`Arrival.deinit`) and must `adopt` or `release` each. UI thread.
-pub fn takeArrivals(self: *Slimed) []Arrival {
+/// Take the panes waiting for sessions and the latest tabs, together so
+/// the tabs name no pane the caller hasn't seen. The caller owns them
+/// (`Taken.deinit`) and must `adopt` or `release` each arrival. UI
+/// thread.
+pub fn take(self: *Slimed) Taken {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
-    return self.arrivals.toOwnedSlice(self.alloc) catch &.{};
+    const structure = self.structure;
+    self.structure = null;
+    return .{ .arrivals = self.arrivals.toOwnedSlice(self.alloc) catch &.{}, .structure = structure };
 }
 
 /// Make `sink` the pane's: what came while it waited goes first, then
@@ -329,16 +387,8 @@ pub fn tabNew(self: *Slimed, command: []const u16, size: Size) !void {
 }
 
 fn tabNewTagged(self: *Slimed, command: []const u16, size: Size) !u32 {
-    const t = self.nextTag();
-    {
-        win32.AcquireSRWLockExclusive(&self.lock);
-        defer win32.ReleaseSRWLockExclusive(&self.lock);
-        try self.requested.append(self.alloc, t);
-    }
-    const cmd = std.unicode.utf16LeToUtf8Alloc(self.alloc, command) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.BadCommand,
-    };
+    const t = try self.requestTag();
+    const cmd = try commandUtf8(self.alloc, command);
     defer self.alloc.free(cmd);
     var p: Payload = .{};
     defer p.deinit(self.alloc);
@@ -349,6 +399,39 @@ fn tabNewTagged(self: *Slimed, command: []const u16, size: Size) !u32 {
     try p.putSize(self.alloc, size);
     try self.send(.tab_new, 0, p.bytes());
     return t;
+}
+
+/// Ask for a pane running `command` on side `dir` of `pane`, taking half
+/// its space. It arrives through `arrivals`, marked requested. UI thread.
+pub fn split(self: *Slimed, pane: u32, dir: Direction, command: []const u16) !void {
+    const t = try self.requestTag();
+    const cmd = try commandUtf8(self.alloc, command);
+    defer self.alloc.free(cmd);
+    var p: Payload = .{};
+    defer p.deinit(self.alloc);
+    try p.putU32(self.alloc, t);
+    try p.putU32(self.alloc, pane);
+    try p.list.append(self.alloc, @intFromEnum(dir));
+    try p.putU16(self.alloc, 5000);
+    try p.putStr(self.alloc, cmd);
+    try p.putStr(self.alloc, "");
+    try self.send(.split, 0, p.bytes());
+}
+
+/// A tag for a request whose panes the window shows when they come.
+fn requestTag(self: *Slimed) !u32 {
+    const t = self.nextTag();
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    try self.requested.append(self.alloc, t);
+    return t;
+}
+
+fn commandUtf8(alloc: Allocator, command: []const u16) ![]u8 {
+    return std.unicode.utf16LeToUtf8Alloc(alloc, command) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadCommand,
+    };
 }
 
 fn nextTag(self: *Slimed) u32 {
@@ -471,8 +554,15 @@ fn handle(self: *Slimed, f: Frame) !u32 {
 }
 
 /// A Workspace message: panes in it whose snapshots are in go to
-/// `arrivals`, in layout order. Returns its tag.
+/// `arrivals`, in layout order, and its tabs replace `structure`. Returns
+/// its tag.
 fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
+    const st = try self.alloc.create(Structure);
+    st.* = .{ .arena = .init(self.alloc), .tabs = &.{} };
+    errdefer st.destroy(self.alloc);
+    var tree = r.*;
+    st.tabs = try readStructure(st.arena.allocator(), &tree);
+
     const t = try r.readU32();
     self.workspace = try r.readU32();
     _ = try r.readStr(); // name
@@ -482,7 +572,6 @@ fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
             break true;
         }
     } else false;
-    var arrived = false;
     const tabs = try r.readU32();
     for (0..tabs) |_| {
         const tab = try r.readU32();
@@ -508,11 +597,47 @@ fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
                 .requested = requested,
             });
             pend.arrived = true;
-            arrived = true;
         }
     }
-    if (arrived and self.reader != null) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
+    if (self.structure) |old| old.destroy(self.alloc);
+    self.structure = st;
+    if (self.reader != null) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
     return t;
+}
+
+/// The tabs of a Workspace message, read from its tag on.
+fn readStructure(a: Allocator, r: *Reader) ![]const Structure.TabLayout {
+    _ = try r.readU32(); // tag
+    _ = try r.readU32(); // workspace
+    _ = try r.readStr(); // name
+    const n = try r.readU32();
+    if (n > r.buf.len) return error.Truncated;
+    const tabs = try a.alloc(Structure.TabLayout, n);
+    for (tabs) |*tab| {
+        tab.id = try r.readU32();
+        _ = try r.readStr(); // name
+        tab.root = try readNode(a, r, 0);
+    }
+    return tabs;
+}
+
+fn readNode(a: Allocator, r: *Reader, depth: usize) !Node {
+    if (depth > 32) return error.TooDeep;
+    switch (try r.readU8()) {
+        0 => return .{ .pane = try r.readU32() },
+        1 => {
+            const axis = std.enums.fromInt(Axis, try r.readU8()) orelse return error.BadLayout;
+            const n = try r.readU16();
+            if (n > r.buf.len) return error.Truncated;
+            const children = try a.alloc(Child, n);
+            for (children) |*c| {
+                c.share = try r.readU16();
+                c.node = try readNode(a, r, depth + 1);
+            }
+            return .{ .split = .{ .axis = axis, .children = children } };
+        },
+        else => return error.BadLayout,
+    }
 }
 
 /// The pane ids in a layout tree, in order. More than `ids` holds are
@@ -620,7 +745,7 @@ fn handshake(pipe: *Pipe, buf: []u8) !void {
 /// Open the daemon's pipe, first starting the daemon if `start_daemon` and none
 /// is running.
 fn openPipe(start_daemon: bool) !win32.HANDLE {
-    var name_buf: [128]u16 = undefined;
+    var name_buf: WideBuf = .{};
     const name = try pipeName(&name_buf);
     var started = false;
     const deadline = win32.GetTickCount64() + 5000;
@@ -661,19 +786,29 @@ fn openPipe(start_daemon: bool) !win32.HANDLE {
 }
 
 /// `\\.\pipe\slimed-<user SID>`, NUL-terminated: one daemon per user.
-fn pipeName(buf: []u16) ![:0]const u16 {
+/// With SLIMED_INSTANCE set, `-<instance>` follows, as the daemon names
+/// it (persist.PipeName).
+fn pipeName(buf: *WideBuf) ![:0]const u16 {
     var token_buf: [256]u8 align(@alignOf(win32.TOKEN_USER)) = undefined;
     const sid = try currentUser(&token_buf);
     var str: ?win32.LPWSTR = null;
     if (win32.ConvertSidToStringSidW(sid, &str) == 0) return win32.lastError("ConvertSidToStringSidW");
     defer _ = win32.LocalFree(str);
-    const sid_str = std.mem.span(str.?);
-    const prefix = L("\\\\.\\pipe\\slimed-");
-    if (prefix.len + sid_str.len + 1 > buf.len) return error.NameTooLong;
-    @memcpy(buf[0..prefix.len], prefix);
-    @memcpy(buf[prefix.len..][0..sid_str.len], sid_str);
-    buf[prefix.len + sid_str.len] = 0;
-    return buf[0 .. prefix.len + sid_str.len :0];
+    try buf.put(L("\\\\.\\pipe\\slimed-"));
+    try buf.put(std.mem.span(str.?));
+    var inst: [64]u16 = undefined;
+    if (instance(&inst)) |name| {
+        try buf.put(L("-"));
+        try buf.put(name);
+    }
+    return buf.z();
+}
+
+/// SLIMED_INSTANCE, if it's set: a daemon of its own, for tests.
+fn instance(buf: *[64]u16) ?[]const u16 {
+    const len = win32.GetEnvironmentVariableW(L("SLIMED_INSTANCE"), buf, buf.len);
+    if (len == 0 or len >= buf.len) return null;
+    return buf[0..len];
 }
 
 fn currentUser(buf: *align(@alignOf(win32.TOKEN_USER)) [256]u8) !*win32.SID {
@@ -714,7 +849,8 @@ fn checkServer(pipe: win32.HANDLE) !void {
 /// replaced, and the daemon runs as long as its sessions, so running ours
 /// in place would stop the next build from installing over it. It loads
 /// the ConPTY next to us (which doesn't change between builds). Its log
-/// goes to %LOCALAPPDATA%\slime\slimed.log.
+/// goes to %LOCALAPPDATA%\slime\slimed.log (slimed-<instance>.log with
+/// SLIMED_INSTANCE).
 fn startDaemon() !void {
     var dir_buf: [max_path]u16 = undefined;
     const dir = try exeDir(&dir_buf);
@@ -738,7 +874,13 @@ fn startDaemon() !void {
         try base.put(L("\\slime"));
         try makeDir(&base);
         try log_path.put(base.slice());
-        try log_path.put(L("\\slimed.log"));
+        try log_path.put(L("\\slimed"));
+        var inst: [64]u16 = undefined;
+        if (instance(&inst)) |name| {
+            try log_path.put(L("-"));
+            try log_path.put(name);
+        }
+        try log_path.put(L(".log"));
         try base.put(L("\\bin"));
         try makeDir(&base);
 
@@ -945,6 +1087,12 @@ const Payload = struct {
     fn putU32(self: *Payload, alloc: Allocator, v: u32) !void {
         var b: [4]u8 = undefined;
         std.mem.writeInt(u32, &b, v, .little);
+        try self.list.appendSlice(alloc, &b);
+    }
+
+    fn putU16(self: *Payload, alloc: Allocator, v: u16) !void {
+        var b: [2]u8 = undefined;
+        std.mem.writeInt(u16, &b, v, .little);
         try self.list.appendSlice(alloc, &b);
     }
 

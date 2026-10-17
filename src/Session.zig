@@ -4,8 +4,8 @@
 //!
 //! A reader thread feeds the child's output to the stream; the UI thread
 //! renders and handles input. `lock` guards `terminal` and `stream`
-//! between them. Mouse positions are relative to the window's terminal
-//! area.
+//! between them. Mouse positions are relative to the session's pane
+//! (`rect`).
 const Session = @This();
 
 const std = @import("std");
@@ -23,6 +23,7 @@ const Window = @import("Window.zig");
 const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
 const Images = @import("renderer/image.zig").Images;
+const Rect = @import("renderer/Painter.zig").Rect;
 
 const log = std.log.scoped(.session);
 
@@ -63,6 +64,11 @@ render_state: ghostty_vt.RenderState = .empty,
 cells: Cells = .{},
 images: Images = .{},
 textures: Renderer.ImageTextures = .{},
+
+/// Where the session's pane is in the window, in client pixels, and the
+/// space around its grid in it. Set by the window's layout.
+rect: Rect = .{},
+pad: Window.PaddingPx = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 },
 
 transport: ?Transport = null,
 reader: ?std.Thread = null,
@@ -274,9 +280,6 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
             // with what came while the pane waited for us.
             self.transport = .{ .slimed = .{ .conn = s.conn, .pane = s.arrival.pane } };
             s.conn.adopt(s.arrival.pane, .{ .ctx = self, .output = slimedOutput, .ended = slimedEnded });
-            // The daemon sized it from its layout; we show it whole.
-            const cell = window.cellSizePx();
-            s.conn.resize(s.arrival.pane, .{ .cols = cols, .rows = rows, .cell_width = cell.width, .cell_height = cell.height });
             return self;
         },
     }
@@ -400,6 +403,14 @@ fn applyDefaults(self: *Session) !void {
     try colors.palette.changeDefault(self.alloc, config.palette.colors);
     self.terminal.modes.default.grapheme_cluster = true;
     self.terminal.setDefaultCursorBlink(null);
+}
+
+/// The slimed pane the session shows, if it's one.
+pub fn slimedPane(self: *const Session) ?u32 {
+    return switch (self.transport orelse return null) {
+        .slimed => |s| s.pane,
+        else => null,
+    };
 }
 
 /// The SSH connection the session's shell runs on, if it's remote.
@@ -965,8 +976,8 @@ fn dragGeometry(self: *const Session) ghostty_vt.SelectionGesture.Drag.Geometry 
     return .{
         .columns = self.terminal.cols,
         .cell_width = self.window.grid.metrics.cell_width,
-        .padding_left = self.window.paddingPx().left,
-        .screen_height = self.window.terminalSize().height,
+        .padding_left = self.pad.left,
+        .screen_height = @intFromFloat(self.rect.h),
     };
 }
 
@@ -974,7 +985,7 @@ fn dragGeometry(self: *const Session) ghostty_vt.SelectionGesture.Drag.Geometry 
 /// the terminal locked.
 fn cellAt(self: *const Session, pos: win32.POINT) ghostty_vt.Coordinate {
     const m = self.window.grid.metrics;
-    const pad = self.window.paddingPx();
+    const pad = self.pad;
     const x = @divFloor(pos.x - @as(i32, @intCast(pad.left)), @as(i32, @intCast(m.cell_width)));
     const y = @divFloor(pos.y - @as(i32, @intCast(pad.top)), @as(i32, @intCast(m.cell_height)));
     return .{
@@ -1068,12 +1079,12 @@ fn mouseReport(self: *Session, event: MouseEvent, opts: MouseEncodeOptions) void
     self.writeChild(w.buffered());
 }
 
-/// The terminal area as the mouse encoder sees it, to map positions to
-/// cells. Call with the terminal locked.
+/// The pane as the mouse encoder sees it, to map positions to cells.
+/// Call with the terminal locked.
 fn surfaceSize(self: *const Session) @FieldType(MouseEncodeOptions, "size") {
-    const size = self.window.terminalSize();
+    const size: struct { width: u32, height: u32 } = .{ .width = @intFromFloat(self.rect.w), .height = @intFromFloat(self.rect.h) };
     const m = self.window.grid.metrics;
-    const pad = self.window.paddingPx();
+    const pad = self.pad;
     return .{
         .screen = .{ .width = size.width, .height = size.height },
         .cell = .{ .width = m.cell_width, .height = m.cell_height },

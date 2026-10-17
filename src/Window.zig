@@ -1,5 +1,5 @@
-//! A top-level Win32 window: our own title bar and session list (see
-//! `Chrome`) around the active session's terminal. Heap allocated so that
+//! A top-level Win32 window: our own title bar and tab list (see
+//! `Chrome`) around the active tab's panes, each a session's terminal. Heap allocated so that
 //! its address can be stored in the HWND's user data.
 //!
 //! The window draws its own title bar. WM_NCCALCSIZE gives the caption's
@@ -19,6 +19,7 @@ const clipboard = @import("clipboard.zig");
 const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
+const Tab = @import("Tab.zig");
 const SshConnection = @import("SshConnection.zig");
 const Slimed = @import("Slimed.zig");
 const Hosts = @import("Hosts.zig");
@@ -109,16 +110,21 @@ chrome_layout: Chrome.Layout = undefined,
 /// (WM_SIZE, etc.) arrive before everything else is ready.
 renderer: ?Renderer = null,
 
-/// Never empty once created: closing the last session closes the window.
-/// Grouped as the sidebar shows them: local sessions first, then each
+/// Never empty once created: closing the last tab closes the window.
+/// Grouped as the sidebar shows them: local tabs first, then each
 /// connection's together.
-sessions: std.ArrayList(*Session) = .empty,
-/// The session shown and given input.
+tabs: std.ArrayList(*Tab) = .empty,
+/// The tab shown. Its focused pane gets input.
 active: usize = 0,
 next_session_id: u32 = 1,
-/// Scratch for `view`, with room for every session and group.
-view_sessions: std.ArrayList(Chrome.View.Session) = .empty,
+/// Scratch for `view`, with room for every group.
+view_tabs: std.ArrayList(Chrome.View.Tab) = .empty,
 view_groups: std.ArrayList(Chrome.View.Group) = .empty,
+view_panes: std.ArrayList(Chrome.View.Pane) = .empty,
+/// The active tab's panes on screen, as `view` lists them.
+shown: std.ArrayList(*Session) = .empty,
+/// Scratch for `render`.
+frame_panes: std.ArrayList(Renderer.Pane) = .empty,
 
 /// Auto-reset event every session's reader thread sets after feeding
 /// output to its terminal. The message loop waits on it alongside
@@ -166,7 +172,7 @@ bound_key: ?u32 = null,
 /// A mouse button went down over the terminal, which then gets the mouse
 /// until every button is up.
 mouse_in_terminal: bool = false,
-/// The session a middle click went down on, to close it on release.
+/// The tab a middle click went down on, to close it on release.
 middle_pressed: ?usize = null,
 /// TrackMouseEvent is armed for the mouse leaving the client area, and
 /// for leaving the caption buttons.
@@ -266,7 +272,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     } else if (!(config.@"persist-sessions" and self.connectSlimed(command_line))) {
         try self.spawnSession(.{ .command = command_line });
     }
-    errdefer self.destroySessions();
+    errdefer self.destroyTabs();
     self.showTitle();
 
     // Have the frame recomputed now that WM_NCCALCSIZE can be answered.
@@ -286,7 +292,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
 pub fn destroy(self: *Window) void {
     if (self.renderer) |*r| {
         // Sessions hold GPU resources.
-        self.destroySessions();
+        self.destroyTabs();
         r.deinit();
         self.chrome.deinit();
         self.grid.deinit();
@@ -294,27 +300,58 @@ pub fn destroy(self: *Window) void {
     // Hanging up detaches the workspace; slimed keeps it for the next
     // window.
     if (self.slimed) |conn| conn.deinit();
-    self.view_sessions.deinit(self.alloc);
+    self.view_tabs.deinit(self.alloc);
     self.view_groups.deinit(self.alloc);
+    self.view_panes.deinit(self.alloc);
+    self.shown.deinit(self.alloc);
+    self.frame_panes.deinit(self.alloc);
     _ = win32.CloseHandle(self.output_event);
     _ = win32.CloseHandle(self.hold_timer);
     self.alloc.destroy(self);
 }
 
-fn destroySessions(self: *Window) void {
-    for (self.sessions.items) |s| s.destroy();
-    self.sessions.clearAndFree(self.alloc);
+fn destroyTabs(self: *Window) void {
+    for (self.tabs.items) |t| self.destroyTab(t);
+    self.tabs.clearAndFree(self.alloc);
 }
 
+/// Free a tab and its sessions, which only lets go of slimed panes.
+fn destroyTab(self: *Window, t: *Tab) void {
+    var it = t.iterator();
+    while (it.next()) |s| s.destroy();
+    t.destroy(self.alloc);
+}
+
+pub fn activeTab(self: *const Window) *Tab {
+    return self.tabs.items[self.active];
+}
+
+/// The active tab's focused pane, which gets input.
 pub fn activeSession(self: *const Window) *Session {
-    return self.sessions.items[self.active];
+    return self.activeTab().focus;
 }
 
-fn sessionIndex(self: *const Window, id: u32) ?usize {
-    for (self.sessions.items, 0..) |s, i| {
-        if (s.id == id) return i;
+const Found = struct { tab: usize, s: *Session };
+
+/// The session `id` names, and its tab.
+fn findSession(self: *const Window, id: u32) ?Found {
+    for (self.tabs.items, 0..) |t, i| {
+        if (t.findSession(id)) |s| return .{ .tab = i, .s = s };
     }
     return null;
+}
+
+/// The session showing slimed's pane `id`.
+fn slimedSession(self: *const Window, id: u32) ?*Session {
+    for (self.tabs.items) |t| {
+        if (t.id == 0) continue;
+        if (t.findPane(id)) |s| return s;
+    }
+    return null;
+}
+
+fn tabIndex(self: *const Window, t: *const Tab) ?usize {
+    return std.mem.indexOfScalar(*Tab, self.tabs.items, @constCast(t));
 }
 
 /// Where a new session runs.
@@ -329,45 +366,159 @@ const Target = union(enum) {
 };
 
 /// With `persist-sessions`: connect to slimed and attach the workspace
-/// detached last (a new one running `command` if none), making a session
-/// of each pane. Returns whether any came.
+/// detached last (a new one running `command` if none), making a tab of
+/// each of its tabs. Returns whether any came.
 fn connectSlimed(self: *Window, command: []const u16) bool {
     const conn = Slimed.connect(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.slimedArea(), self.slimedSize(), command) catch |err| {
         log.err("connecting to slimed failed: {}; sessions won't outlive the window", .{err});
         return false;
     };
     self.slimed = conn;
-    self.adoptArrivals();
+    self.slimedChanged();
     conn.start() catch |err| {
         log.err("starting slimed's reader failed: {}", .{err});
-        self.destroySessions();
+        self.destroyTabs();
         conn.deinit();
         self.slimed = null;
         return false;
     };
-    if (self.sessions.items.len > 0) self.activate(0);
-    return self.sessions.items.len > 0;
+    return self.tabs.items.len > 0;
 }
 
-/// Make sessions of the panes slimed delivered. The one we asked for is
-/// shown; others (a script's) are added without taking focus.
-fn adoptArrivals(self: *Window) void {
+/// Take up what slimed sent: make sessions of the panes that arrived,
+/// and lay out tabs as its workspace has them. A pane we asked for (a new
+/// tab or split) is shown and focused; others (a script's) are added
+/// without taking focus.
+fn slimedChanged(self: *Window) void {
     const conn = self.slimed orelse return;
-    const arrivals = conn.takeArrivals();
-    defer {
-        for (arrivals) |*a| a.deinit(self.alloc);
-        self.alloc.free(arrivals);
-    }
-    for (arrivals) |*a| {
-        const shown: ?*Session = if (self.sessions.items.len > 0) self.activeSession() else null;
-        self.spawnSession(.{ .slimed = a }) catch |err| {
+    var taken = conn.take();
+    defer taken.deinit(self.alloc);
+
+    var arrived: std.AutoHashMapUnmanaged(u32, *Session) = .empty;
+    defer arrived.deinit(self.alloc);
+    var requested: ?*Session = null;
+    for (taken.arrivals) |*a| {
+        const s = self.createSession(.{ .slimed = a }, self.gridSize()) catch |err| {
             log.err("showing slimed pane {d} failed: {}", .{ a.pane, err });
             conn.release(a.pane);
             continue;
         };
-        if (!a.requested) if (shown) |s| if (self.sessionIndex(s.id)) |i| self.activate(i);
+        arrived.put(self.alloc, a.pane, s) catch {
+            s.destroy();
+            continue;
+        };
+        if (a.requested) requested = s;
     }
+    if (taken.structure) |st| self.applyStructure(st, &arrived) catch |err| log.err("laying out slimed's tabs failed: {}", .{err});
+    // Panes no tab holds (which slimed doesn't send) aren't shown.
+    var left = arrived.valueIterator();
+    while (left.next()) |s| {
+        if (requested == s.*) requested = null;
+        s.*.destroy();
+    }
+
+    if (self.tabs.items.len == 0) {
+        // Every pane is gone: so is the window.
+        _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
+        return;
+    }
+    if (requested) |s| for (self.tabs.items, 0..) |t, i| {
+        if (!t.contains(s)) continue;
+        self.activate(i);
+        self.focusPane(s);
+        break;
+    };
     self.dirty = true;
+}
+
+/// Lay out slimed's tabs as `st` has them: replace the trees of tabs we
+/// have, add tabs we don't (at the end of Local), and drop tabs and panes
+/// it no longer has. Sessions placed from `arrived` are taken out of it.
+fn applyStructure(self: *Window, st: *const Slimed.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
+    const alloc = self.alloc;
+    const was_active: ?*Tab = if (self.tabs.items.len > 0) self.activeTab() else null;
+    const was_focus: ?*Session = if (was_active) |t| t.focus else null;
+
+    const Lookup = struct {
+        window: *Window,
+        arrived: *std.AutoHashMapUnmanaged(u32, *Session),
+        pub fn session(l: @This(), id: u32) ?*Session {
+            return l.arrived.get(id) orelse l.window.slimedSession(id);
+        }
+    };
+    const lookup: Lookup = .{ .window = self, .arrived = arrived };
+    const roots = try alloc.alloc(?Tab.Node, st.tabs.len);
+    defer alloc.free(roots);
+    @memset(roots, null);
+    defer for (roots) |r| if (r) |n| Tab.freeNode(alloc, n);
+    var used: std.AutoHashMapUnmanaged(*Session, void) = .empty;
+    defer used.deinit(alloc);
+    for (st.tabs, roots) |lt, *root| {
+        root.* = try Tab.fromLayout(alloc, lt.root, lookup);
+        const node = root.* orelse continue;
+        var walk: Tab = .{ .id = 0, .root = node, .focus = Tab.first(node) };
+        var it = walk.iterator();
+        while (it.next()) |s| try used.put(alloc, s, {});
+    }
+    try self.tabs.ensureUnusedCapacity(alloc, st.tabs.len);
+
+    // Panes of ours slimed no longer has, freed once no tree holds them.
+    var dropped: std.ArrayList(*Session) = .empty;
+    defer dropped.deinit(alloc);
+    for (self.tabs.items) |t| {
+        if (t.id == 0) continue;
+        var it = t.iterator();
+        while (it.next()) |s| if (!used.contains(s)) try dropped.append(alloc, s);
+    }
+
+    // Tabs slimed has panes of ours in, by id.
+    var kept: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer kept.deinit(alloc);
+    for (st.tabs, roots) |lt, *root| {
+        const node = root.* orelse continue;
+        try kept.put(alloc, lt.id, {});
+        for (self.tabs.items) |t| {
+            if (t.id != lt.id) continue;
+            t.setRoot(alloc, node);
+            break;
+        } else {
+            const t = try Tab.create(alloc, lt.id, node, Tab.first(node));
+            self.tabs.insertAssumeCapacity(self.groupEnd(0), t);
+        }
+        root.* = null;
+    }
+    var i: usize = 0;
+    while (i < self.tabs.items.len) {
+        const t = self.tabs.items[i];
+        if (t.id == 0 or kept.contains(t.id)) {
+            i += 1;
+            continue;
+        }
+        _ = self.tabs.orderedRemove(i);
+        t.destroy(alloc);
+    }
+
+    if (was_focus) |f| if (std.mem.indexOfScalar(*Session, dropped.items, f) != null) {
+        if (self.mouse_in_terminal) _ = win32.ReleaseCapture();
+        self.mouse_in_terminal = false;
+    };
+    for (dropped.items) |s| s.destroy();
+    var placed = used.keyIterator();
+    while (placed.next()) |s| if (s.*.slimedPane()) |id| {
+        _ = arrived.remove(id);
+    };
+
+    _ = self.chrome.setHover(.none);
+    self.middle_pressed = null;
+    for (self.tabs.items) |t| self.layoutTab(t);
+    if (self.tabs.items.len == 0) return;
+    if (was_active) |t| if (self.tabIndex(t)) |at| {
+        self.active = at;
+        if (t.focus != was_focus) self.activated();
+        return;
+    };
+    self.active = @min(self.active, self.tabs.items.len - 1);
+    self.activated();
 }
 
 /// The grid a slimed pane gets: the terminal area, as for any session.
@@ -391,15 +542,33 @@ fn slimedArea(self: *const Window) Slimed.Area {
     };
 }
 
-/// Start a session on `target`, at the end of its group, and show it.
-/// One that joins a connection doesn't log in again, and starts in the
-/// directory the active session's shell last reported (OSC 7) if that's
-/// on the same connection.
+/// Start a session on `target` in a tab of its own, at the end of its
+/// group, and show it.
 fn spawnSession(self: *Window, target: Target) !void {
-    try self.sessions.ensureUnusedCapacity(self.alloc, 1);
-    try self.view_sessions.ensureTotalCapacity(self.alloc, self.sessions.items.len + 1);
+    try self.tabs.ensureUnusedCapacity(self.alloc, 1);
     try self.reserveGroups();
-    const grid_size = self.gridSize();
+    const s = try self.createSession(target, self.gridSize());
+    const t = Tab.create(self.alloc, 0, .{ .pane = s }, s) catch |err| {
+        s.kill();
+        s.destroy();
+        return err;
+    };
+    const at = self.groupEnd(self.groupOf(t));
+    self.tabs.insertAssumeCapacity(at, t);
+    self.layoutTab(t);
+    if (self.tabs.items.len == 1) return;
+    // The rows from `at` on moved down.
+    if (at <= self.active) self.active += 1;
+    _ = self.chrome.setHover(.none);
+    self.middle_pressed = null;
+    self.activate(at);
+}
+
+/// Start a session on `target` with a grid of `size`. One that joins a
+/// connection doesn't log in again, and starts in the directory the
+/// active session's shell last reported (OSC 7) if that's on the same
+/// connection.
+fn createSession(self: *Window, target: Target, size: GridSize) !*Session {
     // Channel IDs are session IDs, and the helper takes 0 to mean the
     // connection.
     if (self.next_session_id == 0) self.next_session_id = 1;
@@ -416,7 +585,7 @@ fn spawnSession(self: *Window, target: Target) !void {
     const launch: Session.Launch = if (conn) |c| .{ .ssh = .{
         .conn = c,
         .title = c.label(),
-        .cwd = if (self.sessions.items.len > 0 and self.activeSession().sshConnection() == c)
+        .cwd = if (self.tabs.items.len > 0 and self.activeSession().sshConnection() == c)
             self.activeSession().pwd(&cwd_buf)
         else
             null,
@@ -425,20 +594,12 @@ fn spawnSession(self: *Window, target: Target) !void {
         .slimed => |a| .{ .slimed = .{ .conn = self.slimed.?, .arrival = a } },
         .host => unreachable,
     };
-    const s = Session.create(self, self.next_session_id, launch, grid_size.cols, grid_size.rows) catch |err| {
+    const s = Session.create(self, self.next_session_id, launch, size.cols, size.rows) catch |err| {
         if (new_conn) |c| c.shutdownIfUnused();
         return err;
     };
     self.next_session_id +%= 1;
-
-    const at = self.groupEnd(self.groupOf(s));
-    self.sessions.insertAssumeCapacity(at, s);
-    if (self.sessions.items.len == 1) return;
-    // The rows from `at` on moved down.
-    if (at <= self.active) self.active += 1;
-    _ = self.chrome.setHover(.none);
-    self.middle_pressed = null;
-    self.activate(at);
+    return s;
 }
 
 /// Room in `view`'s scratch for Local and every host.
@@ -446,43 +607,43 @@ fn reserveGroups(self: *Window) !void {
     try self.view_groups.ensureTotalCapacity(self.alloc, 1 + self.hosts.items.items.len);
 }
 
-/// The sidebar group `s` is listed in: 0 for Local, else 1 plus its
-/// host's index. Sessions are kept in group order.
-fn groupOf(self: *const Window, s: *const Session) usize {
-    const conn = s.sshConnection() orelse return 0;
+/// The sidebar group `t` is listed in: 0 for Local, else 1 plus its
+/// host's index. Tabs are kept in group order.
+fn groupOf(self: *const Window, t: *const Tab) usize {
+    const conn = t.focus.sshConnection() orelse return 0;
     // A host isn't forgotten while sessions use it.
     return 1 + (self.hosts.indexOf(conn.destination) orelse return 0);
 }
 
-/// Where a session in group `g` goes: after the group's last.
+/// Where a tab in group `g` goes: after the group's last.
 fn groupEnd(self: *const Window, g: usize) usize {
     var i: usize = 0;
-    while (i < self.sessions.items.len and self.groupOf(self.sessions.items[i]) <= g) i += 1;
+    while (i < self.tabs.items.len and self.groupOf(self.tabs.items[i]) <= g) i += 1;
     return i;
 }
 
 /// A live connection to host `h` that its sessions use, the active
 /// session's if it's one.
 fn hostConnection(self: *const Window, h: usize) ?*SshConnection {
-    if (self.sessions.items.len > 0) {
-        const active = self.activeSession();
-        if (self.groupOf(active) == h + 1) if (active.sshConnection()) |c| if (c.isAlive()) return c;
+    if (self.tabs.items.len > 0) {
+        const active = self.activeTab();
+        if (self.groupOf(active) == h + 1) if (active.focus.sshConnection()) |c| if (c.isAlive()) return c;
     }
-    for (self.sessions.items) |s| {
-        if (self.groupOf(s) != h + 1) continue;
-        if (s.sshConnection()) |c| if (c.isAlive()) return c;
+    for (self.tabs.items) |t| {
+        if (self.groupOf(t) != h + 1) continue;
+        if (t.focus.sshConnection()) |c| if (c.isAlive()) return c;
     }
     return null;
 }
 
-/// A session in the active session's group.
+/// A tab in the active tab's group.
 fn newSession(self: *Window) void {
-    self.newSessionIn(self.groupOf(self.activeSession()));
+    self.newSessionIn(self.groupOf(self.activeTab()));
 }
 
-/// A session in sidebar group `g`: a local one, or one on a host.
+/// A tab in sidebar group `g`: a local one, or one on a host.
 fn newSessionIn(self: *Window, g: usize) void {
-    // In slimed, the session comes when its pane does (WM_APP_SLIMED).
+    // In slimed, the tab comes when its pane does (WM_APP_SLIMED).
     if (g == 0) if (self.slimed) |conn| {
         conn.tabNew(self.local_command, self.slimedSize()) catch |err| {
             log.err("new tab in slimed failed: {}; running it directly", .{err});
@@ -494,53 +655,110 @@ fn newSessionIn(self: *Window, g: usize) void {
     self.spawnSession(target) catch |err| log.err("new session failed: {}", .{err});
 }
 
-/// Drop the host behind group `g` from the sidebar, if no session uses
-/// it.
+/// Split the pane shown at `i` in the active tab, starting a shell on
+/// side `dir` of it. The new pane comes from slimed (WM_APP_SLIMED).
+fn splitPane(self: *Window, i: usize, dir: Slimed.Direction) void {
+    const s = self.shownPane(i) orelse return;
+    const pane = s.slimedPane() orelse return;
+    const conn = self.slimed orelse return;
+    const t = self.activeTab();
+    if (t.zoom != null) {
+        t.zoom = null;
+        self.layoutTab(t);
+    }
+    conn.split(pane, dir, self.local_command) catch |err| log.err("split failed: {}", .{err});
+    self.dirty = true;
+}
+
+/// Zoom the pane shown at `i` to fill its tab, or unzoom it.
+fn toggleZoom(self: *Window, i: usize) void {
+    const s = self.shownPane(i) orelse return;
+    const t = self.activeTab();
+    t.zoom = if (t.zoom == s) null else s;
+    self.focusPane(s);
+    _ = self.chrome.setHover(.none);
+    self.layoutTab(t);
+    self.dirty = true;
+}
+
+/// The active tab's pane `view` listed at `i`.
+fn shownPane(self: *const Window, i: usize) ?*Session {
+    return if (i < self.shown.items.len) self.shown.items[i] else null;
+}
+
+/// Give the active tab's pane `s` the keys.
+fn focusPane(self: *Window, s: *Session) void {
+    const t = self.activeTab();
+    if (t.focus == s or !t.contains(s)) return;
+    self.deactivate();
+    t.focus = s;
+    self.activated();
+}
+
+/// Drop the host behind group `g` from the sidebar, if no tab uses it.
 fn forgetHost(self: *Window, g: usize) void {
     if (g == 0 or g > self.hosts.items.items.len) return;
-    for (self.sessions.items) |s| {
-        if (self.groupOf(s) == g) return;
+    for (self.tabs.items) |t| {
+        if (self.groupOf(t) == g) return;
     }
     self.hosts.remove(g - 1);
     _ = self.chrome.setHover(.none);
     self.dirty = true;
 }
 
-/// Close session `i`, killing what runs in it. Closing the last one
+/// Close pane `s` of tab `ti`, killing what runs in it. Closing a tab's
+/// last pane closes the tab.
+fn closePane(self: *Window, ti: usize, s: *Session) void {
+    const t = self.tabs.items[ti];
+    if (t.count() <= 1) return self.closeTab(ti);
+    const focused = ti == self.active and s == t.focus;
+    if (focused) self.deactivate();
+    _ = t.remove(self.alloc, s);
+    s.kill();
+    s.destroy();
+    _ = self.chrome.setHover(.none);
+    self.layoutTab(t);
+    if (focused) self.activated();
+    self.dirty = true;
+}
+
+/// Close tab `i`, killing what runs in its panes. Closing the last one
 /// closes the window.
-fn closeSession(self: *Window, i: usize) void {
-    if (self.sessions.items.len <= 1) {
-        // Closing the window only detaches a slimed session.
-        self.sessions.items[i].kill();
+fn closeTab(self: *Window, i: usize) void {
+    if (self.tabs.items.len <= 1) {
+        // Closing the window only detaches slimed's panes.
+        var it = self.tabs.items[i].iterator();
+        while (it.next()) |s| s.kill();
         _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
         return;
     }
     const was_active = i == self.active;
     if (was_active) self.deactivate();
-    const s = self.sessions.orderedRemove(i);
-    s.kill();
-    s.destroy();
+    const t = self.tabs.orderedRemove(i);
+    var it = t.iterator();
+    while (it.next()) |s| s.kill();
+    self.destroyTab(t);
     // Rows moved under the mouse.
     _ = self.chrome.setHover(.none);
     self.middle_pressed = null;
     if (i < self.active) {
         self.active -= 1;
     } else if (was_active) {
-        self.active = @min(i, self.sessions.items.len - 1);
+        self.active = @min(i, self.tabs.items.len - 1);
         self.activated();
     }
     self.dirty = true;
 }
 
-/// Show session `i` and give it input.
+/// Show tab `i` and give its focused pane input.
 fn activate(self: *Window, i: usize) void {
-    if (i == self.active or i >= self.sessions.items.len) return;
+    if (i == self.active or i >= self.tabs.items.len) return;
     self.deactivate();
     self.active = i;
     self.activated();
 }
 
-/// Let go of the active session before switching away from it.
+/// Let go of the focused pane before switching away from it.
 fn deactivate(self: *Window) void {
     const s = self.activeSession();
     if (self.mouse_in_terminal) _ = win32.ReleaseCapture();
@@ -549,13 +767,16 @@ fn deactivate(self: *Window) void {
     if (self.focused) s.reportFocus(false);
 }
 
-/// Take up the session that just became active.
+/// Take up the pane that just got focus, in the tab now shown.
 fn activated(self: *Window) void {
     const s = self.activeSession();
-    s.activity = false;
-    s.unseen.store(false, .release);
+    var it = self.activeTab().iterator();
+    while (it.next()) |p| {
+        p.activity = false;
+        p.unseen.store(false, .release);
+    }
     if (self.focused) s.reportFocus(true);
-    // Holds were for the last session's updates.
+    // Holds were for the last pane's updates.
     self.hold = .none;
     self.cursor_shown = false;
     self.resetBlink();
@@ -564,9 +785,9 @@ fn activated(self: *Window) void {
     self.dirty = true;
 }
 
-/// Show the next or previous session, wrapping around.
+/// Show the next or previous tab, wrapping around.
 fn cycle(self: *Window, forward: bool) void {
-    const n = self.sessions.items.len;
+    const n = self.tabs.items.len;
     self.activate(if (forward) (self.active + 1) % n else (self.active + n - 1) % n);
 }
 
@@ -576,14 +797,18 @@ fn cycle(self: *Window, forward: bool) void {
 /// once per display refresh, and right away when the terminal was idle.
 pub fn outputArrived(self: *Window) void {
     const quiet = win32.GetTickCount64() < self.quiet_until;
-    for (self.sessions.items, 0..) |s, i| {
-        if (!s.unseen.swap(false, .acq_rel)) continue;
-        if (i == self.active) {
-            self.dirty = true;
-            self.updateHold();
-        } else if (!s.activity and !quiet) {
-            s.activity = true;
-            self.dirty = true;
+    for (self.tabs.items, 0..) |t, i| {
+        var it = t.iterator();
+        while (it.next()) |s| {
+            if (!s.unseen.swap(false, .acq_rel)) continue;
+            if (i == self.active) {
+                if (!t.shows(s)) continue;
+                self.dirty = true;
+                if (s == t.focus) self.updateHold();
+            } else if (!s.activity and !quiet) {
+                s.activity = true;
+                self.dirty = true;
+            }
         }
     }
 }
@@ -687,7 +912,7 @@ fn runAction(self: *Window, action: binding.Action) bool {
             s.paste();
         },
         .new_tab => self.newSession(),
-        .close_surface => self.closeSession(self.active),
+        .close_surface => self.closePane(self.active, s),
         .next_tab => self.cycle(true),
         .previous_tab => self.cycle(false),
         .increase_font_size => |pt| self.setFontSize(self.grid.size_pt + pt),
@@ -917,13 +1142,16 @@ fn loginChanged(self: *Window, id: u32) void {
     self.dirty = true;
     if (id == 0) {
         // Logged in: nothing more to show.
-        for (self.sessions.items) |s| {
-            const conn = s.sshConnection() orelse continue;
-            if (s.login != null and conn.isConnected()) self.closeLogin(s);
+        for (self.tabs.items) |t| {
+            var it = t.iterator();
+            while (it.next()) |s| {
+                const conn = s.sshConnection() orelse continue;
+                if (s.login != null and conn.isConnected()) self.closeLogin(s);
+            }
         }
         return;
     }
-    const s = self.sessions.items[self.sessionIndex(id) orelse return];
+    const s = (self.findSession(id) orelse return).s;
     const conn = s.sshConnection() orelse return;
     var taken = conn.takeLogin();
     defer taken.deinit(conn.alloc);
@@ -954,27 +1182,47 @@ fn updateSpinner(self: *Window) void {
 
 /// The chrome's view of the window's state.
 fn view(self: *Window) Chrome.View {
-    // `spawnSession` and `reserveGroups` keep room for every session and
-    // group.
-    self.view_sessions.clearRetainingCapacity();
+    // `reserveGroups` keeps room for every group. The rest is grown here,
+    // and left out if that fails.
+    self.view_tabs.clearRetainingCapacity();
     self.view_groups.clearRetainingCapacity();
+    self.view_panes.clearRetainingCapacity();
+    self.shown.clearRetainingCapacity();
     // Local is always listed, for its button, then every host.
-    self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .sessions = 0, .kind = .local });
+    self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .tabs = 0, .kind = .local });
     for (self.hosts.items.items, 0..) |dest, h| {
         self.view_groups.appendAssumeCapacity(.{
             .label = SshConnection.labelFor(dest),
-            .sessions = 0,
+            .tabs = 0,
             .kind = if (self.hostConnection(h) != null) .connected else .disconnected,
         });
     }
-    for (self.sessions.items) |s| {
-        self.view_groups.items[self.groupOf(s)].sessions += 1;
-        self.view_sessions.appendAssumeCapacity(.{ .title = s.title(), .activity = s.activity });
+    for (self.tabs.items) |t| {
+        self.view_tabs.append(self.alloc, .{ .title = t.focus.title(), .activity = t.activity() }) catch break;
+        self.view_groups.items[self.groupOf(t)].tabs += 1;
     }
-    const bg = self.activeSession().cells.default_bg;
+    const tab = self.activeTab();
+    const several = tab.count() > 1;
+    var it = tab.iterator();
+    while (it.next()) |s| {
+        if (!tab.shows(s)) continue;
+        self.shown.append(self.alloc, s) catch break;
+        self.view_panes.append(self.alloc, .{
+            .rect = s.rect,
+            .focused = s == tab.focus,
+            .splittable = s.slimedPane() != null,
+            .zoomable = several,
+            .zoomed = tab.zoom == s,
+            .bg = toColor(s.cells.default_bg),
+        }) catch {
+            _ = self.shown.pop();
+            break;
+        };
+    }
     return .{
         .groups = self.view_groups.items,
-        .sessions = self.view_sessions.items,
+        .tabs = self.view_tabs.items,
+        .panes = self.view_panes.items,
         .connect = if (self.connect_field) |*f| f else null,
         .caret_visible = self.blink_visible,
         .dialog = if (self.activeSession().login) |l| &l.dialog else null,
@@ -982,11 +1230,15 @@ fn view(self: *Window) Chrome.View {
         .active = self.active,
         .focused = self.focused,
         .maximized = win32.IsZoomed(self.hwnd.?) != 0,
-        .terminal_bg = Painter.rgb(@as(u24, bg.r) << 16 | @as(u24, bg.g) << 8 | bg.b),
+        .terminal_bg = toColor(self.activeSession().cells.default_bg),
         .stats = self.stats_text[0..self.stats_len],
-        .new_session_key = new_session_key.slice(),
-        .close_session_key = close_session_key.slice(),
+        .new_tab_key = new_session_key.slice(),
+        .close_tab_key = close_session_key.slice(),
     };
+}
+
+fn toColor(c: ghostty_vt.color.RGB) Chrome.Color {
+    return Painter.rgb(@as(u24, c.r) << 16 | @as(u24, c.g) << 8 | c.b);
 }
 
 /// What's under a client position.
@@ -995,10 +1247,9 @@ fn hitAt(self: *Window, pos: win32.POINT) Chrome.Hit {
     return self.chrome.hitTest(&self.chrome_layout, &v, @floatFromInt(pos.x), @floatFromInt(pos.y));
 }
 
-/// A client position relative to the terminal area.
-fn toTerminal(self: *const Window, pos: win32.POINT) win32.POINT {
-    const t = self.chrome_layout.terminal;
-    return .{ .x = pos.x - @as(i32, @intFromFloat(t.x)), .y = pos.y - @as(i32, @intFromFloat(t.y)) };
+/// A client position relative to pane `s`.
+fn toPane(s: *const Session, pos: win32.POINT) win32.POINT {
+    return .{ .x = pos.x - @as(i32, @intFromFloat(s.rect.x)), .y = pos.y - @as(i32, @intFromFloat(s.rect.y)) };
 }
 
 /// Track what the mouse is over, and time the tooltip of a button it
@@ -1029,9 +1280,9 @@ fn setPressed(self: *Window, hit: Chrome.Hit) void {
     if (self.chrome.setPressed(hit)) self.dirty = true;
 }
 
-/// Handle a client area mouse message: the terminal gets it if a button
-/// went down there (until all are up) or it's over the terminal, and the
-/// chrome otherwise.
+/// Handle a client area mouse message: a pane gets it if a button went
+/// down there (until all are up) or it's over the pane, and the chrome
+/// otherwise. Pressing a button over a pane focuses it.
 fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
     const pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
     const s = self.activeSession();
@@ -1044,7 +1295,7 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     }
 
     if (self.mouse_in_terminal) {
-        s.mouseInput(msg, wparam, self.toTerminal(pos));
+        s.mouseInput(msg, wparam, toPane(s, pos));
         if (!held) {
             self.mouse_in_terminal = false;
             // After the session's handled the release, so a selection
@@ -1060,13 +1311,15 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     // Clicking anywhere else closes the host field.
     if (press and hit != .connect) self.cancelConnect();
     if (hit == .terminal) {
+        const pane = self.shownPane(hit.terminal) orelse return;
         if (press) {
+            self.focusPane(pane);
             // Capture the mouse while a button is down, so a drag past
             // the edge still reports and the release comes back to us.
             self.mouse_in_terminal = true;
             _ = win32.SetCapture(self.hwnd.?);
         }
-        s.mouseInput(msg, wparam, self.toTerminal(pos));
+        pane.mouseInput(msg, wparam, toPane(pane, pos));
         return;
     }
 
@@ -1075,7 +1328,7 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             self.setPressed(hit);
             _ = win32.SetCapture(self.hwnd.?);
             // Rows switch on press, as tabs do.
-            if (hit == .session) self.activate(hit.session);
+            if (hit == .tab) self.activate(hit.tab);
         },
         win32.WM_LBUTTONUP => {
             const pressed = self.chrome.pressed;
@@ -1084,14 +1337,14 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             if (pressed.eql(hit)) self.chromeClick(hit);
         },
         win32.WM_MBUTTONDOWN => self.middle_pressed = switch (hit) {
-            .session, .close_session => |i| i,
+            .tab, .close_tab => |i| i,
             else => null,
         },
         win32.WM_MBUTTONUP => {
             const pressed = self.middle_pressed orelse return;
             self.middle_pressed = null;
             switch (hit) {
-                .session, .close_session => |i| if (i == pressed) self.closeSession(i),
+                .tab, .close_tab => |i| if (i == pressed) self.closeTab(i),
                 else => {},
             }
         },
@@ -1105,7 +1358,7 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             self.chrome.toggleMode();
             self.layout();
         },
-        .new_session => |g| self.newSessionIn(g),
+        .new_tab => |g| self.newSessionIn(g),
         .forget_host => |g| self.forgetHost(g),
         .connect => self.startConnect(),
         .dialog_button => |i| {
@@ -1120,7 +1373,10 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             self.resetBlink();
             self.dirty = true;
         },
-        .close_session => |i| self.closeSession(i),
+        .close_tab => |i| self.closeTab(i),
+        .split_right => |i| self.splitPane(i, .right),
+        .split_down => |i| self.splitPane(i, .down),
+        .zoom => |i| self.toggleZoom(i),
         else => {},
     }
 }
@@ -1208,8 +1464,10 @@ pub fn paddingPx(self: *const Window) PaddingPx {
     };
 }
 
+const GridSize = struct { cols: u16, rows: u16 };
+
 /// The number of whole cells that fit in the terminal area.
-fn gridSize(self: *const Window) struct { cols: u16, rows: u16 } {
+fn gridSize(self: *const Window) GridSize {
     const size = self.terminalSize();
     const m = self.grid.metrics;
     const pad = self.paddingPx();
@@ -1242,39 +1500,51 @@ const Ui = struct {
 fn renderFallible(self: *Window, r: *Renderer) !void {
     r.waitForFrame();
     self.dirty = false;
-    const s = self.activeSession();
+    const tab = self.activeTab();
     const stats = build_options.stats;
     var t: i64 = if (stats) Stats.now() else 0;
-    {
-        s.lockTerminal();
-        defer s.unlockTerminal();
-        try s.render_state.update(self.alloc, &s.terminal);
-        try s.images.update(self.alloc, &s.terminal);
+    self.frame_panes.clearRetainingCapacity();
+    var it = tab.iterator();
+    while (it.next()) |s| {
+        if (!tab.shows(s)) continue;
+        {
+            s.lockTerminal();
+            defer s.unlockTerminal();
+            try s.render_state.update(self.alloc, &s.terminal);
+            try s.images.update(self.alloc, &s.terminal);
+        }
+        if (stats) t = self.stats.lap(.update, t);
+        // Panes without focus show a hollow cursor, as an unfocused
+        // window's does.
+        const focus = s == tab.focus;
+        if (focus) self.cursor_shown = s.render_state.cursor.visible;
+        try s.cells.build(self.alloc, &s.render_state, &self.grid, .{
+            // The host field or a login dialog has the keyboard while open.
+            .focused = focus and self.focused and self.connect_field == null and s.login == null,
+            .blink_visible = self.blink_visible,
+        }, .{
+            .cursor_color = self.config.@"cursor-color",
+            .cursor_text = self.config.@"cursor-text",
+            .selection_background = self.config.@"selection-background",
+            .selection_foreground = self.config.@"selection-foreground",
+        });
+        if (stats) t = self.stats.lap(.build, t);
+        try self.frame_panes.append(self.alloc, .{
+            .cells = &s.cells,
+            .images = &s.images,
+            .textures = &s.textures,
+            .viewport = s.rect,
+            .grid_offset = .{ @floatFromInt(s.pad.left), @floatFromInt(s.pad.top) },
+        });
     }
-    if (stats) t = self.stats.lap(.update, t);
-    self.cursor_shown = s.render_state.cursor.visible;
-    try s.cells.build(self.alloc, &s.render_state, &self.grid, .{
-        // The host field or a login dialog has the keyboard while open.
-        .focused = self.focused and self.connect_field == null and s.login == null,
-        .blink_visible = self.blink_visible,
-    }, .{
-        .cursor_color = self.config.@"cursor-color",
-        .cursor_text = self.config.@"cursor-text",
-        .selection_background = self.config.@"selection-background",
-        .selection_foreground = self.config.@"selection-foreground",
-    });
-    if (stats) t = self.stats.lap(.build, t);
-    const pad = self.paddingPx();
     try r.draw(self.alloc, .{
-        .cells = &s.cells,
-        .images = &s.images,
-        .textures = &s.textures,
         .atlas = &self.grid.atlas,
         .color_atlas = &self.grid.color_atlas,
         .lcd_atlas = &self.grid.lcd_atlas,
         .metrics = self.grid.metrics,
-        .viewport = self.chrome_layout.terminal,
-        .grid_offset = .{ @floatFromInt(pad.left), @floatFromInt(pad.top) },
+        .panes = self.frame_panes.items,
+        // The chrome's ground, around and between the panes.
+        .background = self.chrome.theme.ground,
     }, Ui{ .window = self, .view = self.view() });
     if (stats) {
         _ = self.stats.lap(.draw, t);
@@ -1305,8 +1575,27 @@ fn updateLayout(self: *Window, size: ClientSize) void {
     self.chrome_layout = self.chrome.layout(@floatFromInt(size.width), @floatFromInt(size.height));
 }
 
-/// Fit the swap chain, the chrome, and every session's grid to the
-/// client area and redraw.
+/// Place tab `t`'s panes in the terminal area and fit their grids to
+/// them. Each pane is padded as the whole area is (`paddingPx`).
+fn layoutTab(self: *Window, t: *Tab) void {
+    t.place(self.alloc, self.chrome.paneArea(&self.chrome_layout), self.chrome.paneGap()) catch |err| log.err("laying out panes failed: {}", .{err});
+    const pad = self.paddingPx();
+    const m = self.grid.metrics;
+    var it = t.iterator();
+    while (it.next()) |s| {
+        if (!t.shows(s)) continue;
+        s.pad = pad;
+        const w: u32 = @intFromFloat(s.rect.w);
+        const h: u32 = @intFromFloat(s.rect.h);
+        s.resize(
+            @intCast(std.math.clamp((w -| s.pad.left -| s.pad.right) / m.cell_width, 1, std.math.maxInt(u16))),
+            @intCast(std.math.clamp((h -| s.pad.top -| s.pad.bottom) / m.cell_height, 1, std.math.maxInt(u16))),
+        );
+    }
+}
+
+/// Fit the swap chain, the chrome, and every pane's grid to the client
+/// area and redraw.
 fn layout(self: *Window) void {
     const r = &(self.renderer orelse return);
     const size = self.clientSize();
@@ -1318,9 +1607,8 @@ fn layout(self: *Window) void {
     };
     self.updateLayout(size);
 
-    const grid_size = self.gridSize();
     self.quiet_until = win32.GetTickCount64() + resize_quiet_ms;
-    for (self.sessions.items) |s| s.resize(grid_size.cols, grid_size.rows);
+    for (self.tabs.items) |t| self.layoutTab(t);
     if (self.slimed) |conn| conn.resizeWorkspace(self.slimedArea());
 
     // Render synchronously so live resize doesn't show stale frames.
@@ -1378,7 +1666,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     const self: *Window = @ptrFromInt(@as(usize, @bitCast(ptr)));
 
     // Only the frame is ours to handle until the first session runs.
-    if (self.sessions.items.len == 0 and msg != win32.WM_NCCALCSIZE)
+    if (self.tabs.items.len == 0 and msg != win32.WM_NCCALCSIZE)
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
@@ -1501,8 +1789,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         WM_APP_CHILD_EXITED => {
-            const i = self.sessionIndex(@intCast(wparam)) orelse return 0;
-            const s = self.sessions.items[i];
+            const found = self.findSession(@intCast(wparam)) orelse return 0;
+            const s = found.s;
             // So does a slimed session lost to us while it runs.
             if (s.slimedLoss()) |loss| {
                 if (!s.ended) s.showEnded(loss.text());
@@ -1522,7 +1810,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 self.dirty = true;
                 return 0;
             };
-            self.closeSession(i);
+            self.closePane(found.tab, s);
             return 0;
         },
 
@@ -1532,21 +1820,20 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         WM_APP_SLIMED => {
-            self.adoptArrivals();
+            self.slimedChanged();
             return 0;
         },
 
         WM_APP_TITLE_CHANGED => {
-            const i = self.sessionIndex(@intCast(wparam)) orelse return 0;
-            self.sessions.items[i].titleUpdate();
-            if (i == self.active) self.showTitle();
+            const s = (self.findSession(@intCast(wparam)) orelse return 0).s;
+            s.titleUpdate();
+            if (s == self.activeSession()) self.showTitle();
             self.dirty = true;
             return 0;
         },
 
         WM_APP_CLIPBOARD_WRITE => {
-            const i = self.sessionIndex(@intCast(wparam)) orelse return 0;
-            self.sessions.items[i].clipboardWriteFlush();
+            (self.findSession(@intCast(wparam)) orelse return 0).s.clipboardWriteFlush();
             return 0;
         },
 
@@ -1566,7 +1853,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                     // the session shown next.
                     var m: win32.MSG = undefined;
                     while (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) != 0) {}
-                    self.closeSession(self.active);
+                    self.closePane(self.active, self.activeSession());
                 }
                 return 0;
             }
@@ -1641,9 +1928,11 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             // coordinates.
             var pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
             _ = win32.ScreenToClient(hwnd, &pos);
-            if (self.mouse_in_terminal or self.hitAt(pos) == .terminal) {
-                self.activeSession().mouseWheel(msg, wparam, self.toTerminal(pos));
-            }
+            const pane = if (self.mouse_in_terminal) self.activeSession() else switch (self.hitAt(pos)) {
+                .terminal => |i| self.shownPane(i) orelse return 0,
+                else => return 0,
+            };
+            pane.mouseWheel(msg, wparam, toPane(pane, pos));
             return 0;
         },
 
@@ -1656,8 +1945,11 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             var cursor = win32.IDC_ARROW;
             const hit = self.hitAt(pos);
             if (hit == .dialog_field) cursor = win32.IDC_IBEAM;
-            if (self.mouse_in_terminal or hit == .terminal) {
-                const s = self.activeSession();
+            const pane = if (self.mouse_in_terminal) self.activeSession() else switch (hit) {
+                .terminal => |i| self.shownPane(i),
+                else => null,
+            };
+            if (pane) |s| {
                 s.lockTerminal();
                 const shape = s.terminal.mouse_shape;
                 s.unlockTerminal();

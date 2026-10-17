@@ -151,15 +151,22 @@ one.
 a daemon that holds every pane's ConPTY and terminal state, arranged in
 tabs (each a layout tree) and workspaces. A window attaches the workspace
 detached last, or a new one, and mirrors it: closing the window detaches
-the workspace, closing a session ends its pane. `slimed tab new`, `split`,
-and the rest change a workspace from scripts, attached or not. Off by
-default.
+the workspace, closing a pane ends it. Each sidebar row is a tab, drawn as
+its tree of panes; the buttons at a pane's top right split it or zoom it.
+`slimed tab new`, `split`, and the rest change a workspace from scripts,
+attached or not. Off by default, and only slimed's tabs split.
 
-- **Splits aren't drawn.** Each pane is its own sidebar row, sized to the
-  whole terminal area, whatever its tab's layout says. Drawing a tab's
-  tree, focus between panes, and split bindings come next.
-- **A pane a script adds** goes at the end of the Local rows, not beside
-  its tab's.
+- **Dividers can't be dragged**, and there are no split bindings
+  (Ghostty's `new_split`, `goto_split`, `resize_split`,
+  `equalize_splits`, `toggle_split_zoom`): splitting and zooming are
+  mouse only, as is moving focus between panes.
+- **Every pane shares the window's font size.** Panes keep their own
+  cell size in slimed's layout, but the window draws them all from one
+  font grid, and Ctrl+= resizes every pane.
+- **Zoom is the window's**, not the workspace's: it's lost on reattach,
+  and the zoomed pane's pty takes the whole tab's size meanwhile.
+- **A tab a script adds** goes at the end of the Local rows, not where
+  slimed lists it.
 - **Workspaces have no UI**: no list to attach or detach one, create or
   rename one, or see which window has one. A window takes the most
   recently detached at startup and can't change it.

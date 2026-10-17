@@ -1,5 +1,6 @@
 //! Direct3D 11 renderer: device, flip-model swap chain, and the terminal
-//! grid pipeline (see shaders.hlsl) for a single window. The window's
+//! grid pipeline (see shaders.hlsl) for a single window, which shows one
+//! or more terminals (a tab's panes), each in its own viewport. The window's
 //! chrome is drawn over the grid with Direct2D, on the same device.
 //!
 //! Frames are presented without vsync and gated twice (see `frameGate`):
@@ -108,15 +109,22 @@ const ImageTexture = struct {
     }
 };
 
-/// What to draw of a terminal, and where.
+/// What to draw: terminals sharing a font grid.
 pub const Frame = struct {
-    cells: *const cells.Cells,
-    images: *image.Images,
-    textures: *ImageTextures,
     atlas: *const font.Atlas,
     color_atlas: *const font.Atlas,
     lcd_atlas: *const font.Atlas,
     metrics: font.Grid.Metrics,
+    panes: []const Pane,
+    /// Behind the panes, where none is.
+    background: [4]f32,
+};
+
+/// What to draw of a terminal, and where.
+pub const Pane = struct {
+    cells: *const cells.Cells,
+    images: *image.Images,
+    textures: *ImageTextures,
     /// The terminal's part of the window, which clips it.
     viewport: Painter.Rect,
     /// The grid's top-left in the viewport.
@@ -362,7 +370,7 @@ pub fn resize(self: *D3D11, width: u32, height: u32) Error!void {
     try self.createRenderTarget();
 }
 
-/// Draw the terminal, then `ui` over it, and present. `ui` has a
+/// Draw the terminals, then `ui` over them, and present. `ui` has a
 /// `paint(*Painter)` method. Waits for the swap chain first unless
 /// `waitForFrame` or `frameAcquired` already did.
 pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error{ DeviceLost, HResult }!void {
@@ -373,22 +381,27 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
     try self.atlas.upload(self.device, ctx, f.atlas);
     try self.color_atlas.upload(self.device, ctx, f.color_atlas);
     try self.lcd_atlas.upload(self.device, ctx, f.lcd_atlas);
-    try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.bg.items));
-    try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(f.cells.instances.items));
-    try self.uploadImages(alloc, f.images, f.textures);
-
-    const v = f.viewport;
-    const uniforms = f.cells.uniforms(f.metrics, .{ v.x, v.y, v.w, v.h }, f.grid_offset);
-    var mapped: d3d11.MAPPED_SUBRESOURCE = undefined;
-    try com.check(ctx.map(self.uniforms.resource(), d3d11.MAP_WRITE_DISCARD, &mapped), "Map(uniforms)");
-    @as(*cells.Uniforms, @ptrCast(@alignCast(mapped.pData.?))).* = uniforms;
-    ctx.unmap(self.uniforms.resource());
 
     // Direct2D shares the context and leaves its own state bound.
     ctx.clearState();
     ctx.omSetRenderTargets(&.{rtv});
-    ctx.clearRenderTargetView(rtv, &uniforms.default_bg);
-    if (v.w >= 1 and v.h >= 1) try self.drawGrid(f);
+    ctx.clearRenderTargetView(rtv, &f.background);
+    // Each pane's data replaces the last's in the same buffers, which
+    // discarding maps rename, so draws already queued keep theirs.
+    for (f.panes) |pane| {
+        const v = pane.viewport;
+        if (v.w < 1 or v.h < 1) continue;
+        try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(pane.cells.bg.items));
+        try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(pane.cells.instances.items));
+        try self.uploadImages(alloc, pane.images, pane.textures);
+
+        const uniforms = pane.cells.uniforms(f.metrics, .{ v.x, v.y, v.w, v.h }, pane.grid_offset);
+        var mapped: d3d11.MAPPED_SUBRESOURCE = undefined;
+        try com.check(ctx.map(self.uniforms.resource(), d3d11.MAP_WRITE_DISCARD, &mapped), "Map(uniforms)");
+        @as(*cells.Uniforms, @ptrCast(@alignCast(mapped.pData.?))).* = uniforms;
+        ctx.unmap(self.uniforms.resource());
+        try self.drawGrid(pane);
+    }
     try self.paintUi(ui);
 
     self.frame_acquired = false;
@@ -401,14 +414,20 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
     try com.check(hr, "IDXGISwapChain::Present");
 }
 
-/// The grid's passes, with kitty images before, between, and after them,
-/// clipped to the viewport.
-fn drawGrid(self: *D3D11, f: Frame) Error!void {
+/// A pane's default background, then the grid's passes, with kitty
+/// images before, between, and after them, clipped to the viewport.
+fn drawGrid(self: *D3D11, f: Pane) Error!void {
     const ctx = self.context;
     const frame = f.cells;
     const images = f.images;
     const v = f.viewport;
     ctx.rsSetViewports(&.{.{ .TopLeftX = v.x, .TopLeftY = v.y, .Width = v.w, .Height = v.h }});
+    ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx.vsSetShader(self.pipeline.bg_vs);
+    ctx.psSetShader(self.pipeline.fill_ps);
+    ctx.psSetConstantBuffers(0, &.{self.uniforms});
+    ctx.omSetBlendState(null);
+    ctx.draw(3, 0);
     try self.drawImages(images, f.textures, .below_bg);
 
     if (frame.bg.items.len > 0) {
@@ -678,6 +697,7 @@ fn createDevice(device: *?*d3d11.IDevice, context: *?*d3d11.IDeviceContext) Erro
 const Pipeline = struct {
     bg_vs: *d3d11.IVertexShader,
     bg_ps: *d3d11.IPixelShader,
+    fill_ps: *d3d11.IPixelShader,
     text_vs: *d3d11.IVertexShader,
     text_ps: *d3d11.IPixelShader,
     image_vs: *d3d11.IVertexShader,
@@ -689,6 +709,7 @@ const Pipeline = struct {
     fn init(device: *d3d11.IDevice) Error!Pipeline {
         var bg_vs: ?*d3d11.IVertexShader = null;
         var bg_ps: ?*d3d11.IPixelShader = null;
+        var fill_ps: ?*d3d11.IPixelShader = null;
         var text_vs: ?*d3d11.IVertexShader = null;
         var text_ps: ?*d3d11.IPixelShader = null;
         var image_vs: ?*d3d11.IVertexShader = null;
@@ -699,6 +720,7 @@ const Pipeline = struct {
         errdefer {
             com.releaseOpt(&bg_vs);
             com.releaseOpt(&bg_ps);
+            com.releaseOpt(&fill_ps);
             com.releaseOpt(&text_vs);
             com.releaseOpt(&text_ps);
             com.releaseOpt(&image_vs);
@@ -710,6 +732,7 @@ const Pipeline = struct {
 
         try createShader(device, "bg_vs", &bg_vs);
         try createShader(device, "bg_ps", &bg_ps);
+        try createShader(device, "fill_ps", &fill_ps);
         try createShader(device, "text_vs", &text_vs);
         try createShader(device, "text_ps", &text_ps);
         try createShader(device, "image_vs", &image_vs);
@@ -740,6 +763,7 @@ const Pipeline = struct {
         return .{
             .bg_vs = bg_vs.?,
             .bg_ps = bg_ps.?,
+            .fill_ps = fill_ps.?,
             .text_vs = text_vs.?,
             .text_ps = text_ps.?,
             .image_vs = image_vs.?,
@@ -753,6 +777,7 @@ const Pipeline = struct {
     fn deinit(self: *Pipeline) void {
         com.release(self.bg_vs);
         com.release(self.bg_ps);
+        com.release(self.fill_ps);
         com.release(self.text_vs);
         com.release(self.text_ps);
         com.release(self.image_vs);

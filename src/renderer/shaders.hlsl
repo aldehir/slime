@@ -3,7 +3,8 @@
 //
 //   1. bg: a full-screen triangle; each pixel looks up its cell's
 //      background color. Default backgrounds are transparent, over the
-//      cleared frame and any kitty images below the background.
+//      default background (fill_ps) and any kitty images below the
+//      background.
 //   2. text: instanced quads for glyphs (sampled from the coverage atlas,
 //      the RGBA one for color glyphs, or the ClearType one) and solid
 //      rectangles (cursor, underline, strikethrough), blended with a
@@ -53,6 +54,12 @@ float4 bg_vs(uint id : SV_VertexID) : SV_Position {
     // (0,0), (2,0), (0,2) in UV space covers the viewport with one triangle.
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+// The terminal's default background over its whole viewport, before
+// anything else: a window draws several terminals (panes), each its own.
+float4 fill_ps(float4 pos : SV_Position) : SV_Target {
+    return default_bg;
 }
 
 float4 bg_ps(float4 pos : SV_Position) : SV_Target {

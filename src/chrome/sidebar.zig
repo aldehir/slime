@@ -1,7 +1,7 @@
-//! Sessions in a sidebar under the title bar, grouped by where they run:
+//! Tabs in a sidebar under the title bar, grouped by where they run:
 //! Local, then each remembered SSH host. A group's header has a button
-//! that opens another session there, connecting first if the host isn't
-//! connected; a host with no sessions can be forgotten. A "Connect" button at the bottom turns
+//! that opens another tab there, connecting first if the host isn't
+//! connected; a host with no tabs can be forgotten. A "Connect" button at the bottom turns
 //! into a field for a host to connect to.
 
 const std = @import("std");
@@ -21,11 +21,10 @@ const section_gap = 10;
 const header_height = 28;
 const row_height = 30;
 const row_gap = 4;
-/// Rows' close buttons and headers' new session buttons, in one column.
+/// Rows' close buttons and headers' new tab buttons, in one column.
 const button_size = 20;
 const connect_height = 32;
 const pad_bottom = 12;
-const corner = 10;
 
 pub fn layout(c: *const Chrome, l: *Chrome.Layout) void {
     const top = l.titlebar.bottom();
@@ -33,7 +32,6 @@ pub fn layout(c: *const Chrome, l: *Chrome.Layout) void {
     const h = @max(0, l.window.h - top);
     l.list = .{ .y = top, .w = w, .h = h };
     l.terminal = .{ .x = w, .y = top, .w = l.window.w - w, .h = h };
-    l.corner = c.px(corner);
 }
 
 pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.View, x: f32, y: f32) ?Hit {
@@ -48,12 +46,12 @@ pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.Vi
         const on_button = rowButton(c, item.rect).contains(x, y);
         return switch (item.part) {
             .header => |g| if (on_button)
-                .{ .new_session = g }
+                .{ .new_tab = g }
             else if (forgettable(view.groups[g]) and forgetButton(c, item.rect).contains(x, y))
                 .{ .forget_host = g }
             else
                 .{ .header = g },
-            .row => |i| if (on_button) .{ .close_session = i } else .{ .session = i },
+            .row => |i| if (on_button) .{ .close_tab = i } else .{ .tab = i },
         };
     }
     return .none;
@@ -67,11 +65,11 @@ pub fn buttonRect(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome
         if (item.rect.bottom() > rows.bottom()) break;
         switch (item.part) {
             .header => |g| switch (hit) {
-                .new_session => |h| if (h == g) return rowButton(c, item.rect),
+                .new_tab => |h| if (h == g) return rowButton(c, item.rect),
                 .forget_host => |h| if (h == g) return forgetButton(c, item.rect),
                 else => {},
             },
-            .row => |i| if (hit == .close_session and hit.close_session == i) return rowButton(c, item.rect),
+            .row => |i| if (hit == .close_tab and hit.close_tab == i) return rowButton(c, item.rect),
         }
     }
     return null;
@@ -90,7 +88,7 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
         if (item.rect.y >= rows.bottom()) break;
         switch (item.part) {
             .header => |g| paintHeader(c, p, item.rect, g, view.groups[g]),
-            .row => |i| paintRow(c, p, item.rect, i, view.sessions[i], i == view.active),
+            .row => |i| paintRow(c, p, item.rect, i, view.tabs[i], i == view.active),
         }
     }
     p.popClip();
@@ -162,7 +160,7 @@ fn paintField(c: *const Chrome, p: *Painter, r: Rect, field: *const Chrome.TextF
 
 fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.View.Group) void {
     const button = rowButton(c, r);
-    const hit: Hit = .{ .new_session = g };
+    const hit: Hit = .{ .new_tab = g };
     const hovered = c.hover.eql(hit);
     paintIconButton(c, p, button, hit);
     const color = if (hovered) c.theme.text_strong else c.theme.text_muted;
@@ -177,7 +175,7 @@ fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.V
 
     var label_right = button.x - c.px(4);
     const show_forget = forgettable(group) and switch (c.hover) {
-        .header, .new_session, .forget_host => |h| h == g,
+        .header, .new_tab, .forget_host => |h| h == g,
         else => false,
     };
     if (show_forget) {
@@ -215,12 +213,12 @@ fn paintIconButton(c: *const Chrome, p: *Painter, r: Rect, hit: Hit) void {
     });
 }
 
-/// A host with no sessions, which can be dropped from the list.
+/// A host with no tabs, which can be dropped from the list.
 fn forgettable(group: Chrome.View.Group) bool {
-    return group.kind != .local and group.sessions == 0;
+    return group.kind != .local and group.tabs == 0;
 }
 
-/// The button left of a header's new session button.
+/// The button left of a header's new tab button.
 fn forgetButton(c: *const Chrome, header: Rect) Rect {
     var r = rowButton(c, header);
     r.x -= r.w + c.px(2);
@@ -237,9 +235,9 @@ fn upper(buf: []u16, text: []const u16) []const u16 {
     return buf[0..n];
 }
 
-fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.View.Session, active: bool) void {
-    const close_hovered = c.hover.eql(.{ .close_session = i });
-    const hovered = close_hovered or c.hover.eql(.{ .session = i });
+fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, tab: Chrome.View.Tab, active: bool) void {
+    const close_hovered = c.hover.eql(.{ .close_tab = i });
+    const hovered = close_hovered or c.hover.eql(.{ .tab = i });
     const radius = c.px(6);
     if (active) {
         p.fillRounded(r, radius, c.theme.row_selected);
@@ -253,23 +251,23 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.Vi
 
     const close = rowButton(c, r);
     const text_x = r.x + c.px(34);
-    const text_right = if (hovered or active or session.activity) close.x - c.px(4) else r.right() - c.px(8);
+    const text_right = if (hovered or active or tab.activity) close.x - c.px(4) else r.right() - c.px(8);
     const text_rect: Rect = .{ .x = text_x, .y = r.y, .w = @max(0, text_right - text_x), .h = r.h };
     if (active) {
-        p.text(session.title, c.fonts.body_strong, text_rect, c.theme.text_strong);
+        p.text(tab.title, c.fonts.body_strong, text_rect, c.theme.text_strong);
     } else {
-        p.text(session.title, c.fonts.body, text_rect, c.theme.text);
+        p.text(tab.title, c.fonts.body, text_rect, c.theme.text);
     }
 
     if (hovered or active) {
-        if (close_hovered) p.fillRounded(close, c.px(4), switch (c.buttonState(.{ .close_session = i })) {
+        if (close_hovered) p.fillRounded(close, c.px(4), switch (c.buttonState(.{ .close_tab = i })) {
             .pressed => c.theme.button_pressed,
             else => c.theme.button_hover,
         });
         // Lucide's x spans 12 of its 24 units: 8 DIPs in this box.
         const g = c.px(16);
         c.drawIcon(p, .x, close.center(g, g), if (close_hovered) c.theme.text_strong else c.theme.text_muted);
-    } else if (session.activity) {
+    } else if (tab.activity) {
         p.dot(close.x + close.w / 2, close.y + close.h / 2, c.px(3), c.theme.accent);
     }
 }
@@ -299,7 +297,7 @@ const Walk = struct {
     group: usize = 0,
     /// Parts given out of the current group, its header first.
     in_group: usize = 0,
-    session: usize = 0,
+    tab: usize = 0,
 
     const Item = struct {
         part: union(enum) { header: usize, row: usize },
@@ -325,10 +323,10 @@ const Walk = struct {
                 self.in_group = 1;
                 return .{ .part = .{ .header = self.group }, .rect = self.take(self.header_h, 0) };
             }
-            if (self.in_group <= self.groups[self.group].sessions) {
+            if (self.in_group <= self.groups[self.group].tabs) {
                 self.in_group += 1;
-                self.session += 1;
-                return .{ .part = .{ .row = self.session - 1 }, .rect = self.take(self.row_h, self.row_gap) };
+                self.tab += 1;
+                return .{ .part = .{ .row = self.tab - 1 }, .rect = self.take(self.row_h, self.row_gap) };
             }
             self.group += 1;
             self.in_group = 0;
@@ -349,11 +347,11 @@ test "groups, rows, and their buttons" {
     const c: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: Chrome.View = .{
         .groups = &.{
-            .{ .label = &.{}, .sessions = 0, .kind = .local },
-            .{ .label = &.{}, .sessions = 2, .kind = .connected },
-            .{ .label = &.{}, .sessions = 0, .kind = .disconnected },
+            .{ .label = &.{}, .tabs = 0, .kind = .local },
+            .{ .label = &.{}, .tabs = 2, .kind = .connected },
+            .{ .label = &.{}, .tabs = 0, .kind = .disconnected },
         },
-        .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = false } },
+        .tabs = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = false } },
         .active = 0,
         .focused = true,
         .maximized = false,
@@ -375,13 +373,13 @@ test "groups, rows, and their buttons" {
     try std.testing.expectEqual(l.list.bottom() - pad_bottom, connect.bottom());
     try std.testing.expectEqual(Hit.connect, c.hitTest(&l, &view, connect.x + 1, connect.y + 1));
 
-    try std.testing.expectEqual(Hit{ .session = 1 }, c.hitTest(&l, &view, second.x + 2, second.y + 2));
+    try std.testing.expectEqual(Hit{ .tab = 1 }, c.hitTest(&l, &view, second.x + 2, second.y + 2));
     const close = rowButton(&c, second);
-    try std.testing.expectEqual(Hit{ .close_session = 1 }, c.hitTest(&l, &view, close.x + 1, close.y + 1));
+    try std.testing.expectEqual(Hit{ .close_tab = 1 }, c.hitTest(&l, &view, close.x + 1, close.y + 1));
     const plus = rowButton(&c, remote.rect);
-    try std.testing.expectEqual(Hit{ .new_session = 1 }, c.hitTest(&l, &view, plus.x + 1, plus.y + 1));
+    try std.testing.expectEqual(Hit{ .new_tab = 1 }, c.hitTest(&l, &view, plus.x + 1, plus.y + 1));
     try std.testing.expectEqual(Hit{ .header = 1 }, c.hitTest(&l, &view, remote.rect.x + 2, remote.rect.y + 2));
-    // Only a host with no sessions can be forgotten.
+    // Only a host with no tabs can be forgotten.
     const keep = forgetButton(&c, remote.rect);
     try std.testing.expectEqual(Hit{ .header = 1 }, c.hitTest(&l, &view, keep.x + 1, keep.y + 1));
     const forget = forgetButton(&c, forgotten.rect);

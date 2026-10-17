@@ -4,18 +4,25 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
 )
 
-// PipeName is the current user's daemon pipe: one daemon per user.
+// PipeName is the current user's daemon pipe: one daemon per user, or
+// per user and SLIMED_INSTANCE when that's set, so tests can run a
+// daemon beside the one in use.
 func PipeName() (string, error) {
 	sid, err := userSID()
 	if err != nil {
 		return "", err
 	}
-	return `\\.\pipe\slimed-` + sid.String(), nil
+	name := `\\.\pipe\slimed-` + sid.String()
+	if inst := os.Getenv("SLIMED_INSTANCE"); inst != "" {
+		name += "-" + inst
+	}
+	return name, nil
 }
 
 // Listen creates the daemon's pipe, open to the current user only. It

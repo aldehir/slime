@@ -1,7 +1,8 @@
 //! The window's own UI around the terminal, drawn with Direct2D over each
-//! frame: a title bar with caption buttons, and the list of sessions.
+//! frame: a title bar with caption buttons, the list of tabs, and over
+//! the terminal area, the active tab's panes' corners and buttons.
 //!
-//! The session list has two layouts (`Mode`), each a module with the same
+//! The tab list has two layouts (`Mode`), each a module with the same
 //! three functions: `layout` places the list and the terminal, `hitTest`
 //! finds what's under a point in the list, and `paint` draws it. The
 //! title bar's toggle switches between them. What's drawn is a function
@@ -18,6 +19,7 @@ pub const Theme = @import("theme.zig").Theme;
 pub const TextField = @import("TextField.zig");
 pub const Dialog = @import("Dialog.zig");
 const modal = @import("modal.zig");
+const panes = @import("panes.zig");
 
 pub const Rect = Painter.Rect;
 pub const Color = Painter.Color;
@@ -61,16 +63,23 @@ pub const Hit = union(enum) {
     toggle_mode,
     /// Group `i`'s header, away from its buttons.
     header: usize,
-    /// The button that opens a session in group `i`, connecting first
-    /// if it's a host that isn't connected.
-    new_session: usize,
+    /// The button that opens a tab in group `i`, connecting first if
+    /// it's a host that isn't connected.
+    new_tab: usize,
     /// The button that removes host group `i` from the list.
     forget_host: usize,
     /// The button that connects to a host, or its field.
     connect,
-    session: usize,
-    close_session: usize,
-    terminal,
+    tab: usize,
+    close_tab: usize,
+    /// Pane `i` of `View.panes`, away from its buttons.
+    terminal: usize,
+    /// Pane `i`'s buttons, which show while the mouse is over it.
+    split_right: usize,
+    split_down: usize,
+    zoom: usize,
+    /// Between panes, or around them.
+    divider,
     /// The terminal area under a dialog, away from its controls.
     dialog,
     dialog_button: usize,
@@ -83,16 +92,19 @@ pub const Hit = union(enum) {
 
 /// The window's state, as the chrome shows it.
 pub const View = struct {
-    /// Where sessions run, in the order listed. Their sessions come one
-    /// group after another.
+    /// Where tabs run, in the order listed. Their tabs come one group
+    /// after another.
     groups: []const Group,
-    sessions: []const Session,
+    tabs: []const Tab,
     active: usize,
+    /// The active tab's panes on screen, which tile `paneArea` but for
+    /// the gaps between them (one pane while one is zoomed).
+    panes: []const Pane = &.{},
     /// The host being typed after "Connect" was clicked, if it was.
     connect: ?*const TextField = null,
     /// The on phase of the caret's blink, while focused.
     caret_visible: bool = false,
-    /// The active session's dialog, over its terminal.
+    /// The active pane's dialog, over the terminal area.
     dialog: ?*const Dialog = null,
     /// Steps of the dialog's spinner.
     spinner: u32 = 0,
@@ -105,41 +117,53 @@ pub const View = struct {
     /// Frame stats, when built with `-Dstats`. Lines end with LF.
     stats: []const u16 = &.{},
 
-    /// The keys for a new session in the active session's group and for
-    /// closing the active session, which their tooltips show.
-    new_session_key: []const u16 = &.{},
-    close_session_key: []const u16 = &.{},
+    /// The keys for a new tab in the active tab's group and for closing
+    /// the active pane, which their tooltips show.
+    new_tab_key: []const u16 = &.{},
+    close_tab_key: []const u16 = &.{},
 
     pub const Group = struct {
         label: []const u16,
-        /// How many of `sessions` are in it.
-        sessions: usize,
+        /// How many of `tabs` are in it.
+        tabs: usize,
         kind: Kind,
 
         pub const Kind = enum {
             local,
-            /// A host with a live connection, which new sessions join.
+            /// A host with a live connection, which new tabs join.
             connected,
-            /// A remembered host that new sessions connect to.
+            /// A remembered host that new tabs connect to.
             disconnected,
         };
     };
 
-    pub const Session = struct {
+    pub const Tab = struct {
         title: []const u16,
         /// Output arrived while it wasn't shown.
         activity: bool,
     };
 
+    pub const Pane = struct {
+        rect: Rect,
+        /// It gets the keys. Others are dimmed while the tab has several.
+        focused: bool,
+        /// It can be split (it runs in slimed), and zoomed if not alone.
+        splittable: bool,
+        zoomable: bool,
+        zoomed: bool,
+        /// Its terminal's default background.
+        bg: Color,
+    };
+
     pub fn title(self: *const View) []const u16 {
-        return if (self.active < self.sessions.len) self.sessions[self.active].title else &.{};
+        return if (self.active < self.tabs.len) self.tabs[self.active].title else &.{};
     }
 
-    /// The group the active session is in.
+    /// The group the active tab is in.
     pub fn activeGroup(self: *const View) usize {
         var end: usize = 0;
         for (self.groups, 0..) |g, i| {
-            end += g.sessions;
+            end += g.tabs;
             if (self.active < end) return i;
         }
         return 0;
@@ -159,10 +183,10 @@ pub const Layout = struct {
     minimize: Rect,
     maximize: Rect,
     close: Rect,
-    /// The session list's own area. Empty when it's in the title bar.
+    /// The tab list's own area. Empty when it's in the title bar.
     list: Rect = .{},
     terminal: Rect = .{},
-    /// The radius of the terminal area's top-left corner.
+    /// The radius of each pane's corners.
     corner: f32 = 0,
     /// Space inside the terminal area, before the grid, at its left and
     /// top, which border the chrome. Added to the configured padding.
@@ -220,6 +244,7 @@ pub fn layout(self: *const Chrome, width: f32, height: f32) Layout {
         .minimize = minimize,
         .maximize = maximize,
         .close = close,
+        .corner = self.px(10),
         .inset = self.px(10),
     };
     switch (self.mode) {
@@ -228,10 +253,23 @@ pub fn layout(self: *const Chrome, width: f32, height: f32) Layout {
     return l;
 }
 
+/// The part of the terminal area a tab's panes tile, leaving the chrome's
+/// ground around them but at the top, under the title bar.
+pub fn paneArea(self: *const Chrome, l: *const Layout) Rect {
+    const m = self.paneGap();
+    const t = l.terminal;
+    return .{ .x = t.x + m, .y = t.y, .w = @max(0, t.w - 2 * m), .h = @max(0, t.h - m) };
+}
+
+/// Between panes, and around them in the terminal area.
+pub fn paneGap(self: *const Chrome) f32 {
+    return self.px(panes.gap);
+}
+
 pub fn hitTest(self: *const Chrome, l: *const Layout, view: *const View, x: f32, y: f32) Hit {
     if (l.terminal.contains(x, y)) {
         if (view.dialog) |d| return modal.hitTest(self, l.terminal, d, x, y);
-        return .terminal;
+        return panes.hitTest(self, view, x, y);
     }
     if (l.close.contains(x, y)) return .close;
     if (l.maximize.contains(x, y)) return .maximize;
@@ -248,8 +286,8 @@ pub fn hitTest(self: *const Chrome, l: *const Layout, view: *const View, x: f32,
 /// Track what the mouse is over. Returns true if that changed what's
 /// drawn.
 pub fn setHover(self: *Chrome, hit: Hit) bool {
-    // The terminal draws nothing for hover.
-    const h: Hit = if (hit == .terminal or hit == .caption) .none else hit;
+    // The caption draws nothing for hover. A pane shows its buttons.
+    const h: Hit = if (hit == .caption or hit == .divider) .none else hit;
     if (self.hover.eql(h)) return false;
     self.hover = h;
     self.tip = .none;
@@ -259,7 +297,7 @@ pub fn setHover(self: *Chrome, hit: Hit) bool {
 /// Buttons that are only an icon, which tooltips name.
 pub fn hasTip(hit: Hit) bool {
     return switch (hit) {
-        .toggle_mode, .new_session, .forget_host, .close_session => true,
+        .toggle_mode, .new_tab, .forget_host, .close_tab, .split_right, .split_down, .zoom => true,
         else => false,
     };
 }
@@ -299,13 +337,15 @@ pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const Vi
     switch (self.mode) {
         inline else => |m| Impl(m).paint(self, p, l, view),
     }
+    p.pushClip(l.terminal);
+    panes.paint(self, p, l, view);
+    p.popClip();
     if (view.dialog) |d| modal.paint(self, p, l.terminal, d, .{
         .focused = view.focused,
         .caret_visible = view.caret_visible,
         .spinner = view.spinner,
         .terminal_bg = view.terminal_bg,
     });
-    if (l.corner > 0) p.cornerMask(l.terminal.x, l.terminal.y, l.corner, self.theme.ground);
     p.appIcon(l.icon);
     self.paintToggle(p, l, view);
     self.paintCaptionButtons(p, l, view);
@@ -321,12 +361,15 @@ fn tipText(self: *const Chrome, view: *const View, hit: Hit) struct { []const u1
             .sidebar => L("Hide sidebar"),
             .tabs => L("Show sidebar"),
         }, none },
-        .new_session => |g| if (g < view.groups.len and view.groups[g].kind == .disconnected)
+        .new_tab => |g| if (g < view.groups.len and view.groups[g].kind == .disconnected)
             .{ L("Connect"), none }
         else
-            .{ L("New session"), if (g == view.activeGroup()) view.new_session_key else none },
+            .{ L("New tab"), if (g == view.activeGroup()) view.new_tab_key else none },
         .forget_host => .{ L("Forget host"), none },
-        .close_session => |i| .{ L("Close session"), if (i == view.active) view.close_session_key else none },
+        .split_right => .{ L("Split right"), none },
+        .split_down => .{ L("Split down"), none },
+        .zoom => |i| .{ if (i < view.panes.len and view.panes[i].zoomed) L("Unzoom") else L("Zoom"), none },
+        .close_tab => |i| .{ L("Close tab"), if (i == view.active) view.close_tab_key else none },
         else => .{ none, none },
     };
 }
@@ -334,6 +377,7 @@ fn tipText(self: *const Chrome, view: *const View, hit: Hit) struct { []const u1
 /// The button `hit` is, if it's on screen.
 fn buttonRect(self: *const Chrome, l: *const Layout, view: *const View, hit: Hit) ?Rect {
     if (hit == .toggle_mode) return l.toggle;
+    if (panes.rect(self, view, hit)) |r| return r;
     return switch (self.mode) {
         inline else => |m| Impl(m).buttonRect(self, l, view, hit),
     };
@@ -388,7 +432,7 @@ pub fn buttonState(self: *const Chrome, hit: Hit) ButtonState {
     return if (self.pressed.eql(hit)) .pressed else .hover;
 }
 
-/// The active session's title, centered in the title bar.
+/// The active tab's title, centered in the title bar.
 pub fn paintTitle(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
     const color = if (view.focused) self.theme.text_muted else self.theme.text_inactive;
     p.text(view.title(), self.fonts.title, l.title.inset(self.px(8), 0), color);
@@ -651,9 +695,10 @@ pub const Fonts = struct {
 test "layout and hit testing" {
     var chrome: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: View = .{
-        .groups = &.{.{ .label = &.{}, .sessions = 2, .kind = .local }},
-        .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = true } },
+        .groups = &.{.{ .label = &.{}, .tabs = 2, .kind = .local }},
+        .tabs = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = true } },
         .active = 0,
+        .panes = &.{.{ .rect = .{ .x = 240, .y = 36, .w = 760, .h = 564 }, .focused = true, .splittable = false, .zoomable = false, .zoomed = false, .bg = .{ 0, 0, 0, 1 } }},
         .focused = true,
         .maximized = false,
         .terminal_bg = .{ 0, 0, 0, 1 },
@@ -663,7 +708,7 @@ test "layout and hit testing" {
     try std.testing.expectEqual(Hit.caption, chrome.hitTest(&l, &view, 500, 5));
     try std.testing.expectEqual(Hit.toggle_mode, chrome.hitTest(&l, &view, l.toggle.x + 1, 5));
     try std.testing.expectEqual(Hit.caption, chrome.hitTest(&l, &view, l.icon.x + 1, l.icon.y + 1));
-    try std.testing.expectEqual(Hit.terminal, chrome.hitTest(&l, &view, l.terminal.x + 1, l.terminal.y + 1));
+    try std.testing.expectEqual(Hit{ .terminal = 0 }, chrome.hitTest(&l, &view, l.terminal.x + 1, l.terminal.y + 1));
     try std.testing.expect(l.list.w > 0 and l.terminal.x == l.list.right());
 
     chrome.toggleMode();

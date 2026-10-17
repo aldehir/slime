@@ -176,9 +176,12 @@ test {
     _ = Config;
     _ = @import("Hosts.zig");
     _ = @import("Session.zig");
+    _ = @import("Slimed.zig");
+    _ = @import("Tab.zig");
     _ = @import("SshConnection.zig");
     _ = @import("chrome/Chrome.zig");
     _ = @import("chrome/sidebar.zig");
+    _ = @import("chrome/panes.zig");
     _ = @import("chrome/TextField.zig");
     _ = @import("chrome/Dialog.zig");
     _ = @import("chrome/theme.zig");
