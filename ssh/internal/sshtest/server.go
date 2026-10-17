@@ -48,7 +48,21 @@ type Options struct {
 	// Unresponsive ignores global requests (keepalives) without
 	// replying, like a server that has hung.
 	Unresponsive bool
+	// Terminfo is how the host answers the helper's xterm-ghostty
+	// check.
+	Terminfo TerminfoMode
 }
+
+type TerminfoMode int
+
+const (
+	// TerminfoMissing has neither the entry nor tic.
+	TerminfoMissing TerminfoMode = iota
+	// TerminfoInstalled already has the entry.
+	TerminfoInstalled
+	// TerminfoTic compiles the entry it's sent, then has it.
+	TerminfoTic
+)
 
 type Server struct {
 	// Addr is host:port.
@@ -62,6 +76,8 @@ type Server struct {
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
 	sessions int
+	// compiled is what tic was sent, once it has been.
+	compiled string
 	closed   bool
 	wg       sync.WaitGroup
 }
@@ -269,7 +285,7 @@ func (s *Server) serveConn(c net.Conn) {
 		}
 		go func() {
 			defer s.endSession()
-			(&session{ch: ch}).serve(reqs)
+			(&session{srv: s, ch: ch}).serve(reqs)
 		}()
 	}
 }
@@ -313,7 +329,8 @@ func (s *Server) endSession() {
 }
 
 type session struct {
-	ch ssh.Channel
+	srv *Server
+	ch  ssh.Channel
 
 	mu         sync.Mutex
 	term       string
@@ -365,6 +382,11 @@ func (s *session) serve(reqs <-chan *ssh.Request) {
 					req.Reply(false, nil)
 					continue
 				}
+				if strings.Contains(e.Command, "tic -x -") {
+					req.Reply(true, nil)
+					go s.terminfo()
+					continue
+				}
 				dir, ok := ParseCwdCommand(e.Command)
 				if !ok {
 					req.Reply(false, nil)
@@ -384,6 +406,37 @@ func (s *session) serve(reqs <-chan *ssh.Request) {
 			req.Reply(false, nil)
 		}
 	}
+}
+
+// terminfo answers the helper's xterm-ghostty check per
+// Options.Terminfo.
+func (s *session) terminfo() {
+	defer s.ch.Close()
+	srv := s.srv
+	srv.mu.Lock()
+	installed := srv.opts.Terminfo == TerminfoInstalled || srv.compiled != ""
+	srv.mu.Unlock()
+	status := 1
+	switch {
+	case installed:
+		status = 0
+	case srv.opts.Terminfo == TerminfoTic:
+		src, err := io.ReadAll(s.ch)
+		if err == nil && strings.HasPrefix(string(src), "xterm-ghostty|") {
+			srv.mu.Lock()
+			srv.compiled = string(src)
+			srv.mu.Unlock()
+			status = 0
+		}
+	}
+	s.ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(status)}))
+}
+
+// Compiled is the terminfo source the helper sent to tic, if it did.
+func (s *Server) Compiled() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compiled
 }
 
 // run is the fake shell. Commands:

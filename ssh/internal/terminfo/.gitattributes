@@ -1,0 +1,2 @@
+# Byte-for-byte what build.zig generates and checks, and what tic reads.
+*.terminfo text eol=lf

@@ -22,9 +22,10 @@ import (
 
 	"github.com/aldehir/slime/ssh/internal/prompt"
 	"github.com/aldehir/slime/ssh/internal/proto"
+	"github.com/aldehir/slime/ssh/internal/terminfo"
 )
 
-const defaultTerm = "xterm-256color"
+const defaultTerm = terminfo.Fallback
 
 type Options struct {
 	// Dest has its user and port filled in.
@@ -101,6 +102,9 @@ type Server struct {
 	answers chan proto.Answer
 	netConn net.Conn
 	client  *ssh.Client
+	// ghosttyTerm is set when the host has xterm-ghostty, so channels
+	// that ask for it get it.
+	ghosttyTerm bool
 	// jumps carry client, first hop first.
 	jumps []*ssh.Client
 	// connDone is closed when client.Wait returns, with connErr.
@@ -377,6 +381,8 @@ func (s *Server) connect(ch *channel) {
 		a = &dialogAsker{s: s, id: ch.id, term: term}
 	}
 	client, err := s.dial(a)
+	// Before any shell starts, so they all get the same TERM.
+	ghosttyTerm := err == nil && ch.term == terminfo.Name && installTerminfo(client)
 
 	s.mu.Lock()
 	if err != nil || s.state == stateClosing {
@@ -394,6 +400,7 @@ func (s *Server) connect(ch *channel) {
 		return
 	}
 	s.client = client
+	s.ghosttyTerm = ghosttyTerm
 	s.state = stateConnected
 	start := append([]*channel{ch}, s.pending...)
 	s.pending = nil
@@ -548,6 +555,10 @@ func (s *Server) start(client *ssh.Client, ch *channel) {
 
 	s.mu.Lock()
 	size := ch.size
+	term := ch.term
+	if term == terminfo.Name && !s.ghosttyTerm {
+		term = terminfo.Fallback
+	}
 	s.mu.Unlock()
 
 	modes := ssh.TerminalModes{
@@ -558,7 +569,7 @@ func (s *Server) start(client *ssh.Client, ch *channel) {
 		ssh.TTY_OP_ISPEED: 38400,
 		ssh.TTY_OP_OSPEED: 38400,
 	}
-	if err := requestPty(sess, ch.term, size, modes); err != nil {
+	if err := requestPty(sess, term, size, modes); err != nil {
 		sess.Close()
 		s.fail(ch, fmt.Errorf("pty request: %w", err))
 		return
