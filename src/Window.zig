@@ -48,8 +48,9 @@ pub const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
 /// something to show. WPARAM is the channel (session) ID, or 0 once
 /// logged in.
 pub const WM_APP_SSH_LOGIN = win32.WM_APP + 3;
-/// Posted from slimed's connection reader when panes arrive for
-/// sessions (`Slimed.takeArrivals`).
+/// Posted from a slimed connection's reader when panes arrive for
+/// sessions (`Slimed.take`), and when a host's has attached or failed
+/// to.
 pub const WM_APP_SLIMED = win32.WM_APP + 4;
 
 /// Room for the stats report, in UTF-16 units.
@@ -159,6 +160,9 @@ connect_field: ?Chrome.TextField = null,
 /// The connection to slimed, with `persist-sessions`: local sessions are
 /// panes of the workspace it holds for this window.
 slimed: ?*Slimed = null,
+/// Connections to slimed on SSH hosts, with `persist-sessions`: a host's
+/// sessions are panes of the workspace its slimed holds for this window.
+remotes: std.ArrayList(Remote) = .empty,
 
 /// Until when the next tooltip shows at once. See `tip_warm_ms`.
 tip_warm_until: u64 = 0,
@@ -218,6 +222,15 @@ const PaneDrag = struct {
 const Drop = struct {
     place: Tab.Place,
     rect: Chrome.Rect,
+};
+
+/// A host's slimed, and the session standing in for its panes until
+/// they come.
+const Remote = struct {
+    conn: *Slimed,
+    /// The id of the session that logs in and waits for the panes, until
+    /// they come or it's closed; then 0.
+    placeholder: u32,
 };
 
 const Hold = enum {
@@ -302,7 +315,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     try self.reserveGroups();
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     if (std.mem.startsWith(u16, command_line, ssh_scheme)) {
-        try self.spawnSession(.{ .host = try hosts.add(command_line) });
+        try self.openOnHost(try hosts.add(command_line));
     } else if (!(config.@"persist-sessions" and self.connectSlimed(command_line))) {
         try self.spawnSession(.{ .command = command_line });
     }
@@ -334,6 +347,8 @@ pub fn destroy(self: *Window) void {
     // Hanging up detaches the workspace; slimed keeps it for the next
     // window.
     if (self.slimed) |conn| conn.deinit();
+    for (self.remotes.items) |r| r.conn.deinit();
+    self.remotes.deinit(self.alloc);
     self.view_tabs.deinit(self.alloc);
     self.view_tab_panes.deinit(self.alloc);
     self.view_groups.deinit(self.alloc);
@@ -377,10 +392,10 @@ fn findSession(self: *const Window, id: u32) ?Found {
     return null;
 }
 
-/// The session showing slimed's pane `id`.
-fn slimedSession(self: *const Window, id: u32) ?*Session {
+/// The session showing `conn`'s pane `id`.
+fn slimedSession(self: *const Window, conn: *Slimed, id: u32) ?*Session {
     for (self.tabs.items) |t| {
-        if (t.id == 0) continue;
+        if (t.conn != conn) continue;
         if (t.findPane(id)) |s| return s;
     }
     return null;
@@ -397,8 +412,11 @@ const Target = union(enum) {
     /// A shell on remembered host `i`: on a live connection its sessions
     /// use, else a new one.
     host: usize,
-    /// A pane of our slimed workspace.
-    slimed: *const Slimed.Arrival,
+    /// A pane of a workspace slimed holds for us.
+    slimed: struct { conn: *Slimed, arrival: *const Slimed.Arrival },
+    /// Nothing yet, on a connection: standing in for its host's slimed
+    /// panes until they come.
+    waiting: *SshConnection,
 };
 
 /// With `persist-sessions`: connect to slimed and attach the workspace
@@ -410,7 +428,7 @@ fn connectSlimed(self: *Window, command: []const u16) bool {
         return false;
     };
     self.slimed = conn;
-    self.slimedChanged();
+    self.slimedChanged(conn);
     conn.start() catch |err| {
         log.err("starting slimed's reader failed: {}", .{err});
         self.destroyTabs();
@@ -421,12 +439,11 @@ fn connectSlimed(self: *Window, command: []const u16) bool {
     return self.tabs.items.len > 0;
 }
 
-/// Take up what slimed sent: make sessions of the panes that arrived,
+/// Take up what `conn` sent: make sessions of the panes that arrived,
 /// and lay out tabs as its workspace has them. A pane we asked for (a new
 /// tab or split) is shown and focused; others (a script's) are added
 /// without taking focus.
-fn slimedChanged(self: *Window) void {
-    const conn = self.slimed orelse return;
+fn slimedChanged(self: *Window, conn: *Slimed) void {
     var taken = conn.take();
     defer taken.deinit(self.alloc);
 
@@ -434,7 +451,7 @@ fn slimedChanged(self: *Window) void {
     defer arrived.deinit(self.alloc);
     var requested: ?*Session = null;
     for (taken.arrivals) |*a| {
-        const s = self.createSession(.{ .slimed = a }, self.gridSize()) catch |err| {
+        const s = self.createSession(.{ .slimed = .{ .conn = conn, .arrival = a } }, self.gridSize()) catch |err| {
             log.err("showing slimed pane {d} failed: {}", .{ a.pane, err });
             conn.release(a.pane);
             continue;
@@ -445,7 +462,7 @@ fn slimedChanged(self: *Window) void {
         };
         if (a.requested) requested = s;
     }
-    if (taken.structure) |st| self.applyStructure(st, &arrived) catch |err| log.err("laying out slimed's tabs failed: {}", .{err});
+    if (taken.structure) |st| self.applyStructure(conn, st, &arrived) catch |err| log.err("laying out slimed's tabs failed: {}", .{err});
     // Panes no tab holds (which slimed doesn't send) aren't shown.
     var left = arrived.valueIterator();
     while (left.next()) |s| {
@@ -467,10 +484,11 @@ fn slimedChanged(self: *Window) void {
     self.dirty = true;
 }
 
-/// Lay out slimed's tabs as `st` has them: replace the trees of tabs we
-/// have, add tabs we don't (at the end of Local), and drop tabs and panes
-/// it no longer has. Sessions placed from `arrived` are taken out of it.
-fn applyStructure(self: *Window, st: *const Slimed.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
+/// Lay out `conn`'s tabs as `st` has them: replace the trees of tabs we
+/// have, add tabs we don't (at the end of their group), and drop tabs and
+/// panes it no longer has. Sessions placed from `arrived` are taken out
+/// of it.
+fn applyStructure(self: *Window, conn: *Slimed, st: *const Slimed.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
     const alloc = self.alloc;
     self.cancelDrag();
     const was_active: ?*Tab = if (self.tabs.items.len > 0) self.activeTab() else null;
@@ -478,12 +496,13 @@ fn applyStructure(self: *Window, st: *const Slimed.Structure, arrived: *std.Auto
 
     const Lookup = struct {
         window: *Window,
+        conn: *Slimed,
         arrived: *std.AutoHashMapUnmanaged(u32, *Session),
         pub fn session(l: @This(), id: u32) ?*Session {
-            return l.arrived.get(id) orelse l.window.slimedSession(id);
+            return l.arrived.get(id) orelse l.window.slimedSession(l.conn, id);
         }
     };
-    const lookup: Lookup = .{ .window = self, .arrived = arrived };
+    const lookup: Lookup = .{ .window = self, .conn = conn, .arrived = arrived };
     const roots = try alloc.alloc(?Tab.Node, st.tabs.len);
     defer alloc.free(roots);
     @memset(roots, null);
@@ -503,7 +522,7 @@ fn applyStructure(self: *Window, st: *const Slimed.Structure, arrived: *std.Auto
     var dropped: std.ArrayList(*Session) = .empty;
     defer dropped.deinit(alloc);
     for (self.tabs.items) |t| {
-        if (t.id == 0) continue;
+        if (t.conn != conn) continue;
         var it = t.iterator();
         while (it.next()) |s| if (!used.contains(s)) try dropped.append(alloc, s);
     }
@@ -515,19 +534,19 @@ fn applyStructure(self: *Window, st: *const Slimed.Structure, arrived: *std.Auto
         const node = root.* orelse continue;
         try kept.put(alloc, lt.id, {});
         for (self.tabs.items) |t| {
-            if (t.id != lt.id) continue;
+            if (t.conn != conn or t.id != lt.id) continue;
             t.setRoot(alloc, node);
             break;
         } else {
-            const t = try Tab.create(alloc, lt.id, node, Tab.first(node));
-            self.tabs.insertAssumeCapacity(self.groupEnd(0), t);
+            const t = try Tab.create(alloc, conn, lt.id, node, Tab.first(node));
+            self.tabs.insertAssumeCapacity(self.groupEnd(self.groupOf(t)), t);
         }
         root.* = null;
     }
     var i: usize = 0;
     while (i < self.tabs.items.len) {
         const t = self.tabs.items[i];
-        if (t.id == 0 or kept.contains(t.id)) {
+        if (t.conn != conn or kept.contains(t.id)) {
             i += 1;
             continue;
         }
@@ -585,7 +604,7 @@ fn spawnSession(self: *Window, target: Target) !void {
     try self.tabs.ensureUnusedCapacity(self.alloc, 1);
     try self.reserveGroups();
     const s = try self.createSession(target, self.gridSize());
-    const t = Tab.create(self.alloc, 0, .{ .pane = s }, s) catch |err| {
+    const t = Tab.create(self.alloc, null, 0, .{ .pane = s }, s) catch |err| {
         s.kill();
         s.destroy();
         return err;
@@ -606,13 +625,9 @@ fn spawnSession(self: *Window, target: Target) !void {
 /// active session's shell last reported (OSC 7) if that's on the same
 /// connection.
 fn createSession(self: *Window, target: Target, size: GridSize) !*Session {
-    // Channel IDs are session IDs, and the helper takes 0 to mean the
-    // connection.
-    if (self.next_session_id == 0) self.next_session_id = 1;
-
     var new_conn: ?*SshConnection = null;
     const conn: ?*SshConnection = switch (target) {
-        .command, .slimed => null,
+        .command, .slimed, .waiting => null,
         .host => |h| self.hostConnection(h) orelse conn: {
             new_conn = try SshConnection.spawn(self.alloc, self.hosts.items.items[h], .{ .hwnd = self.hwnd.?, .msg = WM_APP_SSH_LOGIN });
             break :conn new_conn;
@@ -628,15 +643,23 @@ fn createSession(self: *Window, target: Target, size: GridSize) !*Session {
             null,
     } } else switch (target) {
         .command => |command| .{ .command = command },
-        .slimed => |a| .{ .slimed = .{ .conn = self.slimed.?, .arrival = a } },
+        .slimed => |sl| .{ .slimed = .{ .conn = sl.conn, .arrival = sl.arrival } },
+        .waiting => |c| .{ .waiting = .{ .conn = c, .title = c.label() } },
         .host => unreachable,
     };
-    const s = Session.create(self, self.next_session_id, launch, size.cols, size.rows) catch |err| {
+    return Session.create(self, self.nextSessionId(), launch, size.cols, size.rows) catch |err| {
         if (new_conn) |c| c.shutdownIfUnused();
         return err;
     };
+}
+
+/// A new session id. Channel ids are session ids, and the helper takes 0
+/// to mean the connection.
+fn nextSessionId(self: *Window) u32 {
+    if (self.next_session_id == 0) self.next_session_id = 1;
+    const id = self.next_session_id;
     self.next_session_id +%= 1;
-    return s;
+    return id;
 }
 
 /// Room in `view`'s scratch for Local and every host.
@@ -688,8 +711,170 @@ fn newSessionIn(self: *Window, g: usize) void {
         };
         return;
     };
-    const target: Target = if (g == 0) .{ .command = self.local_command } else .{ .host = g - 1 };
-    self.spawnSession(target) catch |err| log.err("new session failed: {}", .{err});
+    if (g == 0) {
+        self.spawnSession(.{ .command = self.local_command }) catch |err| log.err("new session failed: {}", .{err});
+    } else {
+        self.openOnHost(g - 1) catch |err| log.err("new session failed: {}", .{err});
+    }
+}
+
+/// A session on remembered host `h`. With `persist-sessions` it's a tab
+/// of the workspace the host's slimed holds for us: through the slimed
+/// we're attached to there, or else one we connect to, with a session
+/// standing in while that logs in and attaches. Where slimed can't run
+/// it's a shell of its own, as it is without the option.
+fn openOnHost(self: *Window, h: usize) !void {
+    if (self.config.@"persist-sessions") {
+        if (self.remoteOn(h)) |r| switch (r.conn.attachState()) {
+            // The tab comes when its pane does (WM_APP_SLIMED).
+            .attached => return r.conn.tabNew(&.{}, self.slimedSize()),
+            // Still logging in or attaching: show where.
+            .connecting => {
+                if (self.findSession(r.placeholder)) |found| self.activate(found.tab);
+                return;
+            },
+            .failed => {},
+        };
+        const conn = self.hostConnection(h);
+        if (conn == null or !conn.?.slimed_unavailable) return self.connectRemote(h, conn);
+    }
+    try self.spawnSession(.{ .host = h });
+}
+
+/// Our slimed on host `h` that's attached, or attaching, and not lost.
+fn remoteOn(self: *Window, h: usize) ?*Remote {
+    for (self.remotes.items) |*r| {
+        const dest = r.conn.host().?.destination;
+        if (self.hosts.indexOf(dest) != h) continue;
+        if (r.conn.attachState() == .failed or r.conn.isLost()) continue;
+        return r;
+    }
+    return null;
+}
+
+/// Connect to host `h`'s slimed, over `conn` or a new connection. A
+/// session stands in for its panes, in a tab of its own, where logging in
+/// asks what it needs; the panes replace it once they come (`remoteChanged`).
+fn connectRemote(self: *Window, h: usize, existing: ?*SshConnection) !void {
+    try self.remotes.ensureUnusedCapacity(self.alloc, 1);
+    const conn = existing orelse try SshConnection.spawn(self.alloc, self.hosts.items.items[h], .{ .hwnd = self.hwnd.?, .msg = WM_APP_SSH_LOGIN });
+    self.spawnSession(.{ .waiting = conn }) catch |err| {
+        // A new connection nothing uses.
+        conn.shutdownIfUnused();
+        return err;
+    };
+    const s = self.activeSession();
+    // The channel's id is the session's, so logging in asks there.
+    const remote = remote: {
+        const ch = conn.openSlimed(s.id, Session.sshTerm(self.config)) catch |err| break :remote err;
+        break :remote Slimed.connectRemote(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, ch, self.slimedArea(), self.slimedSize());
+    } catch |err| {
+        log.err("connecting to slimed on {f} failed: {}; running a shell instead", .{ std.unicode.fmtUtf16Le(conn.label()), err });
+        s.startShell(self.nextSessionId()) catch |e| s.showEnded(@errorName(e));
+        return;
+    };
+    self.remotes.appendAssumeCapacity(.{ .conn = remote, .placeholder = s.id });
+}
+
+/// Take up what slimed connections posted: panes that arrived, and how
+/// attaching to hosts' went.
+fn slimedPosted(self: *Window) void {
+    if (self.slimed) |conn| self.slimedChanged(conn);
+    var i: usize = 0;
+    while (i < self.remotes.items.len) {
+        switch (self.remotes.items[i].conn.attachState()) {
+            .connecting => {},
+            .attached => self.remoteChanged(&self.remotes.items[i]),
+            .failed => {
+                self.remoteFailed(i);
+                continue;
+            },
+        }
+        i += 1;
+    }
+    self.pruneRemotes();
+}
+
+/// Take up what host's slimed `r` sent. Once its panes have come, they
+/// replace the session that stood in for them, and the tabs of slimeds
+/// we lost on the host, which showed the same panes as they were.
+fn remoteChanged(self: *Window, r: *Remote) void {
+    self.slimedChanged(r.conn);
+    if (r.placeholder == 0) return;
+    const found = self.findSession(r.placeholder) orelse {
+        r.placeholder = 0;
+        return;
+    };
+    // In tabs of their own by now.
+    const first = for (self.tabs.items) |t| {
+        if (t.conn == r.conn) break t;
+    } else return;
+    r.placeholder = 0;
+    var show = found.tab == self.active;
+    self.dropTab(found.tab);
+    var i: usize = 0;
+    while (i < self.tabs.items.len) {
+        const old = self.tabs.items[i].conn;
+        if (old == null or old == r.conn or old.?.host() == null or !old.?.isLost() or
+            !std.mem.eql(u16, old.?.host().?.destination, r.conn.host().?.destination))
+        {
+            i += 1;
+            continue;
+        }
+        show = show or i == self.active;
+        self.dropTab(i);
+    }
+    if (show) self.activate(self.tabIndex(first).?);
+}
+
+/// Host's slimed `remotes[i]` couldn't attach: hang up on it. Its
+/// stand-in runs a shell instead, saying why, if the connection is up;
+/// else it shows why logging in failed, as a shell's session would.
+fn remoteFailed(self: *Window, i: usize) void {
+    const r = self.remotes.orderedRemove(i);
+    // After the stand-in is done with the failure's text, and has the
+    // connection from a channel of its own.
+    defer r.conn.deinit();
+    const s = (self.findSession(r.placeholder) orelse return).s;
+    const why = r.conn.failure.text();
+    self.dirty = true;
+    const conn = s.sshConnection() orelse return;
+    if (conn.isAlive() and conn.isConnected()) {
+        // Not again on this connection.
+        conn.slimed_unavailable = true;
+        s.notice("slimed can't run here ({s}), so this shell ends with the connection", .{why});
+        s.startShell(self.nextSessionId()) catch |err| s.showEnded(@errorName(err));
+        return;
+    }
+    if (s.login) |login| {
+        login.fail(why);
+        self.updateSpinner();
+    }
+    s.showEnded(why);
+}
+
+/// Hang up on hosts' slimeds nothing shows any more: one whose stand-in
+/// was closed before its panes came, or whose tabs have all gone.
+fn pruneRemotes(self: *Window) void {
+    var i: usize = 0;
+    while (i < self.remotes.items.len) {
+        const r = &self.remotes.items[i];
+        if (r.placeholder != 0 and self.findSession(r.placeholder) == null) r.placeholder = 0;
+        const shown = r.placeholder != 0 or for (self.tabs.items) |t| {
+            if (t.conn == r.conn) break true;
+        } else false;
+        if (shown or r.conn.attachState() == .failed) {
+            i += 1;
+            continue;
+        }
+        self.remotes.orderedRemove(i).conn.deinit();
+    }
+}
+
+/// What a new pane in `conn` runs: the local command, or for a host's,
+/// its shell.
+fn slimedCommand(self: *const Window, conn: *const Slimed) []const u16 {
+    return if (conn.host() == null) self.local_command else &.{};
 }
 
 /// Split the pane shown at `i` in the active tab, starting a shell on
@@ -697,13 +882,13 @@ fn newSessionIn(self: *Window, g: usize) void {
 fn splitPane(self: *Window, i: usize, dir: Slimed.Direction) void {
     const s = self.shownPane(i) orelse return;
     const pane = s.slimedPane() orelse return;
-    const conn = self.slimed orelse return;
     const t = self.activeTab();
+    const conn = t.conn orelse return;
     if (t.zoom != null) {
         t.zoom = null;
         self.layoutTab(t);
     }
-    conn.split(pane, dir, self.local_command) catch |err| log.err("split failed: {}", .{err});
+    conn.split(pane, dir, self.slimedCommand(conn)) catch |err| log.err("split failed: {}", .{err});
     self.dirty = true;
 }
 
@@ -721,7 +906,7 @@ fn toggleZoom(self: *Window, i: usize) void {
 /// Start dragging divider `i` of the active tab, if slimed has its tree.
 fn startDrag(self: *Window, i: usize, pos: win32.POINT) void {
     const t = self.activeTab();
-    if (t.id == 0 or self.slimed == null or i >= t.dividers.items.len) return;
+    if (t.conn == null or i >= t.dividers.items.len) return;
     const d = t.dividers.items[i];
     self.hideTip();
     self.drag = .{ .tab = t, .divider = d, .from = d.shares(), .origin = across(d, pos) };
@@ -758,7 +943,7 @@ fn endDrag(self: *Window) void {
 
 /// Send slimed tab `t`'s tree, changed here.
 fn sendLayout(self: *Window, t: *const Tab) void {
-    const conn = self.slimed orelse return;
+    const conn = t.conn orelse return;
     var arena: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena.deinit();
     const root = (t.toLayout(arena.allocator()) catch return) orelse return;
@@ -788,7 +973,7 @@ fn startPaneDrag(self: *Window, s: *Session, pos: win32.POINT) void {
 /// system's drag distance, find where the pane would land. Only a tab of
 /// several slimed panes rearranges; others just took focus.
 fn paneDragTo(self: *Window, d: *PaneDrag, pos: win32.POINT) void {
-    if (d.tab.id == 0 or d.tab.count() < 2 or self.slimed == null) return;
+    if (d.tab.conn == null or d.tab.count() < 2) return;
     if (d.at == null) {
         const dx = win32.GetSystemMetricsForDpi(win32.SM_CXDRAG, self.dpi);
         const dy = win32.GetSystemMetricsForDpi(win32.SM_CYDRAG, self.dpi);
@@ -926,6 +1111,7 @@ fn closePane(self: *Window, ti: usize, s: *Session) void {
     _ = self.chrome.setHover(.none);
     self.layoutTab(t);
     if (focused) self.activated();
+    self.pruneRemotes();
     self.dirty = true;
 }
 
@@ -940,12 +1126,18 @@ fn closeTab(self: *Window, i: usize) void {
         _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
         return;
     }
+    var it = self.tabs.items[i].iterator();
+    while (it.next()) |s| s.kill();
+    self.dropTab(i);
+    self.pruneRemotes();
+}
+
+/// Take tab `i` out and free it with its sessions, which lets go of
+/// slimed's panes without ending them. Not the last tab.
+fn dropTab(self: *Window, i: usize) void {
     const was_active = i == self.active;
     if (was_active) self.deactivate();
-    const t = self.tabs.orderedRemove(i);
-    var it = t.iterator();
-    while (it.next()) |s| s.kill();
-    self.destroyTab(t);
+    self.destroyTab(self.tabs.orderedRemove(i));
     // Rows moved under the mouse.
     _ = self.chrome.setHover(.none);
     self.middle_pressed = null;
@@ -1215,7 +1407,7 @@ fn submitConnect(self: *Window) void {
     };
     if (dest.len > scheme.len) connect: {
         const h = self.hosts.add(dest) catch |err| break :connect log.err("connect failed: {}", .{err});
-        self.spawnSession(.{ .host = h }) catch |err| log.err("connect failed: {}", .{err});
+        self.openOnHost(h) catch |err| log.err("connect failed: {}", .{err});
     }
     self.cancelConnect();
 }
@@ -1938,6 +2130,7 @@ fn layout(self: *Window) void {
     self.quiet_until = win32.GetTickCount64() + resize_quiet_ms;
     for (self.tabs.items) |t| self.layoutTab(t);
     if (self.slimed) |conn| conn.resizeWorkspace(self.slimedArea());
+    for (self.remotes.items) |remote| if (remote.conn.attachState() == .attached) remote.conn.resizeWorkspace(self.slimedArea());
 
     // Render synchronously so live resize doesn't show stale frames.
     self.render();
@@ -2148,7 +2341,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         WM_APP_SLIMED => {
-            self.slimedChanged();
+            self.slimedPosted();
             return 0;
         },
 

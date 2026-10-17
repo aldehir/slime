@@ -5,7 +5,8 @@
 //!
 //! slimed owns a split tab's layout: the window asks it to split or close
 //! panes and takes the tree it sends back (`fromLayout`). A session that
-//! doesn't run in slimed is a tab of its own, one pane.
+//! doesn't run in slimed is a tab of its own, one pane. Each slimed, the
+//! local one or a host's, numbers its own tabs.
 const Tab = @This();
 
 const std = @import("std");
@@ -16,6 +17,8 @@ const Rect = @import("renderer/Painter.zig").Rect;
 
 /// slimed's id for the tab, or 0 for a session of its own.
 id: u32,
+/// The slimed whose tab it is, or null for a session of its own.
+conn: ?*Slimed = null,
 root: Node,
 /// The pane that gets the keys.
 focus: *Session,
@@ -46,9 +49,9 @@ pub const Child = struct {
     node: Node,
 };
 
-pub fn create(alloc: Allocator, id: u32, root: Node, focus: *Session) !*Tab {
+pub fn create(alloc: Allocator, conn: ?*Slimed, id: u32, root: Node, focus: *Session) !*Tab {
     const self = try alloc.create(Tab);
-    self.* = .{ .id = id, .root = root, .focus = focus };
+    self.* = .{ .id = id, .conn = conn, .root = root, .focus = focus };
     return self;
 }
 
@@ -529,7 +532,7 @@ test "placing and removing panes" {
     const row = try alloc.alloc(Child, 2);
     row[0] = .{ .share = 7500, .node = .{ .pane = &a } };
     row[1] = .{ .share = 2500, .node = .{ .split = .{ .axis = .column, .children = column } } };
-    const tab = try create(alloc, 1, .{ .split = .{ .axis = .row, .children = row } }, &c);
+    const tab = try create(alloc, null, 1, .{ .split = .{ .axis = .row, .children = row } }, &c);
     defer tab.destroy(alloc);
 
     try tab.place(alloc, .{ .x = 10, .y = 20, .w = 401, .h = 201 }, 1);
@@ -577,7 +580,7 @@ test "moving panes" {
     row[0] = .{ .share = 3334, .node = .{ .pane = &a } };
     row[1] = .{ .share = 3333, .node = .{ .pane = &b } };
     row[2] = .{ .share = 3333, .node = .{ .pane = &c } };
-    const tab = try create(alloc, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    const tab = try create(alloc, null, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
     defer tab.destroy(alloc);
 
     // c along the top: a column of c over the rest.

@@ -16,6 +16,7 @@ const input = @import("input.zig");
 const Pty = @import("Pty.zig");
 const SshConnection = @import("SshConnection.zig");
 const Slimed = @import("Slimed.zig");
+const Config = @import("Config.zig");
 const Login = @import("Login.zig");
 const ProgramStatus = @import("ProgramStatus.zig");
 const clipboard = @import("clipboard.zig");
@@ -139,12 +140,17 @@ const Transport = union(enum) {
     /// A pane slimed holds, which outlives us. Its output comes from the
     /// connection's reader through our sink.
     slimed: struct { conn: *Slimed, pane: u32 },
+    /// Nothing yet: standing in for an SSH host's slimed panes until they
+    /// come, logging in meanwhile, or for a shell if they can't
+    /// (`startShell`). Holds a reference to the connection.
+    waiting: *SshConnection,
 
     fn write(self: *Transport, data: []const u8) void {
         switch (self.*) {
             .conpty => |*pty| pty.write(data),
             .ssh => |ch| ch.write(data),
             .slimed => |s| s.conn.write(s.pane, data),
+            .waiting => {},
         }
     }
 };
@@ -165,6 +171,11 @@ pub const Launch = union(enum) {
     slimed: struct {
         conn: *Slimed,
         arrival: *const Slimed.Arrival,
+    },
+    /// Nothing yet, on `conn`: see `Transport.waiting`.
+    waiting: struct {
+        conn: *SshConnection,
+        title: []const u16,
     },
 };
 
@@ -195,7 +206,13 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     const default_title = try alloc.dupe(u16, switch (launch) {
         .command => |command_line| programName(command_line),
         .ssh => |ssh| ssh.title,
-        .slimed => |s| programName(s.arrival.command),
+        // A host's shell, which slimed lists with no command, goes by the
+        // host until it sets a title.
+        .slimed => |s| if (s.arrival.command.len == 0 and s.conn.host() != null)
+            s.conn.host().?.label()
+        else
+            programName(s.arrival.command),
+        .waiting => |w| w.title,
     });
     errdefer alloc.free(default_title);
     self.* = .{
@@ -289,14 +306,18 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
         },
         .ssh => |ssh| {
             const cell = window.cellSizePx();
-            const term = if (config.@"ssh-terminfo") "xterm-ghostty" else "xterm-256color";
-            self.transport = .{ .ssh = try ssh.conn.open(id, term, cols, rows, cols * cell.width, rows * cell.height, ssh.cwd) };
+            self.transport = .{ .ssh = try ssh.conn.open(id, sshTerm(config), cols, rows, cols * cell.width, rows * cell.height, ssh.cwd) };
         },
         .slimed => |s| {
             // No reader of our own: the connection's feeds the sink, first
             // with what came while the pane waited for us.
             self.transport = .{ .slimed = .{ .conn = s.conn, .pane = s.arrival.pane } };
             s.conn.adopt(s.arrival.pane, .{ .ctx = self, .output = slimedOutput, .ended = slimedEnded });
+            return self;
+        },
+        .waiting => |w| {
+            w.conn.retain();
+            self.transport = .{ .waiting = w.conn };
             return self;
         },
     }
@@ -306,7 +327,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     // An SSH channel has no process here; its reader reports the end.
     const pty = switch (self.transport.?) {
         .conpty => |*pty| pty,
-        .ssh, .slimed => return self,
+        .ssh, .slimed, .waiting => return self,
     };
     var wait: win32.HANDLE = undefined;
     if (win32.RegisterWaitForSingleObject(
@@ -356,13 +377,18 @@ fn stopTransport(self: *Session) void {
             self.transport = null;
             return;
         },
+        .waiting => |conn| {
+            self.transport = null;
+            conn.release();
+            return;
+        },
     }
     if (self.reader) |t| t.join();
     self.reader = null;
     switch (transport.*) {
         .conpty => |*pty| pty.deinit(),
         .ssh => |ch| ch.deinit(),
-        .slimed => unreachable,
+        .slimed, .waiting => unreachable,
     }
     self.transport = null;
 }
@@ -430,11 +456,14 @@ pub fn slimedPane(self: *const Session) ?u32 {
     };
 }
 
-/// The SSH connection the session's shell runs on, if it's remote.
+/// The SSH connection the session's shell runs on, if it's remote: its
+/// channel's, its host's slimed's, or the one it waits on.
 pub fn sshConnection(self: *const Session) ?*SshConnection {
     return switch (self.transport orelse return null) {
-        .conpty, .slimed => null,
+        .conpty => null,
         .ssh => |ch| ch.conn,
+        .slimed => |s| s.conn.host(),
+        .waiting => |conn| conn,
     };
 }
 
@@ -442,9 +471,40 @@ pub fn sshConnection(self: *const Session) ?*SshConnection {
 /// after WM_APP_CHILD_EXITED.
 pub fn sshEnding(self: *const Session) ?*const SshConnection.Ending {
     return switch (self.transport orelse return null) {
-        .conpty, .slimed => null,
+        .conpty, .slimed, .waiting => null,
         .ssh => |ch| &ch.ending,
     };
+}
+
+/// The TERM to ask SSH hosts for.
+pub fn sshTerm(config: *const Config) []const u8 {
+    return if (config.@"ssh-terminfo") "xterm-ghostty" else "xterm-256color";
+}
+
+/// Start a shell in a session that was waiting on its connection
+/// (`Launch.waiting`), as `id`: a new id, since the old one named the
+/// channel it waited for. UI thread only.
+pub fn startShell(self: *Session, id: u32) !void {
+    const conn = switch (self.transport orelse return error.NotWaiting) {
+        .waiting => |c| c,
+        else => return error.NotWaiting,
+    };
+    const cell = self.window.cellSizePx();
+    self.lockTerminal();
+    const cols = self.terminal.cols;
+    const rows = self.terminal.rows;
+    self.unlockTerminal();
+    const ch = try conn.open(id, sshTerm(self.window.config), cols, rows, @as(u32, cols) * cell.width, @as(u32, rows) * cell.height, null);
+    errdefer {
+        ch.close();
+        ch.deinit();
+    }
+    self.id = id;
+    self.transport = .{ .ssh = ch };
+    errdefer self.transport = .{ .waiting = conn };
+    self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
+    // The channel holds the connection now.
+    conn.release();
 }
 
 /// Keep the session after its SSH channel failed, saying why. Any key
@@ -456,6 +516,19 @@ pub fn showEnded(self: *Session, why: []const u8) void {
     self.stream.nextSlice("\r\n\x1b[0m[");
     self.stream.nextSlice(why);
     self.stream.nextSlice(". Press any key to close.]\r\n");
+    self.unseen.store(true, .release);
+}
+
+/// Print a line in the terminal, dimmed, before what runs in it: why it
+/// runs as it does. UI thread only, before the transport starts.
+pub fn notice(self: *Session, comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    self.stream.nextSlice("\x1b[2m[");
+    self.stream.nextSlice(text);
+    self.stream.nextSlice("]\x1b[0m\r\n");
     self.unseen.store(true, .release);
 }
 
@@ -512,6 +585,7 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
             .cell_width = cell.width,
             .cell_height = cell.height,
         }),
+        .waiting => {},
     };
 }
 
@@ -523,7 +597,7 @@ fn readLoop(self: *Session) void {
         const n = switch (self.transport.?) {
             .conpty => |*pty| pty.read(&buf),
             .ssh => |ch| ch.read(&buf),
-            .slimed => unreachable,
+            .slimed, .waiting => unreachable,
         } catch break;
         if (n == 0) break;
         self.output(buf[0..n]);
@@ -549,7 +623,7 @@ fn writeChild(self: *Session, data: []const u8) void {
 /// control thread knows how it ended, which the helper sends first.
 fn channelEnded(self: *Session) void {
     const ch = switch (self.transport.?) {
-        .conpty, .slimed => return,
+        .conpty, .slimed, .waiting => return,
         .ssh => |ch| ch,
     };
     ch.waitEnded(5000);

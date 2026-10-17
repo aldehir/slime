@@ -141,8 +141,6 @@ one.
 - **Logging in, in the header.** A host shows `+` from the moment its
   helper starts, before it's logged in. Sessions left from a dead
   connection aren't dimmed.
-- **Persistent remote sessions.** An SSH session ends with its channel.
-  slimed (below) doesn't run on remote hosts yet.
 - **The new session key hint** went with the "New session" button.
   Ctrl+Shift+T opens one in the active session's group.
 - **More of `~/.ssh/config`.** The helper reads Host blocks and
@@ -168,6 +166,16 @@ strip moves it beside another, along a side of the tab, or into
 another's place.
 `slimed tab new`, `split`, and the rest change a workspace from scripts,
 attached or not. Off by default, and only slimed's tabs split.
+
+On SSH hosts it's the same daemon, built for Linux (x86-64 and arm64)
+and carried in slime-ssh, which installs it as
+`~/.cache/slime/slimed-<build>` and bridges a channel to `slimed
+connect` (its socket is `/tmp/slimed-<uid>/sock`). Until the host's
+panes come, a session stands in for them, where logging in asks what it
+needs. Where slimed can't run (another OS, no gzip, a full disk), the
+stand-in becomes a plain shell, saying why, and so do the host's later
+sessions on that connection. A dropped connection leaves its panes
+saying so; the host's button reconnects, reattaches, and replaces them.
 
 - **A pane can't be dragged to another tab**, or out into a tab of its
   own: slimed's Layout only rearranges a tab's own panes, so that needs
@@ -200,6 +208,27 @@ attached or not. Off by default, and only slimed's tabs split.
   then shows that pane without clustering.
 - **New panes take slimed's environment**, from whichever slime started
   it, not the window's.
+- **Only Linux hosts.** macOS and the BSDs get plain shells: slimed
+  builds for darwin with GOOS alone, but slime-pack doesn't carry it,
+  and it's untested there.
+- **Nothing shows while a host's slimed starts.** The stand-in is blank
+  between logging in and the panes coming, which on a first install
+  includes sending about 3 MiB.
+- **Builds pile up on hosts**, one `slimed-<build>` per slime build in
+  `~/.cache/slime`, never removed.
+- **A host's daemon from an older build keeps serving.** A slime whose
+  protocol or snapshot format differs gets plain shells there until that
+  daemon exits, which is when its panes have all ended.
+- **Hosts can still end the daemon.** It runs in a session of its own,
+  but systemd-logind with `KillUserProcesses=yes` ends it with the
+  user's last login, as it does tmux.
+- **A host's panes take the environment of the SSH session that started
+  its daemon**, so `SSH_CONNECTION` and the like go stale once that
+  connection's gone.
+- **Login notices on a slimed connection** (banners, "Permanently
+  added") go to slime-ssh's log, there being no terminal yet to print
+  them in.
+- **Nothing reconnects by itself** when a host's connection drops.
 - **Several windows on one workspace.** Attaching takes a workspace from
   whoever has it. Sharing needs a rule for whose replies to device
   queries reach the program (clients would send them as their own frame

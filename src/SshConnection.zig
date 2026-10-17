@@ -29,6 +29,7 @@ const MsgType = enum(u8) {
     resize = 3,
     close = 4,
     answer = 5,
+    open_slimed = 6,
     hello_reply = 65,
     connected = 66,
     opened = 67,
@@ -65,8 +66,12 @@ login: Login = .{},
 /// Logged in. Guarded by `lock`.
 connected: bool = false,
 
-/// Channels opened and not yet released. UI thread only.
+/// Channels opened and not yet released, and `retain`s. UI thread only.
 refs: u32 = 0,
+
+/// slimed can't run on the host (`openSlimed` failed), so its sessions
+/// are plain shells. UI thread only.
+slimed_unavailable: bool = false,
 
 /// A window message posted from the reader thread when `login` or
 /// `connected` changes. WPARAM is the channel ID, 0 for the connection.
@@ -206,6 +211,13 @@ pub const Channel = struct {
     /// just before closing the channel's output.
     pub fn waitEnded(self: *Channel, ms: u32) void {
         _ = win32.WaitForSingleObject(self.done, ms);
+    }
+
+    /// How the channel ended, waiting up to `ms` to hear; null if that
+    /// isn't known by then. Any thread.
+    pub fn ended(self: *Channel, ms: u32) ?*const Ending {
+        if (win32.WaitForSingleObject(self.done, ms) != win32.WAIT_OBJECT_0) return null;
+        return &self.ending;
     }
 
     /// Ask the helper to close the channel. `read` returns 0 once it has.
@@ -404,6 +416,35 @@ pub fn isAlive(self: *SshConnection) bool {
 /// falls back from xterm-ghostty on hosts it can't install that on. `id`
 /// must be unique and nonzero. UI thread only.
 pub fn open(self: *SshConnection, id: u32, term: []const u8, cols: u16, rows: u16, width_px: u32, height_px: u32, cwd: ?[]const u8) !*Channel {
+    var p: Payload = .{};
+    p.putU64(0);
+    p.putU64(0);
+    p.putU16(cols);
+    p.putU16(rows);
+    p.putStr(term);
+    p.putStr(cwd orelse "");
+    p.putU32(width_px);
+    p.putU32(height_px);
+    if (p.overflow) return error.NameTooLong;
+    return self.openWith(.open, id, &p);
+}
+
+/// Open a channel to the host's slimed, whose pipes carry its protocol
+/// (Slimed.connectRemote). The helper installs slimed first if the host
+/// lacks it. If slimed can't run there, the channel ends saying why, and
+/// the connection stays up for `open`. `term` is the TERM its panes get,
+/// as `open`'s. UI thread only.
+pub fn openSlimed(self: *SshConnection, id: u32, term: []const u8) !*Channel {
+    var p: Payload = .{};
+    p.putU64(0);
+    p.putU64(0);
+    p.putStr(term);
+    return self.openWith(.open_slimed, id, &p);
+}
+
+/// Open a channel with `msg`, whose payload `p` starts with room for the
+/// helper's ends of its pipes.
+fn openWith(self: *SshConnection, msg: MsgType, id: u32, p: *Payload) !*Channel {
     std.debug.assert(id != 0);
     var input_read: win32.HANDLE = undefined;
     var input_write: win32.HANDLE = undefined;
@@ -450,17 +491,9 @@ pub fn open(self: *SshConnection, id: u32, term: []const u8, cols: u16, rows: u1
         win32.ReleaseSRWLockExclusive(&self.lock);
     }
 
-    var p: Payload = .{};
-    p.putU64(@intFromPtr(helper_in));
-    p.putU64(@intFromPtr(helper_out));
-    p.putU16(cols);
-    p.putU16(rows);
-    p.putStr(term);
-    p.putStr(cwd orelse "");
-    p.putU32(width_px);
-    p.putU32(height_px);
-    if (p.overflow) return error.NameTooLong;
-    try self.send(.open, id, p.bytes());
+    std.mem.writeInt(u64, p.buf[0..8], @intFromPtr(helper_in), .little);
+    std.mem.writeInt(u64, p.buf[8..16], @intFromPtr(helper_out), .little);
+    try self.send(msg, id, p.bytes());
     self.refs += 1;
     return ch;
 }
@@ -479,8 +512,15 @@ fn moveHandle(self: *SshConnection, h: win32.HANDLE) !win32.HANDLE {
     return target;
 }
 
-/// Drop a channel's reference, shutting the helper down after the last.
-fn release(self: *SshConnection) void {
+/// Keep the connection for something other than a channel: a session
+/// waiting for the host's slimed. UI thread only.
+pub fn retain(self: *SshConnection) void {
+    self.refs += 1;
+}
+
+/// Drop a channel's reference, or a `retain`, shutting the helper down
+/// after the last. UI thread only.
+pub fn release(self: *SshConnection) void {
     self.refs -= 1;
     self.shutdownIfUnused();
 }

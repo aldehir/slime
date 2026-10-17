@@ -14,12 +14,18 @@
 //! `notify` message. Adopting one replays what was buffered under the
 //! connection's lock before the pane goes live, so nothing is lost or
 //! reordered at the handoff.
+//!
+//! The local daemon is reached through its named pipe (`connect`). An SSH
+//! host's runs there, and is reached through a channel slime-ssh bridges
+//! to it (`connectRemote`), whose reader logs in and attaches before it
+//! routes frames.
 const Slimed = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
+const SshConnection = @import("SshConnection.zig");
 
 const log = std.log.scoped(.slimed);
 
@@ -72,8 +78,24 @@ reader: ?std.Thread = null,
 write_lock: win32.SRWLOCK = .{},
 /// The attached workspace.
 workspace: u32 = 0,
-/// Tags for requests. UI thread only.
-next_tag: u32 = 0,
+/// Tags for requests, from the UI thread and, while a host's attaches,
+/// its reader.
+next_tag: std.atomic.Value(u32) = .init(0),
+
+/// The channel a host's slimed is reached through; null for the local
+/// daemon's pipe. Owned.
+channel: ?*SshConnection.Channel = null,
+/// How attaching went. A host's starts out connecting, and its reader
+/// says how it ended (`notify`).
+state: std.atomic.Value(State) = .init(.attached),
+/// Why attaching failed, once `state` says it did.
+failure: Failure = .{},
+/// What a host's reader attaches with.
+area: Area = undefined,
+size: Size = undefined,
+/// The reader posts `notify` when panes arrive: from `start` for the
+/// local daemon, and once attached for a host's.
+posting: std.atomic.Value(bool) = .init(false),
 
 /// Guards `panes`, `arrivals`, `structure`, `requested`, and `lost`, and
 /// is held while calling a sink, so a session can't go while one runs.
@@ -89,10 +111,28 @@ lost: bool = false,
 /// `deinit` is hanging up, so the reader's end isn't a loss.
 closing: std.atomic.Value(bool) = .init(false),
 
-/// A window message posted from the reader thread when panes arrive.
+/// A window message posted from the reader thread when panes arrive, and
+/// when a host's slimed has attached or failed to.
 pub const Notify = struct {
     hwnd: win32.HWND,
     msg: u32,
+};
+
+pub const State = enum(u8) { connecting, attached, failed };
+
+/// Why attaching to a host's slimed failed, for the window to show.
+pub const Failure = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    pub fn text(self: *const Failure) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn set(self: *Failure, s: []const u8) void {
+        self.len = @min(s.len, self.buf.len);
+        @memcpy(self.buf[0..self.len], s[0..self.len]);
+    }
 };
 
 /// A tab's space in pixels, which its layout's shares divide, and the
@@ -247,12 +287,47 @@ pub fn connect(alloc: Allocator, notify: Notify, area: Area, size: Size, command
     errdefer pipe.close();
     const buf = try alloc.alloc(u8, max_frame);
     defer alloc.free(buf);
-    try handshake(&pipe, buf);
 
     const self = try alloc.create(Slimed);
     errdefer alloc.destroy(self);
     self.* = .{ .alloc = alloc, .pipe = pipe, .notify = notify };
     errdefer self.freeState();
+    try self.attachFirst(buf, area, size, command);
+    return self;
+}
+
+/// Connect to a host's slimed through `channel` (`SshConnection.openSlimed`),
+/// which logs in first if its connection hasn't. The reader does the
+/// rest: it attaches as `connect` does, a new workspace's tab running the
+/// host's shell, and posts `notify` once `state` says how that went. The
+/// panes then wait in `arrivals`. Takes the channel, even on failure. UI
+/// thread.
+pub fn connectRemote(alloc: Allocator, notify: Notify, channel: *SshConnection.Channel, area: Area, size: Size) !*Slimed {
+    errdefer {
+        channel.close();
+        channel.deinit();
+    }
+    const self = try alloc.create(Slimed);
+    errdefer alloc.destroy(self);
+    self.* = .{
+        .alloc = alloc,
+        .pipe = .ofChannel(channel),
+        .notify = notify,
+        .channel = channel,
+        .state = .init(.connecting),
+        .area = area,
+        .size = size,
+    };
+    self.reader = try std.Thread.spawn(.{}, remoteLoop, .{self});
+    return self;
+}
+
+/// Say hello, then attach the most recently detached workspace, or a new
+/// one with a tab running `command`, reading the replies in line. Before
+/// the reader routes frames.
+fn attachFirst(self: *Slimed, buf: []u8, area: Area, size: Size, command: []const u16) !void {
+    const alloc = self.alloc;
+    try handshake(&self.pipe, buf);
 
     // Most recently detached, from the list.
     try self.send(.list, 0, &.{});
@@ -287,11 +362,11 @@ pub fn connect(alloc: Allocator, notify: Notify, area: Area, size: Size, command
         const t = try self.tabNewTagged(command, size);
         try self.awaitReply(buf, t, true);
     }
-    return self;
 }
 
 /// Start the reader, once the panes from `connect` are adopted.
 pub fn start(self: *Slimed) !void {
+    self.posting.store(true, .release);
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
 }
 
@@ -299,18 +374,76 @@ pub fn start(self: *Slimed) !void {
 /// session must have released its pane. UI thread.
 pub fn deinit(self: *Slimed) void {
     self.closing.store(true, .release);
+    // Closing a host's channel has the helper close its ends, which ends
+    // the reader's read, or its wait to log in.
+    if (self.channel) |ch| ch.close();
     if (self.reader) |t| {
         // Wake it until it's gone: a cancel that lands before it blocks in
         // ReadFile again is lost.
         while (win32.WaitForSingleObject(t.getHandle(), 0) != win32.WAIT_OBJECT_0) {
-            _ = win32.CancelIoEx(self.pipe.h, null);
+            if (self.channel == null)
+                _ = win32.CancelIoEx(self.pipe.read_h, null)
+            else
+                _ = win32.CancelSynchronousIo(t.getHandle());
             _ = win32.WaitForSingleObject(t.getHandle(), 20);
         }
         t.join();
     }
     self.pipe.close();
+    if (self.channel) |ch| ch.deinit();
     self.freeState();
     self.alloc.destroy(self);
+}
+
+/// The SSH connection a host's slimed is reached through; null for the
+/// local daemon.
+pub fn host(self: *const Slimed) ?*SshConnection {
+    return if (self.channel) |ch| ch.conn else null;
+}
+
+/// How attaching went. The reader posts `notify` when it changes.
+pub fn attachState(self: *const Slimed) State {
+    return self.state.load(.acquire);
+}
+
+/// Every pane was lost to us: the connection ended, or another window
+/// took the workspace. UI thread.
+pub fn isLost(self: *Slimed) bool {
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    return self.lost;
+}
+
+/// A host's reader: attach, then route frames as `readLoop` does.
+fn remoteLoop(self: *Slimed) void {
+    const buf = self.alloc.alloc(u8, max_frame) catch return self.fail(error.OutOfMemory);
+    defer self.alloc.free(buf);
+    // The host's own shell: the command is for its slimed to run.
+    self.attachFirst(buf, self.area, self.size, &.{}) catch |err| return self.fail(err);
+    log.info("attached workspace {d} on {f}", .{ self.workspace, std.unicode.fmtUtf16Le(self.host().?.label()) });
+    self.state.store(.attached, .release);
+    self.posting.store(true, .release);
+    _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
+    self.route(buf);
+}
+
+/// A host's slimed couldn't attach: say why, which for a channel that
+/// ended is what the helper said. Nobody's told if `deinit` is hanging
+/// up.
+fn fail(self: *Slimed, err: anyerror) void {
+    if (self.closing.load(.acquire)) return;
+    const ch = self.channel.?;
+    const text = switch (err) {
+        error.EndOfStream => if (ch.ended(5000)) |e| e.text() else "slimed hung up",
+        error.VersionMismatch => "its slimed doesn't match this slime",
+        error.Refused => "slimed refused to attach",
+        error.OutOfMemory => "out of memory",
+        else => @errorName(err),
+    };
+    log.info("no slimed on {f}: {s}", .{ std.unicode.fmtUtf16Le(ch.conn.label()), text });
+    self.failure.set(text);
+    self.state.store(.failed, .release);
+    _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
 }
 
 fn freeState(self: *Slimed) void {
@@ -502,9 +635,10 @@ fn commandUtf8(alloc: Allocator, command: []const u16) ![]u8 {
 }
 
 fn nextTag(self: *Slimed) u32 {
-    self.next_tag +%= 1;
-    if (self.next_tag == 0) self.next_tag = 1;
-    return self.next_tag;
+    while (true) {
+        const t = self.next_tag.fetchAdd(1, .monotonic) +% 1;
+        if (t != 0) return t;
+    }
 }
 
 fn send(self: *Slimed, msg: MsgType, id: u32, payload: []const u8) !void {
@@ -540,20 +674,31 @@ fn awaitReply(self: *Slimed, buf: []u8, t: u32, created: bool) !void {
     }
 }
 
-/// Reader thread: route frames until the connection ends, then tell
-/// every live pane.
+/// Reader thread for the local daemon.
 fn readLoop(self: *Slimed) void {
+    const buf = self.alloc.alloc(u8, max_frame) catch {
+        if (!self.closing.load(.acquire)) self.loseAll("out of memory");
+        return;
+    };
+    defer self.alloc.free(buf);
+    self.route(buf);
+}
+
+/// Route frames until the connection ends, then tell every live pane:
+/// for a host's, why its channel ended (the connection broke, say).
+fn route(self: *Slimed, buf: []u8) void {
+    while (true) {
+        const f = self.pipe.readFrame(buf) catch break;
+        _ = self.handle(f) catch |err| {
+            log.warn("bad message {d} from slimed: {}", .{ @intFromEnum(f.type), err });
+        };
+    }
+    if (self.closing.load(.acquire)) return;
     var why: []const u8 = "lost slimed";
-    if (self.alloc.alloc(u8, max_frame)) |buf| {
-        defer self.alloc.free(buf);
-        while (true) {
-            const f = self.pipe.readFrame(buf) catch break;
-            _ = self.handle(f) catch |err| {
-                log.warn("bad message {d} from slimed: {}", .{ @intFromEnum(f.type), err });
-            };
-        }
-    } else |_| why = "out of memory";
-    if (!self.closing.load(.acquire)) self.loseAll(why);
+    if (self.channel) |ch| if (ch.ended(1000)) |e| {
+        if (e.text().len > 0) why = e.text();
+    };
+    self.loseAll(why);
 }
 
 /// Act on one frame. Returns a Workspace message's tag, else 0.
@@ -671,7 +816,7 @@ fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
     }
     if (self.structure) |old| old.destroy(self.alloc);
     self.structure = st;
-    if (self.reader != null) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
+    if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
     return t;
 }
 
@@ -879,7 +1024,7 @@ fn openPipe(start_daemon: bool) !win32.HANDLE {
 
 /// `\\.\pipe\slimed-<user SID>`, NUL-terminated: one daemon per user.
 /// With SLIMED_INSTANCE set, `-<instance>` follows, as the daemon names
-/// it (persist.PipeName).
+/// it (persist.Address).
 fn pipeName(buf: *WideBuf) ![:0]const u16 {
     var token_buf: [256]u8 align(@alignOf(win32.TOKEN_USER)) = undefined;
     const sid = try currentUser(&token_buf);
@@ -1058,16 +1203,20 @@ const WideBuf = struct {
     }
 };
 
-/// The daemon's pipe, opened for overlapped I/O. Windows serializes
+/// The connection: the daemon's pipe, or a host's channel. Reads are the
+/// reader's (or `connect`'s, before the reader starts); writes take the
+/// connection's write lock.
+///
+/// The daemon's pipe is opened for overlapped I/O. Windows serializes
 /// synchronous I/O on a handle, so a blocking read, which the reader
 /// thread is in most of the time, would hold up every write behind it.
-/// Reads and writes each wait on their own event instead. Reads are the
-/// reader's (or `open`'s, before the reader starts); writes take the
-/// connection's write lock.
+/// Reads and writes each wait on their own event instead. A channel's
+/// anonymous pipes are synchronous, but one each way, so they don't.
 const Pipe = struct {
-    h: win32.HANDLE,
-    read_event: win32.HANDLE,
-    write_event: win32.HANDLE,
+    read_h: win32.HANDLE,
+    write_h: win32.HANDLE,
+    /// The daemon's pipe's, for reads and writes; null for a channel.
+    events: ?[2]win32.HANDLE,
 
     fn open(start_daemon: bool) !Pipe {
         const h = try openPipe(start_daemon);
@@ -1075,13 +1224,18 @@ const Pipe = struct {
         const read_event = win32.CreateEventW(null, win32.TRUE, win32.FALSE, null) orelse return win32.lastError("CreateEventW");
         errdefer _ = win32.CloseHandle(read_event);
         const write_event = win32.CreateEventW(null, win32.TRUE, win32.FALSE, null) orelse return win32.lastError("CreateEventW");
-        return .{ .h = h, .read_event = read_event, .write_event = write_event };
+        return .{ .read_h = h, .write_h = h, .events = .{ read_event, write_event } };
+    }
+
+    /// The channel's pipes, which stay the channel's.
+    fn ofChannel(ch: *SshConnection.Channel) Pipe {
+        return .{ .read_h = ch.output, .write_h = ch.input, .events = null };
     }
 
     fn close(self: *Pipe) void {
-        _ = win32.CloseHandle(self.h);
-        _ = win32.CloseHandle(self.read_event);
-        _ = win32.CloseHandle(self.write_event);
+        const events = self.events orelse return;
+        _ = win32.CloseHandle(self.read_h);
+        for (events) |e| _ = win32.CloseHandle(e);
     }
 
     fn send(self: *Pipe, msg: MsgType, id: u32, payload: []const u8) !void {
@@ -1104,12 +1258,14 @@ const Pipe = struct {
     fn writeAll(self: *Pipe, data: []const u8) !void {
         var rest = data;
         while (rest.len > 0) {
-            var ov: win32.OVERLAPPED = .{ .hEvent = self.write_event };
             const len: u32 = @intCast(@min(rest.len, std.math.maxInt(u32)));
-            if (win32.WriteFile(self.h, rest.ptr, len, null, &ov) == 0 and win32.GetLastError() != win32.ERROR_IO_PENDING)
-                return error.BrokenPipe;
             var n: u32 = 0;
-            if (win32.GetOverlappedResult(self.h, &ov, &n, win32.TRUE) == 0) return error.BrokenPipe;
+            if (self.events) |events| {
+                var ov: win32.OVERLAPPED = .{ .hEvent = events[1] };
+                if (win32.WriteFile(self.write_h, rest.ptr, len, null, &ov) == 0 and win32.GetLastError() != win32.ERROR_IO_PENDING)
+                    return error.BrokenPipe;
+                if (win32.GetOverlappedResult(self.write_h, &ov, &n, win32.TRUE) == 0) return error.BrokenPipe;
+            } else if (win32.WriteFile(self.write_h, rest.ptr, len, &n, null) == 0) return error.BrokenPipe;
             rest = rest[n..];
         }
     }
@@ -1127,15 +1283,19 @@ const Pipe = struct {
         };
     }
 
-    /// Fails at EOF, and when `cancel` aborts the read.
+    /// Fails at EOF, and when `deinit` cancels the read.
     fn readExact(self: *Pipe, buf: []u8) !void {
         var got: usize = 0;
         while (got < buf.len) {
-            var ov: win32.OVERLAPPED = .{ .hEvent = self.read_event };
-            if (win32.ReadFile(self.h, buf[got..].ptr, @intCast(buf.len - got), null, &ov) == 0 and win32.GetLastError() != win32.ERROR_IO_PENDING)
-                return error.EndOfStream;
+            const len: u32 = @intCast(buf.len - got);
             var n: u32 = 0;
-            if (win32.GetOverlappedResult(self.h, &ov, &n, win32.TRUE) == 0 or n == 0) return error.EndOfStream;
+            if (self.events) |events| {
+                var ov: win32.OVERLAPPED = .{ .hEvent = events[0] };
+                if (win32.ReadFile(self.read_h, buf[got..].ptr, len, null, &ov) == 0 and win32.GetLastError() != win32.ERROR_IO_PENDING)
+                    return error.EndOfStream;
+                if (win32.GetOverlappedResult(self.read_h, &ov, &n, win32.TRUE) == 0) return error.EndOfStream;
+            } else if (win32.ReadFile(self.read_h, buf[got..].ptr, len, &n, null) == 0) return error.EndOfStream;
+            if (n == 0) return error.EndOfStream;
             got += n;
         }
     }

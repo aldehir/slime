@@ -431,6 +431,7 @@ pub extern "kernel32" fn WaitNamedPipeW(LPCWSTR, u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetNamedPipeServerProcessId(HANDLE, *u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn OpenProcess(u32, BOOL, u32) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn CancelIoEx(HANDLE, ?*OVERLAPPED) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CancelSynchronousIo(HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetOverlappedResult(HANDLE, *OVERLAPPED, *u32, BOOL) callconv(.winapi) BOOL;
 pub extern "kernel32" fn Sleep(u32) callconv(.winapi) void;
 
