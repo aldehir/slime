@@ -12,6 +12,10 @@ zig build test
 ```
 
 - Zig 0.16.0 lives in `tools\` (gitignored; download from ziglang.org).
+- slimed links libghostty-vt with cgo, compiled by `zig cc` (the setup
+  script sets `CC`); no other C toolchain. `zig build` builds the static
+  libs into `ssh\internal\vt\lib`; for `go test` alone, run
+  `scripts\build-vt-lib.ps1` once. `scripts\race.ps1` runs `-race`.
 - Without the setup script, clang picks a legacy MSVC and the C++ deps fail
   with `char16_t` undeclared. Don't remove the machine's old VS installs.
 

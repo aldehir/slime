@@ -187,20 +187,29 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
         std.log.warn("go not found; building without slime-ssh and slimed (ssh:// commands and persist-sessions won't work)", .{});
         return;
     };
-    // slimed embeds libghostty-vt built as wasm (ssh/internal/vt), from a
-    // nested build of the submodule, which tracks its own sources.
-    const wasm = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-Demit-lib-vt", "-Dtarget=wasm32-freestanding", "-Doptimize=ReleaseSmall", "--prefix" });
-    const prefix = wasm.addOutputDirectoryArg("vt-wasm");
-    wasm.setCwd(b.path("ghostty"));
-    wasm.has_side_effects = true;
+    // slimed links libghostty-vt with cgo (ssh/internal/vt), as a static
+    // library for each target from a nested build of the submodule, which
+    // tracks its own sources. scripts/build-vt-lib.ps1 does the same.
     const copy = b.addUpdateSourceFiles();
-    copy.addCopyFileToSource(prefix.path(b, "bin/ghostty-vt.wasm"), "ssh/internal/vt/ghostty-vt.wasm");
+    for ([_]struct { zig: []const u8, go: []const u8, lib: []const u8 }{
+        .{ .zig = "x86_64-windows-gnu", .go = "windows_amd64", .lib = "ghostty-vt-static.lib" },
+        .{ .zig = "x86_64-linux-musl", .go = "linux_amd64", .lib = "libghostty-vt.a" },
+    }) |t| {
+        const lib = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-Demit-lib-vt", b.fmt("-Dtarget={s}", .{t.zig}), "-Doptimize=ReleaseFast", "--prefix" });
+        const prefix = lib.addOutputDirectoryArg(b.fmt("vt-{s}", .{t.zig}));
+        lib.setCwd(b.path("ghostty"));
+        lib.has_side_effects = true;
+        // Named as an archive on both, for cgo's -l (its flag check
+        // rejects a .lib path).
+        copy.addCopyFileToSource(prefix.path(b, b.fmt("lib/{s}", .{t.lib})), b.fmt("ssh/internal/vt/lib/{s}/libghostty-vt.a", .{t.go}));
+    }
     goBuild(b, go, "slimed").step.dependOn(&copy.step);
 
     // slime-pack builds slimed for each Linux target into
     // ssh/internal/payload/bin, which slime-ssh embeds.
     const pack = b.addSystemCommand(&.{ go, "run", "./cmd/slime-pack" });
     pack.setCwd(b.path("ssh"));
+    pack.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     pack.has_side_effects = true;
     pack.step.dependOn(&copy.step);
     goBuild(b, go, "slime-ssh").step.dependOn(&pack.step);
@@ -214,7 +223,10 @@ fn goBuild(b: *std.Build, go: []const u8, comptime name: []const u8) *std.Build.
     run.setCwd(b.path("ssh"));
     run.setEnvironmentVariable("GOOS", "windows");
     run.setEnvironmentVariable("GOARCH", "amd64");
-    run.setEnvironmentVariable("CGO_ENABLED", "0");
+    // slimed needs cgo for libghostty-vt, compiled by our Zig rather than
+    // whatever C compiler is on PATH.
+    run.setEnvironmentVariable("CGO_ENABLED", "1");
+    run.setEnvironmentVariable("CC", b.fmt("\"{s}\" cc -target x86_64-windows-gnu", .{b.graph.zig_exe}));
     run.has_side_effects = true;
     b.getInstallStep().dependOn(&b.addInstallBinFile(out, name ++ ".exe").step);
     return run;

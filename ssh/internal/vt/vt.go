@@ -1,53 +1,30 @@
-// Package vt runs libghostty-vt, built as wasm (scripts/build-vt-wasm.ps1),
-// under wazero, so the daemon holding terminal state needs no cgo.
+// Package vt runs libghostty-vt, linked in with cgo from a static
+// library built with Zig (scripts/build-vt-lib.ps1, or build.zig), for
+// the daemon that holds terminal state.
 //
-// Each Terminal gets its own module instance: wasm linear memory only
-// grows, so closing the instance is the only way to give a big
-// scrollback's memory back.
-//
-// The module is wasm32. Pointers and size_t are u32 offsets into the
-// instance's memory; out-parameters live in scratch memory allocated
-// from the guest.
+// cgo's C compiler is `zig cc` for the target: x86_64-windows-gnu on
+// Windows, x86_64-linux-musl (linked fully static) on Linux.
 package vt
+
+/*
+#cgo CFLAGS: -DGHOSTTY_STATIC -I${SRCDIR}/../../../ghostty/include
+#cgo windows,amd64 LDFLAGS: -L${SRCDIR}/lib/windows_amd64 -lghostty-vt -lntdll
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/lib/linux_amd64 -lghostty-vt
+#include <stdlib.h>
+#include <ghostty/vt.h>
+
+// In callbacks.c, which can see the exported Go callbacks.
+extern GhosttyResult slime_install_callbacks(GhosttyTerminal t, uintptr_t userdata);
+extern void slime_install_log(void);
+*/
+import "C"
 
 import (
 	"context"
-	_ "embed"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
-
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
-)
-
-//go:embed ghostty-vt.wasm
-var wasmBin []byte
-
-// Result codes (GhosttyResult).
-const (
-	resSuccess    = 0
-	resOutOfSpace = -3
-)
-
-// Options and data keys from terminal.h and snapshot.h.
-const (
-	optContinuationMaxBytes = 31
-
-	dataCols    = 1
-	dataRows    = 2
-	dataCursorX = 3
-	dataCursorY = 4
-	dataScreen  = 6
-	dataTitle   = 12
-	dataPwd     = 13
-
-	decoderOptMaxContinuation    = 0
-	decoderOptRetainContinuation = 1
-
-	formatPlain = 0
-	formatVT    = 1
+	"unsafe"
 )
 
 // ContinuationLimit is how many bytes of an unfinished escape sequence a
@@ -64,70 +41,59 @@ type Error struct {
 
 func (e *Error) Error() string { return fmt.Sprintf("vt: %s: result %d", e.Op, e.Code) }
 
-// Runtime holds the compiled module. Compiling takes most of the cost of
-// starting a terminal, so do it once and share the Runtime.
-type Runtime struct {
-	rt  wazero.Runtime
-	mod wazero.CompiledModule
-	log *slog.Logger
-
-	mu     sync.Mutex
-	nextID uint32
-	terms  map[uint32]*Terminal // by id, for the host callbacks
+func check(op string, r C.GhosttyResult) error {
+	if r != C.GHOSTTY_SUCCESS {
+		return &Error{Op: op, Code: int32(r)}
+	}
+	return nil
 }
 
-// NewRuntime compiles the embedded module. log receives libghostty-vt's
-// own log lines; nil discards them.
-func NewRuntime(ctx context.Context, log *slog.Logger) (*Runtime, error) {
+// Runtime makes terminals. It holds nothing: it's kept so callers set up
+// the package once, as they did when it compiled a wasm module.
+type Runtime struct{}
+
+// registry has the open terminals, for the callbacks, which find their
+// Terminal by the id in their userdata.
+var registry struct {
+	sync.Mutex
+	nextID uint32
+	terms  map[uint32]*Terminal
+}
+
+func lookup(id uint32) *Terminal {
+	registry.Lock()
+	defer registry.Unlock()
+	return registry.terms[id]
+}
+
+// logger receives libghostty-vt's own log lines. The library's log hook
+// is process-wide, so the last NewRuntime's logger wins.
+var logger struct {
+	sync.Mutex
+	l *slog.Logger
+}
+
+// NewRuntime returns a Runtime. log receives libghostty-vt's own log
+// lines; nil discards them.
+func NewRuntime(_ context.Context, log *slog.Logger) (*Runtime, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	rt := wazero.NewRuntime(ctx)
-	r := &Runtime{rt: rt, log: log, terms: map[uint32]*Terminal{}}
-	if err := r.hostModule(ctx); err != nil {
-		rt.Close(ctx)
-		return nil, err
-	}
-	_, err := rt.NewHostModuleBuilder("env").
-		NewFunctionBuilder().
-		WithFunc(func(ctx context.Context, m api.Module, ptr, n uint32) {
-			if b, ok := m.Memory().Read(ptr, n); ok {
-				r.log.Debug("ghostty-vt", "msg", string(b))
-			}
-		}).
-		Export("log").
-		Instantiate(ctx)
-	if err != nil {
-		rt.Close(ctx)
-		return nil, err
-	}
-	r.mod, err = rt.CompileModule(ctx, wasmBin)
-	if err != nil {
-		rt.Close(ctx)
-		return nil, err
-	}
-	return r, nil
+	logger.Lock()
+	logger.l = log
+	logger.Unlock()
+	C.slime_install_log()
+	return &Runtime{}, nil
 }
 
-// Close frees the runtime and every terminal still open on it.
-func (r *Runtime) Close(ctx context.Context) error { return r.rt.Close(ctx) }
+// Close does nothing: each Terminal frees itself on Close.
+func (r *Runtime) Close(context.Context) error { return nil }
 
 // Terminal is one libghostty-vt terminal. It isn't safe for concurrent
 // use.
 type Terminal struct {
-	ctx   context.Context
-	rt    *Runtime
-	id    uint32
-	mod   api.Module
-	tramp api.Module // installs the callbacks; see installCallbacks
-	mem   api.Memory
-	fn    funcs
-	term  uint32
-
-	// Guest scratch: out-parameters (16 bytes) and Write's input.
-	out     uint32
-	buf     uint32
-	bufSize uint32
+	id   uint32
+	term C.GhosttyTerminal
 
 	events Events
 	pend   pending
@@ -137,91 +103,16 @@ type Terminal struct {
 	cellW, cellH uint32
 }
 
-type funcs struct {
-	alloc, free                   api.Function
-	allocOpaque, freeOpaque       api.Function
-	ghosttyFree                   api.Function
-	termNew, termFree, termResize api.Function
-	termSet, termGet, termWrite   api.Function
-	snapEncode                    api.Function
-	decNewBuf, decSet, decDecode  api.Function
-	decFree                       api.Function
-	fmtNew, fmtFormat, fmtFree    api.Function
-	typeJSON                      api.Function
-}
-
-func (r *Runtime) instantiate() (*Terminal, error) {
-	ctx := context.Background()
-	r.mu.Lock()
-	r.nextID++
-	id := r.nextID
-	r.mu.Unlock()
-	// Named so the callback trampoline can import its table.
-	name := fmt.Sprintf("ghostty-vt-%d", id)
-	mod, err := r.rt.InstantiateModule(ctx, r.mod, wazero.NewModuleConfig().WithName(name))
-	if err != nil {
-		return nil, err
-	}
-	t := &Terminal{ctx: ctx, rt: r, id: id, mod: mod, mem: mod.Memory()}
-	var missing []string
-	get := func(name string) api.Function {
-		f := mod.ExportedFunction(name)
-		if f == nil {
-			missing = append(missing, name)
-		}
-		return f
-	}
-	t.fn = funcs{
-		alloc:       get("ghostty_wasm_alloc"),
-		free:        get("ghostty_wasm_free"),
-		allocOpaque: get("ghostty_wasm_alloc_opaque"),
-		freeOpaque:  get("ghostty_wasm_free_opaque"),
-		ghosttyFree: get("ghostty_free"),
-		termNew:     get("ghostty_terminal_new"),
-		termFree:    get("ghostty_terminal_free"),
-		termResize:  get("ghostty_terminal_resize"),
-		termSet:     get("ghostty_terminal_set"),
-		termGet:     get("ghostty_terminal_get"),
-		termWrite:   get("ghostty_terminal_vt_write"),
-		snapEncode:  get("ghostty_snapshot_encode_alloc"),
-		decNewBuf:   get("ghostty_snapshot_decoder_new_buf"),
-		decSet:      get("ghostty_snapshot_decoder_set"),
-		decDecode:   get("ghostty_snapshot_decoder_decode"),
-		decFree:     get("ghostty_snapshot_decoder_free"),
-		fmtNew:      get("ghostty_formatter_terminal_new"),
-		fmtFormat:   get("ghostty_formatter_format_alloc"),
-		fmtFree:     get("ghostty_formatter_free"),
-		typeJSON:    get("ghostty_type_json"),
-	}
-	if missing != nil {
-		mod.Close(ctx)
-		return nil, fmt.Errorf("vt: module lacks %v", missing)
-	}
-	if t.out, err = t.malloc(16); err != nil {
-		mod.Close(ctx)
-		return nil, err
-	}
-	return t, nil
-}
-
 // New creates a terminal with continuation tracking on, so Snapshot works
 // whatever the last Write ended on.
 func (r *Runtime) New(cols, rows uint16) (*Terminal, error) {
-	t, err := r.instantiate()
-	if err != nil {
+	var term C.GhosttyTerminal
+	if err := check("terminal_new", C.ghostty_terminal_new(nil, &term, C.uint16_t(cols), C.uint16_t(rows))); err != nil {
 		return nil, err
 	}
-	slot, err := t.call1(t.fn.allocOpaque)
-	if err == nil {
-		err = t.result("terminal_new", t.fn.termNew, 0, slot, uint64(cols), uint64(rows))
-		if err == nil {
-			t.term = t.u32(uint32(slot))
-		}
-		t.call(t.fn.freeOpaque, slot)
-	}
-	if err == nil {
-		err = t.setSize(optContinuationMaxBytes, ContinuationLimit)
-	}
+	t := &Terminal{term: term}
+	limit := C.size_t(ContinuationLimit)
+	err := check("terminal_set", C.ghostty_terminal_set(term, C.GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES, unsafe.Pointer(&limit)))
 	if err == nil {
 		err = t.finish()
 	}
@@ -236,15 +127,29 @@ func (r *Runtime) New(cols, rows uint16) (*Terminal, error) {
 // on as New leaves it. Callbacks set in the snapshot's terminal aren't
 // part of it; the new terminal gets its own.
 func (r *Runtime) Decode(snapshot []byte) (*Terminal, error) {
-	t, err := r.instantiate()
-	if err != nil {
+	if len(snapshot) == 0 {
+		return nil, &Error{Op: "snapshot_decoder_new_buf", Code: int32(C.GHOSTTY_INVALID_VALUE)}
+	}
+	var dec C.GhosttySnapshotDecoder
+	src := (*C.uint8_t)(unsafe.Pointer(&snapshot[0]))
+	if err := check("snapshot_decoder_new_buf", C.ghostty_snapshot_decoder_new_buf(nil, &dec, src, C.size_t(len(snapshot)))); err != nil {
 		return nil, err
 	}
-	err = t.decode(snapshot)
-	if err == nil {
-		err = t.finish()
+	defer C.ghostty_snapshot_decoder_free(dec)
+	limit := C.size_t(ContinuationLimit)
+	if err := check("snapshot_decoder_set", C.ghostty_snapshot_decoder_set(dec, C.GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES, unsafe.Pointer(&limit))); err != nil {
+		return nil, err
 	}
-	if err != nil {
+	retain := C.bool(true)
+	if err := check("snapshot_decoder_set", C.ghostty_snapshot_decoder_set(dec, C.GHOSTTY_SNAPSHOT_DECODER_OPT_RETAIN_CONTINUATION, unsafe.Pointer(&retain))); err != nil {
+		return nil, err
+	}
+	var term C.GhosttyTerminal
+	if err := check("snapshot_decoder_decode", C.ghostty_snapshot_decoder_decode(dec, &term)); err != nil {
+		return nil, err
+	}
+	t := &Terminal{term: term}
+	if err := t.finish(); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -257,62 +162,33 @@ func (t *Terminal) finish() error {
 	if t.cols, t.rows, err = t.Size(); err != nil {
 		return err
 	}
-	t.rt.mu.Lock()
-	t.rt.terms[t.id] = t
-	t.rt.mu.Unlock()
-	return t.installCallbacks(t.rt, fmt.Sprintf("ghostty-vt-%d", t.id))
+	registry.Lock()
+	if registry.terms == nil {
+		registry.terms = map[uint32]*Terminal{}
+	}
+	registry.nextID++
+	t.id = registry.nextID
+	registry.terms[t.id] = t
+	registry.Unlock()
+	return check("terminal_set", C.slime_install_callbacks(t.term, C.uintptr_t(t.id)))
 }
 
 // SetEvents sets the handlers for what the terminal reports.
 func (t *Terminal) SetEvents(e Events) { t.events = e }
 
-func (t *Terminal) decode(snapshot []byte) error {
-	src, err := t.copyIn(snapshot)
-	if err != nil {
-		return err
-	}
-	slot, err := t.call1(t.fn.allocOpaque)
-	if err != nil {
-		return err
-	}
-	defer t.call(t.fn.freeOpaque, slot)
-	err = t.result("snapshot_decoder_new_buf", t.fn.decNewBuf,
-		0, slot, uint64(src), uint64(len(snapshot)))
-	if err != nil {
-		return err
-	}
-	dec := uint64(t.u32(uint32(slot)))
-	defer t.call(t.fn.decFree, dec)
-
-	t.mem.WriteUint32Le(t.out, ContinuationLimit)
-	if err := t.result("snapshot_decoder_set", t.fn.decSet, dec, decoderOptMaxContinuation, uint64(t.out)); err != nil {
-		return err
-	}
-	t.mem.WriteByte(t.out, 1)
-	if err := t.result("snapshot_decoder_set", t.fn.decSet, dec, decoderOptRetainContinuation, uint64(t.out)); err != nil {
-		return err
-	}
-	if err := t.result("snapshot_decoder_decode", t.fn.decDecode, dec, slot); err != nil {
-		return err
-	}
-	t.term = t.u32(uint32(slot))
-	return nil
-}
-
-// Close frees the terminal and its instance.
+// Close frees the terminal.
 func (t *Terminal) Close() error {
-	if t.mod == nil {
+	if t.term == nil {
 		return nil
 	}
-	t.rt.mu.Lock()
-	delete(t.rt.terms, t.id)
-	t.rt.mu.Unlock()
-	if t.tramp != nil {
-		t.tramp.Close(t.ctx)
+	if t.id != 0 {
+		registry.Lock()
+		delete(registry.terms, t.id)
+		registry.Unlock()
 	}
-	err := t.mod.Close(t.ctx)
-	t.mod = nil
-	return err
+	C.ghostty_terminal_free(t.term)
+	t.term = nil
+	return nil
 }
 
 // Write feeds pty output to the terminal, then delivers the events it
@@ -321,23 +197,17 @@ func (t *Terminal) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	src, err := t.copyIn(p)
-	if err != nil {
-		return 0, err
-	}
-	_, err = t.fn.termWrite.Call(t.ctx, uint64(t.term), uint64(src), uint64(len(p)))
+	// p holds no Go pointers, so C may read it in place.
+	C.ghostty_terminal_vt_write(t.term, (*C.uint8_t)(unsafe.Pointer(&p[0])), C.size_t(len(p)))
 	t.deliver()
-	if err != nil {
-		return 0, err
-	}
 	return len(p), nil
 }
 
 // Resize changes the grid size. The cell size in pixels is the client's
 // (zero if unknown); it only feeds pixel size reports.
 func (t *Terminal) Resize(cols, rows uint16, cellW, cellH uint32) error {
-	err := t.result("terminal_resize", t.fn.termResize,
-		uint64(t.term), uint64(cols), uint64(rows), uint64(cellW), uint64(cellH))
+	err := check("terminal_resize", C.ghostty_terminal_resize(t.term,
+		C.uint16_t(cols), C.uint16_t(rows), C.uint32_t(cellW), C.uint32_t(cellH)))
 	if err != nil {
 		return err
 	}
@@ -348,221 +218,122 @@ func (t *Terminal) Resize(cols, rows uint16, cellW, cellH uint32) error {
 }
 
 // Title is the title the program last set (OSC 0/2).
-func (t *Terminal) Title() (string, error) { return t.getString(dataTitle) }
+func (t *Terminal) Title() (string, error) { return t.getString(C.GHOSTTY_TERMINAL_DATA_TITLE) }
 
 // Pwd is the working directory the shell last reported (OSC 7, 9, 1337),
 // as sent: OSC 7's is a file:// URI.
-func (t *Terminal) Pwd() (string, error) { return t.getString(dataPwd) }
+func (t *Terminal) Pwd() (string, error) { return t.getString(C.GHOSTTY_TERMINAL_DATA_PWD) }
 
-func (t *Terminal) getString(key uint64) (string, error) {
-	// GhosttyString: ptr, len. Borrowed from the terminal.
-	if err := t.result("terminal_get", t.fn.termGet, uint64(t.term), key, uint64(t.out)); err != nil {
+func (t *Terminal) getString(key C.GhosttyTerminalData) (string, error) {
+	// Borrowed from the terminal.
+	var s C.GhosttyString
+	if err := check("terminal_get", C.ghostty_terminal_get(t.term, key, unsafe.Pointer(&s))); err != nil {
 		return "", err
 	}
-	ptr, n := t.u32(t.out), t.u32(t.out+4)
-	if n == 0 {
-		return "", nil
+	return goString(s), nil
+}
+
+func goString(s C.GhosttyString) string {
+	if s.len == 0 {
+		return ""
 	}
-	b, ok := t.mem.Read(ptr, n)
-	if !ok {
-		return "", errors.New("vt: string out of bounds")
-	}
-	return string(b), nil
+	return C.GoStringN((*C.char)(unsafe.Pointer(s.ptr)), C.int(s.len))
 }
 
 // Size reports the grid size.
 func (t *Terminal) Size() (cols, rows uint16, err error) {
-	c, err := t.getU16(dataCols)
+	c, err := t.getU16(C.GHOSTTY_TERMINAL_DATA_COLS)
 	if err != nil {
 		return 0, 0, err
 	}
-	r, err := t.getU16(dataRows)
+	r, err := t.getU16(C.GHOSTTY_TERMINAL_DATA_ROWS)
 	return c, r, err
 }
 
 // Cursor reports the cursor position on the active screen, zero-based.
 func (t *Terminal) Cursor() (x, y uint16, err error) {
-	x, err = t.getU16(dataCursorX)
+	x, err = t.getU16(C.GHOSTTY_TERMINAL_DATA_CURSOR_X)
 	if err != nil {
 		return 0, 0, err
 	}
-	y, err = t.getU16(dataCursorY)
+	y, err = t.getU16(C.GHOSTTY_TERMINAL_DATA_CURSOR_Y)
 	return x, y, err
 }
 
 // AltScreen reports whether the alternate screen is active.
 func (t *Terminal) AltScreen() (bool, error) {
-	if err := t.result("terminal_get", t.fn.termGet, uint64(t.term), dataScreen, uint64(t.out)); err != nil {
+	var screen C.GhosttyTerminalScreen
+	if err := check("terminal_get", C.ghostty_terminal_get(t.term, C.GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, unsafe.Pointer(&screen))); err != nil {
 		return false, err
 	}
-	v, _ := t.mem.ReadUint32Le(t.out)
-	return v != 0, nil
+	return screen != C.GHOSTTY_TERMINAL_SCREEN_PRIMARY, nil
+}
+
+func (t *Terminal) getU16(key C.GhosttyTerminalData) (uint16, error) {
+	var v C.uint16_t
+	if err := check("terminal_get", C.ghostty_terminal_get(t.term, key, unsafe.Pointer(&v))); err != nil {
+		return 0, err
+	}
+	return uint16(v), nil
 }
 
 // Snapshot encodes the terminal's complete state, scrollback included.
 func (t *Terminal) Snapshot() ([]byte, error) {
-	return t.allocOut("snapshot_encode_alloc", t.fn.snapEncode, uint64(t.term), 0)
+	var ptr *C.uint8_t
+	var n C.size_t
+	if err := check("snapshot_encode_alloc", C.ghostty_snapshot_encode_alloc(t.term, nil, &ptr, &n)); err != nil {
+		return nil, err
+	}
+	return takeBytes(ptr, n), nil
 }
 
 // Text formats the active screen as plain text, scrollback included,
 // with soft-wrapped lines joined and trailing blanks trimmed.
 func (t *Terminal) Text() (string, error) {
-	b, err := t.format(formatPlain)
+	b, err := t.format(C.GHOSTTY_FORMATTER_FORMAT_PLAIN)
 	return string(b), err
 }
 
 // VT formats the active screen, scrollback included, as the VT sequences
 // that redraw it on a cleared terminal of the same size: styles, then
 // the cursor, modes, scrolling region, tab stops, and keyboard state.
-func (t *Terminal) VT() ([]byte, error) { return t.format(formatVT) }
+func (t *Terminal) VT() ([]byte, error) { return t.format(C.GHOSTTY_FORMATTER_FORMAT_VT) }
 
-// GhosttyFormatterTerminalOptions, wasm32 layout (TestFormatterLayout
-// checks it against ghostty_type_json).
-const (
-	fmtOptsSize   = 40
-	fmtOffEmit    = 4
-	fmtOffUnwrap  = 8
-	fmtOffTrim    = 9
-	fmtOffExtra   = 12
-	fmtOffScreen  = fmtOffExtra + 12
-	fmtExtraSize  = 24
-	fmtScreenSize = 12
-	// The bools after each extra struct's size field: palette, modes,
-	// scrolling region, tab stops, pwd, keyboard; then the screen's
-	// cursor, style, hyperlink, protection, kitty keyboard, charsets.
-	fmtExtraBools  = 6
-	fmtScreenBools = 6
-)
-
-func (t *Terminal) format(emit uint32) ([]byte, error) {
-	opts, err := t.malloc(fmtOptsSize)
-	if err != nil {
-		return nil, err
-	}
-	defer t.call(t.fn.free, uint64(opts), fmtOptsSize)
-	t.mem.Write(opts, make([]byte, fmtOptsSize))
-	t.mem.WriteUint32Le(opts, fmtOptsSize)
-	t.mem.WriteUint32Le(opts+fmtOffEmit, emit)
-	t.mem.WriteUint32Le(opts+fmtOffExtra, fmtExtraSize)
-	t.mem.WriteUint32Le(opts+fmtOffScreen, fmtScreenSize)
-	if emit == formatPlain {
-		t.mem.WriteByte(opts+fmtOffUnwrap, 1)
-		t.mem.WriteByte(opts+fmtOffTrim, 1)
+func (t *Terminal) format(emit C.GhosttyFormatterFormat) ([]byte, error) {
+	var opts C.GhosttyFormatterTerminalOptions
+	opts.size = C.sizeof_GhosttyFormatterTerminalOptions
+	opts.emit = emit
+	opts.extra.size = C.sizeof_GhosttyFormatterTerminalExtra
+	opts.extra.screen.size = C.sizeof_GhosttyFormatterScreenExtra
+	if emit == C.GHOSTTY_FORMATTER_FORMAT_PLAIN {
+		opts.unwrap = true
+		opts.trim = true
 	} else {
 		// Every extra but pwd (OSC 7 would claim our host's directory).
-		for i := range uint32(fmtExtraBools) {
-			if i != 4 {
-				t.mem.WriteByte(opts+fmtOffExtra+4+i, 1)
-			}
-		}
-		for i := range uint32(fmtScreenBools) {
-			t.mem.WriteByte(opts+fmtOffScreen+4+i, 1)
-		}
+		e := &opts.extra
+		e.palette, e.modes, e.scrolling_region, e.tabstops, e.keyboard = true, true, true, true, true
+		s := &e.screen
+		s.cursor, s.style, s.hyperlink, s.protection, s.kitty_keyboard, s.charsets = true, true, true, true, true, true
 	}
-
-	slot, err := t.call1(t.fn.allocOpaque)
-	if err != nil {
+	var f C.GhosttyFormatter
+	if err := check("formatter_terminal_new", C.ghostty_formatter_terminal_new(nil, &f, t.term, opts)); err != nil {
 		return nil, err
 	}
-	defer t.call(t.fn.freeOpaque, slot)
-	// Structs passed by value go by pointer in the wasm32 C ABI.
-	if err := t.result("formatter_terminal_new", t.fn.fmtNew, 0, slot, uint64(t.term), uint64(opts)); err != nil {
+	defer C.ghostty_formatter_free(f)
+	var ptr *C.uint8_t
+	var n C.size_t
+	if err := check("formatter_format_alloc", C.ghostty_formatter_format_alloc(f, nil, &ptr, &n)); err != nil {
 		return nil, err
 	}
-	f := uint64(t.u32(uint32(slot)))
-	defer t.call(t.fn.fmtFree, f)
-	return t.allocOut("formatter_format_alloc", t.fn.fmtFormat, f, 0)
+	return takeBytes(ptr, n), nil
 }
 
-// allocOut calls an `_alloc` function whose last two parameters are
-// `uint8_t **out_ptr, size_t *out_len`, copies the result out, and frees
-// it.
-func (t *Terminal) allocOut(op string, f api.Function, args ...uint64) ([]byte, error) {
-	args = append(args, uint64(t.out), uint64(t.out+4))
-	if err := t.result(op, f, args...); err != nil {
-		return nil, err
+// takeBytes copies out a buffer libghostty-vt allocated and frees it.
+func takeBytes(ptr *C.uint8_t, n C.size_t) []byte {
+	if ptr == nil {
+		return nil
 	}
-	ptr, n := t.u32(t.out), t.u32(t.out+4)
-	if ptr == 0 {
-		return nil, nil
-	}
-	b, ok := t.mem.Read(ptr, n)
-	if !ok {
-		return nil, fmt.Errorf("vt: %s: result out of bounds", op)
-	}
-	b = append([]byte(nil), b...)
-	t.call(t.fn.ghosttyFree, 0, uint64(ptr), uint64(n))
-	return b, nil
-}
-
-func (t *Terminal) setSize(opt uint64, v uint32) error {
-	t.mem.WriteUint32Le(t.out, v)
-	return t.result("terminal_set", t.fn.termSet, uint64(t.term), opt, uint64(t.out))
-}
-
-func (t *Terminal) getU16(key uint64) (uint16, error) {
-	if err := t.result("terminal_get", t.fn.termGet, uint64(t.term), key, uint64(t.out)); err != nil {
-		return 0, err
-	}
-	v, _ := t.mem.ReadUint16Le(t.out)
-	return v, nil
-}
-
-// copyIn copies p into the reusable input buffer, growing it as needed.
-func (t *Terminal) copyIn(p []byte) (uint32, error) {
-	if uint32(len(p)) > t.bufSize {
-		if t.buf != 0 {
-			t.call(t.fn.free, uint64(t.buf), uint64(t.bufSize))
-			t.buf, t.bufSize = 0, 0
-		}
-		size := max(uint32(len(p)), 64*1024)
-		buf, err := t.malloc(size)
-		if err != nil {
-			return 0, err
-		}
-		t.buf, t.bufSize = buf, size
-	}
-	if !t.mem.Write(t.buf, p) {
-		return 0, errors.New("vt: input buffer out of bounds")
-	}
-	return t.buf, nil
-}
-
-func (t *Terminal) malloc(n uint32) (uint32, error) {
-	p, err := t.call1(t.fn.alloc, uint64(n))
-	if err != nil {
-		return 0, err
-	}
-	if p == 0 {
-		return 0, errors.New("vt: out of memory")
-	}
-	return uint32(p), nil
-}
-
-func (t *Terminal) u32(ptr uint32) uint32 {
-	v, _ := t.mem.ReadUint32Le(ptr)
-	return v
-}
-
-func (t *Terminal) call(f api.Function, args ...uint64) ([]uint64, error) {
-	return f.Call(t.ctx, args...)
-}
-
-func (t *Terminal) call1(f api.Function, args ...uint64) (uint64, error) {
-	r, err := f.Call(t.ctx, args...)
-	if err != nil {
-		return 0, err
-	}
-	return r[0], nil
-}
-
-func (t *Terminal) result(op string, f api.Function, args ...uint64) error {
-	r, err := f.Call(t.ctx, args...)
-	if err != nil {
-		return err
-	}
-	if code := int32(r[0]); code != resSuccess {
-		return &Error{Op: op, Code: code}
-	}
-	return nil
+	b := C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+	C.ghostty_free(nil, ptr, n)
+	return b
 }

@@ -1,10 +1,14 @@
 package vt
 
+/*
+#include <ghostty/vt.h>
+*/
+import "C"
+
 import (
 	"context"
-	"fmt"
-
-	"github.com/tetratelabs/wazero"
+	"log/slog"
+	"unsafe"
 )
 
 // Events are what a terminal reports while it processes output. They're
@@ -66,46 +70,6 @@ type Mode struct {
 	Enabled bool
 }
 
-// Callback options (GhosttyTerminalOption) and the order the trampoline
-// installs them in.
-var callbacks = []struct {
-	name string
-	opt  uint64
-	typ  byte // index into the trampoline's types
-}{
-	{"write_pty", 1, 0},
-	{"bell", 2, 1},
-	{"title_changed", 5, 1},
-	{"pwd_changed", 25, 1},
-	{"device_attributes", 8, 2},
-	{"size", 6, 2},
-	{"unknown_sequence", 35, 3},
-	{"semantic_prompt", 42, 3},
-	{"program_status", 46, 3},
-}
-
-const optUserdata = 0
-
-// GhosttyTerminalUnknownSequence, wasm32 layout (TestCallbackLayouts):
-// a u32 tag, then the union at its 8-byte alignment.
-const (
-	unknownTagMode    = 2
-	unknownOffMode    = 8
-	unknownOffANSI    = 10
-	unknownOffEnabled = 11
-)
-
-// GhosttyTerminalProgramStatus and GhosttyTerminalSemanticPrompt, wasm32
-// layout (TestCallbackLayouts): only what slimed reads.
-const (
-	statusOffState    = 4
-	statusOffProgress = 12
-	statusOffID       = 16 // a GhosttyString: pointer, then length
-
-	promptOffKind   = 4
-	promptKindStart = 1
-)
-
 // pending is what callbacks recorded during one Write.
 type pending struct {
 	reply []byte
@@ -124,163 +88,120 @@ const (
 	daConformance = 62
 	daFeatureANSI = 22
 	daDeviceType  = 1
-
-	// GhosttyDeviceAttributes, wasm32 layout (TestCallbackLayouts).
-	daOffFeatures    = 2
-	daOffNumFeatures = 132
-	daOffSecondary   = 136
-	daSize           = 148
 )
 
-// hostModule defines the callbacks libghostty-vt calls. Each finds its
-// Terminal by the userdata, which is the terminal's id.
-func (r *Runtime) hostModule(ctx context.Context) error {
-	b := r.rt.NewHostModuleBuilder("slime")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud, ptr, n uint32) {
-			if t := r.lookup(ud); t != nil {
-				if p, ok := t.mem.Read(ptr, n); ok {
-					t.pend.reply = append(t.pend.reply, p...)
-				}
-			}
-		}).Export("write_pty")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud uint32) {
-			if t := r.lookup(ud); t != nil {
-				t.pend.bell++
-			}
-		}).Export("bell")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud uint32) {
-			if t := r.lookup(ud); t != nil {
-				t.pend.title = true
-			}
-		}).Export("title_changed")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud uint32) {
-			if t := r.lookup(ud); t != nil {
-				t.pend.pwd = true
-			}
-		}).Export("pwd_changed")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud, out uint32) uint32 {
-			t := r.lookup(ud)
-			if t == nil {
-				return 0
-			}
-			t.mem.Write(out, make([]byte, daSize))
-			t.mem.WriteUint16Le(out, daConformance)
-			t.mem.WriteUint16Le(out+daOffFeatures, daFeatureANSI)
-			t.mem.WriteUint32Le(out+daOffNumFeatures, 1)
-			t.mem.WriteUint16Le(out+daOffSecondary, daDeviceType)
-			return 1
-		}).Export("device_attributes")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud, out uint32) uint32 {
-			t := r.lookup(ud)
-			if t == nil {
-				return 0
-			}
-			// GhosttySizeReportSize: rows, columns, cell width, height.
-			t.mem.WriteUint16Le(out, t.rows)
-			t.mem.WriteUint16Le(out+2, t.cols)
-			t.mem.WriteUint32Le(out+4, t.cellW)
-			t.mem.WriteUint32Le(out+8, t.cellH)
-			return 1
-		}).Export("size")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud, seq uint32) {
-			t := r.lookup(ud)
-			if t == nil {
-				return
-			}
-			if tag, _ := t.mem.ReadUint32Le(seq); tag != unknownTagMode {
-				return
-			}
-			mode, _ := t.mem.ReadUint16Le(seq + unknownOffMode)
-			ansi, _ := t.mem.ReadByte(seq + unknownOffANSI)
-			enabled, _ := t.mem.ReadByte(seq + unknownOffEnabled)
-			t.pend.modes = append(t.pend.modes, Mode{mode, ansi != 0, enabled != 0})
-		}).Export("unknown_sequence")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud, ev uint32) {
-			t := r.lookup(ud)
-			if t == nil {
-				return
-			}
-			if kind, _ := t.mem.ReadUint32Le(ev + promptOffKind); kind == promptKindStart {
-				t.pend.status = append(t.pend.status, nil)
-			}
-		}).Export("semantic_prompt")
-	b.NewFunctionBuilder().
-		WithFunc(func(_ context.Context, _, ud, rep uint32) {
-			t := r.lookup(ud)
-			if t == nil {
-				return
-			}
-			state, _ := t.mem.ReadUint32Le(rep + statusOffState)
-			progress, _ := t.mem.ReadByte(rep + statusOffProgress)
-			ptr, _ := t.mem.ReadUint32Le(rep + statusOffID)
-			n, _ := t.mem.ReadUint32Le(rep + statusOffID + 4)
-			id := ""
-			if n > 0 {
-				if b, ok := t.mem.Read(ptr, n); ok {
-					id = string(b)
-				}
-			}
-			t.pend.status = append(t.pend.status, &Status{State: StatusState(state), Progress: int8(progress), ID: id})
-		}).Export("program_status")
-	_, err := b.Instantiate(ctx)
-	return err
+// The callbacks run inside ghostty_terminal_vt_write (or resize), on the
+// goroutine that called it. They only record, for deliver.
+
+func termOf(ud unsafe.Pointer) *Terminal { return lookup(uint32(uintptr(ud))) }
+
+//export goWritePty
+func goWritePty(_ C.GhosttyTerminal, ud unsafe.Pointer, data *C.uint8_t, n C.size_t) {
+	if t := termOf(ud); t != nil && n > 0 {
+		t.pend.reply = append(t.pend.reply, unsafe.Slice((*byte)(data), int(n))...)
+	}
 }
 
-func (r *Runtime) lookup(id uint32) *Terminal {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.terms[id]
+//export goBell
+func goBell(_ C.GhosttyTerminal, ud unsafe.Pointer) {
+	if t := termOf(ud); t != nil {
+		t.pend.bell++
+	}
 }
 
-// installCallbacks puts the host callbacks into the instance's function
-// table and points the terminal's options at them.
-//
-// wazero gives the host no way to write a guest's table, so a trampoline
-// module, assembled per instance because it names the instance in its
-// imports, imports the table and the host functions and grows the table
-// by one entry for each. libghostty-vt patches its table to be growable
-// for this.
-func (t *Terminal) installCallbacks(r *Runtime, name string) error {
-	compiled, err := r.rt.CompileModule(t.ctx, trampoline(name))
-	if err != nil {
-		return fmt.Errorf("vt: trampoline: %w", err)
+//export goTitleChanged
+func goTitleChanged(_ C.GhosttyTerminal, ud unsafe.Pointer) {
+	if t := termOf(ud); t != nil {
+		t.pend.title = true
 	}
-	defer compiled.Close(t.ctx)
-	tramp, err := r.rt.InstantiateModule(t.ctx, compiled, wazero.NewModuleConfig().WithName(""))
-	if err != nil {
-		return fmt.Errorf("vt: trampoline: %w", err)
+}
+
+//export goPwdChanged
+func goPwdChanged(_ C.GhosttyTerminal, ud unsafe.Pointer) {
+	if t := termOf(ud); t != nil {
+		t.pend.pwd = true
 	}
-	t.tramp = tramp
-	idx, err := tramp.ExportedFunction("install").Call(t.ctx)
-	if err != nil {
-		return err
+}
+
+//export goDeviceAttributes
+func goDeviceAttributes(_ C.GhosttyTerminal, ud unsafe.Pointer, out *C.GhosttyDeviceAttributes) C.bool {
+	if termOf(ud) == nil {
+		return false
 	}
-	if err := t.termSetValue(optUserdata, uint64(t.id)); err != nil {
-		return err
+	*out = C.GhosttyDeviceAttributes{}
+	out.primary.conformance_level = daConformance
+	out.primary.features[0] = daFeatureANSI
+	out.primary.num_features = 1
+	out.secondary.device_type = daDeviceType
+	return true
+}
+
+//export goSize
+func goSize(_ C.GhosttyTerminal, ud unsafe.Pointer, out *C.GhosttySizeReportSize) C.bool {
+	t := termOf(ud)
+	if t == nil {
+		return false
 	}
-	for i, cb := range callbacks {
-		if int32(idx[i]) < 0 {
-			return fmt.Errorf("vt: table.grow failed for %s", cb.name)
+	out.rows = C.uint16_t(t.rows)
+	out.columns = C.uint16_t(t.cols)
+	out.cell_width = C.uint32_t(t.cellW)
+	out.cell_height = C.uint32_t(t.cellH)
+	return true
+}
+
+//export goUnknownSequence
+func goUnknownSequence(_ C.GhosttyTerminal, ud unsafe.Pointer, seq *C.GhosttyTerminalUnknownSequence) {
+	t := termOf(ud)
+	if t == nil || seq.tag != C.GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_MODE {
+		return
+	}
+	// cgo sees the value union as bytes.
+	m := (*C.GhosttyTerminalUnknownModeSequence)(unsafe.Pointer(&seq.value))
+	t.pend.modes = append(t.pend.modes, Mode{uint16(m.mode), bool(m.ansi), bool(m.enabled)})
+}
+
+//export goSemanticPrompt
+func goSemanticPrompt(_ C.GhosttyTerminal, ud unsafe.Pointer, ev *C.GhosttyTerminalSemanticPrompt) {
+	if t := termOf(ud); t != nil && ev.kind == C.GHOSTTY_SEMANTIC_PROMPT_PROMPT_START {
+		t.pend.status = append(t.pend.status, nil)
+	}
+}
+
+//export goProgramStatus
+func goProgramStatus(_ C.GhosttyTerminal, ud unsafe.Pointer, rep *C.GhosttyTerminalProgramStatus) {
+	if t := termOf(ud); t != nil {
+		t.pend.status = append(t.pend.status, &Status{
+			State:    StatusState(rep.state),
+			Progress: int8(rep.progress),
+			ID:       goString(rep.id),
+		})
+	}
+}
+
+//export goLog
+func goLog(_ unsafe.Pointer, level C.GhosttySysLogLevel, scope *C.uint8_t, scopeLen C.size_t, msg *C.uint8_t, msgLen C.size_t) {
+	logger.Lock()
+	l := logger.l
+	logger.Unlock()
+	if l == nil {
+		return
+	}
+	lvl := slog.LevelDebug
+	switch level {
+	case C.GHOSTTY_SYS_LOG_LEVEL_ERROR:
+		lvl = slog.LevelError
+	case C.GHOSTTY_SYS_LOG_LEVEL_WARNING:
+		lvl = slog.LevelWarn
+	case C.GHOSTTY_SYS_LOG_LEVEL_INFO:
+		lvl = slog.LevelInfo
+	}
+	text := func(p *C.uint8_t, n C.size_t) string {
+		if n == 0 {
+			return ""
 		}
-		if err := t.termSetValue(cb.opt, idx[i]); err != nil {
-			return err
-		}
+		return string(unsafe.Slice((*byte)(p), int(n)))
 	}
-	return nil
-}
-
-// termSetValue sets an option whose value is the pointer argument itself
-// (callbacks, userdata), not something it points to.
-func (t *Terminal) termSetValue(opt, v uint64) error {
-	return t.result("terminal_set", t.fn.termSet, uint64(t.term), opt, v)
+	l.Log(context.Background(), lvl, "ghostty-vt", "scope", text(scope, scopeLen), "msg", text(msg, msgLen))
 }
 
 // deliver hands what the last Write's callbacks recorded to the handlers.
@@ -315,97 +236,4 @@ func (t *Terminal) deliver() {
 	if p.pwd && t.events.PwdChanged != nil {
 		t.events.PwdChanged()
 	}
-}
-
-// trampoline assembles the wasm module that installs the callbacks:
-//
-//	(import "slime" "<cb>" (func ...))                  ;; one per callback
-//	(import "<module>" "__indirect_function_table" (table 0 funcref))
-//	(elem declare func 0 1 2 ...)
-//	(func (export "install") (result i32 i32 ...)
-//	  (table.grow (ref.func 0) (i32.const 1))           ;; old size = index
-//	  ...)
-func trampoline(module string) []byte {
-	const (
-		i32     = 0x7f
-		funcref = 0x70
-	)
-	n := len(callbacks)
-
-	var types []byte
-	const installType = 4
-	types = append(types, installType+1)
-	types = append(types, 0x60, 4, i32, i32, i32, i32, 0) // write_pty
-	types = append(types, 0x60, 2, i32, i32, 0)           // bell, title, pwd
-	types = append(types, 0x60, 3, i32, i32, i32, 1, i32) // DA, size
-	types = append(types, 0x60, 3, i32, i32, i32, 0)      // unknown_sequence, semantic_prompt, program_status
-	types = append(types, 0x60, 0, byte(n))               // install
-	for range n {
-		types = append(types, i32)
-	}
-
-	var imports []byte
-	imports = uleb(imports, uint32(n+1))
-	for _, cb := range callbacks {
-		imports = name(imports, "slime")
-		imports = name(imports, cb.name)
-		imports = append(imports, 0x00, cb.typ)
-	}
-	imports = name(imports, module)
-	imports = name(imports, "__indirect_function_table")
-	imports = append(imports, 0x01, funcref, 0x00, 0x00) // table, min 0, no max
-
-	funcs := []byte{1, installType}
-
-	var exports []byte
-	exports = append(exports, 1)
-	exports = name(exports, "install")
-	exports = append(exports, 0x00)
-	exports = uleb(exports, uint32(n)) // function index after the imports
-
-	// A declarative segment lets ref.func name the imported functions.
-	elems := []byte{1, 0x03, 0x00}
-	elems = uleb(elems, uint32(n))
-	for i := range n {
-		elems = uleb(elems, uint32(i))
-	}
-
-	body := []byte{0} // no locals
-	for i := range n {
-		body = append(body, 0xd2) // ref.func
-		body = uleb(body, uint32(i))
-		body = append(body, 0x41, 1)       // i32.const 1
-		body = append(body, 0xfc, 0x0f, 0) // table.grow 0
-	}
-	body = append(body, 0x0b)
-	code := []byte{1}
-	code = uleb(code, uint32(len(body)))
-	code = append(code, body...)
-
-	m := []byte{0x00, 'a', 's', 'm', 1, 0, 0, 0}
-	for _, s := range []struct {
-		id   byte
-		data []byte
-	}{{1, types}, {2, imports}, {3, funcs}, {7, exports}, {9, elems}, {10, code}} {
-		m = append(m, s.id)
-		m = uleb(m, uint32(len(s.data)))
-		m = append(m, s.data...)
-	}
-	return m
-}
-
-func uleb(b []byte, v uint32) []byte {
-	for {
-		c := byte(v & 0x7f)
-		v >>= 7
-		if v == 0 {
-			return append(b, c)
-		}
-		b = append(b, c|0x80)
-	}
-}
-
-func name(b []byte, s string) []byte {
-	b = uleb(b, uint32(len(s)))
-	return append(b, s...)
 }

@@ -3,7 +3,6 @@ package vt
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -91,80 +90,6 @@ func sameState(t testing.TB, a, b *Terminal) {
 	}
 }
 
-type layoutField struct {
-	Offset int `json:"offset"`
-}
-
-type layoutType struct {
-	Size   int                    `json:"size"`
-	Fields map[string]layoutField `json:"fields"`
-}
-
-// layouts reads the module's own struct layout manifest.
-func layouts(t *testing.T) map[string]layoutType {
-	t.Helper()
-	term := newTerm(t, 10, 2)
-	p, err := term.call1(term.fn.typeJSON)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var raw []byte
-	for off := uint32(p); ; off++ {
-		c, ok := term.mem.ReadByte(off)
-		if !ok {
-			t.Fatal("type json runs off memory")
-		}
-		if c == 0 {
-			break
-		}
-		raw = append(raw, c)
-	}
-	var manifest struct {
-		Types map[string]layoutType `json:"types"`
-	}
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		t.Fatal(err)
-	}
-	return manifest.Types
-}
-
-type layoutCheck struct {
-	name      string
-	got, want int
-}
-
-func checkLayout(t *testing.T, checks []layoutCheck) {
-	t.Helper()
-	for _, c := range checks {
-		if c.got != c.want {
-			t.Errorf("%s: manifest %d, code uses %d", c.name, c.got, c.want)
-		}
-	}
-}
-
-// TestFormatterLayout checks Text's hand-written struct offsets.
-func TestFormatterLayout(t *testing.T) {
-	types := layouts(t)
-	opts := types["GhosttyFormatterTerminalOptions"]
-	extra := types["GhosttyFormatterTerminalExtra"]
-	screen := types["GhosttyFormatterScreenExtra"]
-	checkLayout(t, []layoutCheck{
-		{"options size", opts.Size, 40},
-		{"emit", opts.Fields["emit"].Offset, 4},
-		{"unwrap", opts.Fields["unwrap"].Offset, 8},
-		{"trim", opts.Fields["trim"].Offset, 9},
-		{"extra", opts.Fields["extra"].Offset, 12},
-		{"extra size", extra.Size, 24},
-		{"extra.screen", extra.Fields["screen"].Offset, 12},
-		{"screen size", screen.Size, 12},
-		{"extra.palette", extra.Fields["palette"].Offset, 4},
-		{"extra.pwd", extra.Fields["pwd"].Offset, 8},
-		{"extra.keyboard", extra.Fields["keyboard"].Offset, 4 + fmtExtraBools - 1},
-		{"screen.cursor", screen.Fields["cursor"].Offset, 4},
-		{"screen.charsets", screen.Fields["charsets"].Offset, 4 + fmtScreenBools - 1},
-	})
-}
-
 // TestVT redraws a terminal from its VT output onto a fresh one.
 func TestVT(t *testing.T) {
 	src := newTerm(t, 30, 6)
@@ -179,39 +104,6 @@ func TestVT(t *testing.T) {
 	if !bytes.Contains(b, []byte("\x1b[")) {
 		t.Errorf("no escape sequences in %q", b)
 	}
-}
-
-// TestCallbackLayouts checks the structs the host callbacks fill.
-func TestCallbackLayouts(t *testing.T) {
-	types := layouts(t)
-	da := types["GhosttyDeviceAttributes"]
-	primary := types["GhosttyDeviceAttributesPrimary"]
-	size := types["GhosttySizeReportSize"]
-	seq := types["GhosttyTerminalUnknownSequence"]
-	mode := types["GhosttyTerminalUnknownModeSequence"]
-	status := types["GhosttyTerminalProgramStatus"]
-	prompt := types["GhosttyTerminalSemanticPrompt"]
-	str := types["GhosttyString"]
-	checkLayout(t, []layoutCheck{
-		{"status state", status.Fields["state"].Offset, statusOffState},
-		{"status progress", status.Fields["progress"].Offset, statusOffProgress},
-		{"status id", status.Fields["id"].Offset, statusOffID},
-		{"string ptr", str.Fields["ptr"].Offset, 0},
-		{"string len", str.Fields["len"].Offset, 4},
-		{"prompt kind", prompt.Fields["kind"].Offset, promptOffKind},
-		{"unknown value", seq.Fields["value"].Offset, unknownOffMode},
-		{"unknown mode.mode", unknownOffMode + mode.Fields["mode"].Offset, unknownOffMode},
-		{"unknown mode.ansi", unknownOffMode + mode.Fields["ansi"].Offset, unknownOffANSI},
-		{"unknown mode.enabled", unknownOffMode + mode.Fields["enabled"].Offset, unknownOffEnabled},
-		{"DA size", da.Size, daSize},
-		{"DA secondary", da.Fields["secondary"].Offset, daOffSecondary},
-		{"DA1 features", primary.Fields["features"].Offset, daOffFeatures},
-		{"DA1 num_features", primary.Fields["num_features"].Offset, daOffNumFeatures},
-		{"size rows", size.Fields["rows"].Offset, 0},
-		{"size columns", size.Fields["columns"].Offset, 2},
-		{"size cell_width", size.Fields["cell_width"].Offset, 4},
-		{"size cell_height", size.Fields["cell_height"].Offset, 8},
-	})
 }
 
 // recorder collects a terminal's events.
@@ -311,8 +203,8 @@ func TestDecodedCallbacks(t *testing.T) {
 	}
 }
 
-// TestChurn opens and closes terminals to catch leaks of instances or
-// trampolines.
+// TestChurn opens and closes terminals to catch ones left in the
+// callback registry.
 func TestChurn(t *testing.T) {
 	for range 200 {
 		term, err := runtime(t).New(80, 24)
@@ -326,9 +218,9 @@ func TestChurn(t *testing.T) {
 		}
 		term.Close()
 	}
-	shared.mu.Lock()
-	n := len(shared.terms)
-	shared.mu.Unlock()
+	registry.Lock()
+	n := len(registry.terms)
+	registry.Unlock()
 	if n != 0 {
 		t.Errorf("%d terminals still registered", n)
 	}
@@ -468,15 +360,6 @@ func BenchmarkNew(b *testing.B) {
 		}
 		term.Close()
 	}
-}
-
-// TestIdleMemory logs a fresh terminal's linear memory, the floor per
-// session.
-func TestIdleMemory(t *testing.T) {
-	term := newTerm(t, 80, 24)
-	t.Logf("idle terminal: %d KiB linear memory", term.mem.Size()/1024)
-	term.Write(benchStream())
-	t.Logf("after 1 MiB of output: %d KiB", term.mem.Size()/1024)
 }
 
 // TestProgramStatus checks OSC 7501 reports and new prompts come through

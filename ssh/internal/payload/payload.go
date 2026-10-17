@@ -17,7 +17,6 @@ var bin embed.FS
 // Targets are the systems slime-pack builds for.
 var Targets = []struct{ OS, Arch string }{
 	{"linux", "amd64"},
-	{"linux", "arm64"},
 }
 
 // Name is the file a target's build is kept in, here and on the host.

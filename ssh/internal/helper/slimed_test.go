@@ -155,9 +155,9 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 
 func TestSlimedFoundNotInstalled(t *testing.T) {
 	needPayload(t)
-	build, _ := payload.For("linux", "arm64")
+	build, _ := payload.For("linux", "amd64")
 	exe := "/home/alde/.cache/slime/slimed-" + build.ID
-	host := &fakeHost{uname: "Linux aarch64", installed: map[string][]byte{exe: nil}}
+	host := &fakeHost{uname: "Linux x86_64", installed: map[string][]byte{exe: nil}}
 	srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
 	h := newDialogHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
 	h.openSlimed(1, "")

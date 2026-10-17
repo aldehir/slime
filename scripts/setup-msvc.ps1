@@ -31,5 +31,11 @@ if (-not $vsPath) {
 $vcVersion = (Get-Content (Join-Path $vsPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt')).Trim()
 $env:VCToolsInstallDir = Join-Path $vsPath "VC\Tools\MSVC\$vcVersion\"
 
+# cgo (ssh/internal/vt links libghostty-vt) compiles with Zig's clang, so
+# `go build` and `go test` in ssh\ need no other C toolchain. slime-pack
+# sets its own CC for each target.
+$env:CGO_ENABLED = '1'
+$env:CC = 'zig cc -target x86_64-windows-gnu'
+
 Write-Host "zig  $(& zig version)"
 Write-Host "msvc $env:VCToolsInstallDir"

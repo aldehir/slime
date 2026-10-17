@@ -33,10 +33,34 @@ func main() {
 	}
 }
 
+// zigTargets are the `zig cc` targets cgo compiles libghostty-vt's
+// callers with, by Go target.
+var zigTargets = map[string]string{
+	"linux/amd64": "x86_64-linux-musl",
+}
+
+// zig is the Zig to compile with: $ZIG (build.zig sets it), else zig on
+// PATH.
+func zig() string {
+	if z := os.Getenv("ZIG"); z != "" {
+		return z
+	}
+	return "zig"
+}
+
 func pack(tmp, goos, goarch string) error {
+	triple, ok := zigTargets[goos+"/"+goarch]
+	if !ok {
+		return fmt.Errorf("no zig target for %s/%s", goos, goarch)
+	}
 	exe := filepath.Join(tmp, "slimed-"+goos+"-"+goarch)
-	build := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", exe, "./cmd/slimed")
-	build.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=0")
+	// Linked fully static against musl, so it runs whatever the host's
+	// libc, and stripped by the C linker too: -s alone leaves the Zig
+	// library's debug info.
+	build := exec.Command("go", "build", "-trimpath",
+		"-ldflags=-s -w -linkmode external -extldflags '-static -s'", "-o", exe, "./cmd/slimed")
+	build.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED=1",
+		"CC="+zig()+" cc -target "+triple)
 	build.Stdout = os.Stderr
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {

@@ -100,8 +100,10 @@ under the MIT License, Copyright (c) Microsoft Corporation.
 ## slime-ssh and slimed
 
 `slime-ssh.exe` and `slimed.exe` are written in Go, and statically link
-the Go standard library and the modules below, unmodified. `slimed.exe`
-also embeds libghostty-vt (above), compiled to WebAssembly.
+the Go standard library and the modules below, unmodified. `slimed`
+also links libghostty-vt (above) as a static library, with the C
+runtime Zig provides for each target: MinGW-w64's on Windows, musl on
+Linux (see below).
 `slime-ssh.exe` carries builds of `slimed` for Linux, which it installs
 on SSH hosts.
 
@@ -229,11 +231,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 [spf13/cobra](https://github.com/spf13/cobra), Copyright 2013-2023 The
-Cobra Authors,
+Cobra Authors, and
 [inconshreveable/mousetrap](https://github.com/inconshreveable/mousetrap),
-Copyright 2022 Alan Shreve, and
-[tetratelabs/wazero](https://github.com/tetratelabs/wazero), Copyright
-2020-2023 wazero authors, are licensed under the Apache License 2.0:
+Copyright 2022 Alan Shreve, are licensed under the Apache License 2.0:
 
 ```
                                 Apache License
@@ -410,4 +410,81 @@ Copyright 2022 Alan Shreve, and
       defend, and hold each Contributor harmless for any liability
       incurred by, or claims asserted against, such Contributor by reason
       of your accepting any such warranty or additional liability.
+```
+
+[musl](https://musl.libc.org/), linked into the Linux builds of `slimed`,
+is licensed as follows:
+
+```
+----------------------------------------------------------------------
+Copyright © 2005-2020 Rich Felker, et al.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+----------------------------------------------------------------------
+```
+
+The [MinGW-w64](https://www.mingw-w64.org/) runtime, linked into
+`slimed.exe`, is licensed as follows:
+
+```
+With exception of certain parts that are prominently marked as being
+in the Public Domain, BSD, or LGPL this Software is provided under the
+Zope Public License (ZPL) Version 2.1.
+
+Copyright (c) 2009 - 2013 by the mingw-w64 project
+
+See the AUTHORS file for the list of contributors to the mingw-w64 project.
+
+This license has been certified as open source. It has also been designated
+as GPL compatible by the Free Software Foundation (FSF).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+   1. Redistributions in source code must retain the accompanying copyright
+      notice, this list of conditions, and the following disclaimer.
+   2. Redistributions in binary form must reproduce the accompanying
+      copyright notice, this list of conditions, and the following disclaimer
+      in the documentation and/or other materials provided with the
+      distribution.
+   3. Names of the copyright holders must not be used to endorse or promote
+      products derived from this software without prior written permission
+      from the copyright holders.
+   4. The right to distribute this software or to use it for any purpose does
+      not give you the right to use Servicemarks (sm) or Trademarks (tm) of
+      the copyright holders.  Use of them is covered by separate agreement
+      with the copyright holders.
+   5. If any files are modified, you must cause the modified files to carry
+      prominent notices stating that you changed the files and the date of
+      any change.
+
+Disclaimer
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY EXPRESSED
+OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA,
+OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
