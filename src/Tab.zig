@@ -23,7 +23,7 @@ focus: *Session,
 /// sizes, out of sight.
 zoom: ?*Session = null,
 /// Between panes, from the last `place`.
-dividers: std.ArrayList(Rect) = .empty,
+dividers: std.ArrayList(Divider) = .empty,
 
 pub const Axis = Slimed.Axis;
 
@@ -235,16 +235,16 @@ pub fn place(self: *Tab, alloc: Allocator, area: Rect, gap: f32) !void {
         z.rect = area;
         return;
     }
-    try self.placeNode(alloc, self.root, area, gap);
+    try self.placeNode(alloc, &self.root, area, gap);
 }
 
-fn placeNode(self: *Tab, alloc: Allocator, node: Node, r: Rect, gap: f32) !void {
-    const sp = switch (node) {
+fn placeNode(self: *Tab, alloc: Allocator, node: *Node, r: Rect, gap: f32) !void {
+    const sp = switch (node.*) {
         .pane => |s| {
             s.rect = r;
             return;
         },
-        .split => |sp| sp,
+        .split => |*sp| sp,
     };
     const row = sp.axis == .row;
     const n: f32 = @floatFromInt(sp.children.len);
@@ -254,7 +254,7 @@ fn placeNode(self: *Tab, alloc: Allocator, node: Node, r: Rect, gap: f32) !void 
     for (sp.children) |c| total += c.share;
     var sum: u32 = 0;
     var start: f32 = base;
-    for (sp.children, 0..) |c, i| {
+    for (sp.children, 0..) |*c, i| {
         sum += c.share;
         const last = i == sp.children.len - 1;
         // Ends on whole pixels, from the running total so rounding
@@ -265,12 +265,75 @@ fn placeNode(self: *Tab, alloc: Allocator, node: Node, r: Rect, gap: f32) !void 
             .{ .x = start, .y = r.y, .w = @max(0, end - start), .h = r.h }
         else
             .{ .x = r.x, .y = start, .w = r.w, .h = @max(0, end - start) };
-        try self.placeNode(alloc, c.node, child, gap);
-        if (!last) try self.dividers.append(alloc, if (row)
-            .{ .x = end, .y = r.y, .w = gap, .h = r.h }
-        else
-            .{ .x = r.x, .y = end, .w = r.w, .h = gap });
+        try self.placeNode(alloc, &c.node, child, gap);
+        if (!last) try self.dividers.append(alloc, .{
+            .rect = if (row)
+                .{ .x = end, .y = r.y, .w = gap, .h = r.h }
+            else
+                .{ .x = r.x, .y = end, .w = r.w, .h = gap },
+            .split = sp,
+            .index = i,
+            .span = span,
+        });
         start = end + gap;
+    }
+}
+
+/// A gap between two of a split's children, which dragging moves.
+/// Points into the tree, so it's good until the tree next changes.
+pub const Divider = struct {
+    rect: Rect,
+    split: *Split,
+    /// Between children `index` and `index + 1`.
+    index: usize,
+    /// The split's pixels, gaps aside, which its shares divide.
+    span: f32,
+
+    pub fn axis(self: Divider) Axis {
+        return self.split.axis;
+    }
+
+    /// The shares of the children on either side.
+    pub fn shares(self: Divider) [2]u16 {
+        return .{ self.split.children[self.index].share, self.split.children[self.index + 1].share };
+    }
+
+    /// Move the divider `delta` pixels from where the children's shares
+    /// `from` had it, keeping either side at least `min` pixels where
+    /// there's room. Only those two children change.
+    pub fn drag(self: Divider, from: [2]u16, delta: f32, min: f32) void {
+        var total: u32 = 0;
+        for (self.split.children) |c| total += c.share;
+        if (total == 0 or self.span <= 0) return;
+        const pair = @as(u32, from[0]) + from[1];
+        if (pair < 2) return;
+        const per = self.span / @as(f32, @floatFromInt(total));
+        const pair_px = @as(f32, @floatFromInt(pair)) * per;
+        const lo = @min(min, pair_px / 2);
+        const a_px = std.math.clamp(@as(f32, @floatFromInt(from[0])) * per + delta, lo, pair_px - lo);
+        const a: u32 = std.math.clamp(@as(u32, @intFromFloat(@round(a_px / per))), 1, pair - 1);
+        self.split.children[self.index].share = @intCast(a);
+        self.split.children[self.index + 1].share = @intCast(pair - a);
+    }
+};
+
+/// The tree as slimed's, in `arena`, for sending back after a drag. Null
+/// if a pane isn't slimed's.
+pub fn toLayout(self: *const Tab, arena: Allocator) !?Slimed.Node {
+    return toLayoutNode(arena, self.root);
+}
+
+fn toLayoutNode(arena: Allocator, node: Node) !?Slimed.Node {
+    switch (node) {
+        .pane => |s| return .{ .pane = s.slimedPane() orelse return null },
+        .split => |sp| {
+            const children = try arena.alloc(Slimed.Child, sp.children.len);
+            for (children, sp.children) |*out, c| out.* = .{
+                .share = c.share,
+                .node = try toLayoutNode(arena, c.node) orelse return null,
+            };
+            return .{ .split = .{ .axis = sp.axis, .children = children } };
+        },
     }
 }
 
@@ -327,6 +390,17 @@ test "placing and removing panes" {
     try std.testing.expectEqual(Rect{ .x = 311, .y = 121, .w = 100, .h = 100 }, c.rect);
     try std.testing.expectEqual(@as(usize, 2), tab.dividers.items.len);
     try std.testing.expectEqual(@as(usize, 3), tab.count());
+
+    // Dragging the row's divider 100 of its 400 pixels left makes it
+    // 50/50; past the minimum, it stops there.
+    const d = tab.dividers.items[0];
+    try std.testing.expectEqual(Axis.row, d.axis());
+    const from = d.shares();
+    d.drag(from, -100, 50);
+    try std.testing.expectEqual([2]u16{ 5000, 5000 }, d.shares());
+    d.drag(from, -1000, 50);
+    try std.testing.expectEqual([2]u16{ 1250, 8750 }, d.shares());
+    d.drag(from, 0, 50);
 
     // Removing c gives its space to b, which takes the focus, and the
     // column collapses.

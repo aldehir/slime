@@ -78,8 +78,8 @@ pub const Hit = union(enum) {
     split_right: usize,
     split_down: usize,
     zoom: usize,
-    /// Between panes, or around them.
-    divider,
+    /// The gap between two panes, `View.dividers[i]`, which drags.
+    divider: usize,
     /// The terminal area under a dialog, away from its controls.
     dialog,
     dialog_button: usize,
@@ -100,6 +100,8 @@ pub const View = struct {
     /// The active tab's panes on screen, which tile `paneArea` but for
     /// the gaps between them (one pane while one is zoomed).
     panes: []const Pane = &.{},
+    /// Those gaps.
+    dividers: []const Rect = &.{},
     /// The host being typed after "Connect" was clicked, if it was.
     connect: ?*const TextField = null,
     /// The on phase of the caret's blink, while focused.

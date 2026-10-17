@@ -152,14 +152,18 @@ a daemon that holds every pane's ConPTY and terminal state, arranged in
 tabs (each a layout tree) and workspaces. A window attaches the workspace
 detached last, or a new one, and mirrors it: closing the window detaches
 the workspace, closing a pane ends it. Each sidebar row is a tab, drawn as
-its tree of panes; the buttons at a pane's top right split it or zoom it.
+its tree of panes; the buttons at a pane's top right split it or zoom it,
+and dragging the gap between panes resizes them.
 `slimed tab new`, `split`, and the rest change a workspace from scripts,
 attached or not. Off by default, and only slimed's tabs split.
 
-- **Dividers can't be dragged**, and there are no split bindings
-  (Ghostty's `new_split`, `goto_split`, `resize_split`,
-  `equalize_splits`, `toggle_split_zoom`): splitting and zooming are
-  mouse only, as is moving focus between panes.
+- **No split bindings** (Ghostty's `new_split`, `goto_split`,
+  `resize_split`, `equalize_splits`, `toggle_split_zoom`): splitting,
+  zooming, resizing, and moving focus between panes are mouse only.
+- **Dragging a divider resizes the ptys on every move**, so shells
+  redraw as it goes; ConPTY copes, but a full-screen program may flicker.
+  Holding resizes until the drag ends would need the panes drawn
+  scaled or cropped meanwhile.
 - **Every pane shares the window's font size.** Panes keep their own
   cell size in slimed's layout, but the window draws them all from one
   font grid, and Ctrl+= resizes every pane.

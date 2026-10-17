@@ -121,6 +121,7 @@ next_session_id: u32 = 1,
 view_tabs: std.ArrayList(Chrome.View.Tab) = .empty,
 view_groups: std.ArrayList(Chrome.View.Group) = .empty,
 view_panes: std.ArrayList(Chrome.View.Pane) = .empty,
+view_dividers: std.ArrayList(Chrome.Rect) = .empty,
 /// The active tab's panes on screen, as `view` lists them.
 shown: std.ArrayList(*Session) = .empty,
 /// Scratch for `render`.
@@ -172,6 +173,8 @@ bound_key: ?u32 = null,
 /// A mouse button went down over the terminal, which then gets the mouse
 /// until every button is up.
 mouse_in_terminal: bool = false,
+/// A divider being dragged, which has the mouse until the button's up.
+drag: ?Drag = null,
 /// The tab a middle click went down on, to close it on release.
 middle_pressed: ?usize = null,
 /// TrackMouseEvent is armed for the mouse leaving the client area, and
@@ -185,6 +188,17 @@ quiet_until: u64 = 0,
 
 /// Only used with `-Dstats`.
 stats: Stats = .{},
+
+const Drag = struct {
+    tab: *Tab,
+    /// As `Tab.place` made it when the button went down; the tree it
+    /// points into doesn't change while dragging (see `cancelDrag`).
+    divider: Tab.Divider,
+    /// The children's shares then, and the mouse's position across the
+    /// divider.
+    from: [2]u16,
+    origin: i32,
+};
 
 const Hold = enum {
     none,
@@ -303,6 +317,7 @@ pub fn destroy(self: *Window) void {
     self.view_tabs.deinit(self.alloc);
     self.view_groups.deinit(self.alloc);
     self.view_panes.deinit(self.alloc);
+    self.view_dividers.deinit(self.alloc);
     self.shown.deinit(self.alloc);
     self.frame_panes.deinit(self.alloc);
     _ = win32.CloseHandle(self.output_event);
@@ -436,6 +451,7 @@ fn slimedChanged(self: *Window) void {
 /// it no longer has. Sessions placed from `arrived` are taken out of it.
 fn applyStructure(self: *Window, st: *const Slimed.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
     const alloc = self.alloc;
+    self.cancelDrag();
     const was_active: ?*Tab = if (self.tabs.items.len > 0) self.activeTab() else null;
     const was_focus: ?*Session = if (was_active) |t| t.focus else null;
 
@@ -681,6 +697,56 @@ fn toggleZoom(self: *Window, i: usize) void {
     self.dirty = true;
 }
 
+/// Start dragging divider `i` of the active tab, if slimed has its tree.
+fn startDrag(self: *Window, i: usize, pos: win32.POINT) void {
+    const t = self.activeTab();
+    if (t.id == 0 or self.slimed == null or i >= t.dividers.items.len) return;
+    const d = t.dividers.items[i];
+    self.hideTip();
+    self.drag = .{ .tab = t, .divider = d, .from = d.shares(), .origin = across(d, pos) };
+    _ = win32.SetCapture(self.hwnd.?);
+}
+
+/// The mouse's position across divider `d`'s axis.
+fn across(d: Tab.Divider, pos: win32.POINT) i32 {
+    return if (d.axis() == .row) pos.x else pos.y;
+}
+
+/// Move the dragged divider to the mouse, resizing the panes either side
+/// as it goes. Each keeps room for a few cells.
+fn dragTo(self: *Window, d: Drag, pos: win32.POINT) void {
+    const m = self.grid.metrics;
+    const pad = self.paddingPx();
+    const min: f32 = @floatFromInt(if (d.divider.axis() == .row) pad.left + pad.right + 4 * m.cell_width else pad.top + pad.bottom + 2 * m.cell_height);
+    const before = d.divider.shares();
+    d.divider.drag(d.from, @floatFromInt(across(d.divider, pos) - d.origin), min);
+    if (std.meta.eql(before, d.divider.shares())) return;
+    self.layoutTab(d.tab);
+    self.dirty = true;
+}
+
+/// Let go of the dragged divider and send slimed the tree it left.
+fn endDrag(self: *Window) void {
+    const d = self.drag orelse return;
+    // First: releasing the capture comes back as WM_CAPTURECHANGED.
+    self.drag = null;
+    _ = win32.ReleaseCapture();
+    if (std.meta.eql(d.from, d.divider.shares())) return;
+    const conn = self.slimed orelse return;
+    var arena: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena.deinit();
+    const root = (d.tab.toLayout(arena.allocator()) catch return) orelse return;
+    conn.layout(d.tab.id, root) catch |err| log.err("sending the layout failed: {}", .{err});
+}
+
+/// Drop a drag whose tree is about to change, as it stands: slimed's
+/// tree, or the pane closing, decides the layout now.
+fn cancelDrag(self: *Window) void {
+    if (self.drag == null) return;
+    self.drag = null;
+    _ = win32.ReleaseCapture();
+}
+
 /// The active tab's pane `view` listed at `i`.
 fn shownPane(self: *const Window, i: usize) ?*Session {
     return if (i < self.shown.items.len) self.shown.items[i] else null;
@@ -709,6 +775,7 @@ fn forgetHost(self: *Window, g: usize) void {
 /// Close pane `s` of tab `ti`, killing what runs in it. Closing a tab's
 /// last pane closes the tab.
 fn closePane(self: *Window, ti: usize, s: *Session) void {
+    self.cancelDrag();
     const t = self.tabs.items[ti];
     if (t.count() <= 1) return self.closeTab(ti);
     const focused = ti == self.active and s == t.focus;
@@ -725,6 +792,7 @@ fn closePane(self: *Window, ti: usize, s: *Session) void {
 /// Close tab `i`, killing what runs in its panes. Closing the last one
 /// closes the window.
 fn closeTab(self: *Window, i: usize) void {
+    self.cancelDrag();
     if (self.tabs.items.len <= 1) {
         // Closing the window only detaches slimed's panes.
         var it = self.tabs.items[i].iterator();
@@ -1187,6 +1255,7 @@ fn view(self: *Window) Chrome.View {
     self.view_tabs.clearRetainingCapacity();
     self.view_groups.clearRetainingCapacity();
     self.view_panes.clearRetainingCapacity();
+    self.view_dividers.clearRetainingCapacity();
     self.shown.clearRetainingCapacity();
     // Local is always listed, for its button, then every host.
     self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .tabs = 0, .kind = .local });
@@ -1219,10 +1288,12 @@ fn view(self: *Window) Chrome.View {
             break;
         };
     }
+    for (tab.dividers.items) |d| self.view_dividers.append(self.alloc, d.rect) catch break;
     return .{
         .groups = self.view_groups.items,
         .tabs = self.view_tabs.items,
         .panes = self.view_panes.items,
+        .dividers = self.view_dividers.items,
         .connect = if (self.connect_field) |*f| f else null,
         .caret_visible = self.blink_visible,
         .dialog = if (self.activeSession().login) |l| &l.dialog else null,
@@ -1294,6 +1365,12 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         self.tracking_mouse = win32.TrackMouseEvent(&tme) != 0;
     }
 
+    if (self.drag) |d| {
+        self.dragTo(d, pos);
+        if (!held) self.endDrag();
+        return;
+    }
+
     if (self.mouse_in_terminal) {
         s.mouseInput(msg, wparam, toPane(s, pos));
         if (!held) {
@@ -1325,6 +1402,7 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
     switch (msg) {
         win32.WM_LBUTTONDOWN => {
+            if (hit == .divider) return self.startDrag(hit.divider, pos);
             self.setPressed(hit);
             _ = win32.SetCapture(self.hwnd.?);
             // Rows switch on press, as tabs do.
@@ -1914,6 +1992,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         // Losing the capture mid-drag (alt+tab, a modal window) ends it.
         win32.WM_CAPTURECHANGED => {
             if (lparam != @as(isize, @bitCast(@intFromPtr(hwnd)))) {
+                if (self.drag != null) self.endDrag();
                 if (self.mouse_in_terminal) {
                     self.mouse_in_terminal = false;
                     self.activeSession().cancelSelection();
@@ -1945,6 +2024,11 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             var cursor = win32.IDC_ARROW;
             const hit = self.hitAt(pos);
             if (hit == .dialog_field) cursor = win32.IDC_IBEAM;
+            const divider: ?Tab.Divider = if (self.drag) |d| d.divider else switch (hit) {
+                .divider => |i| if (i < self.activeTab().dividers.items.len) self.activeTab().dividers.items[i] else null,
+                else => null,
+            };
+            if (divider) |d| cursor = if (d.axis() == .row) win32.IDC_SIZEWE else win32.IDC_SIZENS;
             const pane = if (self.mouse_in_terminal) self.activeSession() else switch (hit) {
                 .terminal => |i| self.shownPane(i),
                 else => null,

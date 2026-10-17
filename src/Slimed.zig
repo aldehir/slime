@@ -418,6 +418,50 @@ pub fn split(self: *Slimed, pane: u32, dir: Direction, command: []const u16) !vo
     try self.send(.split, 0, p.bytes());
 }
 
+/// Replace tab `tab`'s tree with `root`, which must hold the same panes:
+/// a divider was dragged. Each split's shares are scaled to sum to the
+/// whole slimed wants. The tree comes back as a Workspace message. UI
+/// thread.
+pub fn layout(self: *Slimed, tab: u32, root: Node) !void {
+    var p: Payload = .{};
+    defer p.deinit(self.alloc);
+    try p.putU32(self.alloc, tab);
+    try putNode(self.alloc, &p, root);
+    try self.send(.layout, 0, p.bytes());
+}
+
+/// layout.go's Whole: what a split's shares sum to.
+const whole_share = 10000;
+
+fn putNode(alloc: Allocator, p: *Payload, node: Node) !void {
+    switch (node) {
+        .pane => |id| {
+            try p.list.append(alloc, 0);
+            try p.putU32(alloc, id);
+        },
+        .split => |sp| {
+            try p.list.append(alloc, 1);
+            try p.list.append(alloc, @intFromEnum(sp.axis));
+            try p.putU16(alloc, @intCast(sp.children.len));
+            var total: u32 = 0;
+            for (sp.children) |c| total += c.share;
+            // Scaled from the running total, so rounding doesn't add up;
+            // every child keeps at least 1.
+            var sum: u32 = 0;
+            var given: u32 = 0;
+            for (sp.children, 0..) |c, i| {
+                sum += c.share;
+                const left: u32 = @intCast(sp.children.len - 1 - i);
+                const end: u32 = if (total == 0) whole_share * @as(u32, @intCast(i + 1)) / @as(u32, @intCast(sp.children.len)) else @intCast(@as(u64, sum) * whole_share / total);
+                const share = std.math.clamp(end -| given, 1, whole_share - given - left);
+                given += share;
+                try p.putU16(alloc, @intCast(share));
+                try putNode(alloc, p, c.node);
+            }
+        },
+    }
+}
+
 /// A tag for a request whose panes the window shows when they come.
 fn requestTag(self: *Slimed) !u32 {
     const t = self.nextTag();
@@ -1146,6 +1190,28 @@ const Reader = struct {
         return self.take(try self.readU32());
     }
 };
+
+test "a layout's shares are sent summing to the whole" {
+    const alloc = std.testing.allocator;
+    var inner = [_]Child{ .{ .share = 1, .node = .{ .pane = 2 } }, .{ .share = 1, .node = .{ .pane = 3 } }, .{ .share = 1, .node = .{ .pane = 4 } } };
+    var outer = [_]Child{ .{ .share = 7000, .node = .{ .pane = 1 } }, .{ .share = 2000, .node = .{ .split = .{ .axis = .column, .children = &inner } } } };
+    var p: Payload = .{};
+    defer p.deinit(alloc);
+    try putNode(alloc, &p, .{ .split = .{ .axis = .row, .children = &outer } });
+
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var r: Reader = .{ .buf = p.bytes() };
+    const back = try readNode(arena.allocator(), &r, 0);
+    const row = back.split.children;
+    try std.testing.expectEqual(@as(u16, 7777), row[0].share);
+    try std.testing.expectEqual(@as(u16, 2223), row[1].share);
+    const column = row[1].node.split.children;
+    try std.testing.expectEqual(@as(u16, 3333), column[0].share);
+    try std.testing.expectEqual(@as(u16, 3333), column[1].share);
+    try std.testing.expectEqual(@as(u16, 3334), column[2].share);
+    try std.testing.expectEqual(@as(u32, 4), column[2].node.pane);
+}
 
 test "frames match the Go side's wire format" {
     // ssh/internal/persist: Resize{Size{0x0102, 0x0304, 0x05060708,

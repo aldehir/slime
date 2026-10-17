@@ -33,15 +33,18 @@ const Button = enum { split_right, split_down, zoom };
 pub fn hitTest(c: *const Chrome, view: *const Chrome.View, x: f32, y: f32) Hit {
     for (view.panes, 0..) |pane, i| {
         if (!pane.rect.contains(x, y)) continue;
-        for (buttons(pane)) |b| {
+        for (buttons(c, pane)) |b| {
             if (buttonRect(c, pane, b).contains(x, y)) return hitFor(b, i);
         }
         return .{ .terminal = i };
     }
-    return .divider;
+    for (view.dividers, 0..) |d, i| {
+        if (d.contains(x, y)) return .{ .divider = i };
+    }
+    return .none;
 }
 
-/// Where a pane button is, if `hit` is one.
+/// Where a pane button is, if `hit` is one on screen.
 pub fn rect(c: *const Chrome, view: *const Chrome.View, hit: Hit) ?Rect {
     const b: Button, const i = switch (hit) {
         .split_right => |i| .{ .split_right, i },
@@ -50,14 +53,16 @@ pub fn rect(c: *const Chrome, view: *const Chrome.View, hit: Hit) ?Rect {
         else => return null,
     };
     if (i >= view.panes.len) return null;
-    return buttonRect(c, view.panes[i], b);
+    const pane = view.panes[i];
+    if (std.mem.indexOfScalar(Button, buttons(c, pane), b) == null) return null;
+    return buttonRect(c, pane, b);
 }
 
 pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *const Chrome.View) void {
     for (view.panes, 0..) |pane, i| {
         if (view.panes.len > 1 and !pane.focused) p.fill(pane.rect, .{ pane.bg[0], pane.bg[1], pane.bg[2], dim });
         p.cornerMasks(pane.rect, l.corner, c.theme.ground);
-        for (buttons(pane)) |b| {
+        for (buttons(c, pane)) |b| {
             const hit = hitFor(b, i);
             const t = c.theme.text_strong;
             const alpha: f32 = switch (c.buttonState(hit)) {
@@ -78,9 +83,14 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
 }
 
 /// The buttons a pane has, left to right.
-fn buttons(pane: Pane) []const Button {
+/// None in a pane too small to hold them with room to spare.
+fn buttons(c: *const Chrome, pane: Pane) []const Button {
     if (!pane.splittable) return &.{};
-    return if (pane.zoomable) &.{ .split_right, .split_down, .zoom } else &.{ .split_right, .split_down };
+    const all: []const Button = if (pane.zoomable) &.{ .split_right, .split_down, .zoom } else &.{ .split_right, .split_down };
+    const n: f32 = @floatFromInt(all.len);
+    const size = c.px(button_size);
+    if (pane.rect.w < (n + 1) * size + 2 * c.px(margin) or pane.rect.h < 2 * size + 2 * c.px(margin)) return &.{};
+    return all;
 }
 
 fn hitFor(b: Button, i: usize) Hit {
@@ -93,7 +103,7 @@ fn hitFor(b: Button, i: usize) Hit {
 
 /// Button `b` in its bar at the pane's top right, counted from the right.
 fn buttonRect(c: *const Chrome, pane: Pane, b: Button) Rect {
-    const shown = buttons(pane);
+    const shown = buttons(c, pane);
     const index = std.mem.indexOfScalar(Button, shown, b) orelse 0;
     const from_right: f32 = @floatFromInt(shown.len - 1 - index);
     const size = c.px(button_size);
@@ -117,16 +127,26 @@ test "pane buttons" {
         .tabs = &.{},
         .active = 0,
         .panes = &panes,
+        .dividers = &.{.{ .x = 400, .w = 1, .h = 300 }},
         .focused = true,
         .maximized = false,
         .terminal_bg = .{ 0, 0, 0, 1 },
     };
     try std.testing.expectEqual(Hit{ .terminal = 0 }, hitTest(&c, &view, 10, 10));
-    try std.testing.expectEqual(Hit.divider, hitTest(&c, &view, 400.5, 10));
+    try std.testing.expectEqual(Hit{ .divider = 0 }, hitTest(&c, &view, 400.5, 10));
+    try std.testing.expectEqual(Hit.none, hitTest(&c, &view, 400.5, 400));
     const zoom = rect(&c, &view, .{ .zoom = 1 }).?;
     try std.testing.expectEqual(@as(f32, 801 - margin), zoom.right());
     try std.testing.expectEqual(Hit{ .zoom = 1 }, hitTest(&c, &view, zoom.x + 1, zoom.y + 1));
     const split = rect(&c, &view, .{ .split_right = 1 }).?;
     try std.testing.expectEqual(Hit{ .split_right = 1 }, hitTest(&c, &view, split.x + 1, split.y + 1));
     try std.testing.expect(split.right() <= zoom.x);
+
+    // A pane too narrow for its icons has none.
+    var narrow = panes;
+    narrow[1].rect.w = 80;
+    var small = view;
+    small.panes = &narrow;
+    try std.testing.expect(rect(&c, &small, .{ .zoom = 1 }) == null);
+    try std.testing.expectEqual(Hit{ .terminal = 1 }, hitTest(&c, &small, 401 + 80 - 10, 10));
 }
