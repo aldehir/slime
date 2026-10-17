@@ -35,6 +35,12 @@ jobs:
           if ($hash -ne $env:ZIG_SHA256) { throw "zig sha256 mismatch: $hash" }
           Expand-Archive $zip -DestinationPath tools
 
+      # For slime-ssh. Caches the module and build caches by ssh/go.sum.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ssh/go.mod
+          cache-dependency-path: ssh/go.sum
+
       - uses: actions/cache@v4
         with:
           path: |
@@ -56,10 +62,16 @@ jobs:
           . .\scripts\setup-msvc.ps1
           zig build test
 
+      - name: Test slime-ssh
+        working-directory: ssh
+        run: |
+          go vet ./...
+          go test ./...
+
       - name: Build
         run: |
           . .\scripts\setup-msvc.ps1
-          zig build -Doptimize=ReleaseFast
+          zig build -Doptimize=ReleaseFast -Dssh=true
 
       - name: Package
         id: package
