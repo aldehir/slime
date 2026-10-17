@@ -131,6 +131,11 @@ pub const View = struct {
     /// the active pane, which their tooltips show.
     new_tab_key: []const u16 = &.{},
     close_tab_key: []const u16 = &.{},
+    /// The keys for splitting and zooming the focused pane, which its
+    /// buttons' tooltips show.
+    split_right_key: []const u16 = &.{},
+    split_down_key: []const u16 = &.{},
+    zoom_key: []const u16 = &.{},
 
     pub const Group = struct {
         label: []const u16,
@@ -422,12 +427,16 @@ fn tipText(self: *const Chrome, view: *const View, hit: Hit) struct { []const u1
         else
             .{ L("New tab"), if (g == view.activeGroup()) view.new_tab_key else none },
         .forget_host => .{ L("Forget host"), none },
-        .split_right => .{ L("Split right"), none },
-        .split_down => .{ L("Split down"), none },
-        .zoom => |i| .{ if (i < view.panes.len and view.panes[i].zoomed) L("Unzoom") else L("Zoom"), none },
+        .split_right => |i| .{ L("Split right"), if (focusedPane(view, i)) view.split_right_key else none },
+        .split_down => |i| .{ L("Split down"), if (focusedPane(view, i)) view.split_down_key else none },
+        .zoom => |i| .{ if (i < view.panes.len and view.panes[i].zoomed) L("Unzoom") else L("Zoom"), if (focusedPane(view, i)) view.zoom_key else none },
         .close_tab => |i| .{ L("Close tab"), if (i == view.active) view.close_tab_key else none },
         else => .{ none, none },
     };
+}
+
+fn focusedPane(view: *const View, i: usize) bool {
+    return i < view.panes.len and view.panes[i].focused;
 }
 
 /// The button `hit` is, if it's on screen.

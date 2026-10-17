@@ -180,9 +180,9 @@ saying so; the host's button reconnects, reattaches, and replaces them.
 - **A pane can't be dragged to another tab**, or out into a tab of its
   own: slimed's Layout only rearranges a tab's own panes, so that needs
   a message that moves a pane between tabs.
-- **No split bindings** (Ghostty's `new_split`, `goto_split`,
-  `resize_split`, `equalize_splits`, `toggle_split_zoom`): splitting,
-  zooming, resizing, and moving focus between panes are mouse only.
+- **Pane keys unzoom.** Moving focus or resizing from the keyboard while
+  a pane is zoomed shows every pane again; there's no Ghostty
+  `split-preserve-zoom`, which keeps the newly focused pane zoomed.
 - **Dragging a divider resizes the ptys on every move**, so shells
   redraw as it goes; ConPTY copes, but a full-screen program may flicker.
   Holding resizes until the drag ends would need the panes drawn

@@ -20,6 +20,21 @@ pub const Action = union(enum) {
     increase_font_size: f32,
     decrease_font_size: f32,
     reset_font_size,
+    new_split: SplitDirection,
+    goto_split: GotoSplit,
+    /// By `amount` cells.
+    resize_split: ResizeSplit,
+    equalize_splits,
+    toggle_split_zoom,
+};
+
+pub const SplitDirection = enum { right, down, left, up };
+
+pub const GotoSplit = enum { previous, next, up, left, down, right };
+
+pub const ResizeSplit = struct {
+    direction: SplitDirection,
+    amount: u16,
 };
 
 pub const Trigger = struct {
@@ -38,6 +53,8 @@ pub const Binding = struct {
 const ctrl: Mods.Keys = .{ .ctrl = true };
 const shift: Mods.Keys = .{ .shift = true };
 const ctrl_shift: Mods.Keys = .{ .ctrl = true, .shift = true };
+const ctrl_alt: Mods.Keys = .{ .ctrl = true, .alt = true };
+const ctrl_alt_shift: Mods.Keys = .{ .ctrl = true, .alt = true, .shift = true };
 
 /// Ghostty's defaults where it has them.
 pub const defaults = [_]Binding{
@@ -57,6 +74,23 @@ pub const defaults = [_]Binding{
     // Windows' default input language hotkeys take ctrl+shift+0 (direct
     // switch to the Japanese IME), so it never arrives on most machines.
     .{ .trigger = .{ .vk = '0', .mods = ctrl }, .action = .reset_font_size },
+    // Only slimed's tabs split; elsewhere the keys go to the child.
+    .{ .trigger = .{ .vk = 'O', .mods = ctrl_shift }, .action = .{ .new_split = .right }, .performable = true },
+    .{ .trigger = .{ .vk = 'E', .mods = ctrl_shift }, .action = .{ .new_split = .down }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_RETURN, .mods = ctrl_shift }, .action = .toggle_split_zoom, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_UP, .mods = ctrl_alt }, .action = .{ .goto_split = .up }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_DOWN, .mods = ctrl_alt }, .action = .{ .goto_split = .down }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_LEFT, .mods = ctrl_alt }, .action = .{ .goto_split = .left }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_RIGHT, .mods = ctrl_alt }, .action = .{ .goto_split = .right }, .performable = true },
+    // Ghostty's ctrl+super chords are the shell's on Windows (ctrl+win+
+    // arrows switch desktops), so these take ctrl+shift and ctrl+alt+shift.
+    .{ .trigger = .{ .vk = win32.VK_OEM_4, .mods = ctrl_shift }, .action = .{ .goto_split = .previous }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_OEM_6, .mods = ctrl_shift }, .action = .{ .goto_split = .next }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_UP, .mods = ctrl_alt_shift }, .action = .{ .resize_split = .{ .direction = .up, .amount = 1 } }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_DOWN, .mods = ctrl_alt_shift }, .action = .{ .resize_split = .{ .direction = .down, .amount = 1 } }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_LEFT, .mods = ctrl_alt_shift }, .action = .{ .resize_split = .{ .direction = .left, .amount = 1 } }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_RIGHT, .mods = ctrl_alt_shift }, .action = .{ .resize_split = .{ .direction = .right, .amount = 1 } }, .performable = true },
+    .{ .trigger = .{ .vk = win32.VK_OEM_PLUS, .mods = ctrl_alt_shift }, .action = .equalize_splits, .performable = true },
 };
 
 /// The binding for a key pressed with `mods`. Lock keys and sides don't
@@ -87,10 +121,10 @@ pub const Label = struct {
 
 /// The first of `bindings` that runs `action`, named. Empty if none does
 /// or its key has no name here.
-pub fn label(bindings: []const Binding, action: std.meta.Tag(Action)) Label {
+pub fn label(bindings: []const Binding, action: Action) Label {
     var out: Label = .{};
     const b = for (bindings) |b| {
-        if (b.action == action) break b;
+        if (std.meta.eql(b.action, action)) break b;
     } else return out;
     var key_buf: [1]u8 = undefined;
     const key: []const u8 = switch (b.trigger.vk) {
@@ -99,11 +133,18 @@ pub fn label(bindings: []const Binding, action: std.meta.Tag(Action)) Label {
             break :key &key_buf;
         },
         win32.VK_TAB => "Tab",
+        win32.VK_RETURN => "Enter",
+        win32.VK_LEFT => "Left",
+        win32.VK_UP => "Up",
+        win32.VK_RIGHT => "Right",
+        win32.VK_DOWN => "Down",
         win32.VK_INSERT => "Insert",
         win32.VK_PRIOR => "PgUp",
         win32.VK_NEXT => "PgDn",
         win32.VK_OEM_PLUS => "+",
         win32.VK_OEM_MINUS => "-",
+        win32.VK_OEM_4 => "[",
+        win32.VK_OEM_6 => "]",
         else => return out,
     };
     const mods = b.trigger.mods;
@@ -119,6 +160,8 @@ test label {
     const L = std.unicode.utf8ToUtf16LeStringLiteral;
     try std.testing.expectEqualSlices(u16, L("Ctrl+Shift+T"), label(&defaults, .new_tab).slice());
     try std.testing.expectEqualSlices(u16, L("Ctrl+Shift+C"), label(&defaults, .copy_to_clipboard).slice());
+    try std.testing.expectEqualSlices(u16, L("Ctrl+Shift+E"), label(&defaults, .{ .new_split = .down }).slice());
+    try std.testing.expectEqualSlices(u16, L("Ctrl+Shift+Enter"), label(&defaults, .toggle_split_zoom).slice());
     try std.testing.expectEqual(@as(usize, 0), label(&.{}, .new_tab).len);
 }
 

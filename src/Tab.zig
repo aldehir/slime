@@ -430,6 +430,133 @@ fn placeNode(self: *Tab, alloc: Allocator, node: *Node, r: Rect, gap: f32) !void
     }
 }
 
+/// The pane next to `from` on `side`, as the last `place` drew them: of
+/// those past that edge and level with it, the nearest, then the one
+/// most in line with it.
+pub fn neighbor(self: *const Tab, from: *const Session, side: Slimed.Direction) ?*Session {
+    const f = from.frame;
+    const along = axisOf(side) == .row;
+    var best: ?*Session = null;
+    var best_gap: f32 = 0;
+    var best_off: f32 = 0;
+    var it = self.iterator();
+    while (it.next()) |s| {
+        if (s == from) continue;
+        const r = s.frame;
+        const gap = switch (side) {
+            .left => f.x - r.right(),
+            .right => r.x - f.right(),
+            .up => f.y - r.bottom(),
+            .down => r.y - f.bottom(),
+        };
+        if (gap < 0) continue;
+        const level = if (along)
+            @min(f.bottom(), r.bottom()) - @max(f.y, r.y)
+        else
+            @min(f.right(), r.right()) - @max(f.x, r.x);
+        if (level <= 0) continue;
+        const off = if (along) @abs((r.y + r.h / 2) - (f.y + f.h / 2)) else @abs((r.x + r.w / 2) - (f.x + f.w / 2));
+        if (best == null or gap < best_gap or (gap == best_gap and off < best_off)) {
+            best = s;
+            best_gap = gap;
+            best_off = off;
+        }
+    }
+    return best;
+}
+
+/// The pane after `from` in layout order, or before it, wrapping.
+pub fn following(self: *const Tab, from: *const Session, forward: bool) *Session {
+    var it = self.iterator();
+    var head: ?*Session = null;
+    var prev: ?*Session = null;
+    var found = false;
+    while (it.next()) |s| {
+        if (found) return s;
+        if (head == null) head = s;
+        if (s == from) {
+            if (forward) found = true else if (prev) |p| return p;
+        }
+        prev = s;
+    }
+    return if (forward) head.? else prev.?;
+}
+
+/// The divider that resizing `s` toward `side` moves, from the last
+/// `place`: the nearest on that side of it, across that way, else the
+/// nearest on the other.
+pub fn dividerFor(self: *const Tab, s: *const Session, side: Slimed.Direction) ?Divider {
+    var found: [2]?DividerAt = .{ null, null };
+    _ = dividerIn(&self.root, s, axisOf(side), after(side), &found);
+    const at = found[0] orelse found[1] orelse return null;
+    for (self.dividers.items) |d| {
+        if (d.split == at.split and d.index == at.index) return d;
+    }
+    return null;
+}
+
+const DividerAt = struct { split: *const Split, index: usize };
+
+/// Whether `node` holds `s`. On the way back up, fills in the dividers
+/// toward that side of it and away, innermost first.
+fn dividerIn(node: *const Node, s: *const Session, axis: Axis, toward_after: bool, out: *[2]?DividerAt) bool {
+    const sp = switch (node.*) {
+        .pane => |p| return p == s,
+        .split => |*sp| sp,
+    };
+    for (sp.children, 0..) |*c, i| {
+        if (!dividerIn(&c.node, s, axis, toward_after, out)) continue;
+        if (sp.axis != axis) return true;
+        const before: ?usize = if (i > 0) i - 1 else null;
+        const behind: ?usize = if (i + 1 < sp.children.len) i else null;
+        const toward, const away = if (toward_after) .{ behind, before } else .{ before, behind };
+        if (out[0] == null) if (toward) |j| {
+            out[0] = .{ .split = sp, .index = j };
+        };
+        if (out[1] == null) if (away) |j| {
+            out[1] = .{ .split = sp, .index = j };
+        };
+        return true;
+    }
+    return false;
+}
+
+/// Share each split's space so the panes across it come out the same
+/// size: a child gets as much as the panes side by side in it.
+pub fn equalize(self: *Tab) void {
+    equalizeNode(&self.root);
+}
+
+fn equalizeNode(node: *Node) void {
+    const sp = switch (node.*) {
+        .pane => return,
+        .split => |*sp| sp,
+    };
+    const total = width(node.*, sp.axis);
+    var given: u32 = 0;
+    for (sp.children, 0..) |*c, i| {
+        equalizeNode(&c.node);
+        const share: u32 = if (i + 1 == sp.children.len) 10000 - given else 10000 * width(c.node, sp.axis) / total;
+        c.share = @intCast(share);
+        given += share;
+    }
+}
+
+/// How many panes `node` puts side by side along `axis`.
+fn width(node: Node, axis: Axis) u32 {
+    return switch (node) {
+        .pane => 1,
+        .split => |sp| n: {
+            var n: u32 = 0;
+            for (sp.children) |c| {
+                const w = width(c.node, axis);
+                n = if (sp.axis == axis) n + w else @max(n, w);
+            }
+            break :n n;
+        },
+    };
+}
+
 /// A gap between two of a split's children, which dragging moves.
 /// Points into the tree, so it's good until the tree next changes.
 pub const Divider = struct {
@@ -569,6 +696,61 @@ test "placing and removing panes" {
     try std.testing.expectEqual(&b, tab.remove(alloc, &a).?);
     try std.testing.expect(tab.zoom == null);
     try std.testing.expect(tab.remove(alloc, &b) == null);
+}
+
+test "navigating, resizing, and equalizing panes" {
+    const alloc = std.testing.allocator;
+    var a: Session = undefined;
+    var b: Session = undefined;
+    var c: Session = undefined;
+    var d: Session = undefined;
+    // a | (b over (c | d)).
+    const pair = try alloc.alloc(Child, 2);
+    pair[0] = .{ .share = 5000, .node = .{ .pane = &c } };
+    pair[1] = .{ .share = 5000, .node = .{ .pane = &d } };
+    const column = try alloc.alloc(Child, 2);
+    column[0] = .{ .share = 5000, .node = .{ .pane = &b } };
+    column[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .row, .children = pair } } };
+    const row = try alloc.alloc(Child, 2);
+    row[0] = .{ .share = 5000, .node = .{ .pane = &a } };
+    row[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = column } } };
+    const tab = try create(alloc, null, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    defer tab.destroy(alloc);
+    try tab.place(alloc, .{ .w = 401, .h = 201 }, 1);
+
+    // From a, right is b: b and c touch it and are as far off its middle,
+    // and b comes first. From c, up is b, and left is a.
+    try std.testing.expectEqual(&b, tab.neighbor(&a, .right).?);
+    try std.testing.expectEqual(null, tab.neighbor(&a, .left));
+    try std.testing.expectEqual(&b, tab.neighbor(&c, .up).?);
+    try std.testing.expectEqual(&a, tab.neighbor(&c, .left).?);
+    try std.testing.expectEqual(&c, tab.neighbor(&b, .down).?);
+    try std.testing.expectEqual(&d, tab.neighbor(&c, .right).?);
+
+    try std.testing.expectEqual(&b, tab.following(&a, true));
+    try std.testing.expectEqual(&a, tab.following(&d, true));
+    try std.testing.expectEqual(&d, tab.following(&a, false));
+    try std.testing.expectEqual(&c, tab.following(&d, false));
+
+    // Resizing c left moves the divider on its left, the outer row's;
+    // right, the one between it and d. d has none on its right, so takes
+    // the one on its left.
+    const row_split = &tab.root.split;
+    const pair_split = &row_split.children[1].node.split.children[1].node.split;
+    const left = tab.dividerFor(&c, .left).?;
+    try std.testing.expect(left.split == row_split and left.index == 0);
+    const right = tab.dividerFor(&c, .right).?;
+    try std.testing.expect(right.split == pair_split and right.index == 0);
+    try std.testing.expect(tab.dividerFor(&d, .right).?.split == pair_split);
+    // b up has only the column's divider below it.
+    try std.testing.expectEqual(@as(usize, 0), tab.dividerFor(&b, .up).?.index);
+    try std.testing.expectEqual(null, tab.dividerFor(&a, .up));
+
+    // a takes half the row's width in panes across: a third.
+    tab.equalize();
+    try std.testing.expectEqual(@as(u16, 3333), row_split.children[0].share);
+    try std.testing.expectEqual(@as(u16, 6667), row_split.children[1].share);
+    try std.testing.expectEqual(@as(u16, 5000), pair_split.children[0].share);
 }
 
 test "moving panes" {

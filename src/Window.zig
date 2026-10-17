@@ -75,6 +75,9 @@ const tip_warm_ms = 1000;
 /// The keys tooltips name.
 const new_session_key = binding.label(&binding.defaults, .new_tab);
 const close_session_key = binding.label(&binding.defaults, .close_surface);
+const split_right_key = binding.label(&binding.defaults, .{ .new_split = .right });
+const split_down_key = binding.label(&binding.defaults, .{ .new_split = .down });
+const zoom_key = binding.label(&binding.defaults, .toggle_split_zoom);
 
 /// How long a frame waits for a cursor that output just hid to come
 /// back. See `updateHold`.
@@ -877,10 +880,9 @@ fn slimedCommand(self: *const Window, conn: *const Slimed) []const u16 {
     return if (conn.host() == null) self.local_command else &.{};
 }
 
-/// Split the pane shown at `i` in the active tab, starting a shell on
-/// side `dir` of it. The new pane comes from slimed (WM_APP_SLIMED).
-fn splitPane(self: *Window, i: usize, dir: Slimed.Direction) void {
-    const s = self.shownPane(i) orelse return;
+/// Split the active tab's pane `s`, starting a shell on side `dir` of
+/// it. The new pane comes from slimed (WM_APP_SLIMED).
+fn splitPane(self: *Window, s: *Session, dir: Slimed.Direction) void {
     const pane = s.slimedPane() orelse return;
     const t = self.activeTab();
     const conn = t.conn orelse return;
@@ -892,14 +894,64 @@ fn splitPane(self: *Window, i: usize, dir: Slimed.Direction) void {
     self.dirty = true;
 }
 
-/// Zoom the pane shown at `i` to fill its tab, or unzoom it.
-fn toggleZoom(self: *Window, i: usize) void {
-    const s = self.shownPane(i) orelse return;
+/// Zoom the active tab's pane `s` to fill the tab, or unzoom it.
+fn toggleZoom(self: *Window, s: *Session) void {
     const t = self.activeTab();
     t.zoom = if (t.zoom == s) null else s;
     self.focusPane(s);
     _ = self.chrome.setHover(.none);
     self.layoutTab(t);
+    self.dirty = true;
+}
+
+/// Show every pane of tab `t` again, if one is zoomed.
+fn unzoom(self: *Window, t: *Tab) void {
+    if (t.zoom == null) return;
+    t.zoom = null;
+    _ = self.chrome.setHover(.none);
+    self.layoutTab(t);
+    self.dirty = true;
+}
+
+/// Focus the pane `to` picks in the active tab, from the focused one.
+fn gotoPane(self: *Window, to: binding.GotoSplit) void {
+    const t = self.activeTab();
+    if (t.count() < 2) return;
+    // The panes' places, to look between, are the unzoomed ones.
+    self.unzoom(t);
+    const next = switch (to) {
+        .previous => t.following(t.focus, false),
+        .next => t.following(t.focus, true),
+        inline else => |side| t.neighbor(t.focus, @field(Slimed.Direction, @tagName(side))) orelse return,
+    };
+    self.focusPane(next);
+    self.dirty = true;
+}
+
+/// Move the divider beside the focused pane `cells` cells toward `side`,
+/// as dragging it would, and send slimed the tree.
+fn resizePane(self: *Window, side: Slimed.Direction, cells: u16) void {
+    const t = self.activeTab();
+    self.unzoom(t);
+    const d = t.dividerFor(t.focus, side) orelse return;
+    const m = self.grid.metrics;
+    const cell: f32 = @floatFromInt(if (d.axis() == .row) m.cell_width else m.cell_height);
+    const px = cell * @as(f32, @floatFromInt(cells));
+    const before = d.shares();
+    d.drag(before, if (side == .right or side == .down) px else -px, self.paneMin(d.axis()));
+    if (std.meta.eql(before, d.shares())) return;
+    self.layoutTab(t);
+    self.sendLayout(t);
+    self.dirty = true;
+}
+
+/// Give the active tab's panes the same sizes, and send slimed the tree.
+fn equalizePanes(self: *Window) void {
+    const t = self.activeTab();
+    if (t.count() < 2) return;
+    t.equalize();
+    self.layoutTab(t);
+    self.sendLayout(t);
     self.dirty = true;
 }
 
@@ -918,14 +970,19 @@ fn across(d: Tab.Divider, pos: win32.POINT) i32 {
     return if (d.axis() == .row) pos.x else pos.y;
 }
 
-/// Move the dragged divider to the mouse, resizing the panes either side
-/// as it goes. Each keeps room for a few cells.
-fn dragTo(self: *Window, d: Drag, pos: win32.POINT) void {
+/// The least a pane takes along `axis` when a divider moves: room for a
+/// few cells.
+fn paneMin(self: *const Window, axis: Tab.Axis) f32 {
     const m = self.grid.metrics;
     const pad = self.paddingPx();
-    const min: f32 = @floatFromInt(if (d.divider.axis() == .row) pad.left + pad.right + 4 * m.cell_width else pad.top + pad.bottom + 2 * m.cell_height);
+    return @floatFromInt(if (axis == .row) pad.left + pad.right + 4 * m.cell_width else pad.top + pad.bottom + 2 * m.cell_height);
+}
+
+/// Move the dragged divider to the mouse, resizing the panes either side
+/// as it goes.
+fn dragTo(self: *Window, d: Drag, pos: win32.POINT) void {
     const before = d.divider.shares();
-    d.divider.drag(d.from, @floatFromInt(across(d.divider, pos) - d.origin), min);
+    d.divider.drag(d.from, @floatFromInt(across(d.divider, pos) - d.origin), self.paneMin(d.divider.axis()));
     if (std.meta.eql(before, d.divider.shares())) return;
     self.layoutTab(d.tab);
     self.dirty = true;
@@ -1308,9 +1365,14 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
 }
 
 /// Returns false if the action couldn't run: copy with no selection,
-/// paste with no text on the clipboard.
+/// paste with no text on the clipboard, a pane action in a tab slimed
+/// doesn't run.
 fn runAction(self: *Window, action: binding.Action) bool {
     const s = self.activeSession();
+    switch (action) {
+        .new_split, .goto_split, .resize_split, .equalize_splits, .toggle_split_zoom => if (self.activeTab().conn == null) return false,
+        else => {},
+    }
     switch (action) {
         .copy_to_clipboard => return s.copySelection(),
         .paste_from_clipboard => {
@@ -1324,6 +1386,15 @@ fn runAction(self: *Window, action: binding.Action) bool {
         .increase_font_size => |pt| self.setFontSize(self.grid.size_pt + pt),
         .decrease_font_size => |pt| self.setFontSize(self.grid.size_pt - pt),
         .reset_font_size => self.setFontSize(self.config.@"font-size"),
+        .new_split => |dir| self.splitPane(s, switch (dir) {
+            inline else => |d| @field(Slimed.Direction, @tagName(d)),
+        }),
+        .goto_split => |to| self.gotoPane(to),
+        .resize_split => |r| self.resizePane(switch (r.direction) {
+            inline else => |d| @field(Slimed.Direction, @tagName(d)),
+        }, r.amount),
+        .equalize_splits => self.equalizePanes(),
+        .toggle_split_zoom => if (self.activeTab().count() > 1 or self.activeTab().zoom != null) self.toggleZoom(s),
     }
     return true;
 }
@@ -1689,6 +1760,9 @@ fn view(self: *Window) Chrome.View {
         .stats = self.stats_text[0..self.stats_len],
         .new_tab_key = new_session_key.slice(),
         .close_tab_key = close_session_key.slice(),
+        .split_right_key = split_right_key.slice(),
+        .split_down_key = split_down_key.slice(),
+        .zoom_key = zoom_key.slice(),
     };
 }
 
@@ -1849,9 +1923,9 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             _ = self.chrome.setHover(.none);
             self.dirty = true;
         },
-        .split_right => |i| self.splitPane(i, .right),
-        .split_down => |i| self.splitPane(i, .down),
-        .zoom => |i| self.toggleZoom(i),
+        .split_right => |i| if (self.shownPane(i)) |s| self.splitPane(s, .right),
+        .split_down => |i| if (self.shownPane(i)) |s| self.splitPane(s, .down),
+        .zoom => |i| if (self.shownPane(i)) |s| self.toggleZoom(s),
         else => {},
     }
 }
