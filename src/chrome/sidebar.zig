@@ -126,10 +126,7 @@ fn paintConnect(c: *const Chrome, p: *Painter, r: Rect) void {
         .hover, .pressed => c.theme.surface_hover,
     };
     p.fillRounded(r, c.px(6), bg);
-    // Lucide's plug spans 16 of its 24 units: 13 DIPs in this box, which
-    // puts the prongs on pixel centers.
-    const icon = c.px(20);
-    c.drawIcon(p, .plug, .{ .x = r.x + c.px(7), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, c.theme.text);
+    paintPlug(c, p, .{ .x = r.x + c.px(7), .y = r.y, .w = c.px(20), .h = r.h }, c.theme.text);
     const label_x = r.x + c.px(32);
     p.text(L("Connect…"), c.fonts.body, .{ .x = label_x, .y = r.y, .w = @max(0, r.right() - c.px(8) - label_x), .h = r.h }, c.theme.text);
 }
@@ -153,9 +150,7 @@ fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.V
     paintIconButton(c, p, button, hit);
     const color = if (hovered) c.theme.text_strong else c.theme.text_muted;
     if (group.kind == .disconnected) {
-        // Lucide's plug spans 16 of its 24 units; this box puts its
-        // prongs on pixel centers.
-        c.drawIcon(p, .plug, button, color);
+        paintPlug(c, p, button, color);
     } else {
         // Lucide's plus spans 14 of its 24 units: 10 DIPs in this box,
         // whose odd size centers the lines on pixels.
@@ -185,6 +180,16 @@ fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.V
 }
 
 /// A small button's background under the mouse.
+/// Lucide's plug, centered in `area`. It spans 16 of its 24 units: 11
+/// DIPs in this box, about the plus's size. Its prongs land on pixel edges
+/// at this size, so a half pixel moves them onto centers.
+fn paintPlug(c: *const Chrome, p: *Painter, area: Rect, color: Chrome.Color) void {
+    const icon = c.px(16);
+    var box = area.center(icon, icon);
+    box.x += 0.5;
+    c.drawIcon(p, .plug, box, color);
+}
+
 fn paintIconButton(c: *const Chrome, p: *Painter, r: Rect, hit: Hit) void {
     if (!c.hover.eql(hit)) return;
     p.fillRounded(r, c.px(4), switch (c.buttonState(hit)) {
