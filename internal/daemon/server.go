@@ -39,11 +39,12 @@ type Server struct {
 	idle  time.Duration
 
 	mu         sync.Mutex
-	nextID     uint32 // shared by workspaces, tabs, and panes
+	nextID     uint32 // shared by workspaces, tabs, panes, and scripts
 	workspaces map[uint32]*workspace
 	tabs       map[uint32]*tab
 	panes      map[uint32]*Pane
 	conns      map[*conn]struct{}
+	scripts    map[uint32]*script
 	hosts      hostTable
 	idleT      *time.Timer
 	idleC      chan struct{} // closed when the idle timer fires
@@ -80,6 +81,7 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		tabs:       map[uint32]*tab{},
 		panes:      map[uint32]*Pane{},
 		conns:      map[*conn]struct{}{},
+		scripts:    map[uint32]*script{},
 		hosts:      newHostTable(opts.Hosts),
 		idleC:      make(chan struct{}),
 	}
@@ -137,7 +139,7 @@ func (s *Server) checkIdleLocked() {
 
 // idleLocked says whether nothing keeps the daemon alive.
 func (s *Server) idleLocked() bool {
-	return len(s.workspaces) == 0 && len(s.panes) == 0 && len(s.conns) == 0 && s.hostsActiveLocked() == 0
+	return len(s.workspaces) == 0 && len(s.panes) == 0 && len(s.conns) == 0 && len(s.scripts) == 0 && s.hostsActiveLocked() == 0
 }
 
 func (s *Server) handle(rw io.ReadWriteCloser) {
@@ -169,6 +171,7 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 		}
 		delete(s.conns, c)
 		s.hostClientGoneLocked(c)
+		s.scriptClientGoneLocked(c)
 		s.checkIdleLocked()
 		s.mu.Unlock()
 	}()

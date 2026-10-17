@@ -96,6 +96,9 @@ const (
 	HostAnswer      = "host.answer"
 	HostDisconnect  = "host.disconnect"
 	HostList        = "host.list"
+	ScriptRun       = "script.run"
+	ScriptCancel    = "script.cancel"
+	ScriptList      = "script.list"
 )
 
 // Notifications. A workspace's viewers get their workspace's without
@@ -116,6 +119,8 @@ const (
 	EvPaneExited            = "pane.exited"
 	EvHostChanged           = "host.changed"
 	EvHostPrompt            = "host.prompt"
+	EvScriptOutput          = "script.output"
+	EvScriptDone            = "script.done"
 )
 
 // Size is a terminal's grid and, if known, its cell size in pixels.
@@ -848,4 +853,67 @@ type HostPromptParams struct {
 type Question struct {
 	Label string `json:"label"`
 	Echo  bool   `json:"echo,omitempty"`
+}
+
+// Scripts: Lua the daemon runs (internal/lua), each in a state of its
+// own, against its own method table in process.
+
+// ScriptRunParams starts a script: Source, compiled as chunk Name (a
+// file name, for error messages), with Args as slime.args (a JSON
+// object). Pane is the pane it runs for, filled into slime.pane_id and,
+// through it, tab_id and workspace_id; zero for none. The caller gets
+// script.output and script.done for it without subscribing, and a
+// caller that hangs up before it's done cancels it unless Detach is set.
+// The reply comes as soon as it's started; the result comes with
+// script.done.
+type ScriptRunParams struct {
+	Source string          `json:"source"`
+	Name   string          `json:"name,omitempty"`
+	Args   json.RawMessage `json:"args,omitempty"`
+	Pane   uint32          `json:"pane,omitempty"`
+	Detach bool            `json:"detach,omitempty"`
+}
+
+// ScriptRunResult answers script.run with the script's id.
+type ScriptRunResult struct {
+	ID uint32 `json:"id"`
+}
+
+// ScriptParams names a script: cancel.
+type ScriptParams struct {
+	ID uint32 `json:"id"`
+}
+
+// ScriptListResult answers script.list.
+type ScriptListResult struct {
+	Scripts []ScriptDesc `json:"scripts"`
+}
+
+// ScriptDesc is a running script.
+type ScriptDesc struct {
+	ID      uint32 `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Pane    uint32 `json:"pane,omitempty"`
+	Started int64  `json:"started"` // unix milliseconds
+	// Detached: it outlives the connection that started it.
+	Detached bool `json:"detached,omitempty"`
+}
+
+// ScriptOutputParams: script.output, what a script printed. Stream is
+// "stdout" (print) or "stderr" (slime.log).
+type ScriptOutputParams struct {
+	ID     uint32 `json:"id"`
+	Stream string `json:"stream"`
+	Data   string `json:"data"`
+}
+
+// ScriptDoneParams: script.done. OK with Result (what the chunk
+// returned, as JSON; null for nothing) when it ran to the end or called
+// slime.stop; otherwise Error says what went wrong, with the Lua stack
+// trace, or that it was cancelled.
+type ScriptDoneParams struct {
+	ID     uint32          `json:"id"`
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  string          `json:"error,omitempty"`
 }

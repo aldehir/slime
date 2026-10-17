@@ -274,6 +274,29 @@ reconnects, reattaches, and replaces them.
   tab; per-window views (tmux's grouped sessions) are the model if
   that's wanted.
 
+## Scripting
+
+`slime do` runs Lua in the daemon (internal/lua, gopher-lua): the
+`slime` table calls any method of the control plane in process, with
+the pane, tab, and workspace the script runs for filled into the ids
+it leaves out. Hooks, waiting, timers, exec, bindings, and actions wait
+on the rearchitect plan's stages 7 and 8.
+
+- **No `io` library.** `print` is a script's stdout and `slime.log` its
+  stderr, one `script.output` each; there's no `io.write`, `io.read`,
+  or file access beyond `dofile` and `require`.
+- **`pcall` catches `slime.stop`**, which ends a run by raising a
+  sentinel error, so a script that wraps it in `pcall` runs on.
+- **Empty Lua tables are JSON objects**, so a method that takes a list
+  can't be given an empty one; `tabs = {}` fails where no tabs would.
+- **`slime.layout.pane{name}`** is passed through and ignored: panes
+  have no name.
+- **A script's `workspace.new` needs tabs.** With none, the workspace
+  would have no viewer to keep it; `slime.tab.new` can't add to it
+  first.
+- **Scripts can't subscribe to events** until stage 8: `subscribe`
+  needs a connection, and a script runs in process.
+
 ## Configuration
 
 `Config.zig` covers fonts, colors, themes, padding, word characters, and

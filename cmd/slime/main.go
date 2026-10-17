@@ -37,6 +37,9 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("slime: ")
 	if err := newCommand().Execute(); err != nil {
+		if errors.Is(err, errScriptFailed) {
+			os.Exit(1)
+		}
 		var rerr *rpc.Error
 		if errors.As(err, &rerr) {
 			log.Fatalf("%s (code %d)", rerr.Message, rerr.Code)
@@ -55,7 +58,7 @@ func newCommand() *cobra.Command {
 	}
 	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "print results as JSON, as the daemon replies")
 	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
-		paneCommand(), callCommand())
+		paneCommand(), doCommand(), scriptsCommand(), callCommand())
 	root.AddCommand(hostCommands()...)
 	return root
 }

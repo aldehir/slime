@@ -13,16 +13,19 @@ import (
 // bindings (in process, later) all go through Server.Call, so a method
 // that exists for one exists for all.
 
-// callCtx is one call being served: who asked, and whether it's been
-// answered. A handler whose result must reach the caller before
-// anything else does (the structure an attach returns) replies under
-// the server's lock with reply; the rest return their result and Call
-// sends it.
+// callCtx is one call being served: who asked (c is nil for a caller
+// in process, a script), and whether it's been answered. A handler
+// whose result must reach the caller before anything else does (the
+// structure an attach returns) replies under the server's lock with
+// reply; the rest return their result and Call sends it.
 type callCtx struct {
 	s       *Server
 	c       *conn
 	id      uint32
 	replied bool
+	// result is what reply was given, for a caller in process, who
+	// gets it when the handler returns.
+	result any
 }
 
 // reply answers the call now, with result.
@@ -33,6 +36,8 @@ func (cl *callCtx) reply(result any) {
 	cl.replied = true
 	if cl.c != nil {
 		cl.c.sendForce(0, reply(cl.id, result, nil))
+	} else {
+		cl.result = result
 	}
 }
 
@@ -82,6 +87,9 @@ var methods = map[string]handler{
 	rpc.HostAnswer:      method((*Server).hostAnswer),
 	rpc.HostDisconnect:  method((*Server).hostDisconnect),
 	rpc.HostList:        method((*Server).hostList),
+	rpc.ScriptRun:       method((*Server).scriptRun),
+	rpc.ScriptCancel:    method((*Server).scriptCancel),
+	rpc.ScriptList:      method((*Server).scriptList),
 }
 
 // Methods lists the control plane's methods.
@@ -127,6 +135,9 @@ func (s *Server) invoke(cl *callCtx, name string, params json.RawMessage) (any, 
 	if err != nil {
 		return nil, toRPCError(err)
 	}
+	if cl.replied && cl.c == nil {
+		result = cl.result
+	}
 	if result == nil {
 		result = rpc.Empty{}
 	}
@@ -140,7 +151,7 @@ func toRPCError(err error) *rpc.Error {
 		return rerr
 	}
 	code := rpc.CodeFailed
-	if errors.Is(err, errNoWorkspace) || errors.Is(err, errNoTab) || errors.Is(err, errNoPane) || errors.Is(err, errNoHost) {
+	if errors.Is(err, errNoWorkspace) || errors.Is(err, errNoTab) || errors.Is(err, errNoPane) || errors.Is(err, errNoHost) || errors.Is(err, errNoScript) {
 		code = rpc.CodeNotFound
 	}
 	return &rpc.Error{Code: code, Message: err.Error()}
