@@ -63,6 +63,11 @@ palette: Palette = .{},
 /// overrides it; with neither, %COMSPEC%.
 command: ?[]const u8 = null,
 
+/// Give SSH sessions TERM=xterm-ghostty, compiling Ghostty's terminfo
+/// into ~/.terminfo on hosts that lack it (Ghostty's ssh-terminfo). Hosts
+/// it can't be installed on get xterm-256color, as do all with this off.
+@"ssh-terminfo": bool = true,
+
 /// A theme name or absolute path, or `light:<theme>,dark:<theme>` to
 /// follow the Windows app mode. Names are looked up in `themes` next to
 /// the config file, then in `themes` next to the executable.
@@ -282,6 +287,12 @@ fn set(self: *Config, key: []const u8, value: []const u8) !void {
                 return;
             }
             switch (field.type) {
+                bool => ptr.* = if (std.mem.eql(u8, value, "true"))
+                    true
+                else if (std.mem.eql(u8, value, "false"))
+                    false
+                else
+                    return error.InvalidValue,
                 f32 => ptr.* = try std.fmt.parseFloat(f32, value),
                 RGB => ptr.* = try RGB.parse(value),
                 ?TerminalColor => ptr.* = try TerminalColor.parse(value),
@@ -442,6 +453,11 @@ test "padding, word chars, theme, clipboard" {
     try std.testing.expectEqual(.cleartype, c.@"font-antialias");
     try std.testing.expectEqual(1.25, c.@"chrome-scale");
     try std.testing.expectError(error.InvalidValue, c.set("font-antialias", "subpixel"));
+
+    try std.testing.expect(c.@"ssh-terminfo");
+    try c.set("ssh-terminfo", "false");
+    try std.testing.expect(!c.@"ssh-terminfo");
+    try std.testing.expectError(error.InvalidValue, c.set("ssh-terminfo", "no"));
 
     try std.testing.expectError(error.InvalidTheme, Theme.parse(c._arena.allocator(), "light:A"));
     const path = try Theme.parse(c._arena.allocator(), "C:\\themes\\mine");

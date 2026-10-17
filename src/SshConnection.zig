@@ -400,9 +400,10 @@ pub fn isAlive(self: *SshConnection) bool {
 }
 
 /// Open a channel with a shell, in `cwd` if given, on a pty of the given
-/// size in cells and pixels. `id` must be unique and nonzero. UI thread
-/// only.
-pub fn open(self: *SshConnection, id: u32, cols: u16, rows: u16, width_px: u32, height_px: u32, cwd: ?[]const u8) !*Channel {
+/// size in cells and pixels. `term` is the TERM to ask for; the helper
+/// falls back from xterm-ghostty on hosts it can't install that on. `id`
+/// must be unique and nonzero. UI thread only.
+pub fn open(self: *SshConnection, id: u32, term: []const u8, cols: u16, rows: u16, width_px: u32, height_px: u32, cwd: ?[]const u8) !*Channel {
     std.debug.assert(id != 0);
     var input_read: win32.HANDLE = undefined;
     var input_write: win32.HANDLE = undefined;
@@ -454,7 +455,7 @@ pub fn open(self: *SshConnection, id: u32, cols: u16, rows: u16, width_px: u32, 
     p.putU64(@intFromPtr(helper_out));
     p.putU16(cols);
     p.putU16(rows);
-    p.putStr("xterm-256color");
+    p.putStr(term);
     p.putStr(cwd orelse "");
     p.putU32(width_px);
     p.putU32(height_px);

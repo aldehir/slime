@@ -214,7 +214,8 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
         },
         .ssh => |ssh| {
             const cell = window.cellSizePx();
-            self.transport = .{ .ssh = try ssh.conn.open(id, cols, rows, cols * cell.width, rows * cell.height, ssh.cwd) };
+            const term = if (config.@"ssh-terminfo") "xterm-ghostty" else "xterm-256color";
+            self.transport = .{ .ssh = try ssh.conn.open(id, term, cols, rows, cols * cell.width, rows * cell.height, ssh.cwd) };
         },
     }
     errdefer self.stopTransport();
