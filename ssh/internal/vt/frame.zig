@@ -1,7 +1,7 @@
 //! Frames: what slimed sends slime to draw a pane. A frame carries the
-//! grid size, colors, the cursor, and the rows of the viewport that
-//! changed since the last one (all of them in a full frame), with the
-//! selection on each row.
+//! grid size, colors, the cursor, the rows of the viewport that changed
+//! since the last one (all of them in a full frame), with the selection
+//! on each row, and the kitty images placed in the viewport.
 //!
 //! Both ends use this file. slimed's library (slime.zig) instantiates
 //! `Codec` with libghostty-vt's root, slime with its ghostty-vt module:
@@ -25,9 +25,18 @@
 //!       runs of equal cells covering cols: u64 cell, uleb128 count
 //!       u16  styles, each: u16 style id, style
 //!       u16  graphemes, each: u16 x, u8 n, n * u24 extra codepoints
+//!     u16  dropped images, each: u32 image id
+//!     u16  placements, each: u32 image id, i32 z, u16 x, i32 y,
+//!          u32 offset x, y, u32 width, height, u32 source x, y, width,
+//!          height
 //!
 //! A style is three colors (u8 tag; palette: u8; rgb: 3 bytes), then u16
 //! flags.
+//!
+//! An image's pixels go once, in a message of their own before the
+//! first frame that places it (`ImageSender`); the frame's placements
+//! name images by id. A dropped image is one the terminal no longer
+//! has, which the receiver frees.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,7 +44,33 @@ const Allocator = std.mem.Allocator;
 /// Bumped with any change to the encoding. It's also derived from the
 /// cell and style layouts (`layout_id`), so a slime and a slimed built
 /// from different libghostty-vt versions refuse each other's frames.
-pub const version = 1;
+pub const version = 2;
+
+/// One kitty image placed in the viewport, as a frame carries it. Its
+/// pixel sizes come from the sender's cell size (the one the receiver
+/// said in Resize), its position in cells, so the receiver lays it on
+/// its own grid.
+pub const Placement = struct {
+    image_id: u32,
+    /// Kitty's z-index: below `min(i32) / 2` is under the background,
+    /// below 0 under the text, the rest above it.
+    z: i32,
+    /// The cell its top-left is in. A placement scrolled partly out of
+    /// the viewport starts on a row above it, so y can be negative.
+    x: u16,
+    y: i32,
+    /// Pixels from that cell's top-left.
+    offset_x: u32,
+    offset_y: u32,
+    /// Its size on screen, in pixels.
+    width: u32,
+    height: u32,
+    /// The part of the image shown, in image pixels.
+    src_x: u32,
+    src_y: u32,
+    src_width: u32,
+    src_height: u32,
+};
 
 pub const Flags = packed struct(u8) {
     /// Every row is in the frame, and the screen takes its size.
@@ -68,6 +103,11 @@ pub fn Codec(comptime vt: type) type {
         const Cursor = RenderState.Cursor;
         const VisualStyle = @FieldType(Cursor, "visual_style");
         const StyleId = @FieldType(Cell, "style_id");
+        const kitty = vt.kitty.graphics;
+
+        /// Placements with a z-index below this are drawn under cell
+        /// backgrounds, as in kitty.
+        pub const below_bg_z = std.math.minInt(i32) / 2;
 
         /// Identifies this codec's encoding and the layouts it copies:
         /// equal on both ends or they can't talk.
@@ -84,6 +124,178 @@ pub fn Codec(comptime vt: type) type {
             break :id h.final();
         };
 
+        /// The sender's side of images: which the receiver has, by
+        /// generation, and what the next frame carries of them, from
+        /// `gather`. The pixels of `pending` go out before the frame
+        /// (`pixels`); the receiver keeps every image sent until a
+        /// frame drops it, placed or not, as it may be placed again.
+        pub const ImageSender = struct {
+            /// The generation of each image the receiver has.
+            sent: std.AutoHashMapUnmanaged(u32, u64) = .empty,
+            /// The placements in the viewport, in no order.
+            placements: std.ArrayList(Placement) = .empty,
+            /// Images the frame places that the receiver lacks, or has
+            /// an older generation of.
+            pending: std.ArrayList(ImageRef) = .empty,
+            /// Images the receiver has that the terminal no longer does.
+            dropped: std.ArrayList(u32) = .empty,
+
+            pub const ImageRef = struct { id: u32, generation: u64 };
+
+            /// An image's pixels, to send.
+            pub const Pixels = struct {
+                id: u32,
+                generation: u64,
+                width: u32,
+                height: u32,
+                /// Straight (not premultiplied) RGBA, rows top-down.
+                rgba: []u8,
+            };
+
+            pub fn deinit(self: *ImageSender, alloc: Allocator) void {
+                self.sent.deinit(alloc);
+                self.placements.deinit(alloc);
+                self.pending.deinit(alloc);
+                self.dropped.deinit(alloc);
+            }
+
+            /// Forget what the receiver has: a new one attached.
+            pub fn reset(self: *ImageSender) void {
+                self.sent.clearRetainingCapacity();
+            }
+
+            /// Find the placements in the viewport, the images among them
+            /// to send first, and the sent images the terminal dropped.
+            /// Call with the terminal locked, before each `encode`.
+            pub fn gather(self: *ImageSender, alloc: Allocator, t: *const vt.Terminal) !void {
+                self.placements.clearRetainingCapacity();
+                self.pending.clearRetainingCapacity();
+                self.dropped.clearRetainingCapacity();
+                const screen = t.screens.active;
+                const storage = &screen.kitty_images;
+
+                var sent = self.sent.keyIterator();
+                while (sent.next()) |id| {
+                    if (storage.imageById(id.*) == null) try self.dropped.append(alloc, id.*);
+                }
+                for (self.dropped.items) |id| _ = self.sent.remove(id);
+
+                if (t.cols == 0 or t.rows == 0 or storage.placements.count() == 0) return;
+                const cell_width = t.width_px / t.cols;
+                const cell_height = t.height_px / t.rows;
+                if (cell_width == 0 or cell_height == 0) return;
+                const pages = &screen.pages;
+                const top = pages.getTopLeft(.viewport);
+                const bot = pages.getBottomRight(.viewport).?;
+                const top_y = pages.pointFromPin(.screen, top).?.screen.y;
+                const bot_y = pages.pointFromPin(.screen, bot).?.screen.y;
+
+                var virtual = false;
+                var it = storage.placements.iterator();
+                while (it.next()) |kv| {
+                    const p = kv.value_ptr;
+                    const pin = switch (p.location) {
+                        .pin => |pin| pin,
+                        // Shown where placeholder cells are; see below.
+                        .virtual => {
+                            virtual = true;
+                            continue;
+                        },
+                        // TODO: relative placements.
+                        .relative => continue,
+                    };
+                    if (pin.garbage) continue;
+                    const image = storage.imageById(kv.key_ptr.image_id) orelse continue;
+                    if (image.data.isPending()) continue;
+
+                    const grid = p.gridSize(image, t);
+                    if (grid.cols == 0 or grid.rows == 0) continue;
+                    const y = pages.pointFromPin(.screen, pin.*).?.screen.y;
+                    if (y > bot_y or y + grid.rows - 1 < top_y) continue;
+
+                    const size = p.pixelSize(image, t);
+                    if (size.width == 0 or size.height == 0) continue;
+                    const offset = p.cellOffset(t);
+                    const src = p.sourceRect(image);
+                    try self.place(alloc, image, .{
+                        .image_id = image.id,
+                        .z = p.z,
+                        .x = pin.x,
+                        .y = @intCast(@as(i64, y) - @as(i64, top_y)),
+                        .offset_x = offset.x,
+                        .offset_y = offset.y,
+                        .width = size.width,
+                        .height = size.height,
+                        .src_x = src.x,
+                        .src_y = src.y,
+                        .src_width = src.width,
+                        .src_height = src.height,
+                    });
+                }
+
+                // Unicode placeholders: cells of U+10EEEE whose colors and
+                // diacritics name an image and which part of it to show.
+                // A program draws them as text, so they scroll and
+                // redraw with it, which is what lets images work through
+                // tmux. Below the text, as in Ghostty.
+                if (!virtual) return;
+                var v_it = kitty.unicode.placementIterator(top, bot);
+                while (v_it.next()) |vp| {
+                    const image = storage.imageById(vp.image_id) orelse continue;
+                    if (image.data.isPending()) continue;
+                    const rp = vp.renderPlacement(storage, &image, cell_width, cell_height) catch continue;
+                    if (rp.dest_width == 0 or rp.dest_height == 0) continue;
+                    const y = pages.pointFromPin(.viewport, rp.top_left) orelse continue;
+                    try self.place(alloc, image, .{
+                        .image_id = image.id,
+                        .z = -1,
+                        .x = rp.top_left.x,
+                        .y = @intCast(y.viewport.y),
+                        .offset_x = rp.offset_x,
+                        .offset_y = rp.offset_y,
+                        .width = rp.dest_width,
+                        .height = rp.dest_height,
+                        .src_x = rp.source_x,
+                        .src_y = rp.source_y,
+                        .src_width = rp.source_width,
+                        .src_height = rp.source_height,
+                    });
+                }
+            }
+
+            fn place(self: *ImageSender, alloc: Allocator, image: kitty.Image, p: Placement) !void {
+                try self.placements.append(alloc, p);
+                const gop = try self.sent.getOrPut(alloc, image.id);
+                if (gop.found_existing and gop.value_ptr.* == image.generation) return;
+                errdefer if (!gop.found_existing) {
+                    _ = self.sent.remove(image.id);
+                };
+                try self.pending.append(alloc, .{ .id = image.id, .generation = image.generation });
+                gop.value_ptr.* = image.generation;
+            }
+
+            /// The pixels of `pending[i]`, or null if the terminal lost
+            /// it since `gather`. The caller frees `rgba`.
+            pub fn pixels(self: *const ImageSender, alloc: Allocator, t: *const vt.Terminal, i: usize) !?Pixels {
+                const ref = self.pending.items[i];
+                const image = t.screens.active.kitty_images.imageById(ref.id) orelse return null;
+                if (image.generation != ref.generation) return null;
+                // For animated images this is the current frame.
+                const data = image.renderData().bytes() orelse return null;
+                const rgba = try kitty.pixel.rgbaFromFormat(alloc, image.format, data);
+                errdefer alloc.free(rgba);
+                const len = std.math.mul(usize, std.math.mul(usize, image.width, image.height) catch return null, 4) catch return null;
+                if (rgba.len != len) return null;
+                return .{
+                    .id = image.id,
+                    .generation = image.generation,
+                    .width = image.width,
+                    .height = image.height,
+                    .rgba = rgba,
+                };
+            }
+        };
+
         /// Encode a frame from `state`: every row if `full` or the state
         /// says so, else its dirty rows. The caller cleans the state
         /// after (`RenderState.clean`), and decides whether the palette
@@ -94,6 +306,9 @@ pub fn Codec(comptime vt: type) type {
             /// Terminal state the render state doesn't carry.
             motion: bool = false,
             mouse_shape: u8 = 0,
+            /// The images placed, from `ImageSender.gather`; none if
+            /// null.
+            images: ?*const ImageSender = null,
         }) std.Io.Writer.Error!void {
             const full = opts.full or state.dirty == .full;
             const flags: Flags = .{ .full = full, .palette = opts.palette or full, .motion = opts.motion };
@@ -139,6 +354,22 @@ pub fn Codec(comptime vt: type) type {
                 try w.writeInt(u16, s[0], .little);
                 try w.writeInt(u16, s[1], .little);
                 try writeCells(w, row_cells.slice(), state.cols);
+            }
+
+            const dropped: []const u32 = if (opts.images) |im| im.dropped.items else &.{};
+            try w.writeInt(u16, @intCast(@min(dropped.len, std.math.maxInt(u16))), .little);
+            for (dropped[0..@min(dropped.len, std.math.maxInt(u16))]) |id| try w.writeInt(u32, id, .little);
+            const placements: []const Placement = if (opts.images) |im| im.placements.items else &.{};
+            const n_placements = @min(placements.len, std.math.maxInt(u16));
+            try w.writeInt(u16, @intCast(n_placements), .little);
+            for (placements[0..n_placements]) |p| {
+                try w.writeInt(u32, p.image_id, .little);
+                try w.writeInt(i32, p.z, .little);
+                try w.writeInt(u16, p.x, .little);
+                try w.writeInt(i32, p.y, .little);
+                for ([_]u32{ p.offset_x, p.offset_y, p.width, p.height, p.src_x, p.src_y, p.src_width, p.src_height }) |v| {
+                    try w.writeInt(u32, v, .little);
+                }
             }
         }
 
@@ -219,6 +450,11 @@ pub fn Codec(comptime vt: type) type {
             mouse_shape: u8 = 0,
             /// Send mouse motion without a button held (Flags.motion).
             motion: bool = false,
+            /// The images placed in the viewport, as of the last frame.
+            placements: std.ArrayList(Placement) = .empty,
+            /// Images the frames applied dropped, for the owner of the
+            /// pixels to free; it clears the list.
+            dropped: std.ArrayList(u32) = .empty,
 
             /// Scratch for decoding a row: its style table.
             style_table: std.AutoHashMapUnmanaged(StyleId, Style) = .empty,
@@ -246,6 +482,8 @@ pub fn Codec(comptime vt: type) type {
             pub fn deinit(self: *Screen, alloc: Allocator) void {
                 for (self.row_data.items) |*r| r.deinit(alloc);
                 self.row_data.deinit(alloc);
+                self.placements.deinit(alloc);
+                self.dropped.deinit(alloc);
                 self.style_table.deinit(alloc);
                 self.* = undefined;
             }
@@ -302,6 +540,29 @@ pub fn Codec(comptime vt: type) type {
                     row.selection = if (has_sel) sel else null;
                     try self.readCells(alloc, &r, row);
                     row.dirty = true;
+                }
+
+                const n_dropped = try r.takeInt(u16, .little);
+                try self.dropped.ensureUnusedCapacity(alloc, n_dropped);
+                for (0..n_dropped) |_| self.dropped.appendAssumeCapacity(try r.takeInt(u32, .little));
+                const n_placements = try r.takeInt(u16, .little);
+                self.placements.clearRetainingCapacity();
+                try self.placements.ensureTotalCapacity(alloc, n_placements);
+                for (0..n_placements) |_| {
+                    self.placements.appendAssumeCapacity(.{
+                        .image_id = try r.takeInt(u32, .little),
+                        .z = try r.takeInt(i32, .little),
+                        .x = try r.takeInt(u16, .little),
+                        .y = try r.takeInt(i32, .little),
+                        .offset_x = try r.takeInt(u32, .little),
+                        .offset_y = try r.takeInt(u32, .little),
+                        .width = try r.takeInt(u32, .little),
+                        .height = try r.takeInt(u32, .little),
+                        .src_x = try r.takeInt(u32, .little),
+                        .src_y = try r.takeInt(u32, .little),
+                        .src_width = try r.takeInt(u32, .little),
+                        .src_height = try r.takeInt(u32, .little),
+                    });
                 }
             }
 

@@ -1,8 +1,13 @@
 package vt
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"math"
 	"strings"
 	"testing"
@@ -74,6 +79,112 @@ func TestFrames(t *testing.T) {
 	}
 	if FrameLayout() == 0 {
 		t.Error("no frame layout id")
+	}
+}
+
+// kittyImage is a kitty graphics transmission of data in format f (24
+// for RGB, 100 for PNG) with image id, placed at the cursor.
+func kittyImage(id int, f string, data []byte) string {
+	return fmt.Sprintf("\x1b_Gf=%s,i=%d,a=T;%s\x1b\\", f, id, base64.StdEncoding.EncodeToString(data))
+}
+
+// TestFrameImages checks that an image a frame places is handed out
+// once, as RGBA, and again for a full frame (a new client).
+func TestFrameImages(t *testing.T) {
+	term := newTerm(t, 20, 5)
+	// Placements have a pixel size only once the cells do.
+	if err := term.Resize(20, 5, 10, 20); err != nil {
+		t.Fatal(err)
+	}
+	v := newView(t, term)
+	frame(t, v, term, false)
+	if _, more := v.Image(term, 0); more {
+		t.Error("an image before any was placed")
+	}
+
+	rgb := []byte{255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255}
+	write(t, term, kittyImage(7, "24,s=2,v=2", rgb))
+	f := frame(t, v, term, false)
+	img, more := v.Image(term, 0)
+	if !more || img == nil {
+		t.Fatalf("image after placing one: %v, more %v", img, more)
+	}
+	if img.ID != 7 || img.Width != 2 || img.Height != 2 || img.Generation == 0 {
+		t.Errorf("image %+v", img)
+	}
+	want := []byte{255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255}
+	if !bytes.Equal(img.RGBA, want) {
+		t.Errorf("RGBA %v, want %v", img.RGBA, want)
+	}
+	if _, more := v.Image(term, 1); more {
+		t.Error("a second image")
+	}
+	// The frame's bytes outlive the images.
+	if _, err := FrameText(f); err != nil {
+		t.Errorf("frame after images: %v", err)
+	}
+
+	write(t, term, "x")
+	frame(t, v, term, false)
+	if _, more := v.Image(term, 0); more {
+		t.Error("the image was sent again")
+	}
+	frame(t, v, term, true)
+	if img, more := v.Image(term, 0); !more || img == nil || img.ID != 7 {
+		t.Error("a full frame didn't send the image again")
+	}
+}
+
+// TestFrameImagePng checks the PNG decoder installed for kitty graphics:
+// a color PNG, and a gray one, which converts pixel by pixel.
+func TestFrameImagePng(t *testing.T) {
+	term := newTerm(t, 20, 5)
+	if err := term.Resize(20, 5, 10, 20); err != nil {
+		t.Fatal(err)
+	}
+	v := newView(t, term)
+	frame(t, v, term, false)
+
+	src := image.NewNRGBA(image.Rect(0, 0, 3, 2))
+	for i := range src.Pix {
+		src.Pix[i] = byte(i * 7)
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		t.Fatal(err)
+	}
+	write(t, term, kittyImage(8, "100", buf.Bytes()))
+	frame(t, v, term, false)
+	img, more := v.Image(term, 0)
+	if !more || img == nil {
+		t.Fatal("no image from a PNG")
+	}
+	if img.ID != 8 || img.Width != 3 || img.Height != 2 || !bytes.Equal(img.RGBA, src.Pix) {
+		t.Errorf("PNG image %+v, want %v", img, src.Pix)
+	}
+
+	gray := image.NewGray(image.Rect(0, 0, 2, 1))
+	gray.SetGray(0, 0, color.Gray{Y: 0})
+	gray.SetGray(1, 0, color.Gray{Y: 255})
+	buf.Reset()
+	if err := png.Encode(&buf, gray); err != nil {
+		t.Fatal(err)
+	}
+	write(t, term, kittyImage(9, "100", buf.Bytes()))
+	frame(t, v, term, false)
+	img, more = v.Image(term, 0)
+	if !more || img == nil {
+		t.Fatal("no image from a gray PNG")
+	}
+	if want := []byte{0, 0, 0, 255, 255, 255, 255, 255}; img.ID != 9 || !bytes.Equal(img.RGBA, want) {
+		t.Errorf("gray PNG image %+v, want %v", img, want)
+	}
+
+	// Not a PNG: rejected, so nothing to send.
+	write(t, term, kittyImage(10, "100", []byte("not a png")))
+	frame(t, v, term, false)
+	if _, more := v.Image(term, 0); more {
+		t.Error("a bad PNG was placed")
 	}
 }
 

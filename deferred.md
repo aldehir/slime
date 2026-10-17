@@ -94,23 +94,29 @@ than being piecemealed with MessageBox and the like.
 
 ## Kitty graphics
 
-Not drawn since sessions moved into slimed: its frames don't carry
-images. The plan is to send each image once, as a message of its own,
-and its placements with each frame; `renderer/image.zig` already draws
-placements in kitty's three z layers, from a terminal. Before the move,
-images placed at the cursor were drawn. Once they are again:
+slimed's terminals keep the images (PNGs decoded by Go's `image/png`,
+Ghostty's default storage limit of 320 MB a screen). Each image a frame
+places goes to the window once, deflated, in pieces (wire.go's `Image`),
+and every frame carries the placements in the viewport (`frame.zig`'s
+`ImageSender`), which `renderer/image.zig` lays out on the window's grid
+for the renderer to draw in kitty's three z layers. Placements at a
+cell and Unicode placeholders (`U=1`, `U+10EEEE` cells) are drawn.
 
-- **Unicode placeholders** (`U=1`, `U+10EEEE` cells) and **relative
-  placements** (`P=`/`Q=`). Ghostty's `renderer/image.zig` has the
-  placement walk to port; placeholder cells should draw no glyph.
-- **Animation.** Nothing calls `ImageStorage.animationTick`, so
-  animated images stay on one frame. It returns the next deadline,
-  for a UI-thread timer.
+- **Relative placements** (`P=`/`Q=`). Ghostty's `renderer/image.zig`
+  has the placement walk to port; `ImageSender.gather` skips them.
+- **Animation.** Nothing calls `ImageStorage.animationTick` in slimed,
+  so animated images stay on one frame. Advancing one changes the
+  image's generation, which resends it whole.
 - **File and temp-file media.** `image_limits` is left at `.direct`.
   Shared memory is POSIX `shm_open`; Windows would need its own scheme.
-- **`image-storage-limit`** config.
+- **`image-storage-limit`** config; slimed's is fixed.
 - **Device loss.** Image pixels are freed after upload, so recreating
-  textures would need them copied from the terminal again.
+  textures would need slimed to send them again, which nothing asks.
+- **A placement's pixel size comes from slimed**, from the cell size
+  the window last sent, so a font size change draws images at the old
+  size until the resize comes back.
+- **Images inflate on the connection's reader thread**, which holds
+  every pane's frames for the tens of milliseconds a big one takes.
 
 ## Terminal and window
 

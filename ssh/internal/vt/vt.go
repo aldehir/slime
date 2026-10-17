@@ -16,6 +16,7 @@ package vt
 // In callbacks.c, which can see the exported Go callbacks.
 extern GhosttyResult slime_install_callbacks(GhosttyTerminal t, uintptr_t userdata);
 extern void slime_install_log(void);
+extern void slime_install_decode_png(void);
 // In slime.zig.
 extern void slime_vt_terminal_defaults(GhosttyTerminal t, bool fresh);
 */
@@ -34,6 +35,11 @@ import (
 // and APC payloads past this make the continuation unavailable until the
 // parser next reaches ground.
 const ContinuationLimit = 64 * 1024
+
+// ImageStorageLimit is how many bytes of kitty images a terminal keeps
+// per screen before evicting the oldest: Ghostty's image-storage-limit
+// default, in place of the library's 10 MB.
+const ImageStorageLimit = 320 * 1000 * 1000
 
 // Error is a GhosttyResult other than success.
 type Error struct {
@@ -85,6 +91,9 @@ func NewRuntime(_ context.Context, log *slog.Logger) (*Runtime, error) {
 	logger.l = log
 	logger.Unlock()
 	C.slime_install_log()
+	// Kitty graphics come as PNGs more often than not, and the library
+	// rejects them without a decoder.
+	C.slime_install_decode_png()
 	return &Runtime{}, nil
 }
 
@@ -163,6 +172,10 @@ func (r *Runtime) Decode(snapshot []byte) (*Terminal, error) {
 // too; a restored one keeps its program's.
 func (t *Terminal) finish(fresh bool) error {
 	C.slime_vt_terminal_defaults(t.term, C.bool(fresh))
+	limit := C.uint64_t(ImageStorageLimit)
+	if err := check("terminal_set", C.ghostty_terminal_set(t.term, C.GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, unsafe.Pointer(&limit))); err != nil {
+		return err
+	}
 	var err error
 	if t.cols, t.rows, err = t.Size(); err != nil {
 		return err

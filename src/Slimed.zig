@@ -74,6 +74,7 @@ const MsgType = enum(u8) {
     draw = 75,
     copied = 76,
     notice = 77,
+    image = 78,
     _,
 };
 
@@ -172,12 +173,28 @@ pub const Sink = struct {
     /// A frame of the pane's screen (frame.zig), to apply in order and
     /// `ack` once drawn.
     draw: *const fn (ctx: *anyopaque, seq: u32, data: []const u8) void,
+    /// A piece of a kitty image the pane's frames place, before the
+    /// first that does.
+    image: *const fn (ctx: *anyopaque, piece: ImagePiece) void,
     notice: *const fn (ctx: *anyopaque, n: Notice) void,
     /// The selection's text, answering a copy event: empty with none.
     copied: *const fn (ctx: *anyopaque, tag: u32, text: []const u8) void,
     /// The pane is gone from us: its child exited (`why` null), or the
     /// workspace or connection was lost (why says how).
     ended: *const fn (ctx: *anyopaque, why: ?[]const u8) void,
+};
+
+/// A piece of a kitty image (wire.go's Image): `data` goes at `offset`
+/// of its `total` deflated bytes, which inflate to `width * height * 4`
+/// of straight RGBA.
+pub const ImagePiece = struct {
+    id: u32,
+    generation: u64,
+    width: u32,
+    height: u32,
+    total: u32,
+    offset: u32,
+    data: []const u8,
 };
 
 /// What a pane did besides change its screen (wire.go's Notice).
@@ -793,7 +810,7 @@ fn handle(self: *Slimed, f: Frame) !u32 {
             };
             gop.value_ptr.* = .{ .pending = .{ .command = command, .status = status } };
         },
-        .draw, .notice, .copied => if (self.panes.getPtr(f.id)) |slot| switch (slot.*) {
+        .draw, .image, .notice, .copied => if (self.panes.getPtr(f.id)) |slot| switch (slot.*) {
             .pending => |*pend| try pend.keep(self.alloc, f),
             .live => |sink| try deliver(sink, f),
         },
@@ -895,6 +912,23 @@ fn deliver(sink: Sink, f: Frame) !void {
         .draw => {
             const seq = try r.readU32();
             sink.draw(sink.ctx, seq, r.buf);
+        },
+        .image => {
+            const id = try r.readU32();
+            const generation = try r.readU64();
+            const width = try r.readU32();
+            const height = try r.readU32();
+            const total = try r.readU32();
+            const offset = try r.readU32();
+            sink.image(sink.ctx, .{
+                .id = id,
+                .generation = generation,
+                .width = width,
+                .height = height,
+                .total = total,
+                .offset = offset,
+                .data = r.buf,
+            });
         },
         .notice => {
             const kind: Notice.Kind = @enumFromInt(try r.readU8());

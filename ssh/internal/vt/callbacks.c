@@ -63,3 +63,7 @@ GhosttyResult slime_install_callbacks(GhosttyTerminal t, uintptr_t userdata) {
 void slime_install_log(void) {
 	ghostty_sys_set(GHOSTTY_SYS_OPT_LOG, (const void*)(GhosttySysLogFn)goLog);
 }
+
+void slime_install_decode_png(void) {
+	ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void*)(GhosttySysDecodePngFn)goDecodePng);
+}

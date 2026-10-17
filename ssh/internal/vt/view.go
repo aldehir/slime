@@ -26,6 +26,18 @@ extern uint8_t slime_vt_view_hold(SlimeView* v, GhosttyTerminal t);
 extern void slime_vt_end_sync(GhosttyTerminal t);
 extern bool slime_vt_view_frame(SlimeView* v, GhosttyTerminal t, bool full,
 	const uint8_t** out_ptr, size_t* out_len);
+
+// slime.zig's Image.
+typedef struct {
+	uint32_t id;
+	uint64_t generation;
+	uint32_t width;
+	uint32_t height;
+	const uint8_t* ptr;
+	size_t len;
+} SlimeImage;
+
+extern uint8_t slime_vt_view_image(SlimeView* v, GhosttyTerminal t, size_t i, SlimeImage* out);
 extern bool slime_vt_view_event(SlimeView* v, GhosttyTerminal t, bool win32_input,
 	const uint8_t* ptr, size_t len, SlimeResult* result);
 extern bool slime_vt_view_autoscroll(SlimeView* v, GhosttyTerminal t, SlimeResult* result);
@@ -113,8 +125,9 @@ func (v *View) Hold(t *Terminal) Hold { return Hold(C.slime_vt_view_hold(v.v, t.
 func (t *Terminal) EndSync() { C.slime_vt_end_sync(t.term) }
 
 // Frame returns a frame of what changed in t since the last frame, or
-// of everything if full: after a new attach, or when a frame was lost.
-// The bytes are valid until the next call on v.
+// of everything if full: after a new attach, which also means the
+// client has none of the images. The bytes are valid until the next
+// Frame; Image may be called meanwhile.
 func (v *View) Frame(t *Terminal, full bool) ([]byte, error) {
 	var ptr *C.uint8_t
 	var n C.size_t
@@ -122,6 +135,38 @@ func (v *View) Frame(t *Terminal, full bool) ([]byte, error) {
 		return nil, errors.New("vt: encoding a frame failed")
 	}
 	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(n)), nil
+}
+
+// Image is a kitty image a frame places that the client lacks: sent
+// before the frame, as frame.zig lays out.
+type Image struct {
+	ID         uint32
+	Generation uint64
+	Width      uint32
+	Height     uint32
+	// RGBA is straight (not premultiplied), rows top-down, Width *
+	// Height * 4 bytes. Valid until the next Image call.
+	RGBA []byte
+}
+
+// Image returns the i-th image the last Frame needs sent before it.
+// more is false past the last; a nil image with more set is one the
+// terminal lost meanwhile, to skip.
+func (v *View) Image(t *Terminal, i int) (img *Image, more bool) {
+	var out C.SlimeImage
+	switch C.slime_vt_view_image(v.v, t.term, C.size_t(i), &out) {
+	case 1:
+		return &Image{
+			ID:         uint32(out.id),
+			Generation: uint64(out.generation),
+			Width:      uint32(out.width),
+			Height:     uint32(out.height),
+			RGBA:       unsafe.Slice((*byte)(unsafe.Pointer(out.ptr)), int(out.len)),
+		}, true
+	case 2:
+		return nil, true
+	}
+	return nil, false
 }
 
 // Result is what an event did. Its bytes are valid until the next call

@@ -259,6 +259,81 @@ test "events round trip" {
     try testing.expectError(error.EndOfStream, Events.decode(&.{@intFromEnum(event.Kind.copy)}, &scratch));
 }
 
+test "kitty images are placed in frames, their pixels sent once" {
+    var h: Harness = undefined;
+    try h.init(10, 5);
+    defer h.deinit();
+    // 10x20 pixel cells.
+    h.t.width_px = 100;
+    h.t.height_px = 100;
+    h.t.modes.set(.grapheme_cluster, true);
+    var sender: Codec.ImageSender = .{};
+    defer sender.deinit(h.alloc);
+
+    // A 2x2 RGB image, id 7, placed at the cursor: row 2, column 3.
+    const rgb = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 };
+    var b64: [16]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&b64, &rgb);
+    h.write("\x1b[2;3H\x1b_Gf=24,s=2,v=2,i=7,a=T;" ++ b64 ++ "\x1b\\");
+    try sender.gather(h.alloc, &h.t);
+    try testing.expectEqual(1, sender.pending.items.len);
+    try testing.expectEqual(1, sender.placements.items.len);
+    try testing.expectEqual(0, sender.dropped.items.len);
+    const px = (try sender.pixels(h.alloc, &h.t, 0)).?;
+    defer h.alloc.free(px.rgba);
+    try testing.expectEqual(7, px.id);
+    try testing.expectEqual(.{ 2, 2 }, .{ px.width, px.height });
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255, 0, 255, 0, 255 }, px.rgba[0..8]);
+
+    try h.state.update(h.alloc, &h.t);
+    h.buf.clearRetainingCapacity();
+    try Codec.encode(&h.buf.writer, &h.state, .{ .images = &sender });
+    h.state.clean();
+    try h.screen.apply(h.alloc, h.buf.written());
+    try h.expectSame();
+    try testing.expectEqual(1, h.screen.placements.items.len);
+    const p = h.screen.placements.items[0];
+    try testing.expectEqual(7, p.image_id);
+    try testing.expectEqual(.{ 2, 1 }, .{ p.x, p.y });
+    try testing.expectEqual(.{ 2, 2 }, .{ p.width, p.height });
+    try testing.expectEqual(.{ 0, 0, 2, 2 }, .{ p.src_x, p.src_y, p.src_width, p.src_height });
+    try testing.expectEqual(0, h.screen.dropped.items.len);
+
+    // Still placed, but sent already.
+    try sender.gather(h.alloc, &h.t);
+    try testing.expectEqual(0, sender.pending.items.len);
+    try testing.expectEqual(1, sender.placements.items.len);
+
+    // A placeholder cell shows part of the image under the text.
+    try h.t.screens.active.kitty_images.addPlacement(testing.io, h.alloc, h.t.screens.active, 7, 1, .{ .location = .{ .virtual = {} } });
+    try h.t.setAttribute(.{ .@"256_fg" = 7 });
+    h.t.screens.active.cursorAbsolute(4, 3);
+    try h.t.printString("\u{10EEEE}\u{0305}\u{0305}");
+    try sender.gather(h.alloc, &h.t);
+    try testing.expectEqual(2, sender.placements.items.len);
+    const v = sender.placements.items[1];
+    try testing.expectEqual(-1, v.z);
+    try testing.expectEqual(.{ 4, 3 }, .{ v.x, v.y });
+    try testing.expectEqual(.{ 10, 10 }, .{ v.width, v.height });
+
+    // Deleted, the image is dropped in the next frame and gone from it.
+    h.write("\x1b_Ga=d,d=I,i=7\x1b\\");
+    try sender.gather(h.alloc, &h.t);
+    try testing.expectEqualSlices(u32, &.{7}, sender.dropped.items);
+    try testing.expectEqual(0, sender.placements.items.len);
+    try h.state.update(h.alloc, &h.t);
+    h.buf.clearRetainingCapacity();
+    try Codec.encode(&h.buf.writer, &h.state, .{ .images = &sender });
+    h.state.clean();
+    try h.screen.apply(h.alloc, h.buf.written());
+    try testing.expectEqualSlices(u32, &.{7}, h.screen.dropped.items);
+    try testing.expectEqual(0, h.screen.placements.items.len);
+    // Placed again, it's sent again.
+    h.write("\x1b_Gf=24,s=2,v=2,i=7,a=T;" ++ b64 ++ "\x1b\\");
+    try sender.gather(h.alloc, &h.t);
+    try testing.expectEqual(1, sender.pending.items.len);
+}
+
 test "frames carry the mouse shape and whether to send motion" {
     var h: Harness = undefined;
     try h.init(10, 3);

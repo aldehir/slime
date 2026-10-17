@@ -1,9 +1,13 @@
 package persist
 
 import (
+	"bytes"
+	"compress/flate"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -20,6 +24,8 @@ type drawer struct {
 	c    *Client
 	conn net.Conn
 	pane uint32
+	// The image pieces that came before the frames read.
+	images []*Image
 }
 
 // newDrawer connects a client that draws, makes a workspace with one
@@ -73,6 +79,11 @@ func (d *drawer) draw(wait time.Duration) *Draw {
 		if f, ok := m.(*Draw); ok && id == d.pane {
 			return &Draw{Seq: f.Seq, Data: append([]byte(nil), f.Data...)}
 		}
+		if im, ok := m.(*Image); ok && id == d.pane {
+			piece := *im
+			piece.Data = append([]byte(nil), im.Data...)
+			d.images = append(d.images, &piece)
+		}
 		if _, ok := m.(*Output); ok {
 			d.t.Fatal("a client that draws got raw output")
 		}
@@ -109,6 +120,54 @@ func TestFramesOnAttach(t *testing.T) {
 	}
 	if text := frameText(t, next); text != "hello\n" {
 		t.Errorf("partial frame carries %q, want the one row written", text)
+	}
+}
+
+// TestFramesImages checks that a kitty image placed in the pane comes
+// before the frame that places it, deflated, and only once.
+func TestFramesImages(t *testing.T) {
+	h := newHarness(t)
+	d := newDrawer(t, h)
+	first := d.draw(5 * time.Second)
+	if first == nil {
+		t.Fatal("no first frame")
+	}
+	d.ack(first)
+	// Placements have a pixel size only once the cells do.
+	d.c.Send(d.pane, &Resize{Size: Size{Cols: 40, Rows: 10, CellW: 10, CellH: 20}})
+	rgb := []byte{255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255}
+	h.pty(0).emit("\x1b_Gf=24,s=2,v=2,i=7,a=T;" + base64.StdEncoding.EncodeToString(rgb) + "\x1b\\")
+	for i := 0; len(d.images) == 0 && i < 3; i++ {
+		f := d.draw(5 * time.Second)
+		if f == nil {
+			t.Fatal("no frame after the image")
+		}
+		d.ack(f)
+	}
+	if len(d.images) != 1 {
+		t.Fatalf("got %d image pieces, want 1", len(d.images))
+	}
+	im := d.images[0]
+	if im.ID != 7 || im.Width != 2 || im.Height != 2 || im.Offset != 0 || im.Total != uint32(len(im.Data)) || im.Generation == 0 {
+		t.Errorf("image piece %+v", im)
+	}
+	rgba, err := io.ReadAll(flate.NewReader(bytes.NewReader(im.Data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255}
+	if !bytes.Equal(rgba, want) {
+		t.Errorf("image inflates to %v, want %v", rgba, want)
+	}
+
+	// More output places it still, but it isn't sent again.
+	h.pty(0).emit("x")
+	next := d.draw(5 * time.Second)
+	if next == nil {
+		t.Fatal("no frame after more output")
+	}
+	if len(d.images) != 1 {
+		t.Errorf("the image was sent %d times", len(d.images))
 	}
 }
 

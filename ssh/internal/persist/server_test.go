@@ -362,6 +362,8 @@ func TestWireRoundTrip(t *testing.T) {
 		&Detached{WS: 9, Reason: "too slow"},
 		&Error{Tag: 8, Message: "no such pane"},
 		&Created{Tag: 9, WS: 9, Tab: 2, Pane: 3},
+		&Draw{Seq: 4, Data: []byte{1, 2, 3}},
+		&Image{ID: 7, Generation: 1 << 40, Width: 2, Height: 3, Total: 10, Offset: 4, Data: []byte{9, 8, 7}},
 	}
 	var stream bytes.Buffer
 	for i, m := range msgs {

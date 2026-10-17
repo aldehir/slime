@@ -1,11 +1,9 @@
-//! Kitty graphics: a snapshot of the active screen's images and the
-//! placements in the viewport, taken under the terminal lock and drawn
-//! by the renderer after it's released. Independent of the graphics API.
+//! Kitty graphics: the images slimed sent for a pane and where its last
+//! frame placed them, laid out for the renderer. Independent of the
+//! graphics API.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ghostty_vt = @import("ghostty-vt");
-
-const kitty = ghostty_vt.kitty.graphics;
+const frame = @import("frame");
 
 const log = std.log.scoped(.image);
 
@@ -34,8 +32,8 @@ pub const Image = struct {
 pub const Layer = enum { below_bg, below_text, above_text };
 
 pub const Images = struct {
-    /// Images still in the terminal's storage that a placement has
-    /// shown, by kitty image ID.
+    /// Every image slimed sent that no frame has dropped, by kitty image
+    /// ID. The renderer keeps a texture of each.
     images: std.AutoArrayHashMapUnmanaged(u32, Image) = .empty,
     /// Placements in the viewport, in draw order (by z).
     placements: std.ArrayList(Placement) = .empty,
@@ -80,99 +78,39 @@ pub const Images = struct {
         img.rgba = null;
     }
 
-    /// Rebuild the placements from the terminal's active screen, copying
-    /// any image whose content changed. Call with the terminal locked.
-    pub fn update(self: *Images, alloc: Allocator, t: *const ghostty_vt.Terminal) !void {
-        const screen = t.screens.active;
-        const storage = &screen.kitty_images;
+    /// Take an image slimed sent, in place of any with its id. Its
+    /// pixels are owned from here, whether or not this fails.
+    pub fn put(self: *Images, alloc: Allocator, id: u32, img: Image) !void {
+        const gop = try self.images.getOrPut(alloc, id);
+        if (gop.found_existing) freePixels(alloc, gop.value_ptr);
+        gop.value_ptr.* = img;
+    }
 
-        // Drop images the terminal deleted.
-        var i: usize = 0;
-        while (i < self.images.count()) {
-            if (storage.imageById(self.images.keys()[i]) != null) {
-                i += 1;
-                continue;
-            }
-            freePixels(alloc, &self.images.values()[i]);
-            self.images.swapRemoveAt(i);
+    /// Forget an image a frame dropped.
+    pub fn remove(self: *Images, alloc: Allocator, id: u32) void {
+        if (self.images.fetchSwapRemove(id)) |kv| {
+            var img = kv.value;
+            freePixels(alloc, &img);
         }
+    }
 
+    /// Lay out a frame's placements in draw order on a grid of the given
+    /// cell size. One of an image that hasn't arrived is left out.
+    pub fn update(self: *Images, alloc: Allocator, placements: []const frame.Placement, cell_width: u32, cell_height: u32) !void {
         self.sorted.clearRetainingCapacity();
         defer self.split(alloc) catch |err| log.warn("placements dropped: {}", .{err});
-        if (t.cols == 0 or t.rows == 0 or storage.placements.count() == 0) return;
-
-        const cell_width: f32 = @floatFromInt(t.width_px / t.cols);
-        const cell_height: f32 = @floatFromInt(t.height_px / t.rows);
-        const pages = &screen.pages;
-        const top = pages.getTopLeft(.viewport);
-        const bot = pages.getBottomRight(.viewport).?;
-        const top_y = pages.pointFromPin(.screen, top).?.screen.y;
-        const bot_y = pages.pointFromPin(.screen, bot).?.screen.y;
-
-        var virtual = false;
-        var it = storage.placements.iterator();
-        while (it.next()) |kv| {
-            const p = kv.value_ptr;
-            const pin = switch (p.location) {
-                .pin => |pin| pin,
-                // Shown where placeholder cells are; see below.
-                .virtual => {
-                    virtual = true;
-                    continue;
-                },
-                // TODO: relative placements.
-                .relative => continue,
-            };
-            if (pin.garbage) continue;
-            const image = storage.imageById(kv.key_ptr.image_id) orelse continue;
-            if (image.data.isPending()) continue;
-
-            const grid = p.gridSize(image, t);
-            if (grid.cols == 0 or grid.rows == 0) continue;
-            const y = pages.pointFromPin(.screen, pin.*).?.screen.y;
-            if (y > bot_y or y + grid.rows - 1 < top_y) continue;
-
-            const size = p.pixelSize(image, t);
-            if (size.width == 0 or size.height == 0) continue;
-            const offset = p.cellOffset(t);
-            const src = p.sourceRect(image);
-
-            try self.copyImage(alloc, image);
-            const row: f32 = @floatFromInt(@as(i64, y) - @as(i64, top_y));
-            const col: f32 = @floatFromInt(pin.x);
-            try self.sorted.append(alloc, .{ .z = p.z, .id = image.id, .placement = .{
-                .pos = .{ col * cell_width + @as(f32, @floatFromInt(offset.x)), row * cell_height + @as(f32, @floatFromInt(offset.y)) },
-                .size = .{ @floatFromInt(size.width), @floatFromInt(size.height) },
-                .src_pos = .{ @floatFromInt(src.x), @floatFromInt(src.y) },
-                .src_size = .{ @floatFromInt(src.width), @floatFromInt(src.height) },
-            } });
-        }
-
-        // Unicode placeholders: cells of U+10EEEE whose colors and
-        // diacritics name an image and which part of it to show. A
-        // program draws them as text, so they scroll and redraw with it,
-        // which is what lets images work through tmux. Below the text,
-        // as in Ghostty.
-        if (!virtual) return;
-        var v_it = kitty.unicode.placementIterator(top, bot);
-        while (v_it.next()) |vp| {
-            const image = storage.imageById(vp.image_id) orelse continue;
-            if (image.data.isPending()) continue;
-            const rp = vp.renderPlacement(storage, &image, t.width_px / t.cols, t.height_px / t.rows) catch |err| {
-                log.debug("placeholder for image id={d} not drawn: {}", .{ vp.image_id, err });
-                continue;
-            };
-            if (rp.dest_width == 0 or rp.dest_height == 0) continue;
-            const y = pages.pointFromPin(.viewport, rp.top_left) orelse continue;
-
-            try self.copyImage(alloc, image);
-            const row: f32 = @floatFromInt(y.viewport.y);
-            const col: f32 = @floatFromInt(rp.top_left.x);
-            try self.sorted.append(alloc, .{ .z = -1, .id = image.id, .placement = .{
-                .pos = .{ col * cell_width + @as(f32, @floatFromInt(rp.offset_x)), row * cell_height + @as(f32, @floatFromInt(rp.offset_y)) },
-                .size = .{ @floatFromInt(rp.dest_width), @floatFromInt(rp.dest_height) },
-                .src_pos = .{ @floatFromInt(rp.source_x), @floatFromInt(rp.source_y) },
-                .src_size = .{ @floatFromInt(rp.source_width), @floatFromInt(rp.source_height) },
+        const cw: f32 = @floatFromInt(cell_width);
+        const ch: f32 = @floatFromInt(cell_height);
+        for (placements) |p| {
+            if (!self.images.contains(p.image_id)) continue;
+            if (p.width == 0 or p.height == 0) continue;
+            const col: f32 = @floatFromInt(p.x);
+            const row: f32 = @floatFromInt(p.y);
+            try self.sorted.append(alloc, .{ .z = p.z, .id = p.image_id, .placement = .{
+                .pos = .{ col * cw + @as(f32, @floatFromInt(p.offset_x)), row * ch + @as(f32, @floatFromInt(p.offset_y)) },
+                .size = .{ @floatFromInt(p.width), @floatFromInt(p.height) },
+                .src_pos = .{ @floatFromInt(p.src_x), @floatFromInt(p.src_y) },
+                .src_size = .{ @floatFromInt(p.src_width), @floatFromInt(p.src_height) },
             } });
         }
     }
@@ -197,30 +135,10 @@ pub const Images = struct {
             self.placement_ids.appendAssumeCapacity(s.id);
         }
     }
-
-    fn copyImage(self: *Images, alloc: Allocator, image: kitty.Image) !void {
-        const gop = try self.images.getOrPut(alloc, image.id);
-        if (gop.found_existing) {
-            if (gop.value_ptr.generation == image.generation) return;
-            freePixels(alloc, gop.value_ptr);
-        }
-        errdefer _ = self.images.swapRemove(image.id);
-
-        // For animated images this is the current frame.
-        const data = image.renderData().bytes() orelse unreachable;
-        const rgba = try kitty.pixel.rgbaFromFormat(alloc, image.format, data);
-        premultiply(rgba);
-        gop.value_ptr.* = .{
-            .generation = image.generation,
-            .width = image.width,
-            .height = image.height,
-            .rgba = rgba,
-        };
-        log.debug("copied image id={d} {d}x{d}", .{ image.id, image.width, image.height });
-    }
 };
 
-fn premultiply(rgba: []u8) void {
+/// Premultiply straight RGBA, as the renderer blends it.
+pub fn premultiply(rgba: []u8) void {
     var i: usize = 0;
     while (i + 4 <= rgba.len) : (i += 4) {
         const a: u16 = rgba[i + 3];
@@ -229,52 +147,46 @@ fn premultiply(rgba: []u8) void {
     }
 }
 
-test "unicode placeholders place their image" {
+test "placements lay out by layer, without images not yet here" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    const io = testing.io;
-
-    // 10x10 pixel cells.
-    var t = try ghostty_vt.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
-    defer t.deinit(alloc);
-    t.width_px = 50;
-    t.height_px = 50;
-    t.modes.set(.grapheme_cluster, true);
-
-    const storage = &t.screens.active.kitty_images;
-    const pixels = try alloc.alloc(u8, 10 * 10 * 3);
-    @memset(pixels, 0xff);
-    try storage.addImage(io, alloc, t.screens.active, .{
-        .id = 7,
-        .width = 10,
-        .height = 10,
-        .format = .rgb,
-        .data = .{ .complete = pixels },
-    });
-    try storage.addPlacement(io, alloc, t.screens.active, 7, 1, .{ .location = .{ .virtual = {} } });
-
     var images: Images = .{};
     defer images.deinit(alloc);
+    try images.put(alloc, 1, .{ .generation = 1, .width = 4, .height = 4, .rgba = try alloc.dupe(u8, &[_]u8{0xff} ** 64) });
+    try images.put(alloc, 2, .{ .generation = 1, .width = 1, .height = 1, .rgba = try alloc.dupe(u8, &[_]u8{ 1, 2, 3, 4 }) });
 
-    // No placeholder on screen yet: nothing to draw.
-    try images.update(alloc, &t);
+    const place = struct {
+        fn f(id: u32, z: i32, x: u16, y: i32) frame.Placement {
+            return .{ .image_id = id, .z = z, .x = x, .y = y, .offset_x = 1, .offset_y = 2, .width = 30, .height = 40, .src_x = 0, .src_y = 0, .src_width = 4, .src_height = 4 };
+        }
+    }.f;
+    try images.update(alloc, &.{
+        place(1, 5, 2, 1),
+        place(2, -1, 0, -1),
+        place(1, below_bg_z - 1, 3, 3),
+        place(9, 0, 0, 0),
+    }, 10, 20);
+    try testing.expectEqual(3, images.placements.items.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 1 }, images.placement_ids.items);
+    try testing.expectEqual(.{ 0, 1 }, images.layer(.below_bg));
+    try testing.expectEqual(.{ 1, 2 }, images.layer(.below_text));
+    try testing.expectEqual(.{ 2, 3 }, images.layer(.above_text));
+    // Above the viewport by a row.
+    try testing.expectEqual([2]f32{ 1, -18 }, images.placements.items[1].pos);
+    try testing.expectEqual([2]f32{ 21, 22 }, images.placements.items[2].pos);
+    try testing.expectEqual([2]f32{ 30, 40 }, images.placements.items[2].size);
+
+    // A new generation replaces the pixels; a drop frees them.
+    try images.put(alloc, 2, .{ .generation = 2, .width = 1, .height = 1, .rgba = try alloc.dupe(u8, &[_]u8{ 5, 6, 7, 8 }) });
+    try testing.expectEqual(2, images.images.get(2).?.generation);
+    images.remove(alloc, 1);
+    images.remove(alloc, 7);
+    try images.update(alloc, &.{place(1, 5, 2, 1)}, 10, 20);
     try testing.expectEqual(0, images.placements.items.len);
+}
 
-    // At column 2, row 2 (0-based). The image ID is the foreground
-    // color; the diacritics are row 0, column 0 of the image.
-    try t.setAttribute(.{ .@"256_fg" = 7 });
-    t.screens.active.cursorAbsolute(2, 2);
-    try t.printString("\u{10EEEE}\u{0305}\u{0305}");
-    try images.update(alloc, &t);
-
-    try testing.expectEqual(1, images.placements.items.len);
-    try testing.expectEqual(7, images.placement_ids.items[0]);
-    const p = images.placements.items[0];
-    try testing.expectEqual([2]f32{ 20, 20 }, p.pos);
-    try testing.expectEqual([2]f32{ 10, 10 }, p.size);
-    try testing.expectEqual([2]f32{ 10, 10 }, p.src_size);
-    // Under the text, like Ghostty.
-    const start, const end = images.layer(.below_text);
-    try testing.expectEqual(.{ 0, 1 }, .{ start, end });
-    try testing.expect(images.images.get(7).?.rgba != null);
+test premultiply {
+    var px = [_]u8{ 200, 100, 0, 128, 10, 20, 30, 255 };
+    premultiply(&px);
+    try std.testing.expectEqualSlices(u8, &.{ 100, 50, 0, 128, 10, 20, 30, 255 }, &px);
 }

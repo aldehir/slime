@@ -6,7 +6,11 @@ package vt
 import "C"
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/draw"
+	"image/png"
 	"log/slog"
 	"unsafe"
 )
@@ -197,6 +201,51 @@ func goClipboardWrite(_ C.GhosttyTerminal, ud unsafe.Pointer, data *C.uint8_t, n
 		t.pend.clipboard = append(t.pend.clipboard, unsafe.Slice((*byte)(data), int(n))...)
 	}
 	t.pend.hasClipboard = true
+}
+
+// maxImageDimension is the widest or tallest kitty image libghostty-vt
+// takes (graphics_image.zig's max_dimension), checked before decoding
+// a PNG so a tiny file can't claim gigabytes.
+const maxImageDimension = 10000
+
+// goDecodePng decodes a PNG for kitty graphics into straight RGBA, in
+// memory from the library's allocator, which then owns it. libghostty-vt
+// has no decoder of its own as a library; this is Go's. Runs inside
+// ghostty_terminal_vt_write.
+//
+//export goDecodePng
+func goDecodePng(_ unsafe.Pointer, allocator *C.GhosttyAllocator, data *C.uint8_t, n C.size_t, out *C.GhosttySysImage) C.bool {
+	if n == 0 {
+		return false
+	}
+	src := unsafe.Slice((*byte)(data), int(n))
+	cfg, err := png.DecodeConfig(bytes.NewReader(src))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > maxImageDimension || cfg.Height > maxImageDimension {
+		return false
+	}
+	img, err := png.Decode(bytes.NewReader(src))
+	if err != nil {
+		return false
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	size := w * h * 4
+	buf := C.ghostty_alloc(allocator, C.size_t(size))
+	if buf == nil {
+		return false
+	}
+	dst := unsafe.Slice((*byte)(buf), size)
+	if nrgba, ok := img.(*image.NRGBA); ok && nrgba.Stride == w*4 {
+		copy(dst, nrgba.Pix[:size])
+	} else {
+		// Paletted, gray, and 16-bit images convert pixel by pixel.
+		draw.Draw(&image.NRGBA{Pix: dst, Stride: w * 4, Rect: image.Rect(0, 0, w, h)}, image.Rect(0, 0, w, h), img, b.Min, draw.Src)
+	}
+	out.width = C.uint32_t(w)
+	out.height = C.uint32_t(h)
+	out.data = buf
+	out.data_len = C.size_t(size)
+	return true
 }
 
 //export goLog

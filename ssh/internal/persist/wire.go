@@ -23,12 +23,13 @@ import (
 const Version = 1
 
 // MaxFrame bounds a frame so a corrupt stream can't make us allocate
-// gigabytes. Snapshots go out in SnapshotChunk pieces. A full Frame of
-// a big screen whose every cell has its own style and grapheme can come
-// near a few MiB, and goes whole.
+// gigabytes. Snapshots go out in SnapshotChunk pieces and images in
+// ImageChunk pieces. A full Frame of a big screen whose every cell has
+// its own style and grapheme can come near a few MiB, and goes whole.
 const (
 	MaxFrame      = 8 << 20
 	SnapshotChunk = 256 << 10
+	ImageChunk    = 1 << 20
 )
 
 // maxDepth bounds a layout tree's nesting on the wire.
@@ -76,6 +77,7 @@ const (
 	TypeDraw       Type = 75
 	TypeCopied     Type = 76
 	TypeNotice     Type = 77
+	TypeImage      Type = 78
 )
 
 var (
@@ -236,6 +238,23 @@ type Event struct{ Data []byte }
 type Draw struct {
 	Seq  uint32
 	Data []byte
+}
+
+// Image carries a kitty image the pane in the frame's id places, before
+// the first Draw that places it (again, with a new Generation, if the
+// program retransmits it): its RGBA pixels, deflated (raw, no header),
+// in pieces of up to ImageChunk bytes. Total is the deflated length
+// and Offset where Data goes in it; a piece at Offset 0 starts the
+// image. Images aren't acked: a Draw's images come between its
+// predecessor and it, so they're bounded by the frames in flight.
+type Image struct {
+	ID         uint32
+	Generation uint64
+	Width      uint32
+	Height     uint32
+	Total      uint32
+	Offset     uint32
+	Data       []byte
 }
 
 // Copied answers a copy Event for the pane in the frame's id: Tag is the
@@ -410,6 +429,7 @@ func (*Created) Type() Type         { return TypeCreated }
 func (*Draw) Type() Type            { return TypeDraw }
 func (*Copied) Type() Type          { return TypeCopied }
 func (*Notice) Type() Type          { return TypeNotice }
+func (*Image) Type() Type           { return TypeImage }
 
 func (m *Hello) encode(e *encoder) {
 	e.u32(m.Version)
@@ -558,6 +578,26 @@ func (m *Draw) encode(e *encoder) {
 
 func (m *Draw) decode(d *decoder) {
 	m.Seq = d.u32()
+	m.Data = d.rest()
+}
+
+func (m *Image) encode(e *encoder) {
+	e.u32(m.ID)
+	e.u64(m.Generation)
+	e.u32(m.Width)
+	e.u32(m.Height)
+	e.u32(m.Total)
+	e.u32(m.Offset)
+	e.raw(m.Data)
+}
+
+func (m *Image) decode(d *decoder) {
+	m.ID = d.u32()
+	m.Generation = d.u64()
+	m.Width = d.u32()
+	m.Height = d.u32()
+	m.Total = d.u32()
+	m.Offset = d.u32()
 	m.Data = d.rest()
 }
 
@@ -812,6 +852,8 @@ func newMessage(t Type) Message {
 		return new(Copied)
 	case TypeNotice:
 		return new(Notice)
+	case TypeImage:
+		return new(Image)
 	}
 	return nil
 }

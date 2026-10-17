@@ -62,6 +62,10 @@ const View = struct {
     state: vt.RenderState = .empty,
     frame: std.Io.Writer.Allocating,
     palette: ?vt.color.Palette = null,
+    /// The kitty images the client has, and the last frame's placements.
+    images: Frames.ImageSender = .{},
+    /// The last image's pixels handed out, until the next.
+    image_rgba: ?[]u8 = null,
 
     // Events: what the last one produced.
     out: std.Io.Writer.Allocating,
@@ -130,6 +134,8 @@ export fn slime_vt_view_free(v: ?*View, t: Terminal) void {
     self.copied.deinit();
     self.word_boundary.deinit(alloc);
     self.state.deinit(alloc);
+    self.images.deinit(alloc);
+    if (self.image_rgba) |rgba| alloc.free(rgba);
     alloc.destroy(self);
 }
 
@@ -174,8 +180,10 @@ export fn slime_vt_end_sync(t: Terminal) void {
 }
 
 /// Encode a frame of what changed in `t` since the last one, or of
-/// everything if `full`. The bytes are the View's own, valid until the
-/// next call. Returns false if out of memory.
+/// everything if `full`, which also means a client that has none of
+/// the images. The bytes are the View's own, valid until the next frame
+/// (slime_vt_view_image doesn't touch them). Returns false if out of
+/// memory.
 export fn slime_vt_view_frame(
     v: ?*View,
     t: Terminal,
@@ -186,6 +194,8 @@ export fn slime_vt_view_frame(
     const self = v orelse return false;
     const term = zigTerminal(t) orelse return false;
     self.state.update(alloc, term) catch return false;
+    if (full) self.images.reset();
+    self.images.gather(alloc, term) catch return false;
     const palette = self.state.colors.palette;
     const palette_changed = if (self.palette) |p| !std.mem.eql(vt.color.RGB, &p, &palette) else true;
     self.frame.clearRetainingCapacity();
@@ -194,6 +204,7 @@ export fn slime_vt_view_frame(
         .palette = palette_changed,
         .motion = term.flags.mouse_event == .any,
         .mouse_shape = std.math.cast(u8, @intFromEnum(term.mouse_shape)) orelse 0,
+        .images = &self.images,
     }) catch return false;
     self.state.clean();
     self.palette = palette;
@@ -201,6 +212,41 @@ export fn slime_vt_view_frame(
     out_ptr.* = bytes.ptr;
     out_len.* = bytes.len;
     return true;
+}
+
+/// An image the client needs before the last frame (view.go's Image).
+const Image = extern struct {
+    id: u32 = 0,
+    generation: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    /// Straight RGBA, rows top-down, `width * height * 4` bytes.
+    ptr: ?[*]const u8 = null,
+    len: usize = 0,
+};
+
+/// The `i`th image the last frame places that the client lacks, to send
+/// before it. Returns 0 past the last, 1 with the image (its pixels are
+/// the View's, valid until the next image or the View's end), 2 if it's
+/// gone from the terminal or won't fit in memory, to skip.
+export fn slime_vt_view_image(v: ?*View, t: Terminal, i: usize, out: *Image) u8 {
+    const self = v orelse return 0;
+    const term = zigTerminal(t) orelse return 0;
+    out.* = .{};
+    if (i >= self.images.pending.items.len) return 0;
+    if (self.image_rgba) |rgba| alloc.free(rgba);
+    self.image_rgba = null;
+    const px = (self.images.pixels(alloc, term, i) catch null) orelse return 2;
+    self.image_rgba = px.rgba;
+    out.* = .{
+        .id = px.id,
+        .generation = px.generation,
+        .width = px.width,
+        .height = px.height,
+        .ptr = px.rgba.ptr,
+        .len = px.rgba.len,
+    };
+    return 1;
 }
 
 /// Handle an event (event.zig) from the client. `win32_input` is whether

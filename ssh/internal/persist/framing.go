@@ -1,6 +1,8 @@
 package persist
 
 import (
+	"bytes"
+	"compress/flate"
 	"time"
 
 	"github.com/aldehir/slime/ssh/internal/vt"
@@ -177,6 +179,7 @@ func (p *Pane) frameLocked() {
 		p.srv.log.Error("encoding a frame", "pane", p.id, "err", err)
 		return
 	}
+	p.sendImagesLocked(c)
 	p.fr.seq++
 	// Frames are bounded by maxInFlight rather than the queue's cap.
 	c.sendForce(p.id, &Draw{Seq: p.fr.seq, Data: data})
@@ -184,6 +187,43 @@ func (p *Pane) frameLocked() {
 	p.fr.full = false
 	p.fr.lastSent = now
 	p.fr.holdFrom = time.Time{}
+}
+
+// sendImagesLocked sends c the kitty images the frame just cut places
+// that it lacks, each deflated and in ImageChunk pieces, ahead of the
+// frame. Images aren't counted against the backlog, as frames aren't.
+func (p *Pane) sendImagesLocked(c *conn) {
+	for i := 0; ; i++ {
+		img, more := p.fr.view.Image(p.term, i)
+		if !more {
+			return
+		}
+		if img == nil {
+			p.srv.log.Warn("an image placed in a frame is gone", "pane", p.id)
+			continue
+		}
+		var buf bytes.Buffer
+		// Pixels compress well enough at the fastest level, and a frame
+		// waits on this.
+		w, _ := flate.NewWriter(&buf, flate.BestSpeed)
+		w.Write(img.RGBA)
+		w.Close()
+		data := buf.Bytes()
+		total := uint32(len(data))
+		for off := uint32(0); off < total; {
+			n := min(total-off, ImageChunk)
+			c.sendForce(p.id, &Image{
+				ID:         img.ID,
+				Generation: img.Generation,
+				Width:      img.Width,
+				Height:     img.Height,
+				Total:      total,
+				Offset:     off,
+				Data:       data[off : off+n],
+			})
+			off += n
+		}
+	}
 }
 
 // holdingLocked reports whether a hold that began now or earlier still

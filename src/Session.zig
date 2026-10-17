@@ -26,7 +26,8 @@ const build_options = @import("build_options");
 const Window = @import("Window.zig");
 const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
-const Images = @import("renderer/image.zig").Images;
+const image = @import("renderer/image.zig");
+const Images = image.Images;
 const Rect = @import("renderer/Painter.zig").Rect;
 
 const log = std.log.scoped(.session);
@@ -77,8 +78,18 @@ screen: Frames.Screen = .{},
 applied: u32 = 0,
 acked: u32 = 0,
 cells: Cells = .{},
+/// The kitty images slimed sent and where the last frame placed them.
+/// UI thread only.
 images: Images = .{},
 textures: Renderer.ImageTextures = .{},
+/// The image slimed is sending in pieces, until it's whole. Reader
+/// thread only.
+image_in: ImageIn = .{},
+/// Images received, inflated, for `applyFrames` to install before the
+/// frames that place them. Guarded by `lock`.
+pending_images: std.ArrayList(QueuedImage) = .empty,
+/// What `applyFrames` swaps `pending_images` for.
+installing: std.ArrayList(QueuedImage) = .empty,
 
 /// Where the session's pane is in the window, in client pixels: all of
 /// it (`frame`, its title strip and terminal), its terminal (`rect`), and
@@ -224,6 +235,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
             s.conn.adopt(s.arrival.pane, .{
                 .ctx = self,
                 .draw = slimedDraw,
+                .image = slimedImage,
                 .notice = slimedNotice,
                 .copied = slimedCopied,
                 .ended = slimedEnded,
@@ -249,6 +261,11 @@ pub fn destroy(self: *Session) void {
     self.textures.deinit(alloc);
     self.cells.deinit(alloc);
     self.images.deinit(alloc);
+    for (self.pending_images.items) |*q| Images.freePixels(alloc, &q.image);
+    self.pending_images.deinit(alloc);
+    for (self.installing.items) |*q| Images.freePixels(alloc, &q.image);
+    self.installing.deinit(alloc);
+    self.image_in.data.deinit(alloc);
     self.screen.deinit(alloc);
     self.frames.deinit(alloc);
     self.applying.deinit(alloc);
@@ -319,13 +336,118 @@ fn queueFrame(self: *Session, seq: u32, data: []const u8) !void {
     self.frames.appendSliceAssumeCapacity(data);
 }
 
-/// Apply the frames slimed sent since the last draw to `screen`. UI
-/// thread.
+/// A kitty image on its way from slimed, in pieces (Slimed.ImagePiece).
+const ImageIn = struct {
+    id: u32 = 0,
+    generation: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    total: u32 = 0,
+    /// The deflated bytes so far.
+    data: std.ArrayList(u8) = .empty,
+};
+
+const QueuedImage = struct { id: u32, image: image.Image };
+
+/// Sink for a piece of a kitty image. On the connection's reader
+/// thread, under its lock. A whole image is inflated here, off the UI
+/// thread, and queued for `applyFrames`.
+fn slimedImage(ctx: *anyopaque, piece: Slimed.ImagePiece) void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    const in = &self.image_in;
+    if (piece.offset == 0) {
+        in.* = .{
+            .id = piece.id,
+            .generation = piece.generation,
+            .width = piece.width,
+            .height = piece.height,
+            .total = piece.total,
+            .data = in.data,
+        };
+        in.data.clearRetainingCapacity();
+    } else if (piece.id != in.id or piece.generation != in.generation or piece.offset != in.data.items.len) {
+        return log.warn("image {d}: a piece out of order", .{piece.id});
+    }
+    if (@as(u64, piece.offset) + piece.data.len > in.total) return log.warn("image {d}: more than its {d} bytes", .{ piece.id, in.total });
+    in.data.appendSlice(self.alloc, piece.data) catch return log.err("image {d} dropped: out of memory", .{piece.id});
+    if (build_options.stats) _ = self.window.stats.bytes.fetchAdd(piece.data.len, .monotonic);
+    if (in.data.items.len < in.total) return;
+
+    const rgba = inflateImage(self.alloc, in) catch |err| return log.err("image {d} ({d}x{d}) dropped: {}", .{ in.id, in.width, in.height, err });
+    image.premultiply(rgba);
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    self.pending_images.append(self.alloc, .{ .id = in.id, .image = .{
+        .generation = in.generation,
+        .width = in.width,
+        .height = in.height,
+        .rgba = rgba,
+    } }) catch {
+        self.alloc.free(rgba);
+        log.err("image {d} dropped: out of memory", .{in.id});
+    };
+}
+
+/// Inflate a whole image to its RGBA, owned by the caller.
+fn inflateImage(alloc: Allocator, in: *const ImageIn) ![]u8 {
+    if (in.width == 0 or in.height == 0) return error.BadImage;
+    const len = try std.math.mul(usize, try std.math.mul(usize, in.width, in.height), 4);
+    const rgba = try alloc.alloc(u8, len);
+    errdefer alloc.free(rgba);
+    var reader: std.Io.Reader = .fixed(in.data.items);
+    const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+    defer alloc.free(window);
+    var inflate: std.compress.flate.Decompress = .init(&reader, .raw, window);
+    inflate.reader.readSliceAll(rgba) catch return error.BadImage;
+    return rgba;
+}
+
+test inflateImage {
+    const alloc = std.testing.allocator;
+    var in: ImageIn = .{ .width = 3, .height = 2 };
+    defer in.data.deinit(alloc);
+    const rgba = [_]u8{ 1, 2, 3, 4 } ** 6;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.ensureUnusedCapacity(64);
+    const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+    defer alloc.free(window);
+    var deflate = try std.compress.flate.Compress.init(&out.writer, window, .raw, .level_1);
+    try deflate.writer.writeAll(&rgba);
+    try deflate.finish();
+    try in.data.appendSlice(alloc, out.written());
+    in.total = @intCast(in.data.items.len);
+
+    const got = try inflateImage(alloc, &in);
+    defer alloc.free(got);
+    try std.testing.expectEqualSlices(u8, &rgba, got);
+    // Cut short, it's a bad image rather than a crash or a short read.
+    in.data.items.len -= 2;
+    try std.testing.expectError(error.BadImage, inflateImage(alloc, &in));
+    in.width = 0;
+    try std.testing.expectError(error.BadImage, inflateImage(alloc, &in));
+}
+
+/// Apply the frames slimed sent since the last draw to `screen`, with
+/// the images that came before them, and lay the images out for the
+/// renderer. UI thread.
 pub fn applyFrames(self: *Session) void {
     self.lockTerminal();
     std.mem.swap(std.ArrayList(u8), &self.frames, &self.applying);
+    std.mem.swap(std.ArrayList(QueuedImage), &self.pending_images, &self.installing);
     self.unlockTerminal();
+    if (self.applying.items.len == 0 and self.installing.items.len == 0) return;
     defer self.applying.clearRetainingCapacity();
+    defer self.installing.clearRetainingCapacity();
+
+    // An image comes before the first frame that places it, so all of
+    // them can go in first: only the last frame's placements are drawn.
+    for (self.installing.items) |*q| {
+        self.images.put(self.alloc, q.id, q.image) catch |err| {
+            Images.freePixels(self.alloc, &q.image);
+            log.err("image {d} dropped: {}", .{ q.id, err });
+        };
+    }
     var rest = self.applying.items;
     while (rest.len >= 8) {
         const seq = std.mem.readInt(u32, rest[0..4], .little);
@@ -336,6 +458,10 @@ pub fn applyFrames(self: *Session) void {
         // Half applied, the screen is wrong until the next full frame.
         self.screen.apply(self.alloc, data) catch |err| log.err("bad frame {d} from slimed: {}", .{ seq, err });
     }
+    for (self.screen.dropped.items) |id| self.images.remove(self.alloc, id);
+    self.screen.dropped.clearRetainingCapacity();
+    const cell = self.window.cellSizePx();
+    self.images.update(self.alloc, self.screen.placements.items, cell.width, cell.height) catch |err| log.err("laying out images failed: {}", .{err});
 }
 
 /// Tell slimed the frames applied are drawn, which lets more come. UI
