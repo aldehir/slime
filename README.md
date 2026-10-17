@@ -6,3 +6,6 @@
   Vibe-slopped Windows-only Terminal Emulator powered by
   <a href="https://github.com/ghostty-org/ghostty"><code>libghostty-vt</code></a>
 </p>
+<p align="center">
+  <img src="assets/screenshot.png" alt="slime running PowerShell" width="800">
+</p>
