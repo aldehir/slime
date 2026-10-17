@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aldehir/slime/internal/daemon"
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/sshtest"
 	"github.com/aldehir/slime/internal/vt"
 )
@@ -98,22 +99,18 @@ func TestDaemonOnLinux(t *testing.T) {
 		t.Fatalf("not installed: %v", err)
 	}
 
-	tag := c.NextTag()
-	c.Send(0, &daemon.WorkspaceNew{Tag: tag})
-	created, err := c.AwaitCreated(tag)
-	if err != nil {
+	var ws rpc.Workspace
+	if err := c.Call(rpc.WorkspaceNew, nil, &ws); err != nil {
 		t.Fatal(err)
 	}
-	tag = c.NextTag()
 	// No terminfo on this host, so TERM falls back.
-	c.Send(0, &daemon.TabNew{Tag: tag, WS: created.WS, Command: `echo "marker:$TERM:$HOME"; exec cat`, Size: daemon.Size{Cols: 80, Rows: 24}})
-	a, err := c.Await(tag, true)
-	if err != nil {
+	var created rpc.Created
+	if err := c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: ws.ID, Command: `echo "marker:$TERM:$HOME"; exec cat`, Size: rpc.Size{Cols: 80, Rows: 24}}, &created); err != nil {
 		t.Fatal(err)
 	}
-	pane := a.Created.Pane
+	pane := created.Pane
 	want := "marker:xterm-256color:" + home
-	waitText(t, c, pane, want, a.Panes[pane])
+	waitText(t, c, pane, want)
 	// Hanging up the SSH connection detaches the workspace.
 	c.Close()
 
@@ -122,32 +119,32 @@ func TestDaemonOnLinux(t *testing.T) {
 	if c2.Hello.PID != c.Hello.PID {
 		t.Errorf("a second daemon: pid %d, then %d", c.Hello.PID, c2.Hello.PID)
 	}
-	var list *daemon.Workspaces
+	var list rpc.WorkspaceListResult
 	deadline := time.Now().Add(timeout)
 	for {
-		if list, err = c2.List(); err != nil {
+		if err := c2.Call(rpc.WorkspaceList, nil, &list); err != nil {
 			t.Fatal(err)
 		}
-		if w := daemon.MostRecentDetached(list); w != nil || time.Now().After(deadline) {
+		if w := daemon.MostRecentDetached(&list); w != nil || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if w := daemon.MostRecentDetached(list); w == nil || w.ID != created.WS {
-		t.Fatalf("workspace %d not detached: %+v", created.WS, list)
+	if w := daemon.MostRecentDetached(&list); w == nil || w.ID != ws.ID {
+		t.Fatalf("workspace %d not detached: %+v", ws.ID, list)
 	}
-	text, err := c2.Peek(pane, false)
-	if err != nil {
+	var text rpc.PaneTextResult
+	if err := c2.Call(rpc.PaneText, rpc.PaneTextParams{ID: pane}, &text); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(text), want) {
-		t.Errorf("kept text %q", text)
+	if !strings.Contains(text.Text, want) {
+		t.Errorf("kept text %q", text.Text)
 	}
 }
 
-// waitText draws pane's frames, after what attaching gave, until its
-// screen holds want.
-func waitText(t *testing.T, c *daemon.Client, pane uint32, want string, p *daemon.PaneState) {
+// waitText draws pane's frames (those the calls set aside first) until
+// its screen holds want.
+func waitText(t *testing.T, c *daemon.Client, pane uint32, want string) {
 	t.Helper()
 	got := make(chan string, 1)
 	go func() {
@@ -166,12 +163,6 @@ func waitText(t *testing.T, c *daemon.Client, pane uint32, want string, p *daemo
 			c.Send(pane, &daemon.Ack{Seq: d.Seq})
 			text, _ = s.Text()
 			return strings.Contains(text, want)
-		}
-		for _, d := range p.Draws {
-			if draw(d) {
-				got <- text
-				return
-			}
 		}
 		for {
 			id, m, err := c.Recv()

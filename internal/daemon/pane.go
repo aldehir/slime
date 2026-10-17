@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aldehir/slime/internal/pty"
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
 )
 
@@ -164,15 +165,31 @@ func (p *Pane) run() {
 
 	p.mu.Lock()
 	p.done = true
-	if c := p.client; c != nil {
-		c.sendForce(p.id, &Exit{Status: status})
+	// The viewer hears in order with the pane's frames; the subscribers
+	// from paneExited.
+	viewer := p.client
+	if viewer != nil {
+		viewer.sendForce(0, notify(rpc.EvPaneExited, rpc.PaneExitedParams{ID: p.id, Status: status}))
 		p.client = nil
 	}
 	p.stopFramingLocked()
 	p.mu.Unlock()
-	p.srv.paneExited(p)
+	p.srv.paneExited(p, status, viewer)
 	p.pty.Close()
 	p.term.Close()
+}
+
+// write sends b to the child as typed: pane.write. Outside the lock, as
+// events' input goes.
+func (p *Pane) write(b []byte) error {
+	p.mu.Lock()
+	done := p.done
+	p.mu.Unlock()
+	if done {
+		return errors.New("pane ended")
+	}
+	_, err := p.pty.Write(b)
+	return err
 }
 
 // attach gives the pane to c, resized to size if that's set, and starts
@@ -201,40 +218,38 @@ func (p *Pane) attachLocked(c *conn, size Size) error {
 	return nil
 }
 
-// peek sends c the text of the pane's screen and scrollback without
-// attaching it: plain, or the VT that redraws it. Plain text past what
-// a message holds loses its oldest lines.
-func (p *Pane) peek(c *conn, tag uint32, asVT bool) error {
+// text is the pane's screen and scrollback without attaching it: plain,
+// or the VT that redraws it. Plain text past what a message holds loses
+// its oldest lines.
+func (p *Pane) text(asVT bool) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.done {
-		return errors.New("pane ended")
+		return "", errors.New("pane ended")
 	}
-	var data []byte
+	// JSON escaping can double the text; leave room in the frame.
+	const max = MaxFrame / 4
 	if asVT {
 		b, err := p.term.VT()
 		if err != nil {
-			return err
+			return "", err
 		}
-		if len(b) > MaxFrame-64 {
-			return errors.New("too much to send")
+		if len(b) > max {
+			return "", errors.New("too much to send")
 		}
-		data = b
-	} else {
-		s, err := p.term.Text()
-		if err != nil {
-			return err
-		}
-		if max := MaxFrame - 64; len(s) > max {
-			s = s[len(s)-max:]
-			if i := strings.IndexByte(s, '\n'); i >= 0 {
-				s = s[i+1:]
-			}
-		}
-		data = []byte(s)
+		return string(b), nil
 	}
-	c.sendForce(p.id, &PaneText{Tag: tag, Data: data})
-	return nil
+	s, err := p.term.Text()
+	if err != nil {
+		return "", err
+	}
+	if len(s) > max {
+		s = s[len(s)-max:]
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = s[i+1:]
+		}
+	}
+	return s, nil
 }
 
 // detach releases c's attachment, if it has one.
@@ -281,21 +296,26 @@ func (p *Pane) cell() Size {
 // kill ends the child; run reports the exit and cleans up.
 func (p *Pane) kill() { go p.pty.Close() }
 
-func (p *Pane) info(tab uint32) PaneInfo {
+// desc describes the pane as workspace.list and pane.info do. t is its
+// tab, if it's still in one.
+func (p *Pane) desc(t *tab) rpc.PaneDesc {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	info := PaneInfo{
+	d := rpc.PaneDesc{
 		ID:      p.id,
-		Tab:     tab,
 		Command: p.command,
 		Cols:    p.size.Cols,
 		Rows:    p.size.Rows,
 		Created: p.created.UnixMilli(),
 		PID:     p.pty.PID(),
+		Status:  p.status.records(),
+	}
+	if t != nil {
+		d.Tab, d.Workspace = t.id, t.ws.id
 	}
 	if !p.done {
-		info.Title, _ = p.term.Title()
-		info.Pwd, _ = p.term.Pwd()
+		d.Title, _ = p.term.Title()
+		d.Pwd, _ = p.term.Pwd()
 	}
-	return info
+	return d
 }

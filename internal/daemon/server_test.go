@@ -3,6 +3,8 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aldehir/slime/internal/pty"
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
 )
 
@@ -195,7 +198,7 @@ type window struct {
 	t       *testing.T
 	h       *harness
 	c       *Client
-	ws      *Workspace
+	ws      *rpc.Workspace
 	screens map[uint32]*vt.Screen
 }
 
@@ -203,10 +206,71 @@ func (h *harness) window() *window {
 	return &window{t: h.t, h: h, c: h.connect(), screens: map[uint32]*vt.Screen{}}
 }
 
+// PaneState is a pane as attaching delivered it, with the frames and
+// notices that followed before the reply came.
+type PaneState struct {
+	Attached rpc.PaneAttachedParams
+	Draws    []*Draw
+	Notices  []*Notice
+}
+
+// Attachment collects what attaching (or a request that adds a pane to
+// an attached workspace) delivered before its reply.
+type Attachment struct {
+	Workspace *rpc.Workspace
+	Panes     map[uint32]*PaneState
+}
+
+// collect takes what c set aside before the last reply: the panes that
+// attached, with their frames and notices, and the latest structure.
+func collect(c *Client) *Attachment {
+	a := peekBacklog(c)
+	c.backlog = nil
+	return a
+}
+
+// peekBacklog reads what c set aside as collect does, leaving it for
+// Recv: a reply can follow the first frames of the pane it made.
+func peekBacklog(c *Client) *Attachment {
+	a := &Attachment{Panes: map[uint32]*PaneState{}}
+	for _, p := range c.backlog {
+		switch m := p.m.(type) {
+		case *Draw:
+			if ps := a.Panes[p.id]; ps != nil {
+				ps.Draws = append(ps.Draws, &Draw{Seq: m.Seq, Data: append([]byte(nil), m.Data...)})
+			}
+		case *Notice:
+			if ps := a.Panes[p.id]; ps != nil {
+				ps.Notices = append(ps.Notices, m)
+			}
+		case *Notify:
+			switch m.Notification.Method {
+			case rpc.EvPaneAttached:
+				var at rpc.PaneAttachedParams
+				json.Unmarshal(m.Notification.Params, &at)
+				a.Panes[at.ID] = &PaneState{Attached: at}
+			case rpc.EvWorkspaceChanged:
+				var ws rpc.Workspace
+				json.Unmarshal(m.Notification.Params, &ws)
+				a.Workspace = &ws
+			}
+		}
+	}
+	return a
+}
+
+// call makes the call and returns what came before its reply.
+func (w *window) call(method string, params, result any) (*Attachment, error) {
+	err := w.c.Call(method, params, result)
+	return collect(w.c), err
+}
+
 // absorb takes in what an attach or a new pane delivered.
 func (w *window) absorb(a *Attachment) {
 	w.t.Helper()
-	w.ws = a.Workspace
+	if a.Workspace != nil {
+		w.ws = a.Workspace
+	}
 	for id, p := range a.Panes {
 		s, err := vt.NewScreen()
 		if err != nil {
@@ -234,37 +298,52 @@ func (w *window) draw(id uint32, d *Draw) {
 // newWorkspace creates a workspace with one tab, and returns its pane.
 func (w *window) newWorkspace() uint32 {
 	w.t.Helper()
-	tag := w.c.NextTag()
-	w.c.Send(0, &WorkspaceNew{Tag: tag, Name: "test"})
-	a, err := w.c.Await(tag, true)
-	if err != nil {
+	var ws rpc.Workspace
+	if _, err := w.call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Name: "test"}, &ws); err != nil {
 		w.t.Fatal(err)
 	}
-	w.absorb(a)
+	w.ws = &ws
 	return w.newTab()
 }
 
 func (w *window) newTab() uint32 {
 	w.t.Helper()
-	tag := w.c.NextTag()
-	w.c.Send(0, &TabNew{Tag: tag, WS: w.ws.ID, Size: Size{Cols: 40, Rows: 10}})
-	a, err := w.c.Await(tag, true)
+	var created rpc.Created
+	a, err := w.call(rpc.TabNew, rpc.TabNewParams{Workspace: w.ws.ID, Size: Size{Cols: 40, Rows: 10}}, &created)
 	if err != nil {
 		w.t.Fatal(err)
 	}
 	w.absorb(a)
-	return a.Created.Pane
+	return created.Pane
+}
+
+// split starts a pane beside pane and returns what came with it.
+func (w *window) split(pane uint32, dir Direction, share uint16, command string) (*Attachment, rpc.Created) {
+	w.t.Helper()
+	var created rpc.Created
+	a, err := w.call(rpc.PaneSplit, rpc.PaneSplitParams{Pane: pane, Direction: dir, Share: share, Command: command}, &created)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	return a, created
 }
 
 func (w *window) attach(ws uint32, area Area) {
 	w.t.Helper()
-	tag := w.c.NextTag()
-	w.c.Send(0, &WorkspaceAttach{Tag: tag, WS: ws, Area: area})
-	a, err := w.c.Await(tag, false)
+	var s rpc.Workspace
+	a, err := w.call(rpc.WorkspaceAttach, rpc.WorkspaceAttachParams{ID: ws, Area: area}, &s)
 	if err != nil {
 		w.t.Fatal(err)
 	}
+	a.Workspace = &s
 	w.absorb(a)
+}
+
+func (w *window) detach() {
+	w.t.Helper()
+	if err := w.c.Call(rpc.WorkspaceDetach, rpc.WorkspaceParams{ID: w.ws.ID}, nil); err != nil {
+		w.t.Fatal(err)
+	}
 }
 
 // until applies frames to the window's screens until pane's shows want,
@@ -292,9 +371,11 @@ func (w *window) until(pane uint32, want string) []Message {
 	}
 }
 
-// next reads until a message of type T, applying frames on the way.
-func next[T Message](w *window) (uint32, T) {
+// nextEvent reads until the notification name, applying frames and
+// structures on the way, and returns its params.
+func nextEvent[P any](w *window, name string) P {
 	w.t.Helper()
+	var p P
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		id, m, err := w.c.Recv()
@@ -305,16 +386,24 @@ func next[T Message](w *window) (uint32, T) {
 			w.draw(id, d)
 			continue
 		}
-		if ws, ok := m.(*Workspace); ok {
-			w.ws = ws
+		got, params, ok := Notification(m)
+		if !ok {
+			continue
 		}
-		if t, ok := m.(T); ok {
-			return id, t
+		if got == rpc.EvWorkspaceChanged {
+			var ws rpc.Workspace
+			json.Unmarshal(params, &ws)
+			w.ws = &ws
+		}
+		if got == name {
+			if err := json.Unmarshal(params, &p); err != nil {
+				w.t.Fatalf("%s params %s: %v", name, params, err)
+			}
+			return p
 		}
 	}
-	var zero T
-	w.t.Fatalf("no %T", zero)
-	return 0, zero
+	w.t.Fatalf("no %s", name)
+	return p
 }
 
 // text is the pane's screen as the window has drawn it: the viewport,
@@ -336,13 +425,13 @@ func (h *harness) serverText(id uint32) string {
 	return s
 }
 
-func (h *harness) list() *Workspaces {
+func (h *harness) list() *rpc.WorkspaceListResult {
 	h.t.Helper()
-	l, err := h.connect().List()
-	if err != nil {
+	var l rpc.WorkspaceListResult
+	if err := h.connect().Call(rpc.WorkspaceList, nil, &l); err != nil {
 		h.t.Fatal(err)
 	}
-	return l
+	return &l
 }
 
 func (h *harness) attached(ws uint32) bool {
@@ -364,50 +453,22 @@ func eventually(t *testing.T, what string, f func() bool) {
 }
 
 func TestWireRoundTrip(t *testing.T) {
-	tree := &Node{Axis: Row, Children: []Child{
-		{6000, &Node{Pane: 3}},
-		{4000, &Node{Axis: Column, Children: []Child{{5000, &Node{Pane: 4}}, {5000, &Node{Pane: 5}}}}},
-	}}
-	tabs := []TabInfo{{ID: 2, Name: "build", Tree: tree}, {ID: 6, Tree: &Node{Pane: 7}}}
 	msgs := []Message{
 		&Hello{Version: 3, FrameInterval: 16667},
-		&List{},
-		&WorkspaceNew{Tag: 1, Name: "main"},
-		&WorkspaceAttach{Tag: 2, WS: 9, Area: Area{720, 432, 9, 18}},
-		&WorkspaceDetach{WS: 9},
-		&WorkspaceKill{WS: 9},
-		&WorkspaceRename{WS: 9, Name: "ops"},
-		&WorkspaceResize{WS: 9, Area: Area{1000, 800, 10, 20}},
-		&TabNew{Tag: 3, WS: 9, Command: "cmd.exe /k", Cwd: `C:\src`, Size: Size{80, 24, 9, 18}},
-		&TabClose{Tab: 2},
-		&TabRename{Tab: 2, Name: "logs"},
-		&Split{Tag: 4, Pane: 3, Dir: Down, Share: 3000, Command: "pwsh", Cwd: "D:\\"},
-		&Layout{Tab: 2, Tree: tree},
-		&PaneKill{},
+		&Call{Request: rpc.Request{JSONRPC: "2.0", ID: 7, Method: "tab.new", Params: json.RawMessage(`{"workspace":9,"command":"cmd.exe /k"}`)}},
+		&Ack{Seq: 4},
+		&Event{Data: []byte{1, 2, 3}},
 		&Resize{Size: Size{1, 2, 3, 4}},
-		&Peek{Tag: 5, VT: true},
+		&Bridge{Term: "xterm-ghostty"},
 		&HelloReply{Version: 1, PID: 99, FrameLayout: 1 << 63},
-		&Workspaces{
-			Workspaces: []WorkspaceInfo{{ID: 9, Name: "main", Attached: true, DetachedAt: 1700000000000, Tabs: tabs}, {ID: 10}},
-			Panes:      []PaneInfo{{ID: 3, Tab: 2, Command: "c", Title: "t", Pwd: "p", Cols: 80, Rows: 24, Created: 1700000000000, PID: 5}},
-		},
-		&Workspace{Tag: 6, ID: 9, Name: "main", Tabs: tabs},
-		&Attached{Command: "pwsh -NoLogo", Status: []StatusRecord{{"", 1, 40}, {"deploy/eu", 3, -1}}},
-		&PaneText{Tag: 5, Data: []byte("\x1b[31mred")},
-		&Exit{Status: 0xc000013a},
-		&Detached{WS: 9, Reason: "too slow"},
-		&Error{Tag: 8, Message: "no such pane"},
-		&Created{Tag: 9, WS: 9, Tab: 2, Pane: 3},
+		&Reply{Response: rpc.Response{JSONRPC: "2.0", ID: 7, Result: json.RawMessage(`{"workspace":9,"tab":2,"pane":3}`)}},
+		&Reply{Response: rpc.Response{JSONRPC: "2.0", ID: 8, Error: &rpc.Error{Code: rpc.CodeNotFound, Message: "no such pane"}}},
+		&Notify{Notification: rpc.Notification{JSONRPC: "2.0", Method: "pane.exited", Params: json.RawMessage(`{"id":3,"status":3221225786}`)}},
+		&Error{Message: "no such host"},
 		&Draw{Seq: 4, Data: []byte{1, 2, 3}},
 		&Image{ID: 7, Generation: 1 << 40, Width: 2, Height: 3, Total: 10, Offset: 4, Data: []byte{9, 8, 7}},
-		&HostConnect{Tag: 10, Dest: "ssh://alde@dev1:2222"},
-		&HostAnswer{Choice: ChoiceAccept, Answers: []string{"hunter2", ""}},
-		&HostDisconnect{},
-		&HostList{},
-		&Bridge{Term: "xterm-ghostty"},
-		&Hosts{Hosts: []HostInfo{{ID: 11, Dest: "dev1", State: HostConnected}, {ID: 12, Dest: "dev2", State: HostFailed, Text: "Permission denied"}}},
-		&HostState{Tag: 13, Dest: "dev1", State: HostConnecting, Text: "installing slime"},
-		&Prompt{Kind: PromptInteractive, Title: "Sign in", Text: "body", Detail: "SHA256:x", Error: "try again", Questions: []Question{{Label: "Password: "}, {Label: "Code: ", Echo: true}}},
+		&Copied{Tag: 5, Text: "sel"},
+		&Notice{Kind: NoticeStatus, Text: "", Status: []StatusRecord{{"", 1, 40}, {"deploy/eu", 3, -1}}},
 	}
 	var stream bytes.Buffer
 	for i, m := range msgs {
@@ -427,36 +488,13 @@ func TestWireRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if f.ID != uint32(i) || !reflect.DeepEqual(normalize(got), normalize(want)) {
+		if f.ID != uint32(i) || !reflect.DeepEqual(got, want) {
 			t.Errorf("frame %d: %#v, want %#v", i, got, want)
 		}
 	}
 	if _, err := r.Read(); err != io.EOF {
 		t.Errorf("after the last frame: %v", err)
 	}
-}
-
-// normalize treats nil and empty slices alike.
-func normalize(m Message) Message {
-	switch m := m.(type) {
-	case *Workspaces:
-		if len(m.Workspaces) == 0 {
-			m.Workspaces = nil
-		}
-		for i := range m.Workspaces {
-			if len(m.Workspaces[i].Tabs) == 0 {
-				m.Workspaces[i].Tabs = nil
-			}
-		}
-		if len(m.Panes) == 0 {
-			m.Panes = nil
-		}
-	case *HostAnswer:
-		if len(m.Answers) == 0 {
-			m.Answers = nil
-		}
-	}
-	return m
 }
 
 func TestWireBadFrames(t *testing.T) {
@@ -468,27 +506,44 @@ func TestWireBadFrames(t *testing.T) {
 	if _, err := NewReader(bytes.NewReader(short)).Read(); err != ErrShortFrame {
 		t.Errorf("short: %v", err)
 	}
-	b, _ := Encode(1, &Detached{Reason: "gone"})
+	b, _ := Encode(1, &Error{Message: "gone"})
 	if _, err := NewReader(bytes.NewReader(b[:len(b)-2])).Read(); err != io.ErrUnexpectedEOF {
 		t.Errorf("cut off: %v", err)
 	}
-	f := Frame{Type: TypeTabNew, Payload: []byte{1, 0, 0, 0, 2, 0, 0, 0, 0xff, 0, 0, 0}}
+	f := Frame{Type: TypeBridge, Payload: []byte{0xff, 0, 0, 0, 'x'}}
 	if _, err := Decode(f); err == nil {
 		t.Error("truncated string decoded")
 	}
-	// A layout nested past maxDepth.
-	deep := &Node{Pane: 1}
-	for range maxDepth + 2 {
-		deep = &Node{Axis: Row, Children: []Child{{5000, deep}, {5000, &Node{Pane: 2}}}}
+	f = Frame{Type: TypeCall, Payload: []byte(`{"jsonrpc":`)}
+	if _, err := Decode(f); !errors.Is(err, ErrBadJSON) {
+		t.Errorf("bad JSON call: %v", err)
 	}
-	b, _ = Encode(0, &Layout{Tab: 1, Tree: deep})
-	if _, err := Decode(Frame{Type: TypeLayout, Payload: b[9:]}); err == nil {
-		t.Error("deep layout decoded")
+}
+
+// A call the daemon can't parse, or doesn't know, gets an error and the
+// connection stays up.
+func TestBadCalls(t *testing.T) {
+	h := newHarness(t)
+	c := h.connect()
+	c.Send(0, &Call{Request: rpc.Request{JSONRPC: "2.0", ID: 1, Method: "no.such"}})
+	_, m, err := c.Recv()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A split claiming more children than the bytes hold.
-	f = Frame{Type: TypeLayout, Payload: []byte{1, 0, 0, 0, 1, 1, 0xff, 0xff}}
-	if _, err := Decode(f); err == nil {
-		t.Error("oversized child count decoded")
+	if r, ok := m.(*Reply); !ok || r.Response.ID != 1 || r.Response.Error == nil || r.Response.Error.Code != rpc.CodeMethodNotFound {
+		t.Errorf("unknown method got %#v", m)
+	}
+	c.Send(0, &Call{Request: rpc.Request{JSONRPC: "2.0", ID: 2, Method: rpc.TabNew, Params: json.RawMessage(`{"workspace":"nine"}`)}})
+	_, m, _ = c.Recv()
+	if r, ok := m.(*Reply); !ok || r.Response.Error == nil || r.Response.Error.Code != rpc.CodeInvalidParams {
+		t.Errorf("bad params got %#v", m)
+	}
+	// Unparseable JSON is dropped; the next call still works.
+	b, _ := Encode(0, &Bridge{Term: `{"jsonrpc":`})
+	b[4] = byte(TypeCall)
+	c.rw.Write(b)
+	if err := c.Call(rpc.WorkspaceList, nil, nil); err != nil {
+		t.Errorf("after bad JSON: %v", err)
 	}
 }
 
@@ -522,8 +577,10 @@ func TestDetachReattach(t *testing.T) {
 	p := h.pty(0)
 	p.emit("one\r\n")
 	w1.until(pane, "one")
-	w1.c.Send(0, &WorkspaceDetach{WS: ws})
-	eventually(t, "detach", func() bool { return !h.attached(ws) })
+	w1.detach()
+	if h.attached(ws) {
+		t.Fatal("attached after the detach replied")
+	}
 	p.emit("two\r\n")
 	eventually(t, "detached output", func() bool { return strings.Contains(h.serverText(pane), "two") })
 
@@ -531,7 +588,7 @@ func TestDetachReattach(t *testing.T) {
 	if len(l.Workspaces) != 1 || l.Workspaces[0].Attached || l.Workspaces[0].DetachedAt == 0 {
 		t.Fatalf("list %+v", l.Workspaces)
 	}
-	if len(l.Panes) != 1 || l.Panes[0].ID != pane || l.Panes[0].PID != 4242 {
+	if len(l.Panes) != 1 || l.Panes[0].ID != pane || l.Panes[0].PID != 4242 || l.Panes[0].Workspace != ws {
 		t.Fatalf("panes %+v", l.Panes)
 	}
 	w2 := h.window()
@@ -577,8 +634,7 @@ func TestAttachSeam(t *testing.T) {
 	w1 := h.window()
 	pane := w1.newWorkspace()
 	ws := w1.ws.ID
-	w1.c.Send(0, &WorkspaceDetach{WS: ws})
-	eventually(t, "detach", func() bool { return !h.attached(ws) })
+	w1.detach()
 	p := h.pty(0)
 
 	done := make(chan struct{})
@@ -619,8 +675,7 @@ func TestRepliesWhileDetached(t *testing.T) {
 	p.emit("\x1b[c")
 	eventually(t, "DA1 reply while attached", func() bool { return p.inputString() == "\x1b[?62;22c" })
 
-	w.c.Send(0, &WorkspaceDetach{WS: w.ws.ID})
-	eventually(t, "detach", func() bool { return !h.attached(w.ws.ID) })
+	w.detach()
 	p.emit("\x1b[c")
 	eventually(t, "DA1 reply while detached", func() bool { return p.inputString() == "\x1b[?62;22c\x1b[?62;22c" })
 }
@@ -633,8 +688,8 @@ func TestSteal(t *testing.T) {
 	w2.attach(w1.ws.ID, Area{})
 	p := h.pty(0)
 
-	_, d := next[*Detached](w1)
-	if d.WS != w1.ws.ID || d.Reason != "attached elsewhere" {
+	d := nextEvent[rpc.WorkspaceDetachedParams](w1, rpc.EvWorkspaceDetached)
+	if d.ID != w1.ws.ID || d.Reason != "attached elsewhere" {
 		t.Fatalf("first window got %+v", d)
 	}
 	w1.c.Send(pane, &Event{Data: evText("from-1")})
@@ -650,8 +705,7 @@ func TestAttachSizesPanes(t *testing.T) {
 	h := newHarness(t)
 	w1 := h.window()
 	pane := w1.newWorkspace()
-	w1.c.Send(0, &Split{Tag: w1.c.NextTag(), Pane: pane, Dir: Right, Share: 2500})
-	next[*Created](w1)
+	w1.split(pane, Right, 2500, "")
 	w1.c.Close()
 	eventually(t, "detach", func() bool { return !h.attached(w1.ws.ID) })
 
@@ -682,22 +736,20 @@ func TestResize(t *testing.T) {
 	}
 }
 
-// TestSplitByOwner: the owner gets the new pane and the new layout, and
-// the pane works.
+// TestSplitByOwner: the owner gets the new pane and the new layout
+// before the reply, and the pane works.
 func TestSplitByOwner(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	first := w.newWorkspace()
-	tag := w.c.NextTag()
-	w.c.Send(0, &Split{Tag: tag, Pane: first, Dir: Down, Share: 3000, Command: "second"})
-	a, err := w.c.Await(tag, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a, created := w.split(first, Down, 3000, "second")
 	w.absorb(a)
-	second := a.Created.Pane
+	second := created.Pane
 	if a.Panes[second] == nil {
-		t.Fatal("no Attached for the new pane")
+		t.Fatal("no pane.attached for the new pane")
+	}
+	if a.Workspace == nil {
+		t.Fatal("no workspace.changed before the reply")
 	}
 	tree := w.ws.Tabs[0].Tree
 	if tree.Axis != Column || fmt.Sprint(tree.Panes()) != fmt.Sprint([]uint32{first, second}) || tree.Children[1].Share != 3000 {
@@ -714,29 +766,37 @@ func TestSplitByScript(t *testing.T) {
 	w := h.window()
 	first := w.newWorkspace()
 	script := h.connect()
-	tag := script.NextTag()
-	script.Send(0, &Split{Tag: tag, Pane: first, Dir: Left, Share: 5000, Command: "watch"})
-	created, err := script.AwaitCreated(tag)
-	if err != nil {
+	var created rpc.Created
+	if err := script.Call(rpc.PaneSplit, rpc.PaneSplitParams{Pane: first, Direction: Left, Share: 5000, Command: "watch"}, &created); err != nil {
 		t.Fatal(err)
 	}
 	var attached bool
 	for {
-		id, m, err := w.c.Recv()
+		_, m, err := w.c.Recv()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := m.(*Attached); ok && id == created.Pane {
-			attached = true
+		name, params, ok := Notification(m)
+		if !ok {
+			continue
 		}
-		if ws, ok := m.(*Workspace); ok {
+		switch name {
+		case rpc.EvPaneAttached:
+			var at rpc.PaneAttachedParams
+			json.Unmarshal(params, &at)
+			if at.ID == created.Pane && at.Command == "watch" {
+				attached = true
+			}
+		case rpc.EvWorkspaceChanged:
 			if !attached {
 				t.Error("structure before the pane it refers to")
 			}
+			var ws rpc.Workspace
+			json.Unmarshal(params, &ws)
 			if got := fmt.Sprint(ws.Tabs[0].Tree.Panes()); got != fmt.Sprint([]uint32{created.Pane, first}) {
 				t.Errorf("panes %s", got)
 			}
-			break
+			return
 		}
 	}
 }
@@ -746,14 +806,13 @@ func TestSplitDetached(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	first := w.newWorkspace()
-	w.c.Send(0, &WorkspaceResize{WS: w.ws.ID, Area: Area{Width: 1200, Height: 800, CellW: 10, CellH: 20}})
-	w.c.Send(0, &WorkspaceDetach{WS: w.ws.ID})
-	eventually(t, "detach", func() bool { return !h.attached(w.ws.ID) })
+	if err := w.c.Call(rpc.WorkspaceResize, rpc.WorkspaceResizeParams{ID: w.ws.ID, Area: Area{Width: 1200, Height: 800, CellW: 10, CellH: 20}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.detach()
 
 	script := h.connect()
-	tag := script.NextTag()
-	script.Send(0, &Split{Tag: tag, Pane: first, Dir: Right, Share: 5000})
-	if _, err := script.AwaitCreated(tag); err != nil {
+	if err := script.Call(rpc.PaneSplit, rpc.PaneSplitParams{Pane: first, Direction: Right, Share: 5000}, nil); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "retile", func() bool {
@@ -768,11 +827,7 @@ func TestDetachRetiles(t *testing.T) {
 	w := h.window()
 	first := w.newWorkspace()
 	for range 2 {
-		tag := w.c.NextTag()
-		w.c.Send(0, &Split{Tag: tag, Pane: first, Dir: Right, Share: 5000})
-		if _, err := w.c.Await(tag, true); err != nil {
-			t.Fatal(err)
-		}
+		w.split(first, Right, 5000, "")
 	}
 	w.c.Close()
 	// The tab started at 40x10 (newTab), the workspace's size since. The
@@ -791,21 +846,16 @@ func TestPaneFonts(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	first := w.newWorkspace()
-	tag := w.c.NextTag()
-	w.c.Send(0, &Split{Tag: tag, Pane: first, Dir: Right, Share: 5000})
-	a, err := w.c.Await(tag, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second := a.Created.Pane
-	w.c.Send(0, &WorkspaceResize{WS: w.ws.ID, Area: Area{Width: 1000, Height: 800, CellW: 10, CellH: 20}})
+	_, created := w.split(first, Right, 5000, "")
+	second := created.Pane
+	w.c.Call(rpc.WorkspaceResize, rpc.WorkspaceResizeParams{ID: w.ws.ID, Area: Area{Width: 1000, Height: 800, CellW: 10, CellH: 20}}, nil)
 	// The second pane's font is twice the size.
 	w.c.Send(first, &Resize{Size: Size{Cols: 50, Rows: 40, CellW: 10, CellH: 20}})
 	w.c.Send(second, &Resize{Size: Size{Cols: 25, Rows: 20, CellW: 20, CellH: 40}})
 	eventually(t, "resizes", func() bool { return h.pty(1).getSize() == [2]uint16{25, 20} })
 
 	// Wider: the daemon retiles once the window is gone.
-	w.c.Send(0, &WorkspaceResize{WS: w.ws.ID, Area: Area{Width: 2000, Height: 800, CellW: 10, CellH: 20}})
+	w.c.Call(rpc.WorkspaceResize, rpc.WorkspaceResizeParams{ID: w.ws.ID, Area: Area{Width: 2000, Height: 800, CellW: 10, CellH: 20}}, nil)
 	w.c.Close()
 	eventually(t, "retile", func() bool {
 		return h.pty(0).getSize() == [2]uint16{100, 40} && h.pty(1).getSize() == [2]uint16{50, 20}
@@ -813,9 +863,7 @@ func TestPaneFonts(t *testing.T) {
 
 	// A split takes its neighbour's font.
 	script := h.connect()
-	tag = script.NextTag()
-	script.Send(0, &Split{Tag: tag, Pane: second, Dir: Down, Share: 5000})
-	if _, err := script.AwaitCreated(tag); err != nil {
+	if err := script.Call(rpc.PaneSplit, rpc.PaneSplitParams{Pane: second, Direction: Down, Share: 5000}, nil); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "split", func() bool { return h.pty(2).getSize() == [2]uint16{50, 10} })
@@ -827,25 +875,23 @@ func TestPaneExit(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	first := w.newWorkspace()
-	tag := w.c.NextTag()
-	w.c.Send(0, &Split{Tag: tag, Pane: first, Dir: Right, Share: 5000})
-	a, _ := w.c.Await(tag, true)
+	a, created := w.split(first, Right, 5000, "")
 	w.absorb(a)
-	second := a.Created.Pane
+	second := created.Pane
 
 	h.pty(1).exit(7)
-	id, e := next[*Exit](w)
-	if id != second || e.Status != 7 {
-		t.Errorf("exit %d on %d", e.Status, id)
+	e := nextEvent[rpc.PaneExitedParams](w, rpc.EvPaneExited)
+	if e.ID != second || e.Status != 7 {
+		t.Errorf("exit %d on %d", e.Status, e.ID)
 	}
-	next[*Workspace](w)
-	if tree := w.ws.Tabs[0].Tree; !tree.isLeaf() || tree.Pane != first {
+	nextEvent[rpc.Workspace](w, rpc.EvWorkspaceChanged)
+	if tree := w.ws.Tabs[0].Tree; !tree.IsLeaf() || tree.Pane != first {
 		t.Errorf("after the exit: %s", show(tree))
 	}
 
 	h.pty(0).exit(0)
-	next[*Exit](w)
-	next[*Workspace](w)
+	nextEvent[rpc.PaneExitedParams](w, rpc.EvPaneExited)
+	nextEvent[rpc.Workspace](w, rpc.EvWorkspaceChanged)
 	if len(w.ws.Tabs) != 0 {
 		t.Errorf("tabs left: %+v", w.ws.Tabs)
 	}
@@ -853,7 +899,7 @@ func TestPaneExit(t *testing.T) {
 	if !h.attached(w.ws.ID) {
 		t.Fatal("empty workspace dropped while attached")
 	}
-	w.c.Send(0, &WorkspaceDetach{WS: w.ws.ID})
+	w.detach()
 	eventually(t, "removal", func() bool { return len(h.list().Workspaces) == 0 })
 }
 
@@ -861,25 +907,27 @@ func TestLayout(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	first := w.newWorkspace()
-	tag := w.c.NextTag()
-	w.c.Send(0, &Split{Tag: tag, Pane: first, Dir: Right, Share: 5000})
-	a, _ := w.c.Await(tag, true)
+	a, _ := w.split(first, Right, 5000, "")
 	w.absorb(a)
 	tab := w.ws.Tabs[0]
 
 	tree := tab.Tree.Clone()
 	tree.Children[0].Share, tree.Children[1].Share = 7000, 3000
-	w.c.Send(0, &Layout{Tab: tab.ID, Tree: tree})
-	next[*Workspace](w)
-	if got := w.ws.Tabs[0].Tree.Children[0].Share; got != 7000 {
+	if _, err := w.call(rpc.TabLayout, rpc.TabLayoutParams{ID: tab.ID, Tree: tree}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var d rpc.WorkspaceDesc
+	w.c.Call(rpc.WorkspaceInfo, rpc.WorkspaceParams{ID: w.ws.ID}, &d)
+	if got := d.Tabs[0].Tree.Children[0].Share; got != 7000 {
 		t.Errorf("share %d after the drag", got)
 	}
 
 	bad := tree.Clone()
 	bad.Children[1].Node.Pane = 999
-	w.c.Send(0, &Layout{Tab: tab.ID, Tree: bad})
-	if _, e := next[*Error](w); !strings.Contains(e.Message, "match") {
-		t.Errorf("bad layout: %q", e.Message)
+	err := w.c.Call(rpc.TabLayout, rpc.TabLayoutParams{ID: tab.ID, Tree: bad}, nil)
+	var rerr *rpc.Error
+	if !errors.As(err, &rerr) || rerr.Code != rpc.CodeInvalidParams || !strings.Contains(rerr.Message, "match") {
+		t.Errorf("bad layout: %v", err)
 	}
 }
 
@@ -891,8 +939,11 @@ func TestTabClose(t *testing.T) {
 	if len(w.ws.Tabs) != 2 {
 		t.Fatalf("tabs %d", len(w.ws.Tabs))
 	}
-	w.c.Send(0, &TabClose{Tab: w.ws.Tabs[0].ID})
-	next[*Workspace](w)
+	a, err := w.call(rpc.TabClose, rpc.TabParams{ID: w.ws.Tabs[0].ID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.absorb(a)
 	if len(w.ws.Tabs) != 1 {
 		t.Errorf("tabs after closing one: %d", len(w.ws.Tabs))
 	}
@@ -911,34 +962,118 @@ func TestWorkspaceKill(t *testing.T) {
 	w := h.window()
 	w.newWorkspace()
 	w.newTab()
-	h.connect().Send(0, &WorkspaceKill{WS: w.ws.ID})
-	_, d := next[*Detached](w)
+	if err := h.connect().Call(rpc.WorkspaceKill, rpc.WorkspaceParams{ID: w.ws.ID}, nil); err != nil {
+		t.Fatal(err)
+	}
+	d := nextEvent[rpc.WorkspaceDetachedParams](w, rpc.EvWorkspaceDetached)
 	if d.Reason != "killed" {
 		t.Errorf("reason %q", d.Reason)
 	}
 	eventually(t, "removal", func() bool { return len(h.list().Workspaces) == 0 })
 }
 
-func TestPeekDoesntTake(t *testing.T) {
+func TestPaneTextDoesntTake(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	pane := w.newWorkspace()
 	h.pty(0).emit("peekaboo")
 	w.until(pane, "peekaboo")
-	text, err := h.connect().Peek(pane, false)
-	if err != nil {
+	var r rpc.PaneTextResult
+	if err := h.connect().Call(rpc.PaneText, rpc.PaneTextParams{ID: pane}, &r); err != nil {
 		t.Fatal(err)
 	}
-	if string(text) != "peekaboo" {
-		t.Errorf("peeked %q", text)
+	if r.Text != "peekaboo" {
+		t.Errorf("read %q", r.Text)
 	}
 	if !h.attached(w.ws.ID) {
-		t.Error("peeking took the workspace")
+		t.Error("reading took the workspace")
 	}
 	h.pty(0).emit(" still mine")
 	w.until(pane, "still mine")
-	if vt, err := h.connect().Peek(pane, true); err != nil || !strings.Contains(string(vt), "peekaboo still mine") {
-		t.Errorf("peeked as VT %q, %v", vt, err)
+	if err := h.connect().Call(rpc.PaneText, rpc.PaneTextParams{ID: pane, VT: true}, &r); err != nil || !strings.Contains(r.Text, "peekaboo still mine") {
+		t.Errorf("read as VT %q, %v", r.Text, err)
+	}
+}
+
+// TestPaneInfoAndWrite: pane.info describes a pane, and pane.write
+// types into it from a client that doesn't own it.
+func TestPaneInfoAndWrite(t *testing.T) {
+	h := newHarness(t)
+	w := h.window()
+	pane := w.newWorkspace()
+	h.pty(0).emit("\x1b]0;my title\x07\x1b]7501;state=working:progress=40\x07")
+	w.until(pane, "")
+	eventually(t, "title", func() bool {
+		var d rpc.PaneDesc
+		h.connect().Call(rpc.PaneInfo, rpc.PaneParams{ID: pane}, &d)
+		return d.Title == "my title"
+	})
+	var d rpc.PaneDesc
+	if err := h.connect().Call(rpc.PaneInfo, rpc.PaneParams{ID: pane}, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.ID != pane || d.Workspace != w.ws.ID || d.Tab != w.ws.Tabs[0].ID || d.Cols != 40 || d.Rows != 10 || d.PID != 4242 {
+		t.Errorf("info %+v", d)
+	}
+	if len(d.Status) != 1 || d.Status[0].Progress != 40 {
+		t.Errorf("status %+v", d.Status)
+	}
+	if err := h.connect().Call(rpc.PaneWrite, rpc.PaneWriteParams{ID: pane, Text: "typed\r"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "input", func() bool { return h.pty(0).inputString() == "typed\r" })
+	var ti rpc.TabInfoResult
+	if err := h.connect().Call(rpc.TabInfo, rpc.TabParams{ID: d.Tab}, &ti); err != nil || ti.Workspace != w.ws.ID || ti.Tree.Pane != pane {
+		t.Errorf("tab.info %+v, %v", ti, err)
+	}
+}
+
+// TestSubscribe: a client with no workspace hears the events it asks
+// for, by name or group, and no others.
+func TestSubscribe(t *testing.T) {
+	h := newHarness(t)
+	sub := h.connect()
+	if err := sub.Call(rpc.Subscribe, rpc.SubscribeParams{Events: []string{rpc.EvPaneExited, "tab.*"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	quiet := h.connect()
+	w := h.window()
+	pane := w.newWorkspace()
+	tab := w.ws.Tabs[0].ID
+	h.pty(0).exit(2)
+
+	var names []string
+	for len(names) < 3 {
+		_, m, err := sub.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		name, params, ok := Notification(m)
+		if !ok {
+			continue
+		}
+		names = append(names, name)
+		switch name {
+		case rpc.EvTabCreated:
+			var p rpc.TabEventParams
+			json.Unmarshal(params, &p)
+			if p.Workspace != w.ws.ID || p.ID != tab {
+				t.Errorf("tab.created %+v", p)
+			}
+		case rpc.EvPaneExited:
+			var p rpc.PaneExitedParams
+			json.Unmarshal(params, &p)
+			if p.ID != pane || p.Status != 2 {
+				t.Errorf("pane.exited %+v", p)
+			}
+		}
+	}
+	if want := []string{rpc.EvTabCreated, rpc.EvPaneExited, rpc.EvTabClosed}; !reflect.DeepEqual(names, want) {
+		t.Errorf("events %v, want %v", names, want)
+	}
+	// The quiet client heard nothing, and still answers.
+	if err := quiet.Call(rpc.WorkspaceList, nil, nil); err != nil || len(quiet.backlog) != 0 {
+		t.Errorf("unsubscribed client got %d messages, %v", len(quiet.backlog), err)
 	}
 }
 
@@ -973,15 +1108,20 @@ func TestDisconnectDetaches(t *testing.T) {
 func TestErrors(t *testing.T) {
 	h := newHarness(t)
 	c := h.connect()
-	for _, m := range []Message{
-		&WorkspaceAttach{Tag: 1, WS: 99},
-		&TabNew{Tag: 2, WS: 99},
-		&Split{Tag: 3, Pane: 99, Dir: Right},
+	for _, call := range []struct {
+		method string
+		params any
+	}{
+		{rpc.WorkspaceAttach, rpc.WorkspaceAttachParams{ID: 99}},
+		{rpc.TabNew, rpc.TabNewParams{Workspace: 99}},
+		{rpc.PaneSplit, rpc.PaneSplitParams{Pane: 99, Direction: Right}},
+		{rpc.PaneText, rpc.PaneTextParams{ID: 99}},
+		{rpc.TabInfo, rpc.TabParams{ID: 99}},
 	} {
-		c.Send(0, m)
-		_, got, err := c.Recv()
-		if e, ok := got.(*Error); err != nil || !ok || !strings.Contains(e.Message, "no such") {
-			t.Errorf("%T: %#v, %v", m, got, err)
+		err := c.Call(call.method, call.params, nil)
+		var rerr *rpc.Error
+		if !errors.As(err, &rerr) || rerr.Code != rpc.CodeNotFound || !strings.Contains(rerr.Message, "no such") {
+			t.Errorf("%s: %v", call.method, err)
 		}
 	}
 }

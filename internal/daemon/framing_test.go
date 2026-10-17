@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
 )
 
@@ -39,21 +40,17 @@ func newDrawer(t *testing.T, h *harness) *drawer {
 	}
 	t.Cleanup(func() { c.Close() })
 	d := &drawer{t: t, c: c, conn: b}
-	tag := c.NextTag()
-	c.Send(0, &WorkspaceNew{Tag: tag, Name: "test"})
-	ws, err := c.Await(tag, false)
-	if err != nil {
+	var ws rpc.Workspace
+	if err := c.Call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Name: "test"}, &ws); err != nil {
 		t.Fatal(err)
 	}
-	tag = c.NextTag()
-	c.Send(0, &TabNew{Tag: tag, WS: ws.Workspace.ID, Size: Size{Cols: 40, Rows: 10}})
-	att, err := c.Await(tag, true)
-	if err != nil {
+	var created rpc.Created
+	if err := c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: ws.ID, Size: Size{Cols: 40, Rows: 10}}, &created); err != nil {
 		t.Fatal(err)
 	}
-	d.pane = att.Created.Pane
-	if att.Panes[d.pane] == nil {
-		t.Fatal("no Attached for the new pane")
+	d.pane = created.Pane
+	if att := peekBacklog(c); att.Panes[d.pane] == nil {
+		t.Fatal("no pane.attached for the new pane")
 	}
 	return d
 }
@@ -276,12 +273,10 @@ func TestFramesReattach(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	tag := c.NextTag()
-	c.Send(0, &WorkspaceAttach{Tag: tag, WS: ws})
-	att, err := c.Await(tag, false)
-	if err != nil {
+	if err := c.Call(rpc.WorkspaceAttach, rpc.WorkspaceAttachParams{ID: ws}, nil); err != nil {
 		t.Fatal(err)
 	}
+	att := peekBacklog(c)
 	// The title it set before, which the new client has no other way to
 	// learn.
 	if ns := att.Panes[d.pane].Notices; len(ns) != 1 || ns[0].Kind != NoticeTitle || ns[0].Text != "its title" {
@@ -474,7 +469,7 @@ func TestFramesReplyOutsideLock(t *testing.T) {
 	pane := h.srv.pane(d.pane)
 	done := make(chan struct{})
 	go func() {
-		pane.info(0)
+		pane.desc(nil)
 		close(done)
 	}()
 	select {
@@ -503,9 +498,7 @@ func attachDrawer(t *testing.T, h *harness, ws, pane uint32) *drawer {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	tag := c.NextTag()
-	c.Send(0, &WorkspaceAttach{Tag: tag, WS: ws})
-	if _, err := c.Await(tag, false); err != nil {
+	if err := c.Call(rpc.WorkspaceAttach, rpc.WorkspaceAttachParams{ID: ws}, nil); err != nil {
 		t.Fatal(err)
 	}
 	return &drawer{t: t, c: c, conn: b, pane: pane}

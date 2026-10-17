@@ -12,7 +12,7 @@ func show(n *Node) string {
 	if n == nil {
 		return "nil"
 	}
-	if n.isLeaf() {
+	if n.IsLeaf() {
 		return fmt.Sprint(n.Pane)
 	}
 	var b strings.Builder

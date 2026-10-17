@@ -1,0 +1,651 @@
+// Package rpc is the control plane's vocabulary: the JSON-RPC 2.0
+// objects that ride in the daemon's Call, Reply, and Notify envelopes,
+// and the params and results of every method and notification. The
+// ops live with the daemon (internal/daemon); clients in Go use these
+// types, and clients in other languages read them as the definition.
+//
+// Every method is one entry in the daemon's table: a name here, a
+// params struct, a result struct, and the op. A client that omits an id
+// a method needs gets an error; the daemon fills nothing from context
+// yet.
+package rpc
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+// Request is a Call's payload. ID is the caller's; a Reply echoes it.
+type Request struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      uint32          `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// Response is a Reply's payload: Result or Error, never both.
+type Response struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      uint32          `json:"id"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *Error          `json:"error,omitempty"`
+}
+
+// Notification is a Notify's payload: an event, with no id and no
+// reply.
+type Notification struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// Error is a failed call's answer.
+type Error struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *Error) Error() string { return e.Message }
+
+// Error codes: JSON-RPC's, and the daemon's own from 1000.
+const (
+	CodeParse          = -32700
+	CodeInvalidRequest = -32600
+	CodeMethodNotFound = -32601
+	CodeInvalidParams  = -32602
+	CodeInternal       = -32603
+	// CodeNotFound: no such workspace, tab, pane, or host.
+	CodeNotFound = 1000
+	// CodeUnsupported: this daemon can't (hosts on a non-Windows daemon).
+	CodeUnsupported = 1001
+	// CodeFailed: the op ran and didn't work (a child didn't start).
+	CodeFailed = 1002
+)
+
+// Errorf makes an Error with code.
+func Errorf(code int, format string, args ...any) *Error {
+	return &Error{Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
+// Methods, as the wire names them. The daemon's table has one op per
+// name.
+const (
+	WorkspaceList   = "workspace.list"
+	WorkspaceNew    = "workspace.new"
+	WorkspaceAttach = "workspace.attach"
+	WorkspaceDetach = "workspace.detach"
+	WorkspaceKill   = "workspace.kill"
+	WorkspaceRename = "workspace.rename"
+	WorkspaceResize = "workspace.resize"
+	WorkspaceInfo   = "workspace.info"
+	TabNew          = "tab.new"
+	TabClose        = "tab.close"
+	TabRename       = "tab.rename"
+	TabLayout       = "tab.layout"
+	TabInfo         = "tab.info"
+	PaneSplit       = "pane.split"
+	PaneKill        = "pane.kill"
+	PaneWrite       = "pane.write"
+	PaneText        = "pane.text"
+	PaneInfo        = "pane.info"
+	Subscribe       = "subscribe"
+	HostConnect     = "host.connect"
+	HostAnswer      = "host.answer"
+	HostDisconnect  = "host.disconnect"
+	HostList        = "host.list"
+)
+
+// Notifications. A workspace's viewer gets its workspace's without
+// subscribing; everyone else subscribes to what it wants.
+const (
+	EvWorkspaceCreated   = "workspace.created"
+	EvWorkspaceDestroyed = "workspace.destroyed"
+	EvWorkspaceChanged   = "workspace.changed"
+	EvWorkspaceDetached  = "workspace.detached"
+	EvTabCreated         = "tab.created"
+	EvTabClosed          = "tab.closed"
+	EvTabRenamed         = "tab.renamed"
+	EvPaneCreated        = "pane.created"
+	EvPaneAttached       = "pane.attached"
+	EvPaneExited         = "pane.exited"
+	EvHostChanged        = "host.changed"
+	EvHostPrompt         = "host.prompt"
+)
+
+// Size is a terminal's grid and, if known, its cell size in pixels.
+type Size struct {
+	Cols  uint16 `json:"cols"`
+	Rows  uint16 `json:"rows"`
+	CellW uint32 `json:"cell_width,omitempty"`
+	CellH uint32 `json:"cell_height,omitempty"`
+}
+
+// Area is a tab's space in pixels, which a layout's shares divide, and
+// the cell size for panes that haven't reported their own.
+type Area struct {
+	Width  uint32 `json:"width"`
+	Height uint32 `json:"height"`
+	CellW  uint32 `json:"cell_width"`
+	CellH  uint32 `json:"cell_height"`
+}
+
+// Whole is 100% of a split, in basis points.
+const Whole = 10000
+
+// Axis is the way a split lays out its children: "row" left to right,
+// sharing the width; "column" top to bottom, sharing the height.
+type Axis uint8
+
+const (
+	Row    Axis = 1
+	Column Axis = 2
+)
+
+var axisNames = map[Axis]string{Row: "row", Column: "column"}
+
+func (a Axis) String() string {
+	if s, ok := axisNames[a]; ok {
+		return s
+	}
+	return fmt.Sprintf("axis %d", uint8(a))
+}
+
+func (a Axis) MarshalText() ([]byte, error) {
+	s, ok := axisNames[a]
+	if !ok {
+		return nil, fmt.Errorf("rpc: bad axis %d", uint8(a))
+	}
+	return []byte(s), nil
+}
+
+func (a *Axis) UnmarshalText(b []byte) error {
+	for k, v := range axisNames {
+		if v == string(b) {
+			*a = k
+			return nil
+		}
+	}
+	return fmt.Errorf("rpc: axis is row or column, not %q", b)
+}
+
+// Direction is where a split puts the new pane beside the old.
+type Direction uint8
+
+const (
+	Right Direction = 1
+	Down  Direction = 2
+	Left  Direction = 3
+	Up    Direction = 4
+)
+
+var directionNames = map[Direction]string{Right: "right", Down: "down", Left: "left", Up: "up"}
+
+func (d Direction) String() string {
+	if s, ok := directionNames[d]; ok {
+		return s
+	}
+	return fmt.Sprintf("direction %d", uint8(d))
+}
+
+func (d Direction) MarshalText() ([]byte, error) {
+	s, ok := directionNames[d]
+	if !ok {
+		return nil, fmt.Errorf("rpc: bad direction %d", uint8(d))
+	}
+	return []byte(s), nil
+}
+
+func (d *Direction) UnmarshalText(b []byte) error {
+	for k, v := range directionNames {
+		if v == string(b) {
+			*d = k
+			return nil
+		}
+	}
+	return fmt.Errorf("rpc: direction is right, down, left, or up, not %q", b)
+}
+
+// Axis is the axis a split in direction d lies along.
+func (d Direction) Axis() Axis {
+	if d == Right || d == Left {
+		return Row
+	}
+	return Column
+}
+
+// Node is a tab's layout tree: a pane (Pane != 0) or a split whose
+// children each have a share of it in basis points, summing to Whole.
+// On the wire a pane is {"pane": id} and a split {"split": {"axis":
+// "row", "children": [{"share": 5000, "node": ...}, ...]}}: the shape
+// a tagged union takes in Zig's std.json.
+type Node struct {
+	Pane     uint32
+	Axis     Axis
+	Children []Child
+}
+
+type Child struct {
+	Share uint16 `json:"share"`
+	Node  *Node  `json:"node"`
+}
+
+// MaxDepth bounds a tree's nesting, on the wire and in the daemon.
+const MaxDepth = 32
+
+var ErrTooDeep = errors.New("rpc: layout nested too deep")
+
+func (n *Node) IsLeaf() bool { return n.Pane != 0 }
+
+// Panes lists the tree's panes in order: left to right, top to bottom.
+func (n *Node) Panes() []uint32 {
+	if n == nil {
+		return nil
+	}
+	if n.IsLeaf() {
+		return []uint32{n.Pane}
+	}
+	var ids []uint32
+	for _, c := range n.Children {
+		ids = append(ids, c.Node.Panes()...)
+	}
+	return ids
+}
+
+// Clone copies the tree, so a copy can go out while the original changes.
+func (n *Node) Clone() *Node {
+	if n == nil {
+		return nil
+	}
+	c := &Node{Pane: n.Pane, Axis: n.Axis}
+	for _, ch := range n.Children {
+		c.Children = append(c.Children, Child{ch.Share, ch.Node.Clone()})
+	}
+	return c
+}
+
+type splitJSON struct {
+	Axis     Axis    `json:"axis"`
+	Children []Child `json:"children"`
+}
+
+type nodeJSON struct {
+	Pane  *uint32    `json:"pane,omitempty"`
+	Split *splitJSON `json:"split,omitempty"`
+}
+
+func (n *Node) MarshalJSON() ([]byte, error) {
+	if n.IsLeaf() {
+		return json.Marshal(nodeJSON{Pane: &n.Pane})
+	}
+	return json.Marshal(nodeJSON{Split: &splitJSON{Axis: n.Axis, Children: n.Children}})
+}
+
+func (n *Node) UnmarshalJSON(b []byte) error {
+	return n.unmarshal(b, 0)
+}
+
+func (n *Node) unmarshal(b []byte, depth int) error {
+	if depth > MaxDepth {
+		return ErrTooDeep
+	}
+	var raw struct {
+		Pane  *uint32 `json:"pane"`
+		Split *struct {
+			Axis     Axis `json:"axis"`
+			Children []struct {
+				Share uint16          `json:"share"`
+				Node  json.RawMessage `json:"node"`
+			} `json:"children"`
+		} `json:"split"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	switch {
+	case raw.Pane != nil && raw.Split == nil:
+		*n = Node{Pane: *raw.Pane}
+	case raw.Split != nil && raw.Pane == nil:
+		*n = Node{Axis: raw.Split.Axis}
+		for _, c := range raw.Split.Children {
+			child := &Node{}
+			if err := child.unmarshal(c.Node, depth+1); err != nil {
+				return err
+			}
+			n.Children = append(n.Children, Child{Share: c.Share, Node: child})
+		}
+	default:
+		return errors.New("rpc: a layout node is a pane or a split")
+	}
+	return nil
+}
+
+// Workspace is a workspace's structure: what workspace.new and
+// workspace.attach return, and what workspace.changed carries.
+type Workspace struct {
+	ID   uint32 `json:"id"`
+	Name string `json:"name"`
+	Tabs []Tab  `json:"tabs"`
+}
+
+// Tab is one tab's layout.
+type Tab struct {
+	ID   uint32 `json:"id"`
+	Name string `json:"name,omitempty"` // empty unless renamed
+	Tree *Node  `json:"tree"`
+}
+
+// WorkspaceListResult answers workspace.list.
+type WorkspaceListResult struct {
+	Workspaces []WorkspaceDesc `json:"workspaces"`
+	Panes      []PaneDesc      `json:"panes"`
+}
+
+// WorkspaceDesc is a workspace as workspace.list and workspace.info
+// describe it.
+type WorkspaceDesc struct {
+	ID       uint32 `json:"id"`
+	Name     string `json:"name"`
+	Attached bool   `json:"attached"`
+	// DetachedAt is when it was last detached, in unix milliseconds;
+	// zero while attached or if it never was.
+	DetachedAt int64 `json:"detached_at,omitempty"`
+	Tabs       []Tab `json:"tabs"`
+}
+
+// PaneDesc is a pane as workspace.list and pane.info describe it.
+type PaneDesc struct {
+	ID        uint32 `json:"id"`
+	Tab       uint32 `json:"tab"`
+	Workspace uint32 `json:"workspace"`
+	Command   string `json:"command"`
+	Title     string `json:"title,omitempty"`
+	Pwd       string `json:"pwd,omitempty"`
+	Cols      uint16 `json:"cols"`
+	Rows      uint16 `json:"rows"`
+	Created   int64  `json:"created"` // unix milliseconds
+	PID       uint32 `json:"pid"`
+	// Status is what the pane's programs report doing (OSC 7501),
+	// oldest update first.
+	Status []StatusRecord `json:"status,omitempty"`
+}
+
+// StatusRecord is one program status record: its id (empty for the
+// program itself), state (vt.StatusState: idle, working, done, blocked,
+// or error), and progress (0 to 100, or -1 for none).
+type StatusRecord struct {
+	ID       string `json:"id"`
+	State    uint8  `json:"state"`
+	Progress int8   `json:"progress"`
+}
+
+// TabInfoResult answers tab.info.
+type TabInfoResult struct {
+	Workspace uint32 `json:"workspace"`
+	Tab
+}
+
+// Created answers tab.new and pane.split with what they made.
+type Created struct {
+	Workspace uint32 `json:"workspace"`
+	Tab       uint32 `json:"tab"`
+	Pane      uint32 `json:"pane"`
+}
+
+// WorkspaceNewParams: the name; "default" if empty.
+type WorkspaceNewParams struct {
+	Name string `json:"name,omitempty"`
+}
+
+// WorkspaceAttachParams takes workspace ID from whichever window has it.
+// Area is what the window gives a tab, which the daemon sizes its panes
+// to; zero leaves them as they are. The viewer gets pane.attached per
+// pane, then the Workspace result: panes come before the structure that
+// refers to them. Each pane's frames follow, starting with a full one.
+type WorkspaceAttachParams struct {
+	ID   uint32 `json:"id"`
+	Area Area   `json:"area,omitempty"`
+}
+
+// WorkspaceParams names a workspace: detach, kill, info.
+type WorkspaceParams struct {
+	ID uint32 `json:"id"`
+}
+
+type WorkspaceRenameParams struct {
+	ID   uint32 `json:"id"`
+	Name string `json:"name"`
+}
+
+// WorkspaceResizeParams tells the daemon the window's tab area, for
+// estimating pane sizes in its tabs. The window still resizes each pane
+// itself.
+type WorkspaceResizeParams struct {
+	ID   uint32 `json:"id"`
+	Area Area   `json:"area"`
+}
+
+// TabNewParams adds a tab with one pane running Command (CreateProcessW
+// syntax on Windows; empty for the default shell) in Cwd, sized Size
+// if given. The workspace's viewer gets pane.attached and
+// workspace.changed, then the caller gets Created.
+type TabNewParams struct {
+	Workspace uint32 `json:"workspace"`
+	Command   string `json:"command,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	Size      Size   `json:"size,omitempty"`
+}
+
+// TabParams names a tab: close, info.
+type TabParams struct {
+	ID uint32 `json:"id"`
+}
+
+type TabRenameParams struct {
+	ID   uint32 `json:"id"`
+	Name string `json:"name"`
+}
+
+// TabLayoutParams replaces a tab's tree, which must hold the same panes:
+// a divider was dragged. The viewer gets workspace.changed back.
+type TabLayoutParams struct {
+	ID   uint32 `json:"id"`
+	Tree *Node  `json:"tree"`
+}
+
+// PaneSplitParams starts a pane beside Pane, on side Direction, taking
+// Share basis points of its space (half if zero). Replies as tab.new
+// does.
+type PaneSplitParams struct {
+	Pane      uint32    `json:"pane"`
+	Direction Direction `json:"direction"`
+	Share     uint16    `json:"share,omitempty"`
+	Command   string    `json:"command,omitempty"`
+	Cwd       string    `json:"cwd,omitempty"`
+}
+
+// PaneParams names a pane: kill, info.
+type PaneParams struct {
+	ID uint32 `json:"id"`
+}
+
+// PaneWriteParams writes Text to the pane's child as typed.
+type PaneWriteParams struct {
+	ID   uint32 `json:"id"`
+	Text string `json:"text"`
+}
+
+// PaneTextParams asks for the text of a pane's screen and scrollback
+// without taking it: plain, or with VT the sequences that redraw it.
+type PaneTextParams struct {
+	ID uint32 `json:"id"`
+	VT bool   `json:"vt,omitempty"`
+}
+
+type PaneTextResult struct {
+	Text string `json:"text"`
+}
+
+// SubscribeParams says which notifications this connection wants
+// beyond its own workspaces': names, "group.*" for a group, or "*" for
+// all. It replaces the last subscription.
+type SubscribeParams struct {
+	Events []string `json:"events"`
+}
+
+// Empty is the result of a method that has nothing to say.
+type Empty struct{}
+
+// WorkspaceCreatedParams: workspace.created.
+type WorkspaceCreatedParams struct {
+	ID   uint32 `json:"id"`
+	Name string `json:"name"`
+}
+
+// WorkspaceDestroyedParams: workspace.destroyed.
+type WorkspaceDestroyedParams struct {
+	ID uint32 `json:"id"`
+}
+
+// WorkspaceDetachedParams ends a viewer's hold on a workspace it didn't
+// let go of: taken by another window, or killed.
+type WorkspaceDetachedParams struct {
+	ID     uint32 `json:"id"`
+	Reason string `json:"reason"`
+}
+
+// TabEventParams: tab.created, tab.closed, and tab.renamed.
+type TabEventParams struct {
+	Workspace uint32 `json:"workspace"`
+	ID        uint32 `json:"id"`
+	Name      string `json:"name,omitempty"`
+}
+
+// PaneCreatedParams: pane.created.
+type PaneCreatedParams struct {
+	Workspace uint32 `json:"workspace"`
+	Tab       uint32 `json:"tab"`
+	ID        uint32 `json:"id"`
+}
+
+// PaneAttachedParams starts a pane's attachment to the viewer it goes
+// to: its frames follow, the first a full one, with a Notice for its
+// title and pwd if it has them.
+type PaneAttachedParams struct {
+	ID uint32 `json:"id"`
+	// Command is what the pane runs, for a client that didn't start it.
+	Command string         `json:"command"`
+	Status  []StatusRecord `json:"status,omitempty"`
+}
+
+// PaneExitedParams says the pane's child exited. The viewer gets
+// workspace.changed after, with the pane gone from its tab.
+type PaneExitedParams struct {
+	ID     uint32 `json:"id"`
+	Status uint32 `json:"status"`
+}
+
+// Hosts: SSH hosts the daemon connects to, on Windows. A host's id is
+// stable for its destination while the daemon lives, so a window can
+// group by it across reconnects.
+
+// HostState is a host's state as the daemon reports it.
+type HostState string
+
+const (
+	// HostConnecting: logging in or installing slime.
+	HostConnecting HostState = "connecting"
+	HostConnected  HostState = "connected"
+	// HostFailed: logging in or installing didn't work.
+	HostFailed HostState = "failed"
+	// HostLost: the connection dropped.
+	HostLost HostState = "lost"
+	// HostGone: disconnected on request.
+	HostGone HostState = "gone"
+)
+
+// Host describes a host: host.connect's result, host.list's items, and
+// host.changed. Text is a status line while connecting (the server's,
+// or ours: "installing slime"), or why it failed, was lost, or went.
+type Host struct {
+	ID    uint32    `json:"id"`
+	Dest  string    `json:"dest"`
+	State HostState `json:"state"`
+	Text  string    `json:"text,omitempty"`
+}
+
+// HostConnectParams logs in to Dest (ssh://[user@]host[:port],
+// [user@]host, or a Host alias), puts slime there, and answers with the
+// host as it is then; host.changed follows as it goes. A host already
+// connected or connecting answers at once with its state. Prompts while
+// logging in go to the caller only, as host.prompt; if it hangs up,
+// logging in is cancelled.
+type HostConnectParams struct {
+	Dest string `json:"dest"`
+}
+
+// HostParams names a host: disconnect.
+type HostParams struct {
+	Host uint32 `json:"host"`
+}
+
+// HostListResult answers host.list.
+type HostListResult struct {
+	Hosts []Host `json:"hosts"`
+}
+
+// Choice is the button a prompt was answered with.
+type Choice string
+
+const (
+	// ChoiceCancel gives up: on logging in for most prompts, on the
+	// host for host key prompts.
+	ChoiceCancel Choice = "cancel"
+	// ChoiceAccept submits the answers, or trusts the host key.
+	ChoiceAccept Choice = "accept"
+	// ChoiceSkip moves on without this key (passphrase prompts).
+	ChoiceSkip Choice = "skip"
+)
+
+// HostAnswerParams replies to the last host.prompt for Host: the button
+// pressed, and one answer per question. A cancel with no prompt waiting
+// gives up on logging in.
+type HostAnswerParams struct {
+	Host    uint32   `json:"host"`
+	Choice  Choice   `json:"choice"`
+	Answers []string `json:"answers,omitempty"`
+}
+
+// PromptKind says what a host.prompt asks.
+type PromptKind string
+
+const (
+	PromptPassword    PromptKind = "password"
+	PromptPassphrase  PromptKind = "passphrase"
+	PromptInteractive PromptKind = "interactive"
+	PromptUnknownHost PromptKind = "unknown_host"
+	PromptChangedHost PromptKind = "changed_host"
+)
+
+// HostPromptParams asks the client whose host.connect is logging in to
+// Host something: a password, a passphrase, a keyboard-interactive
+// round, or whether to trust a host key (no questions; accept trusts
+// it). Text is the body, Detail is shown in a monospace box (a key's
+// path, fingerprints), and Error says why the last answer didn't work.
+// The reply is host.answer.
+type HostPromptParams struct {
+	Host      uint32     `json:"host"`
+	Kind      PromptKind `json:"kind"`
+	Title     string     `json:"title,omitempty"`
+	Text      string     `json:"text,omitempty"`
+	Detail    string     `json:"detail,omitempty"`
+	Error     string     `json:"error,omitempty"`
+	Questions []Question `json:"questions,omitempty"`
+}
+
+// Question is one field to fill in. Label may run over several lines,
+// as keyboard-interactive prompts do; its last line names the field.
+type Question struct {
+	Label string `json:"label"`
+	Echo  bool   `json:"echo,omitempty"`
+}

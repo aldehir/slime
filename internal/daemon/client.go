@@ -1,19 +1,31 @@
 package daemon
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"sync"
+
+	"github.com/aldehir/slime/internal/rpc"
 )
 
 // Client is the client end of a connection, for slime's own commands
-// and tests. The GUI speaks the protocol itself.
+// and tests: a JSON-RPC client over the wire. The GUI speaks the
+// protocol itself.
 type Client struct {
 	rw    io.ReadWriteCloser
 	r     *Reader
 	mu    sync.Mutex // writes
-	tag   uint32
+	id    uint32
 	Hello HelloReply
+	// What came while Call waited for its reply, for Recv to hand out
+	// first: a client that also draws a workspace loses nothing.
+	backlog []pending
+}
+
+type pending struct {
+	id uint32
+	m  Message
 }
 
 // NewClient says hello over rw.
@@ -33,13 +45,16 @@ func NewClientWith(rw io.ReadWriteCloser, hello Hello) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	reply, ok := m.(*HelloReply)
-	if !ok {
+	switch m := m.(type) {
+	case *HelloReply:
+		c.Hello = *m
+	case *Error:
+		return nil, fmt.Errorf("daemon: %s", m.Message)
+	default:
 		return nil, fmt.Errorf("daemon: expected hello, got type %d", m.Type())
 	}
-	c.Hello = *reply
-	if reply.Version != Version {
-		return nil, fmt.Errorf("daemon: slime speaks version %d, not %d", reply.Version, Version)
+	if c.Hello.Version != Version {
+		return nil, fmt.Errorf("daemon: slime speaks version %d, not %d", c.Hello.Version, Version)
 	}
 	return c, nil
 }
@@ -55,8 +70,18 @@ func (c *Client) Send(id uint32, m Message) error {
 	return err
 }
 
-// Recv reads the next message and the pane it's for.
+// Recv reads the next message and the pane it's for: what a Call set
+// aside first, then the connection.
 func (c *Client) Recv() (uint32, Message, error) {
+	if len(c.backlog) > 0 {
+		p := c.backlog[0]
+		c.backlog = c.backlog[1:]
+		return p.id, p.m, nil
+	}
+	return c.read()
+}
+
+func (c *Client) read() (uint32, Message, error) {
 	f, err := c.r.Read()
 	if err != nil {
 		return 0, nil, err
@@ -67,137 +92,64 @@ func (c *Client) Recv() (uint32, Message, error) {
 
 func (c *Client) Close() error { return c.rw.Close() }
 
-// NextTag returns a tag for a request.
-func (c *Client) NextTag() uint32 {
-	c.tag++
-	return c.tag
+// NextID returns an id for a call.
+func (c *Client) NextID() uint32 {
+	c.id++
+	return c.id
 }
 
-// List asks for the workspaces. The helpers below read replies in line,
-// so they're for a client that isn't also drawing a workspace.
-func (c *Client) List() (*Workspaces, error) {
-	if err := c.Send(0, &List{}); err != nil {
-		return nil, err
+// Call sends a method call and reads until its reply, setting aside
+// what comes before it for Recv. The result goes into result (JSON
+// unmarshalling; nil to drop it). A reply with an error is returned as
+// an *rpc.Error.
+func (c *Client) Call(method string, params, result any) error {
+	id := c.NextID()
+	req := rpc.Request{JSONRPC: "2.0", ID: id, Method: method}
+	if params != nil {
+		b, err := json.Marshal(params)
+		if err != nil {
+			return err
+		}
+		req.Params = b
+	}
+	if err := c.Send(0, &Call{Request: req}); err != nil {
+		return err
 	}
 	for {
-		_, m, err := c.Recv()
+		pane, m, err := c.read()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		switch m := m.(type) {
-		case *Workspaces:
-			return m, nil
-		case *Error:
-			return nil, fmt.Errorf("slime: %s", m.Message)
+		r, ok := m.(*Reply)
+		if !ok || r.Response.ID != id {
+			c.backlog = append(c.backlog, pending{pane, m})
+			continue
 		}
+		if r.Response.Error != nil {
+			return r.Response.Error
+		}
+		if result == nil || len(r.Response.Result) == 0 {
+			return nil
+		}
+		return json.Unmarshal(r.Response.Result, result)
 	}
 }
 
-// PaneState is a pane as attaching delivered it, with the frames and
-// notices that followed before the reply was complete.
-type PaneState struct {
-	Attached Attached
-	Draws    []*Draw
-	Notices  []*Notice
-}
-
-// Attachment collects what attaching (or a request that adds a pane to
-// an attached workspace) delivered.
-type Attachment struct {
-	Workspace *Workspace
-	Panes     map[uint32]*PaneState
-	Created   *Created
-}
-
-// Await reads until the Workspace and Created (if want is set) replies
-// tagged tag have come, collecting what came for the panes on the way.
-func (c *Client) Await(tag uint32, wantCreated bool) (*Attachment, error) {
-	a := &Attachment{Panes: map[uint32]*PaneState{}}
-	for a.Workspace == nil || (wantCreated && a.Created == nil) {
-		id, m, err := c.Recv()
-		if err != nil {
-			return nil, err
-		}
-		switch m := m.(type) {
-		case *Attached:
-			a.Panes[id] = &PaneState{Attached: *m}
-		case *Draw:
-			if p := a.Panes[id]; p != nil {
-				p.Draws = append(p.Draws, &Draw{Seq: m.Seq, Data: append([]byte(nil), m.Data...)})
-			}
-		case *Notice:
-			if p := a.Panes[id]; p != nil {
-				p.Notices = append(p.Notices, m)
-			}
-		case *Workspace:
-			if m.Tag == tag {
-				a.Workspace = m
-			}
-		case *Created:
-			if m.Tag == tag {
-				a.Created = m
-			}
-		case *Error:
-			if m.Tag == tag {
-				return nil, fmt.Errorf("slime: %s", m.Message)
-			}
-		}
+// Notification returns m's event name and params, if m is one.
+func Notification(m Message) (name string, params json.RawMessage, ok bool) {
+	n, ok := m.(*Notify)
+	if !ok {
+		return "", nil, false
 	}
-	return a, nil
-}
-
-// AwaitCreated reads until the Created reply tagged tag, for a client
-// that doesn't own the workspace it changed.
-func (c *Client) AwaitCreated(tag uint32) (*Created, error) {
-	for {
-		_, m, err := c.Recv()
-		if err != nil {
-			return nil, err
-		}
-		switch m := m.(type) {
-		case *Created:
-			if m.Tag == tag {
-				return m, nil
-			}
-		case *Error:
-			if m.Tag == tag {
-				return nil, fmt.Errorf("slime: %s", m.Message)
-			}
-		}
-	}
-}
-
-// Peek returns the text of a pane's screen and scrollback without
-// taking it: plain, or with asVT the VT that redraws it.
-func (c *Client) Peek(pane uint32, asVT bool) ([]byte, error) {
-	tag := c.NextTag()
-	if err := c.Send(pane, &Peek{Tag: tag, VT: asVT}); err != nil {
-		return nil, err
-	}
-	for {
-		id, m, err := c.Recv()
-		if err != nil {
-			return nil, err
-		}
-		switch m := m.(type) {
-		case *PaneText:
-			if m.Tag == tag && id == pane {
-				return m.Data, nil
-			}
-		case *Error:
-			if m.Tag == tag {
-				return nil, fmt.Errorf("slime: %s", m.Message)
-			}
-		}
-	}
+	return n.Notification.Method, n.Notification.Params, true
 }
 
 // MostRecentDetached picks the workspace detached last, the one a new
 // window takes: nil if none is detached.
-func MostRecentDetached(ws *Workspaces) *WorkspaceInfo {
-	var best *WorkspaceInfo
-	for i := range ws.Workspaces {
-		w := &ws.Workspaces[i]
+func MostRecentDetached(l *rpc.WorkspaceListResult) *rpc.WorkspaceDesc {
+	var best *rpc.WorkspaceDesc
+	for i := range l.Workspaces {
+		w := &l.Workspaces[i]
 		if w.Attached {
 			continue
 		}

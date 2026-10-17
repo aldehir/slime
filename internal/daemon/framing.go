@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"time"
 
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
 )
 
@@ -127,7 +128,7 @@ func (p *Pane) attachFramesLocked(c *conn) error {
 		// this one's.
 		p.fr.view.Reset(p.term)
 	}
-	c.sendForce(p.id, &Attached{Command: p.command, Status: p.status.records()})
+	c.sendForce(0, notify(rpc.EvPaneAttached, rpc.PaneAttachedParams{ID: p.id, Command: p.command, Status: p.status.records()}))
 	// What the client would otherwise only learn when they change.
 	if title, _ := p.term.Title(); title != "" {
 		c.sendForce(p.id, &Notice{Kind: NoticeTitle, Text: title})

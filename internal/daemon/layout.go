@@ -13,78 +13,10 @@ import (
 // dividers included; the daemon estimates them for panes no window
 // shows.
 
-// Whole is 100% in basis points.
-const Whole = 10000
-
-// Axis is the way a split lays out its children.
-type Axis uint8
-
-const (
-	// Row lays children out left to right, sharing the width.
-	Row Axis = 1
-	// Column stacks children top to bottom, sharing the height.
-	Column Axis = 2
-)
-
-// Direction says where a new pane goes beside an existing one.
-type Direction uint8
-
-const (
-	Right Direction = 1
-	Down  Direction = 2
-	Left  Direction = 3
-	Up    Direction = 4
-)
-
-func (d Direction) axis() Axis {
-	if d == Right || d == Left {
-		return Row
-	}
-	return Column
-}
-
-// Node is a pane (Pane != 0) or a split.
-type Node struct {
-	Pane     uint32
-	Axis     Axis
-	Children []Child
-}
-
-type Child struct {
-	Share uint16 // basis points of the parent split
-	Node  *Node
-}
+// The types (Node, Child, Axis, Direction, Whole) are internal/rpc's,
+// shared with the control plane; the algorithms are here.
 
 func leaf(pane uint32) *Node { return &Node{Pane: pane} }
-
-func (n *Node) isLeaf() bool { return n.Pane != 0 }
-
-// Panes lists the tree's panes in order: left to right, top to bottom.
-func (n *Node) Panes() []uint32 {
-	if n == nil {
-		return nil
-	}
-	if n.isLeaf() {
-		return []uint32{n.Pane}
-	}
-	var ids []uint32
-	for _, c := range n.Children {
-		ids = append(ids, c.Node.Panes()...)
-	}
-	return ids
-}
-
-// Clone copies the tree, so a copy can go out while the original changes.
-func (n *Node) Clone() *Node {
-	if n == nil {
-		return nil
-	}
-	c := &Node{Pane: n.Pane, Axis: n.Axis}
-	for _, ch := range n.Children {
-		c.Children = append(c.Children, Child{ch.Share, ch.Node.Clone()})
-	}
-	return c
-}
 
 // splitNode puts pane beside target, on side dir, taking share basis points
 // of target's space. It returns the new root. A split along the same
@@ -97,7 +29,7 @@ func splitNode(root *Node, target, pane uint32, dir Direction, share uint16) (*N
 	if i < 0 {
 		return nil, fmt.Errorf("daemon: no pane %d in the layout", target)
 	}
-	axis := dir.axis()
+	axis := dir.Axis()
 	before := dir == Left || dir == Up
 	added := leaf(pane)
 
@@ -113,7 +45,7 @@ func splitNode(root *Node, target, pane uint32, dir Direction, share uint16) (*N
 		if before {
 			at = i
 		}
-		parent.Children = append(parent.Children[:at], append([]Child{{newShare, added}}, parent.Children[at:]...)...)
+		parent.Children = append(parent.Children[:at], append([]Child{{Share: newShare, Node: added}}, parent.Children[at:]...)...)
 		return root, nil
 	}
 
@@ -124,9 +56,9 @@ func splitNode(root *Node, target, pane uint32, dir Direction, share uint16) (*N
 	} else {
 		t = parent.Children[i].Node
 	}
-	kids := []Child{{Whole - share, t}, {share, added}}
+	kids := []Child{{Share: Whole - share, Node: t}, {Share: share, Node: added}}
 	if before {
-		kids[0], kids[1] = Child{share, added}, Child{Whole - share, t}
+		kids[0], kids[1] = Child{Share: share, Node: added}, Child{Share: Whole - share, Node: t}
 	}
 	split := &Node{Axis: axis, Children: kids}
 	if parent == nil {
@@ -143,7 +75,7 @@ func removeNode(root *Node, pane uint32) *Node {
 	if root == nil {
 		return nil
 	}
-	if root.isLeaf() {
+	if root.IsLeaf() {
 		if root.Pane == pane {
 			return nil
 		}
@@ -160,7 +92,7 @@ func removeNode(root *Node, pane uint32) *Node {
 
 // collapse replaces every split with one child by that child.
 func collapse(n *Node) *Node {
-	if n.isLeaf() {
+	if n.IsLeaf() {
 		return n
 	}
 	for i := range n.Children {
@@ -200,14 +132,14 @@ func rebalance(n *Node) {
 // find returns pane's parent and its index there; the parent is nil
 // when pane is the root. The index is -1 if pane isn't in the tree.
 func find(n, parent *Node, pane uint32) (*Node, int) {
-	if n.isLeaf() {
+	if n.IsLeaf() {
 		if n.Pane == pane {
 			return parent, 0
 		}
 		return nil, -1
 	}
 	for i, c := range n.Children {
-		if c.Node.isLeaf() {
+		if c.Node.IsLeaf() {
 			if c.Node.Pane == pane {
 				return n, i
 			}
@@ -243,7 +175,7 @@ func Validate(n *Node, want []uint32) error {
 }
 
 func validate(n *Node, seen map[uint32]bool) error {
-	if n.isLeaf() {
+	if n.IsLeaf() {
 		if len(n.Children) != 0 {
 			return errors.New("daemon: a pane with children")
 		}
@@ -291,7 +223,7 @@ func measure(n *Node, width, height uint32, cell func(uint32) (uint32, uint32), 
 	if n == nil {
 		return
 	}
-	if n.isLeaf() {
+	if n.IsLeaf() {
 		cw, ch := cell(n.Pane)
 		cols := min(width/max(cw, 1), 0xffff)
 		rows := min(height/max(ch, 1), 0xffff)

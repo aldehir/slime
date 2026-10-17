@@ -12,15 +12,18 @@ import (
 	"strings"
 
 	"github.com/aldehir/slime/internal/remote"
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/sshbridge"
 )
 
 // Hosts: the SSH connections the daemon holds. Each host is logged in
-// to once (HostConnect), with the prompts going to the client that
-// asked, and then any client reaches the host's own daemon through a
-// bridge: a connection whose first frame is Bridge, spliced to `slime
-// connect` on the host. The connection lives until the host hangs up
-// or a client asks (HostDisconnect), whatever windows come and go.
+// to once (host.connect), with the prompts going to the client that
+// asked (host.prompt), and then any client reaches the host's own
+// daemon through a bridge: a connection whose first frame is Bridge,
+// spliced to `slime connect` on the host. The connection lives until
+// the host hangs up or a client asks (host.disconnect), whatever
+// windows come and go. Every change of state goes to the connections
+// subscribed to host.changed.
 
 // HostOptions configures connecting to SSH hosts.
 type HostOptions struct {
@@ -60,11 +63,11 @@ type host struct {
 
 	// While connecting: cancel gives up on logging in, client is the
 	// one logging in (whose prompts it takes), and answers takes its
-	// reply to the Prompt shown, while there is one.
+	// reply to the prompt shown, while there is one.
 	cancel  context.CancelFunc
 	client  *conn
-	answers chan HostAnswer
-	// disconnecting is set by a HostDisconnect while connecting, so
+	answers chan rpc.HostAnswerParams
+	// disconnecting is set by a host.disconnect while connecting, so
 	// the failure that follows is reported as gone.
 	disconnecting bool
 
@@ -72,8 +75,8 @@ type host struct {
 	conn *sshbridge.Conn
 }
 
-func (h *host) info() HostInfo {
-	return HostInfo{ID: h.id, Dest: h.dest, State: h.state, Text: h.text}
+func (h *host) info() rpc.Host {
+	return rpc.Host{ID: h.id, Dest: h.dest, State: h.state, Text: h.text}
 }
 
 // hostsActiveLocked counts the hosts that keep the daemon alive: those
@@ -88,27 +91,14 @@ func (s *Server) hostsActiveLocked() int {
 	return n
 }
 
-// hostDispatch handles the host messages, reporting whether m was one.
-func (s *Server) hostDispatch(c *conn, id uint32, m Message) bool {
-	switch m := m.(type) {
-	case *HostConnect:
-		s.hostConnect(c, m)
-	case *HostAnswer:
-		s.hostAnswer(c, id, m)
-	case *HostDisconnect:
-		s.hostDisconnect(id)
-	case *HostList:
-		s.hostList(c)
-	default:
-		return false
-	}
-	return true
-}
-
 // hostConnect starts logging in to a destination, or answers with the
 // state of a host already on its way or there.
-func (s *Server) hostConnect(c *conn, m *HostConnect) {
+func (s *Server) hostConnect(cl *callCtx, m rpc.HostConnectParams) (*rpc.Host, error) {
+	if m.Dest == "" {
+		return nil, rpc.Errorf(rpc.CodeInvalidParams, "host.connect needs a destination")
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	var h *host
 	for _, x := range s.hosts.byID {
 		if x.dest == m.Dest {
@@ -121,21 +111,20 @@ func (s *Server) hostConnect(c *conn, m *HostConnect) {
 		s.hosts.byID[h.id] = h
 	}
 	if h.state == HostConnecting || h.state == HostConnected {
-		st := h.stateMessage(m.Tag)
-		s.mu.Unlock()
-		c.sendForce(h.id, st)
-		return
+		info := h.info()
+		return &info, nil
 	}
 	h.gen++
 	gen := h.gen
 	ctx, cancel := context.WithCancel(context.Background())
 	h.state, h.text = HostConnecting, "logging in"
-	h.cancel, h.client, h.answers = cancel, c, nil
+	h.cancel, h.client, h.answers = cancel, cl.c, nil
 	h.disconnecting = false
 	s.checkIdleLocked()
-	s.hostChangedLocked(h, c, m.Tag)
-	s.mu.Unlock()
+	s.hostChangedLocked(h)
 	go s.hostLogin(h, gen, ctx)
+	info := h.info()
+	return &info, nil
 }
 
 // hostLogin logs in to h and sets slime up there, in attempt gen.
@@ -171,7 +160,7 @@ func (s *Server) hostLogin(h *host, gen int, ctx context.Context) {
 	h.conn = conn
 	h.cancel, h.client, h.answers = nil, nil, nil
 	h.state, h.text = HostConnected, ""
-	s.hostChangedLocked(h, nil, 0)
+	s.hostChangedLocked(h)
 	s.mu.Unlock()
 	s.log.Info("host connected", "dest", h.dest, "addr", opts.Dest.Addr())
 
@@ -189,7 +178,7 @@ func (s *Server) hostLogin(h *host, gen int, ctx context.Context) {
 	}
 	s.log.Info("host ended", "dest", h.dest, "state", h.state, "text", h.text)
 	s.checkIdleLocked()
-	s.hostChangedLocked(h, nil, 0)
+	s.hostChangedLocked(h)
 }
 
 // hostFailed ends attempt gen as failed, saying why, or as gone if a
@@ -208,7 +197,7 @@ func (s *Server) hostFailed(h *host, gen int, why string) {
 	}
 	s.log.Info("host failed", "dest", h.dest, "state", h.state, "text", h.text)
 	s.checkIdleLocked()
-	s.hostChangedLocked(h, nil, 0)
+	s.hostChangedLocked(h)
 }
 
 // hostText updates the status line of a host still connecting in
@@ -220,34 +209,28 @@ func (s *Server) hostText(h *host, gen int, text string) {
 		return
 	}
 	h.text = text
-	s.hostChangedLocked(h, nil, 0)
+	s.hostChangedLocked(h)
 }
 
-func (h *host) stateMessage(tag uint32) *HostState {
-	return &HostState{Tag: tag, Dest: h.dest, State: h.state, Text: h.text}
+// hostChangedLocked tells the connections subscribed to host.changed
+// h's state.
+func (s *Server) hostChangedLocked(h *host) {
+	s.emitLocked(rpc.EvHostChanged, h.info(), nil, nil)
 }
 
-// hostChangedLocked tells every client h's state; tagged gets it with
-// tag, as the answer to its HostConnect.
-func (s *Server) hostChangedLocked(h *host, tagged *conn, tag uint32) {
-	for c := range s.conns {
-		if c == tagged {
-			c.sendForce(h.id, h.stateMessage(tag))
-		} else {
-			c.sendForce(h.id, h.stateMessage(0))
-		}
-	}
-}
-
-// hostAnswer hands c's answer to the prompt waiting for it, if c is the
-// client logging in. A cancel with none waiting (the server is busy
-// with the last answer) gives up on logging in.
-func (s *Server) hostAnswer(c *conn, id uint32, m *HostAnswer) {
+// hostAnswer hands the caller's answer to the prompt waiting for it, if
+// the caller is the client logging in. A cancel with none waiting (the
+// server is busy with the last answer) gives up on logging in.
+func (s *Server) hostAnswer(cl *callCtx, m rpc.HostAnswerParams) (rpc.Empty, error) {
 	s.mu.Lock()
-	h := s.hosts.byID[id]
-	if h == nil || h.client != c {
+	h := s.hosts.byID[m.Host]
+	if h == nil {
 		s.mu.Unlock()
-		return
+		return rpc.Empty{}, errNoHost
+	}
+	if h.client != cl.c || cl.c == nil {
+		s.mu.Unlock()
+		return rpc.Empty{}, rpc.Errorf(rpc.CodeFailed, "%s isn't logging in for this connection", h.dest)
 	}
 	answers := h.answers
 	h.answers = nil
@@ -255,19 +238,20 @@ func (s *Server) hostAnswer(c *conn, id uint32, m *HostAnswer) {
 	s.mu.Unlock()
 	switch {
 	case answers != nil:
-		answers <- *m
-	case m.Choice == ChoiceCancel && cancel != nil:
+		answers <- m
+	case m.Choice == rpc.ChoiceCancel && cancel != nil:
 		cancel()
 	}
+	return rpc.Empty{}, nil
 }
 
 // hostDisconnect hangs up on a host, or gives up on logging in to it.
-func (s *Server) hostDisconnect(id uint32) {
+func (s *Server) hostDisconnect(_ *callCtx, m rpc.HostParams) (rpc.Empty, error) {
 	s.mu.Lock()
-	h := s.hosts.byID[id]
+	h := s.hosts.byID[m.Host]
 	if h == nil {
 		s.mu.Unlock()
-		return
+		return rpc.Empty{}, errNoHost
 	}
 	switch h.state {
 	case HostConnecting:
@@ -282,6 +266,7 @@ func (s *Server) hostDisconnect(id uint32) {
 	default:
 		s.mu.Unlock()
 	}
+	return rpc.Empty{}, nil
 }
 
 // hostClientGoneLocked cancels logging in to any host c was answering
@@ -294,15 +279,15 @@ func (s *Server) hostClientGoneLocked(c *conn) {
 	}
 }
 
-func (s *Server) hostList(c *conn) {
+func (s *Server) hostList(_ *callCtx, _ rpc.Empty) (*rpc.HostListResult, error) {
 	s.mu.Lock()
-	out := &Hosts{}
+	out := &rpc.HostListResult{Hosts: []rpc.Host{}}
 	for _, h := range s.hosts.byID {
 		out.Hosts = append(out.Hosts, h.info())
 	}
 	s.mu.Unlock()
-	slices.SortFunc(out.Hosts, func(a, b HostInfo) int { return cmp.Compare(a.ID, b.ID) })
-	c.sendForce(0, out)
+	slices.SortFunc(out.Hosts, func(a, b rpc.Host) int { return cmp.Compare(a.ID, b.ID) })
+	return out, nil
 }
 
 // bridge splices a connection whose first frame was Bridge to `slime
@@ -340,7 +325,7 @@ func (s *Server) bridge(rw io.ReadWriteCloser, r *Reader, id uint32, m *Bridge) 
 }
 
 // hostAsker is how logging in to a host asks the client that asked for
-// it: prompts go to it as Prompt, and its HostAnswer comes back.
+// it: prompts go to it as host.prompt, and its host.answer comes back.
 type hostAsker struct {
 	s   *Server
 	h   *host
@@ -349,7 +334,7 @@ type hostAsker struct {
 }
 
 func (a *hostAsker) Ask(q *sshbridge.Query) (sshbridge.Answer, error) {
-	answers := make(chan HostAnswer, 1)
+	answers := make(chan rpc.HostAnswerParams, 1)
 	a.s.mu.Lock()
 	if a.h.gen != a.gen || a.h.state != HostConnecting {
 		a.s.mu.Unlock()
@@ -366,24 +351,42 @@ func (a *hostAsker) Ask(q *sshbridge.Query) (sshbridge.Answer, error) {
 		a.s.mu.Unlock()
 	}()
 
-	p := &Prompt{
-		Kind:   PromptKind(q.Kind),
+	p := rpc.HostPromptParams{
+		Host:   a.h.id,
+		Kind:   promptKinds[q.Kind],
 		Title:  q.Title,
 		Text:   q.Text,
 		Detail: q.Detail,
 		Error:  q.Error,
 	}
 	for _, pq := range q.Questions {
-		p.Questions = append(p.Questions, Question{Label: pq.Label, Echo: pq.Echo})
+		p.Questions = append(p.Questions, rpc.Question{Label: pq.Label, Echo: pq.Echo})
 	}
-	client.sendForce(a.h.id, p)
+	client.sendForce(0, notify(rpc.EvHostPrompt, p))
 	select {
 	case ans := <-answers:
-		return sshbridge.PadAnswers(sshbridge.Answer{Choice: sshbridge.Choice(ans.Choice), Answers: ans.Answers}, len(q.Questions)), nil
+		return sshbridge.PadAnswers(sshbridge.Answer{Choice: choices[ans.Choice], Answers: ans.Answers}, len(q.Questions)), nil
 	case <-a.ctx.Done():
 		return sshbridge.Answer{}, sshbridge.ErrCancelled
 	}
 }
+
+// The wire's names for sshbridge's prompt kinds and choices. A choice
+// the wire doesn't know cancels.
+var (
+	promptKinds = map[sshbridge.PromptKind]rpc.PromptKind{
+		sshbridge.PromptPassword:    rpc.PromptPassword,
+		sshbridge.PromptPassphrase:  rpc.PromptPassphrase,
+		sshbridge.PromptInteractive: rpc.PromptInteractive,
+		sshbridge.PromptUnknownHost: rpc.PromptUnknownHost,
+		sshbridge.PromptChangedHost: rpc.PromptChangedHost,
+	}
+	choices = map[rpc.Choice]sshbridge.Choice{
+		rpc.ChoiceCancel: sshbridge.ChoiceCancel,
+		rpc.ChoiceAccept: sshbridge.ChoiceAccept,
+		rpc.ChoiceSkip:   sshbridge.ChoiceSkip,
+	}
+)
 
 func (a *hostAsker) Info(text string) {
 	a.s.hostText(a.h, a.gen, strings.TrimRight(text, "\r\n"))

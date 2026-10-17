@@ -3,6 +3,8 @@ package daemon
 import (
 	"errors"
 	"time"
+
+	"github.com/aldehir/slime/internal/rpc"
 )
 
 // workspace is a named, ordered set of tabs, attached by at most one
@@ -36,25 +38,34 @@ var (
 	errNoWorkspace = errors.New("no such workspace")
 	errNoTab       = errors.New("no such tab")
 	errNoPane      = errors.New("no such pane")
+	errNoHost      = errors.New("no such host")
 )
 
-func (ws *workspace) tabInfos() []TabInfo {
-	infos := make([]TabInfo, len(ws.tabs))
+func (ws *workspace) tabInfos() []rpc.Tab {
+	infos := make([]rpc.Tab, len(ws.tabs))
 	for i, t := range ws.tabs {
-		infos[i] = TabInfo{ID: t.id, Name: t.name, Tree: t.root.Clone()}
+		infos[i] = rpc.Tab{ID: t.id, Name: t.name, Tree: t.root.Clone()}
 	}
 	return infos
 }
 
-func (ws *workspace) message(tag uint32) *Workspace {
-	return &Workspace{Tag: tag, ID: ws.id, Name: ws.name, Tabs: ws.tabInfos()}
+// structure is the workspace as workspace.changed carries it.
+func (ws *workspace) structure() *rpc.Workspace {
+	return &rpc.Workspace{ID: ws.id, Name: ws.name, Tabs: ws.tabInfos()}
 }
 
-// notifyLocked sends the owner, if any, the workspace's structure.
-func (s *Server) notifyLocked(ws *workspace, tag uint32) {
-	if ws.owner != nil {
-		ws.owner.sendForce(0, ws.message(tag))
+func (ws *workspace) desc() rpc.WorkspaceDesc {
+	d := rpc.WorkspaceDesc{ID: ws.id, Name: ws.name, Attached: ws.owner != nil, Tabs: ws.tabInfos()}
+	if !ws.detachedAt.IsZero() && ws.owner == nil {
+		d.DetachedAt = ws.detachedAt.UnixMilli()
 	}
+	return d
+}
+
+// changedLocked sends the owner, if any, and the subscribers the
+// workspace's structure.
+func (s *Server) changedLocked(ws *workspace) {
+	s.emitLocked(rpc.EvWorkspaceChanged, ws.structure(), ws, nil)
 }
 
 // retileLocked sizes a tab's panes from its layout, while no window
@@ -114,38 +125,49 @@ func (s *Server) measureLocked(ws *workspace, root *Node, extra map[uint32]Size)
 	return out
 }
 
-func (s *Server) workspaceNew(c *conn, m *WorkspaceNew) {
+// workspaceNew creates an empty workspace attached to the caller, and
+// answers with its structure before anything can change it.
+func (s *Server) workspaceNew(cl *callCtx, p rpc.WorkspaceNewParams) (*rpc.Workspace, error) {
+	if cl.c == nil {
+		return nil, rpc.Errorf(rpc.CodeInvalidRequest, "workspace.new needs a connection to attach to")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ws := &workspace{id: s.newIDLocked(), name: m.Name, owner: c}
+	ws := &workspace{id: s.newIDLocked(), name: p.Name, owner: cl.c}
 	if ws.name == "" {
 		ws.name = "default"
 	}
 	s.workspaces[ws.id] = ws
-	c.owned[ws.id] = ws
+	cl.c.owned[ws.id] = ws
 	s.checkIdleLocked()
 	s.log.Info("workspace created", "workspace", ws.id, "name", ws.name)
-	c.sendForce(0, ws.message(m.Tag))
-	c.sendForce(0, &Created{Tag: m.Tag, WS: ws.id})
+	s.emitLocked(rpc.EvWorkspaceCreated, rpc.WorkspaceCreatedParams{ID: ws.id, Name: ws.name}, nil, nil)
+	cl.reply(ws.structure())
+	return nil, nil
 }
 
-// workspaceAttach gives a workspace to c: each pane, sized to the
-// window's tab area, then the structure.
-func (s *Server) workspaceAttach(c *conn, m *WorkspaceAttach) error {
+// workspaceAttach gives a workspace to the caller: each pane, sized to
+// the window's tab area, then the structure, replied under the lock so
+// nothing comes between.
+func (s *Server) workspaceAttach(cl *callCtx, p rpc.WorkspaceAttachParams) (*rpc.Workspace, error) {
+	c := cl.c
+	if c == nil {
+		return nil, rpc.Errorf(rpc.CodeInvalidRequest, "workspace.attach needs a connection to attach to")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ws := s.workspaces[m.WS]
+	ws := s.workspaces[p.ID]
 	if ws == nil || ws.killed {
-		return errNoWorkspace
+		return nil, errNoWorkspace
 	}
 	if old := ws.owner; old != nil && old != c {
 		s.releaseLocked(ws, "attached elsewhere")
 	}
 	ws.owner = c
 	c.owned[ws.id] = ws
-	given := validArea(m.Area)
+	given := validArea(p.Area)
 	if given {
-		ws.area = m.Area
+		ws.area = p.Area
 	}
 	for _, t := range ws.tabs {
 		var sizes map[uint32]Size
@@ -153,27 +175,32 @@ func (s *Server) workspaceAttach(c *conn, m *WorkspaceAttach) error {
 			sizes = s.measureLocked(ws, t.root, nil)
 		}
 		for _, id := range t.root.Panes() {
-			p := s.panes[id]
-			if p == nil {
+			pn := s.panes[id]
+			if pn == nil {
 				continue
 			}
 			// Without an area, as they are.
-			if err := p.attach(c, sizes[id]); err != nil {
+			if err := pn.attach(c, sizes[id]); err != nil {
 				s.log.Error("attaching pane", "pane", id, "err", err)
 			}
 		}
 	}
 	s.log.Info("workspace attached", "workspace", ws.id)
-	c.sendForce(0, ws.message(m.Tag))
-	return nil
+	cl.reply(ws.structure())
+	return nil, nil
 }
 
-func (s *Server) workspaceDetach(c *conn, id uint32) {
+func (s *Server) workspaceDetach(cl *callCtx, p rpc.WorkspaceParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ws := s.workspaces[id]; ws != nil && ws.owner == c {
+	ws := s.workspaces[p.ID]
+	if ws == nil {
+		return rpc.Empty{}, errNoWorkspace
+	}
+	if ws.owner == cl.c {
 		s.releaseLocked(ws, "")
 	}
+	return rpc.Empty{}, nil
 }
 
 // releaseLocked detaches a workspace from its owner. reason, if set,
@@ -192,7 +219,7 @@ func (s *Server) releaseLocked(ws *workspace, reason string) {
 		}
 	}
 	if reason != "" {
-		c.sendForce(0, &Detached{WS: ws.id, Reason: reason})
+		s.emitLocked(rpc.EvWorkspaceDetached, rpc.WorkspaceDetachedParams{ID: ws.id, Reason: reason}, ws, nil)
 	}
 	delete(c.owned, ws.id)
 	ws.owner = nil
@@ -216,51 +243,78 @@ func (s *Server) removeWorkspaceLocked(ws *workspace) {
 	}
 	s.checkIdleLocked()
 	s.log.Info("workspace removed", "workspace", ws.id)
+	s.emitLocked(rpc.EvWorkspaceDestroyed, rpc.WorkspaceDestroyedParams{ID: ws.id}, nil, nil)
 }
 
-func (s *Server) workspaceKill(id uint32) error {
+func (s *Server) workspaceKill(_ *callCtx, p rpc.WorkspaceParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ws := s.workspaces[id]
+	ws := s.workspaces[p.ID]
 	if ws == nil {
-		return errNoWorkspace
+		return rpc.Empty{}, errNoWorkspace
 	}
 	ws.killed = true
 	if len(ws.tabs) == 0 {
-		if ws.owner != nil {
-			ws.owner.sendForce(0, &Detached{WS: ws.id, Reason: "killed"})
-		}
-		s.removeWorkspaceLocked(ws)
-		return nil
+		s.killedLocked(ws)
+		return rpc.Empty{}, nil
 	}
 	for _, t := range ws.tabs {
 		for _, pid := range t.root.Panes() {
-			if p := s.panes[pid]; p != nil {
-				p.kill()
+			if pn := s.panes[pid]; pn != nil {
+				pn.kill()
 			}
 		}
 	}
-	return nil
+	return rpc.Empty{}, nil
 }
 
-func (s *Server) workspaceRename(id uint32, name string) error {
+// killedLocked removes a killed workspace whose panes are gone, telling
+// its owner.
+func (s *Server) killedLocked(ws *workspace) {
+	if ws.owner != nil {
+		s.emitLocked(rpc.EvWorkspaceDetached, rpc.WorkspaceDetachedParams{ID: ws.id, Reason: "killed"}, ws, nil)
+	}
+	s.removeWorkspaceLocked(ws)
+}
+
+func (s *Server) workspaceRename(_ *callCtx, p rpc.WorkspaceRenameParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ws := s.workspaces[id]
+	ws := s.workspaces[p.ID]
 	if ws == nil {
-		return errNoWorkspace
+		return rpc.Empty{}, errNoWorkspace
 	}
-	ws.name = name
-	s.notifyLocked(ws, 0)
-	return nil
+	ws.name = p.Name
+	s.changedLocked(ws)
+	return rpc.Empty{}, nil
 }
 
-func (s *Server) workspaceResize(c *conn, m *WorkspaceResize) {
+func (s *Server) workspaceResize(cl *callCtx, p rpc.WorkspaceResizeParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ws := s.workspaces[m.WS]; ws != nil && ws.owner == c && validArea(m.Area) {
-		ws.area = m.Area
+	ws := s.workspaces[p.ID]
+	if ws == nil {
+		return rpc.Empty{}, errNoWorkspace
 	}
+	if ws.owner != cl.c {
+		return rpc.Empty{}, rpc.Errorf(rpc.CodeFailed, "workspace %d isn't attached here", p.ID)
+	}
+	if !validArea(p.Area) {
+		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "an area needs a width, height, and cell size")
+	}
+	ws.area = p.Area
+	return rpc.Empty{}, nil
+}
+
+func (s *Server) workspaceInfo(_ *callCtx, p rpc.WorkspaceParams) (*rpc.WorkspaceDesc, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ws := s.workspaces[p.ID]
+	if ws == nil {
+		return nil, errNoWorkspace
+	}
+	d := ws.desc()
+	return &d, nil
 }
 
 // validArea says whether a has the pixels and cell size to measure by.
@@ -268,11 +322,11 @@ func validArea(a Area) bool {
 	return a.Width != 0 && a.Height != 0 && a.CellW != 0 && a.CellH != 0
 }
 
-// tabNew starts a tab with one pane. Its owner gets the pane's Attached,
-// then the structure; the sender gets Created.
-func (s *Server) tabNew(c *conn, m *TabNew) error {
+// tabNew starts a tab with one pane. Its owner gets the pane's
+// pane.attached, then the structure; the caller gets what was made.
+func (s *Server) tabNew(_ *callCtx, m rpc.TabNewParams) (*rpc.Created, error) {
 	s.mu.Lock()
-	ws := s.workspaces[m.WS]
+	ws := s.workspaces[m.Workspace]
 	size := m.Size
 	if ws != nil && (size.Cols == 0 || size.Rows == 0) {
 		// The whole tab area, in the area's cells.
@@ -280,19 +334,19 @@ func (s *Server) tabNew(c *conn, m *TabNew) error {
 	}
 	s.mu.Unlock()
 	if ws == nil || ws.killed {
-		return errNoWorkspace
+		return nil, errNoWorkspace
 	}
 
 	pt, term, err := s.startPane(m.Command, m.Cwd, size)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.workspaces[m.WS] != ws || ws.killed {
+	if s.workspaces[m.Workspace] != ws || ws.killed {
 		pt.Close()
 		term.Close()
-		return errNoWorkspace
+		return nil, errNoWorkspace
 	}
 	if size.Cols == 0 || size.Rows == 0 {
 		size = Size{Cols: defaultSize.Cols, Rows: defaultSize.Rows, CellW: size.CellW, CellH: size.CellH}
@@ -318,19 +372,20 @@ func (s *Server) tabNew(c *conn, m *TabNew) error {
 	ws.tabs = append(ws.tabs, t)
 	s.checkIdleLocked()
 	s.log.Info("tab started", "workspace", ws.id, "tab", t.id, "pane", p.id, "command", m.Command, "pid", pt.PID())
+	s.emitLocked(rpc.EvTabCreated, rpc.TabEventParams{Workspace: ws.id, ID: t.id}, nil, nil)
+	s.emitLocked(rpc.EvPaneCreated, rpc.PaneCreatedParams{Workspace: ws.id, Tab: t.id, ID: p.id}, nil, nil)
 	if ws.owner != nil {
 		p.attach(ws.owner, Size{})
 	}
-	s.notifyLocked(ws, m.Tag)
-	c.sendForce(0, &Created{Tag: m.Tag, WS: ws.id, Tab: t.id, Pane: p.id})
+	s.changedLocked(ws)
 	go p.run()
-	return nil
+	return &rpc.Created{Workspace: ws.id, Tab: t.id, Pane: p.id}, nil
 }
 
-// split starts a pane beside another. Replies as tabNew does.
-func (s *Server) split(c *conn, m *Split) error {
-	if m.Dir < Right || m.Dir > Up {
-		return errors.New("bad split direction")
+// paneSplit starts a pane beside another. Replies as tabNew does.
+func (s *Server) paneSplit(_ *callCtx, m rpc.PaneSplitParams) (*rpc.Created, error) {
+	if m.Direction < Right || m.Direction > Up {
+		return nil, rpc.Errorf(rpc.CodeInvalidParams, "direction is right, down, left, or up")
 	}
 	if m.Share == 0 || m.Share >= Whole {
 		m.Share = Whole / 2
@@ -340,13 +395,13 @@ func (s *Server) split(c *conn, m *Split) error {
 	target := s.panes[m.Pane]
 	if target == nil || target.tab == nil {
 		s.mu.Unlock()
-		return errNoPane
+		return nil, errNoPane
 	}
 	t := target.tab
-	trial, err := splitNode(t.root.Clone(), m.Pane, ^uint32(0), m.Dir, m.Share)
+	trial, err := splitNode(t.root.Clone(), m.Pane, ^uint32(0), m.Direction, m.Share)
 	if err != nil {
 		s.mu.Unlock()
-		return err
+		return nil, err
 	}
 	// The new pane takes its neighbour's cell size, as a split takes its
 	// font.
@@ -355,7 +410,7 @@ func (s *Server) split(c *conn, m *Split) error {
 
 	pt, term, err := s.startPane(m.Command, m.Cwd, size)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -363,14 +418,14 @@ func (s *Server) split(c *conn, m *Split) error {
 	if s.panes[m.Pane] != target || target.tab != t || s.tabs[t.id] != t {
 		pt.Close()
 		term.Close()
-		return errNoPane
+		return nil, errNoPane
 	}
 	id := s.newIDLocked()
-	root, err := splitNode(t.root, m.Pane, id, m.Dir, m.Share)
+	root, err := splitNode(t.root, m.Pane, id, m.Direction, m.Share)
 	if err != nil {
 		pt.Close()
 		term.Close()
-		return err
+		return nil, err
 	}
 	t.root = root
 	p := newPane(s, id, m.Command, size, pt, term)
@@ -378,61 +433,72 @@ func (s *Server) split(c *conn, m *Split) error {
 	s.panes[id] = p
 	s.log.Info("pane split", "tab", t.id, "pane", id, "beside", m.Pane, "command", m.Command, "pid", pt.PID())
 	ws := t.ws
+	s.emitLocked(rpc.EvPaneCreated, rpc.PaneCreatedParams{Workspace: ws.id, Tab: t.id, ID: id}, nil, nil)
 	if ws.owner != nil {
 		p.attach(ws.owner, Size{})
 	}
 	s.retileLocked(t)
-	s.notifyLocked(ws, m.Tag)
-	c.sendForce(0, &Created{Tag: m.Tag, WS: ws.id, Tab: t.id, Pane: id})
+	s.changedLocked(ws)
 	go p.run()
-	return nil
+	return &rpc.Created{Workspace: ws.id, Tab: t.id, Pane: id}, nil
 }
 
-// layout replaces a tab's proportions: a divider was dragged.
-func (s *Server) layout(m *Layout) error {
+// tabLayout replaces a tab's proportions: a divider was dragged.
+func (s *Server) tabLayout(_ *callCtx, m rpc.TabLayoutParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t := s.tabs[m.Tab]
+	t := s.tabs[m.ID]
 	if t == nil {
-		return errNoTab
+		return rpc.Empty{}, errNoTab
 	}
 	if err := Validate(m.Tree, t.root.Panes()); err != nil {
-		return err
+		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "%v", err)
 	}
 	t.root = m.Tree
 	s.retileLocked(t)
-	s.notifyLocked(t.ws, 0)
-	return nil
+	s.changedLocked(t.ws)
+	return rpc.Empty{}, nil
 }
 
 // tabClose ends a tab's panes. The tab goes now; their exits follow.
-func (s *Server) tabClose(id uint32) error {
+func (s *Server) tabClose(_ *callCtx, p rpc.TabParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t := s.tabs[id]
+	t := s.tabs[p.ID]
 	if t == nil {
-		return errNoTab
+		return rpc.Empty{}, errNoTab
 	}
 	for _, pid := range t.root.Panes() {
-		if p := s.panes[pid]; p != nil {
-			p.tab = nil
-			p.kill()
+		if pn := s.panes[pid]; pn != nil {
+			pn.tab = nil
+			pn.kill()
 		}
 	}
 	s.removeTabLocked(t)
-	return nil
+	return rpc.Empty{}, nil
 }
 
-func (s *Server) tabRename(id uint32, name string) error {
+func (s *Server) tabRename(_ *callCtx, p rpc.TabRenameParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t := s.tabs[id]
+	t := s.tabs[p.ID]
 	if t == nil {
-		return errNoTab
+		return rpc.Empty{}, errNoTab
 	}
-	t.name = name
-	s.notifyLocked(t.ws, 0)
-	return nil
+	t.name = p.Name
+	s.emitLocked(rpc.EvTabRenamed, rpc.TabEventParams{Workspace: t.ws.id, ID: t.id, Name: t.name}, nil, nil)
+	s.changedLocked(t.ws)
+	return rpc.Empty{}, nil
+}
+
+func (s *Server) tabInfo(_ *callCtx, p rpc.TabParams) (*rpc.TabInfoResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.tabs[p.ID]
+	if t == nil {
+		return nil, errNoTab
+	}
+	return &rpc.TabInfoResult{Workspace: t.ws.id, Tab: rpc.Tab{ID: t.id, Name: t.name, Tree: t.root.Clone()}}, nil
 }
 
 func (s *Server) removeTabLocked(t *tab) {
@@ -444,14 +510,12 @@ func (s *Server) removeTabLocked(t *tab) {
 			break
 		}
 	}
-	s.notifyLocked(ws, 0)
+	s.emitLocked(rpc.EvTabClosed, rpc.TabEventParams{Workspace: ws.id, ID: t.id}, nil, nil)
+	s.changedLocked(ws)
 	switch {
 	case len(ws.tabs) > 0:
 	case ws.killed:
-		if ws.owner != nil {
-			ws.owner.sendForce(0, &Detached{WS: ws.id, Reason: "killed"})
-		}
-		s.removeWorkspaceLocked(ws)
+		s.killedLocked(ws)
 	case ws.owner == nil:
 		// Nothing left to come back to.
 		s.removeWorkspaceLocked(ws)
@@ -459,12 +523,14 @@ func (s *Server) removeTabLocked(t *tab) {
 }
 
 // paneExited takes a pane whose child is gone out of its tab: the tree
-// closes over it, an empty tab goes, and the owner hears.
-func (s *Server) paneExited(p *Pane) {
+// closes over it, an empty tab goes, and the owner hears. viewer is the
+// client the pane told itself, if any; the subscribers hear here.
+func (s *Server) paneExited(p *Pane, status uint32, viewer *conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.panes, p.id)
 	defer s.checkIdleLocked()
+	s.emitLocked(rpc.EvPaneExited, rpc.PaneExitedParams{ID: p.id, Status: status}, nil, viewer)
 	t := p.tab
 	if t == nil || s.tabs[t.id] != t {
 		return
@@ -475,5 +541,49 @@ func (s *Server) paneExited(p *Pane) {
 		return
 	}
 	s.retileLocked(t)
-	s.notifyLocked(t.ws, 0)
+	s.changedLocked(t.ws)
+}
+
+func (s *Server) paneKill(_ *callCtx, p rpc.PaneParams) (rpc.Empty, error) {
+	pn := s.pane(p.ID)
+	if pn == nil {
+		return rpc.Empty{}, errNoPane
+	}
+	pn.kill()
+	return rpc.Empty{}, nil
+}
+
+func (s *Server) paneWrite(_ *callCtx, p rpc.PaneWriteParams) (rpc.Empty, error) {
+	pn := s.pane(p.ID)
+	if pn == nil {
+		return rpc.Empty{}, errNoPane
+	}
+	return rpc.Empty{}, pn.write([]byte(p.Text))
+}
+
+func (s *Server) paneText(_ *callCtx, p rpc.PaneTextParams) (*rpc.PaneTextResult, error) {
+	pn := s.pane(p.ID)
+	if pn == nil {
+		return nil, errNoPane
+	}
+	text, err := pn.text(p.VT)
+	if err != nil {
+		return nil, err
+	}
+	return &rpc.PaneTextResult{Text: text}, nil
+}
+
+func (s *Server) paneInfo(_ *callCtx, p rpc.PaneParams) (*rpc.PaneDesc, error) {
+	s.mu.Lock()
+	pn := s.panes[p.ID]
+	var t *tab
+	if pn != nil {
+		t = pn.tab
+	}
+	s.mu.Unlock()
+	if pn == nil {
+		return nil, errNoPane
+	}
+	d := pn.desc(t)
+	return &d, nil
 }

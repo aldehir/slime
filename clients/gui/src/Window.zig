@@ -451,7 +451,6 @@ fn daemonChanged(self: *Window, conn: *Daemon) void {
 
     var arrived: std.AutoHashMapUnmanaged(u32, *Session) = .empty;
     defer arrived.deinit(self.alloc);
-    var requested: ?*Session = null;
     for (taken.arrivals) |*a| {
         const s = self.createSession(.{ .daemon = .{ .conn = conn, .arrival = a } }, self.gridSize()) catch |err| {
             log.err("showing daemon pane {d} failed: {}", .{ a.pane, err });
@@ -462,14 +461,16 @@ fn daemonChanged(self: *Window, conn: *Daemon) void {
             s.destroy();
             continue;
         };
-        if (a.requested) requested = s;
     }
     if (taken.structure) |st| self.applyStructure(conn, st, &arrived) catch |err| log.err("laying out slime's tabs failed: {}", .{err});
     // Panes no tab holds (which slime doesn't send) aren't shown.
     var left = arrived.valueIterator();
-    while (left.next()) |s| {
-        if (requested == s.*) requested = null;
-        s.*.destroy();
+    while (left.next()) |s| s.*.destroy();
+    // The last pane we asked for, if it's shown by now: its arrival came
+    // with or before its reply.
+    var requested: ?*Session = null;
+    for (taken.created) |pane| {
+        if (self.daemonSession(conn, pane)) |s| requested = s;
     }
 
     if (self.tabs.items.len == 0) {

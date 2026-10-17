@@ -5,8 +5,8 @@
 // tree, and tabs are grouped in workspaces. A window attaches a whole
 // workspace and draws the frames of each pane's screen the daemon sends
 // (framing.go), sending input back as events (events.go). The daemon
-// owns the structure; a window mirrors it, asking for changes and
-// applying the Workspace messages that come back.
+// owns the structure; a window mirrors it, asking for changes (rpc.go)
+// and applying the workspace.changed events that come back.
 package daemon
 
 import (
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/aldehir/slime/internal/pty"
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
 )
 
@@ -181,7 +182,7 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 		m, err := Decode(f)
 		if err != nil {
 			s.log.Warn("bad frame", "err", err)
-			if errors.Is(err, ErrUnknownType) {
+			if errors.Is(err, ErrUnknownType) || errors.Is(err, ErrBadJSON) {
 				continue
 			}
 			return
@@ -215,40 +216,9 @@ func (s *Server) handshake(c *conn, m Message, err error) bool {
 }
 
 func (s *Server) dispatch(c *conn, id uint32, m Message) {
-	fail := func(tag uint32, err error) {
-		if err != nil {
-			c.sendForce(0, &Error{Tag: tag, Message: err.Error()})
-		}
-	}
 	switch m := m.(type) {
-	case *List:
-		c.sendForce(0, s.list())
-	case *WorkspaceNew:
-		s.workspaceNew(c, m)
-	case *WorkspaceAttach:
-		fail(m.Tag, s.workspaceAttach(c, m))
-	case *WorkspaceDetach:
-		s.workspaceDetach(c, m.WS)
-	case *WorkspaceKill:
-		fail(0, s.workspaceKill(m.WS))
-	case *WorkspaceRename:
-		fail(0, s.workspaceRename(m.WS, m.Name))
-	case *WorkspaceResize:
-		s.workspaceResize(c, m)
-	case *TabNew:
-		fail(m.Tag, s.tabNew(c, m))
-	case *TabClose:
-		fail(0, s.tabClose(m.Tab))
-	case *TabRename:
-		fail(0, s.tabRename(m.Tab, m.Name))
-	case *Split:
-		fail(m.Tag, s.split(c, m))
-	case *Layout:
-		fail(0, s.layout(m))
-	case *PaneKill:
-		if p := s.pane(id); p != nil {
-			p.kill()
-		}
+	case *Call:
+		s.call(c, m.Request)
 	case *Ack:
 		if p := s.pane(id); p != nil {
 			p.ack(c, m.Seq)
@@ -261,17 +231,8 @@ func (s *Server) dispatch(c *conn, id uint32, m Message) {
 		if p := s.pane(id); p != nil {
 			p.resize(c, m.Size)
 		}
-	case *Peek:
-		p := s.pane(id)
-		if p == nil {
-			fail(m.Tag, errors.New("no such pane"))
-			return
-		}
-		fail(m.Tag, p.peek(c, m.Tag, m.VT))
 	default:
-		if !s.hostDispatch(c, id, m) {
-			s.log.Warn("unexpected message", "type", m.Type())
-		}
+		s.log.Warn("unexpected message", "type", m.Type())
 	}
 }
 
@@ -331,25 +292,21 @@ func (s *Server) startPane(command, cwd string, size Size) (pty.Pty, *vt.Termina
 	return p, term, nil
 }
 
-func (s *Server) list() *Workspaces {
+func (s *Server) list() *rpc.WorkspaceListResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := &Workspaces{}
+	out := &rpc.WorkspaceListResult{Workspaces: []rpc.WorkspaceDesc{}, Panes: []rpc.PaneDesc{}}
 	for _, ws := range s.workspaces {
-		info := WorkspaceInfo{ID: ws.id, Name: ws.name, Attached: ws.owner != nil, Tabs: ws.tabInfos()}
-		if !ws.detachedAt.IsZero() && ws.owner == nil {
-			info.DetachedAt = ws.detachedAt.UnixMilli()
-		}
-		out.Workspaces = append(out.Workspaces, info)
+		out.Workspaces = append(out.Workspaces, ws.desc())
 		for _, t := range ws.tabs {
 			for _, id := range t.root.Panes() {
 				if p := s.panes[id]; p != nil {
-					out.Panes = append(out.Panes, p.info(t.id))
+					out.Panes = append(out.Panes, p.desc(t))
 				}
 			}
 		}
 	}
-	slices.SortFunc(out.Workspaces, func(a, b WorkspaceInfo) int { return cmp.Compare(a.ID, b.ID) })
+	slices.SortFunc(out.Workspaces, func(a, b rpc.WorkspaceDesc) int { return cmp.Compare(a.ID, b.ID) })
 	return out
 }
 

@@ -1,13 +1,15 @@
 //! A window's connection to slime (cmd/slime), the daemon that
 //! owns local ptys so they outlive the window. The daemon keeps panes in
 //! tabs and tabs in workspaces; a window attaches one workspace and
-//! mirrors it. The protocol is internal/daemon's (wire.go).
+//! mirrors it. The protocol is internal/daemon's (wire.go): a binary
+//! frame path, and a JSON-RPC control plane (internal/rpc) in Call,
+//! Reply, and Notify envelopes, which `std.json` reads and writes here.
 //!
-//! slime runs each pane's terminal; we draw what it sends (CapFrames):
-//! frames of the pane's screen, and notices of what else it did (a new
-//! title, a clipboard write). Input goes back as events, which slime
-//! handles against the terminal. One reader thread reads the connection
-//! and hands each pane's messages to its session through a `Sink`.
+//! slime runs each pane's terminal; we draw what it sends: frames of
+//! the pane's screen, and notices of what else it did (a new title, a
+//! clipboard write). Input goes back as events, which slime handles
+//! against the terminal. One reader thread reads the connection and
+//! hands each pane's messages to its session through a `Sink`.
 //!
 //! Panes that arrive while the reader runs (a new tab, or one a script
 //! added) keep what comes for them on the reader thread, then wait in
@@ -16,12 +18,12 @@
 //! the pane goes live, so nothing is lost or reordered at the handoff.
 //!
 //! The local daemon is reached through its named pipe (`connect`). It
-//! also holds the SSH connections to hosts: the host messages on the same
+//! also holds the SSH connections to hosts: the host methods on the same
 //! connection log in to one (`hostConnect`, with its prompts coming back
-//! as `HostEvent`s for the window to take) and report every host's state.
-//! A host's own slime is reached through a second connection to the
-//! local pipe that the daemon splices to it (`connectRemote`), whose
-//! reader attaches before it routes frames.
+//! as `HostEvent`s for the window to take) and, subscribed to, report
+//! every host's state. A host's own slime is reached through a second
+//! connection to the local pipe that the daemon splices to it
+//! (`connectRemote`), whose reader attaches before it routes frames.
 const Daemon = @This();
 
 const std = @import("std");
@@ -42,48 +44,30 @@ const max_frame = 8 << 20;
 const max_path = 32 * 1024;
 const daemon_name = L("slime.exe");
 
+/// wire.go's envelope types.
 const MsgType = enum(u8) {
     hello = 1,
-    list = 2,
-    workspace_new = 3,
-    workspace_attach = 4,
-    workspace_detach = 5,
-    workspace_kill = 6,
-    workspace_rename = 7,
-    workspace_resize = 8,
-    tab_new = 9,
-    tab_close = 10,
-    tab_rename = 11,
-    split = 12,
-    layout = 13,
-    pane_kill = 14,
-    resize = 16,
-    peek = 17,
-    ack = 18,
-    event = 19,
-    host_connect = 20,
-    host_answer = 21,
-    host_disconnect = 22,
-    host_list = 23,
-    bridge = 24,
+    call = 2,
+    ack = 3,
+    event = 4,
+    resize = 5,
+    bridge = 6,
     hello_reply = 65,
-    workspaces = 66,
-    workspace = 67,
-    attached = 68,
-    exit = 71,
-    detached = 72,
-    @"error" = 73,
-    created = 74,
-    draw = 75,
-    copied = 76,
-    notice = 77,
-    image = 78,
-    hosts = 79,
-    host_state = 80,
-    prompt = 81,
-    pane_text = 82,
+    reply = 66,
+    notify = 67,
+    @"error" = 68,
+    draw = 69,
+    image = 70,
+    copied = 71,
+    notice = 72,
     _,
 };
+
+/// Unknown fields are the daemon's business: a later one may add some.
+const json_opts: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+/// A call with nothing to say: `{}`. (The empty literal `.{}` is a tuple,
+/// which std.json writes as `[]`.)
+const no_params = struct {}{};
 
 alloc: Allocator,
 pipe: Pipe,
@@ -94,9 +78,9 @@ reader: ?std.Thread = null,
 write_lock: win32.SRWLOCK = .{},
 /// The attached workspace.
 workspace: u32 = 0,
-/// Tags for requests, from the UI thread and, while a host's attaches,
-/// its reader.
-next_tag: std.atomic.Value(u32) = .init(0),
+/// Ids for calls, from the UI thread and, while a host's attaches, its
+/// reader.
+next_id: std.atomic.Value(u32) = .init(0),
 
 /// The host this is bridged to; null for the local daemon itself.
 remote: ?Remote = null,
@@ -105,8 +89,8 @@ remote: ?Remote = null,
 state: std.atomic.Value(State) = .init(.attached),
 /// Why attaching failed, once `state` says it did.
 failure: Failure = .{},
-/// The last Error the daemon sent about the connection (tag 0), which
-/// for a bridge says why it ended. Reader thread.
+/// The last Error the daemon sent about the connection, which for a
+/// bridge says why it ended. Reader thread.
 lost_reason: Failure = .{},
 /// What a host's reader attaches with.
 area: Area = undefined,
@@ -118,9 +102,9 @@ frame_interval: u32 = 0,
 /// local daemon, and once attached for a host's.
 posting: std.atomic.Value(bool) = .init(false),
 
-/// Guards `panes`, `arrivals`, `structure`, `requested`, `host_events`,
-/// and `lost`, and is held while calling a sink, so a session can't go
-/// while one runs.
+/// Guards `panes`, `arrivals`, `structure`, `requested`, `created`,
+/// `host_events`, and `lost`, and is held while calling a sink, so a
+/// session can't go while one runs.
 lock: win32.SRWLOCK = .{},
 panes: std.AutoHashMapUnmanaged(u32, Slot) = .empty,
 arrivals: std.ArrayList(Arrival) = .empty,
@@ -128,9 +112,13 @@ arrivals: std.ArrayList(Arrival) = .empty,
 /// (`takeHosts`).
 host_events: std.ArrayList(HostEvent) = .empty,
 structure: ?*Structure = null,
-/// Tags of our own TabNew and Split requests, so their panes can be
-/// shown.
+/// Ids of our own tab.new and pane.split calls, whose replies name the
+/// panes the window shows.
 requested: std.ArrayList(u32) = .empty,
+/// Panes those replies named, since the UI thread last looked.
+created: std.ArrayList(u32) = .empty,
+/// Ids of our `hostList` calls, whose replies become `hosts` events.
+host_lists: std.ArrayList(u32) = .empty,
 /// The connection ended; every live pane was told why.
 lost: bool = false,
 /// `deinit` is hanging up, so the reader's end isn't a loss.
@@ -155,7 +143,7 @@ const Remote = struct {
     term: []const u8,
 };
 
-/// A host's state as the daemon reports it (wire.go's HostStatus).
+/// A host's state as the daemon reports it (rpc.HostState).
 pub const HostStatus = enum(u8) {
     connecting = 1,
     connected = 2,
@@ -174,6 +162,19 @@ pub const HostInfo = struct {
     state: HostStatus,
     /// Owned.
     text: []const u16,
+
+    fn fromJson(alloc: Allocator, h: Json.Host) !HostInfo {
+        const dest = try toUtf16(alloc, h.dest);
+        errdefer alloc.free(dest);
+        const text = try toUtf16(alloc, h.text);
+        return .{
+            .host = h.id,
+            .dest = dest,
+            // A state this build doesn't know shows as unknown.
+            .state = std.meta.stringToEnum(HostStatus, h.state) orelse @enumFromInt(0xff),
+            .text = text,
+        };
+    }
 
     fn deinit(self: *HostInfo, alloc: Allocator) void {
         alloc.free(self.dest);
@@ -202,8 +203,8 @@ pub const HostEvent = union(enum) {
     }
 };
 
-/// A question while logging in to a host (wire.go's Prompt), its text
-/// in UTF-16 for the chrome.
+/// A question while logging in to a host (rpc.HostPromptParams), its
+/// text in UTF-16 for the chrome.
 pub const Prompt = struct {
     arena: std.heap.ArenaAllocator,
     kind: Kind,
@@ -235,24 +236,22 @@ pub const Prompt = struct {
     /// More than any login asks at once.
     pub const max_questions = 8;
 
-    fn parse(gpa: Allocator, payload: []const u8) !*Prompt {
+    fn fromJson(gpa: Allocator, p: Json.HostPrompt) !*Prompt {
+        if (p.questions.len > max_questions) return error.TooManyQuestions;
         const self = try gpa.create(Prompt);
         errdefer gpa.destroy(self);
         self.arena = .init(gpa);
         errdefer self.arena.deinit();
         const a = self.arena.allocator();
-        var r: Reader = .{ .buf = payload };
-        self.kind = @enumFromInt(try r.readU8());
-        self.title = try toUtf16(a, try r.readStr());
-        self.text = try toUtf16(a, try r.readStr());
-        self.detail = try toUtf16(a, try r.readStr());
-        self.err = try toUtf16(a, try r.readStr());
-        const n = try r.readU32();
-        if (n > max_questions) return error.TooManyQuestions;
-        const questions = try a.alloc(Question, n);
-        for (questions) |*q| q.* = .{
-            .label = try toUtf16(a, try r.readStr()),
-            .echo = try r.readU8() != 0,
+        self.kind = std.meta.stringToEnum(Kind, p.kind) orelse @enumFromInt(0xff);
+        self.title = try toUtf16(a, p.title);
+        self.text = try toUtf16(a, p.text);
+        self.detail = try toUtf16(a, p.detail);
+        self.err = try toUtf16(a, p.@"error");
+        const questions = try a.alloc(Question, p.questions.len);
+        for (questions, p.questions) |*q, src| q.* = .{
+            .label = try toUtf16(a, src.label),
+            .echo = src.echo,
         };
         self.questions = questions;
         return self;
@@ -265,12 +264,8 @@ pub const Prompt = struct {
     }
 };
 
-/// The button a prompt was answered with (wire.go's Choice).
-pub const Choice = enum(u8) {
-    cancel = 0,
-    accept = 1,
-    skip = 2,
-};
+/// The button a prompt was answered with (rpc.Choice).
+pub const Choice = enum { cancel, accept, skip };
 
 /// Why attaching to a host's slime failed, for the window to show.
 pub const Failure = struct {
@@ -289,7 +284,7 @@ pub const Failure = struct {
 
 /// A tab's space in pixels, which its layout's shares divide, and the
 /// cell size for panes that haven't said their own (each pane can have
-/// its own font).
+/// its own font). Its fields name rpc.Area's.
 pub const Area = struct {
     width: u32,
     height: u32,
@@ -297,7 +292,7 @@ pub const Area = struct {
     cell_height: u32,
 };
 
-/// A grid size and its cell size in pixels.
+/// A grid size and its cell size in pixels (rpc.Size).
 pub const Size = struct {
     cols: u16,
     rows: u16,
@@ -380,8 +375,6 @@ pub const Arrival = struct {
     /// What its programs report doing (OSC 7501), oldest update first.
     /// Owned.
     status: []StatusRecord,
-    /// From our own TabNew or Split, so the window shows it.
-    requested: bool,
 
     pub fn deinit(self: *Arrival, alloc: Allocator) void {
         alloc.free(self.command);
@@ -389,8 +382,8 @@ pub const Arrival = struct {
     }
 };
 
-/// A program status record as the daemon keeps it (wire.go's
-/// StatusRecord). `state` numbers as `ProgramStatus.State`.
+/// A program status record as the daemon keeps it (rpc.StatusRecord).
+/// `state` numbers as `ProgramStatus.State`.
 pub const StatusRecord = struct {
     /// Owned in an `Arrival`.
     id: []const u8,
@@ -404,7 +397,7 @@ fn freeStatus(alloc: Allocator, status: []StatusRecord) void {
     alloc.free(status);
 }
 
-/// The way a split lays out its children (layout.go's Axis).
+/// The way a split lays out its children (rpc.Axis).
 pub const Axis = enum(u8) {
     /// Left to right, sharing the width.
     row = 1,
@@ -412,13 +405,57 @@ pub const Axis = enum(u8) {
     column = 2,
 };
 
-/// Where a split puts the new pane beside the old (layout.go's Direction).
+/// Where a split puts the new pane beside the old (rpc.Direction).
 pub const Direction = enum(u8) { right = 1, down = 2, left = 3, up = 4 };
 
-/// A tab's layout tree, as the daemon sends it.
+/// A tab's layout tree, as the daemon sends it: `{"pane": id}` or
+/// `{"split": {"axis": "row", "children": [{"share": s, "node": n},
+/// ...]}}`, which is how std.json reads a tagged union.
 pub const Node = union(enum) {
     pane: u32,
     split: struct { axis: Axis, children: []Child },
+
+    /// Written with each split's shares scaled to sum to the whole slime
+    /// wants: the window's trees carry pixels.
+    pub fn jsonStringify(self: Node, jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .pane => |id| {
+                try jw.objectField("pane");
+                try jw.write(id);
+            },
+            .split => |sp| {
+                try jw.objectField("split");
+                try jw.beginObject();
+                try jw.objectField("axis");
+                try jw.write(sp.axis);
+                try jw.objectField("children");
+                try jw.beginArray();
+                var total: u32 = 0;
+                for (sp.children) |c| total += c.share;
+                // Scaled from the running total, so rounding doesn't add
+                // up; every child keeps at least 1.
+                var sum: u32 = 0;
+                var given: u32 = 0;
+                for (sp.children, 0..) |c, i| {
+                    sum += c.share;
+                    const left: u32 = @intCast(sp.children.len - 1 - i);
+                    const end: u32 = if (total == 0) whole_share * @as(u32, @intCast(i + 1)) / @as(u32, @intCast(sp.children.len)) else @intCast(@as(u64, sum) * whole_share / total);
+                    const share = std.math.clamp(end -| given, 1, whole_share - given - left);
+                    given += share;
+                    try jw.beginObject();
+                    try jw.objectField("share");
+                    try jw.write(share);
+                    try jw.objectField("node");
+                    try jw.write(c.node);
+                    try jw.endObject();
+                }
+                try jw.endArray();
+                try jw.endObject();
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Child = struct {
@@ -427,7 +464,10 @@ pub const Child = struct {
     node: Node,
 };
 
-/// The workspace's tabs, from its last Workspace message, in its order.
+/// rpc.Whole: what a split's shares sum to.
+const whole_share = 10000;
+
+/// The workspace's tabs, from its last structure, in its order.
 pub const Structure = struct {
     arena: std.heap.ArenaAllocator,
     tabs: []const TabLayout,
@@ -447,12 +487,52 @@ pub const Taken = struct {
     /// The tabs as they are now, if they changed. Every pane in them is
     /// live or among `arrivals`.
     structure: ?*Structure,
+    /// Panes we asked for (a new tab or split) whose replies came, for
+    /// the window to show and focus; others (a script's) are added
+    /// without taking focus. Each came in this or an earlier `take`.
+    created: []u32,
 
     pub fn deinit(self: *Taken, alloc: Allocator) void {
         for (self.arrivals) |*a| a.deinit(alloc);
         alloc.free(self.arrivals);
         if (self.structure) |st| st.destroy(alloc);
+        alloc.free(self.created);
     }
+};
+
+/// The control plane's objects as std.json reads them (internal/rpc).
+/// Strings point into the parse's arena.
+const Json = struct {
+    /// A Reply or Notify: whichever fields it has.
+    const Envelope = struct {
+        id: ?u32 = null,
+        method: ?[]const u8 = null,
+        params: std.json.Value = .null,
+        result: std.json.Value = .null,
+        @"error": ?RpcError = null,
+    };
+    const RpcError = struct { code: i64 = 0, message: []const u8 = "" };
+    const Workspace = struct { id: u32, name: []const u8 = "", tabs: []const Tab = &.{} };
+    const Tab = struct { id: u32, name: []const u8 = "", tree: Node };
+    const Created = struct { workspace: u32 = 0, tab: u32 = 0, pane: u32 = 0 };
+    const PaneAttached = struct { id: u32, command: []const u8 = "", status: []const Status = &.{} };
+    const Status = struct { id: []const u8 = "", state: u8 = 0, progress: i8 = -1 };
+    const PaneExited = struct { id: u32, status: u32 = 0 };
+    const WorkspaceDetached = struct { id: u32, reason: []const u8 = "" };
+    const Host = struct { id: u32, dest: []const u8 = "", state: []const u8 = "", text: []const u8 = "" };
+    const HostPrompt = struct {
+        host: u32,
+        kind: []const u8 = "",
+        title: []const u8 = "",
+        text: []const u8 = "",
+        detail: []const u8 = "",
+        @"error": []const u8 = "",
+        questions: []const Question = &.{},
+    };
+    const Question = struct { label: []const u8 = "", echo: bool = false };
+    const HostList = struct { hosts: []const Host = &.{} };
+    const WorkspaceList = struct { workspaces: []const WorkspaceDesc = &.{} };
+    const WorkspaceDesc = struct { id: u32, attached: bool = false, detached_at: i64 = 0 };
 };
 
 const Slot = union(enum) {
@@ -548,45 +628,41 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host
     return self;
 }
 
-/// Say hello, then attach the most recently detached workspace, or a new
-/// one with a tab running `command`, reading the replies in line. Before
-/// the reader routes frames.
+/// Say hello, subscribe to the hosts' changes, then attach the most
+/// recently detached workspace, or a new one with a tab running
+/// `command`, reading the replies in line. Before the reader routes
+/// frames.
 fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16) !void {
-    const alloc = self.alloc;
     try self.handshake(buf);
 
-    // Most recently detached, from the list.
-    try self.send(.list, 0, &.{});
-    var ws: u32 = 0;
-    while (true) {
-        const f = try self.pipe.readFrame(buf);
-        if (f.type != .workspaces) continue;
-        ws = try mostRecentDetached(f.payload);
-        break;
+    // A host's state changes reach every window; a bridged daemon has
+    // none to tell of.
+    if (self.remote == null) {
+        var sub = try self.awaitReply(buf, try self.call("subscribe", .{ .events = .{"host.*"} }), struct {});
+        sub.deinit();
     }
 
-    var p: Payload = .{};
-    defer p.deinit(alloc);
-    const tag = self.nextTag();
+    // Most recently detached, from the list.
+    var list = try self.awaitReply(buf, try self.call("workspace.list", no_params), Json.WorkspaceList);
+    const ws = mostRecentDetached(list.value);
+    list.deinit();
+
     if (ws != 0) {
-        try p.putU32(alloc, tag);
-        try p.putU32(alloc, ws);
-        try p.putArea(alloc, area);
-        try self.send(.workspace_attach, 0, p.bytes());
-        try self.awaitReply(buf, tag, false);
+        var reply = try self.awaitReply(buf, try self.call("workspace.attach", .{ .id = ws, .area = area }), std.json.Value);
+        defer reply.deinit();
+        try self.applyWorkspace(reply.value);
         log.info("attached workspace {d}", .{self.workspace});
     } else {
-        try p.putU32(alloc, tag);
-        try p.putStr(alloc, "");
-        try self.send(.workspace_new, 0, p.bytes());
-        try self.awaitReply(buf, tag, true);
+        var reply = try self.awaitReply(buf, try self.call("workspace.new", no_params), std.json.Value);
+        defer reply.deinit();
+        try self.applyWorkspace(reply.value);
         log.info("created workspace {d}", .{self.workspace});
     }
     // A window needs a pane: a new workspace has none, and an attached one
     // may have lost its last.
     if (self.arrivals.items.len == 0) {
-        const t = try self.tabNewTagged(command, size);
-        try self.awaitReply(buf, t, true);
+        var reply = try self.awaitReply(buf, try self.tabNewCall(command, size), struct {});
+        reply.deinit();
     }
 }
 
@@ -650,10 +726,10 @@ fn remoteLoop(self: *Daemon) void {
     const buf = self.alloc.alloc(u8, max_frame) catch return self.fail(error.OutOfMemory);
     defer self.alloc.free(buf);
     const r = self.remote.?;
-    var p: Payload = .{};
+    var p: std.ArrayList(u8) = .empty;
     defer p.deinit(self.alloc);
-    p.putStr(self.alloc, r.term) catch return self.fail(error.OutOfMemory);
-    self.send(.bridge, r.host, p.bytes()) catch |err| return self.fail(err);
+    putStr(self.alloc, &p, r.term) catch return self.fail(error.OutOfMemory);
+    self.send(.bridge, r.host, p.items) catch |err| return self.fail(err);
     // The host's own shell: the command is for its slime to run.
     self.attachFirst(buf, self.area, self.size, &.{}) catch |err| return self.fail(err);
     log.info("attached workspace {d} on {f}", .{ self.workspace, std.unicode.fmtUtf16Le(self.hostLabel()) });
@@ -691,6 +767,8 @@ fn freeState(self: *Daemon) void {
     for (self.arrivals.items) |*a| a.deinit(self.alloc);
     self.arrivals.deinit(self.alloc);
     self.requested.deinit(self.alloc);
+    self.created.deinit(self.alloc);
+    self.host_lists.deinit(self.alloc);
     if (self.structure) |st| st.destroy(self.alloc);
     for (self.host_events.items) |*e| e.deinit(self.alloc);
     self.host_events.deinit(self.alloc);
@@ -711,57 +789,54 @@ pub fn takeHosts(self: *Daemon) []HostEvent {
 
 /// Ask the daemon to log in to `dest` (`ssh://[user@]host[:port]`, or
 /// whatever its ssh config knows) and put slime there. Its prompts and
-/// states come as `HostEvent`s; a host already connected answers with its
-/// state. Returns the request's tag, which the answering state carries.
-/// UI thread.
+/// states come as `HostEvent`s; the reply, and a host already
+/// connected's state, come as a `state` event too. Returns the call's
+/// id. UI thread.
 pub fn hostConnect(self: *Daemon, dest: []const u16) !u32 {
     const utf8 = try commandUtf8(self.alloc, dest);
     defer self.alloc.free(utf8);
-    const t = self.nextTag();
-    var p: Payload = .{};
-    defer p.deinit(self.alloc);
-    try p.putU32(self.alloc, t);
-    try p.putStr(self.alloc, utf8);
-    try self.send(.host_connect, 0, p.bytes());
-    return t;
+    return self.call("host.connect", .{ .dest = utf8 });
 }
 
 /// Reply to the last prompt for `host_id`, one answer per question. A
 /// cancel with no prompt waiting gives up on logging in. UI thread.
 pub fn hostAnswer(self: *Daemon, host_id: u32, choice: Choice, answers: []const []const u16) !void {
-    var p: Payload = .{};
-    defer p.deinit(self.alloc);
-    try p.list.append(self.alloc, @intFromEnum(choice));
-    try p.putU32(self.alloc, @intCast(answers.len));
-    for (answers) |units| {
-        const utf8 = try commandUtf8(self.alloc, units);
-        defer self.alloc.free(utf8);
-        try p.putStr(self.alloc, utf8);
-    }
-    try self.send(.host_answer, host_id, p.bytes());
+    var arena: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const utf8 = try a.alloc([]const u8, answers.len);
+    for (utf8, answers) |*out, units| out.* = try commandUtf8(a, units);
+    _ = try self.call("host.answer", .{ .host = host_id, .choice = choice, .answers = utf8 });
 }
 
 /// Hang up on `host_id`, ending its bridges, or give up on logging in to
 /// it. UI thread.
 pub fn hostDisconnect(self: *Daemon, host_id: u32) void {
-    self.send(.host_disconnect, host_id, &.{}) catch {};
+    _ = self.call("host.disconnect", .{ .host = host_id }) catch {};
 }
 
 /// Ask for every host; the answer is a `HostEvent.hosts`. UI thread.
 pub fn hostList(self: *Daemon) void {
-    self.send(.host_list, 0, &.{}) catch {};
+    const id = self.call("host.list", no_params) catch return;
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    self.host_lists.append(self.alloc, id) catch {};
 }
 
-/// Take the panes waiting for sessions and the latest tabs, together so
-/// the tabs name no pane the caller hasn't seen. The caller owns them
-/// (`Taken.deinit`) and must `adopt` or `release` each arrival. UI
-/// thread.
+/// Take the panes waiting for sessions, the latest tabs, and the panes
+/// our requests made, together so the tabs name no pane the caller
+/// hasn't seen. The caller owns them (`Taken.deinit`) and must `adopt`
+/// or `release` each arrival. UI thread.
 pub fn take(self: *Daemon) Taken {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     const structure = self.structure;
     self.structure = null;
-    return .{ .arrivals = self.arrivals.toOwnedSlice(self.alloc) catch &.{}, .structure = structure };
+    return .{
+        .arrivals = self.arrivals.toOwnedSlice(self.alloc) catch &.{},
+        .structure = structure,
+        .created = self.created.toOwnedSlice(self.alloc) catch &.{},
+    };
 }
 
 /// Make `sink` the pane's: what came while it waited goes first, then
@@ -822,106 +897,74 @@ pub fn resize(self: *Daemon, pane: u32, size: Size) void {
 /// Tell the daemon the window's tab area, for sizing panes it lays out
 /// while the window is away.
 pub fn resizeWorkspace(self: *Daemon, area: Area) void {
-    var b: [20]u8 = undefined;
-    std.mem.writeInt(u32, b[0..4], self.workspace, .little);
-    writeArea(b[4..20], area);
-    self.send(.workspace_resize, 0, &b) catch {};
+    _ = self.call("workspace.resize", .{ .id = self.workspace, .area = area }) catch {};
 }
 
 /// End a pane, not just our view of it.
 pub fn kill(self: *Daemon, pane: u32) void {
-    self.send(.pane_kill, pane, &.{}) catch {};
+    _ = self.call("pane.kill", .{ .id = pane }) catch {};
 }
 
 /// Ask for a new tab running `command`. Its pane arrives through
-/// `arrivals`, marked requested. UI thread.
+/// `arrivals`, and the reply names it in `Taken.created`. UI thread.
 pub fn tabNew(self: *Daemon, command: []const u16, size: Size) !void {
-    _ = try self.tabNewTagged(command, size);
+    _ = try self.tabNewCall(command, size);
 }
 
-fn tabNewTagged(self: *Daemon, command: []const u16, size: Size) !u32 {
-    const t = try self.requestTag();
+fn tabNewCall(self: *Daemon, command: []const u16, size: Size) !u32 {
     const cmd = try commandUtf8(self.alloc, command);
     defer self.alloc.free(cmd);
-    var p: Payload = .{};
-    defer p.deinit(self.alloc);
-    try p.putU32(self.alloc, t);
-    try p.putU32(self.alloc, self.workspace);
-    try p.putStr(self.alloc, cmd);
-    try p.putStr(self.alloc, "");
-    try p.putSize(self.alloc, size);
-    try self.send(.tab_new, 0, p.bytes());
-    return t;
+    return self.callRequested("tab.new", .{ .workspace = self.workspace, .command = cmd, .size = size });
 }
 
 /// Ask for a pane running `command` on side `dir` of `pane`, taking half
-/// its space. It arrives through `arrivals`, marked requested. UI thread.
+/// its space. It arrives through `arrivals`, named in `Taken.created`.
+/// UI thread.
 pub fn split(self: *Daemon, pane: u32, dir: Direction, command: []const u16) !void {
-    const t = try self.requestTag();
     const cmd = try commandUtf8(self.alloc, command);
     defer self.alloc.free(cmd);
-    var p: Payload = .{};
-    defer p.deinit(self.alloc);
-    try p.putU32(self.alloc, t);
-    try p.putU32(self.alloc, pane);
-    try p.list.append(self.alloc, @intFromEnum(dir));
-    try p.putU16(self.alloc, 5000);
-    try p.putStr(self.alloc, cmd);
-    try p.putStr(self.alloc, "");
-    try self.send(.split, 0, p.bytes());
+    _ = try self.callRequested("pane.split", .{ .pane = pane, .direction = dir, .share = 5000, .command = cmd });
 }
 
 /// Replace tab `tab`'s tree with `root`, which must hold the same panes:
 /// a divider was dragged. Each split's shares are scaled to sum to the
-/// whole slime wants. The tree comes back as a Workspace message. UI
+/// whole slime wants. The tree comes back as workspace.changed. UI
 /// thread.
 pub fn layout(self: *Daemon, tab: u32, root: Node) !void {
-    var p: Payload = .{};
-    defer p.deinit(self.alloc);
-    try p.putU32(self.alloc, tab);
-    try putNode(self.alloc, &p, root);
-    try self.send(.layout, 0, p.bytes());
+    _ = try self.call("tab.layout", .{ .id = tab, .tree = root });
 }
 
-/// layout.go's Whole: what a split's shares sum to.
-const whole_share = 10000;
-
-fn putNode(alloc: Allocator, p: *Payload, node: Node) !void {
-    switch (node) {
-        .pane => |id| {
-            try p.list.append(alloc, 0);
-            try p.putU32(alloc, id);
-        },
-        .split => |sp| {
-            try p.list.append(alloc, 1);
-            try p.list.append(alloc, @intFromEnum(sp.axis));
-            try p.putU16(alloc, @intCast(sp.children.len));
-            var total: u32 = 0;
-            for (sp.children) |c| total += c.share;
-            // Scaled from the running total, so rounding doesn't add up;
-            // every child keeps at least 1.
-            var sum: u32 = 0;
-            var given: u32 = 0;
-            for (sp.children, 0..) |c, i| {
-                sum += c.share;
-                const left: u32 = @intCast(sp.children.len - 1 - i);
-                const end: u32 = if (total == 0) whole_share * @as(u32, @intCast(i + 1)) / @as(u32, @intCast(sp.children.len)) else @intCast(@as(u64, sum) * whole_share / total);
-                const share = std.math.clamp(end -| given, 1, whole_share - given - left);
-                given += share;
-                try p.putU16(alloc, @intCast(share));
-                try putNode(alloc, p, c.node);
-            }
-        },
-    }
-}
-
-/// A tag for a request whose panes the window shows when they come.
-fn requestTag(self: *Daemon) !u32 {
-    const t = self.nextTag();
+/// A call whose reply names a pane the window shows when it comes.
+fn callRequested(self: *Daemon, method: []const u8, params: anytype) !u32 {
+    win32.AcquireSRWLockExclusive(&self.lock);
+    try self.requested.ensureUnusedCapacity(self.alloc, 1);
+    win32.ReleaseSRWLockExclusive(&self.lock);
+    const id = try self.call(method, params);
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
-    try self.requested.append(self.alloc, t);
-    return t;
+    // The reply can't have come yet: it's read under this lock.
+    self.requested.appendAssumeCapacity(id);
+    return id;
+}
+
+/// Send a Call of `method` with `params` (any value std.json writes as
+/// an object) and return its id.
+fn call(self: *Daemon, method: []const u8, params: anytype) !u32 {
+    const id = self.nextId();
+    const body = try encodeCall(self.alloc, id, method, params);
+    defer self.alloc.free(body);
+    try self.send(.call, 0, body);
+    return id;
+}
+
+/// A JSON-RPC request, as rpc.Request lays it out.
+fn encodeCall(alloc: Allocator, id: u32, method: []const u8, params: anytype) ![]u8 {
+    return std.json.Stringify.valueAlloc(alloc, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = method,
+        .params = params,
+    }, .{});
 }
 
 fn commandUtf8(alloc: Allocator, command: []const u16) ![]u8 {
@@ -931,9 +974,9 @@ fn commandUtf8(alloc: Allocator, command: []const u16) ![]u8 {
     };
 }
 
-fn nextTag(self: *Daemon) u32 {
+fn nextId(self: *Daemon) u32 {
     while (true) {
-        const t = self.next_tag.fetchAdd(1, .monotonic) +% 1;
+        const t = self.next_id.fetchAdd(1, .monotonic) +% 1;
         if (t != 0) return t;
     }
 }
@@ -944,30 +987,46 @@ fn send(self: *Daemon, msg: MsgType, id: u32, payload: []const u8) !void {
     try self.pipe.send(msg, id, payload);
 }
 
-/// Read frames in line until the Workspace reply tagged `t` (and Created,
-/// if `created`), as the reader would. Before the reader starts.
-fn awaitReply(self: *Daemon, buf: []u8, t: u32, created: bool) !void {
-    var got_workspace = false;
-    var got_created = !created;
-    while (!got_workspace or !got_created) {
-        const f = try self.pipe.readFrame(buf);
-        switch (f.type) {
-            .workspace => if (try self.handle(f) == t) {
-                got_workspace = true;
-            },
-            .created => {
-                var r: Reader = .{ .buf = f.payload };
-                if (try r.readU32() == t) got_created = true;
-            },
-            .@"error" => {
-                var r: Reader = .{ .buf = f.payload };
-                const et = try r.readU32();
-                const msg = try r.readStr();
-                log.err("slime: {s}", .{msg});
-                if (et == t) return error.Refused;
-            },
-            else => _ = try self.handle(f),
+/// A call's result, parsed as `R` into an arena of its own.
+fn Result(comptime R: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        value: R,
+
+        fn deinit(self: *@This()) void {
+            self.arena.deinit();
         }
+    };
+}
+
+/// Read frames in line until the reply to call `id`, handling the rest
+/// as the reader would, and return its result. A reply with an error
+/// fails with `error.Refused`, the message kept in `failure`. Before the
+/// reader starts.
+fn awaitReply(self: *Daemon, buf: []u8, id: u32, comptime R: type) !Result(R) {
+    while (true) {
+        const f = try self.pipe.readFrame(buf);
+        if (f.type != .reply) {
+            try self.handle(f);
+            continue;
+        }
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const env = try std.json.parseFromSliceLeaky(Json.Envelope, a, f.payload, json_opts);
+        if (env.id != id) {
+            self.replied(env);
+            arena.deinit();
+            continue;
+        }
+        if (env.@"error") |e| {
+            log.err("slime: {s} (code {d})", .{ e.message, e.code });
+            self.failure.set(e.message);
+            return error.Refused;
+        }
+        self.replied(env);
+        const value = try std.json.parseFromValueLeaky(R, a, env.result, json_opts);
+        return .{ .arena = arena, .value = value };
     }
 }
 
@@ -986,7 +1045,7 @@ fn readLoop(self: *Daemon) void {
 fn route(self: *Daemon, buf: []u8) void {
     while (true) {
         const f = self.pipe.readFrame(buf) catch break;
-        _ = self.handle(f) catch |err| {
+        self.handle(f) catch |err| {
             log.warn("bad message {d} from slime: {}", .{ @intFromEnum(f.type), err });
         };
     }
@@ -994,87 +1053,140 @@ fn route(self: *Daemon, buf: []u8) void {
     self.loseAll(if (self.lost_reason.len > 0) self.lost_reason.text() else "lost slime");
 }
 
-/// Act on one frame. Returns a Workspace message's tag, else 0.
-fn handle(self: *Daemon, f: Frame) !u32 {
-    var r: Reader = .{ .buf = f.payload };
-    win32.AcquireSRWLockExclusive(&self.lock);
-    defer win32.ReleaseSRWLockExclusive(&self.lock);
+/// Act on one frame.
+fn handle(self: *Daemon, f: Frame) !void {
     switch (f.type) {
-        .attached => {
-            const command = toUtf16(self.alloc, r.readStr() catch "") catch return error.OutOfMemory;
+        .notify, .reply => {
+            var arena: std.heap.ArenaAllocator = .init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const env = try std.json.parseFromSliceLeaky(Json.Envelope, a, f.payload, json_opts);
+            if (f.type == .reply) {
+                if (env.@"error") |e| log.warn("slime: {s} (code {d})", .{ e.message, e.code });
+                self.replied(env);
+                return;
+            }
+            const method = env.method orelse return error.NoMethod;
+            try self.notified(a, method, env.params);
+        },
+        .draw, .image, .notice, .copied => {
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            if (self.panes.getPtr(f.id)) |slot| switch (slot.*) {
+                .pending => |*pend| try pend.keep(self.alloc, f),
+                .live => |sink| try deliver(sink, f),
+            };
+        },
+        .@"error" => {
+            var r: Reader = .{ .buf = f.payload };
+            const msg = try r.readStr();
+            log.warn("slime: {s}", .{msg});
+            self.lost_reason.set(msg);
+        },
+        else => {},
+    }
+}
+
+/// Act on a notification. `a` is an arena for the parse.
+fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Value) !void {
+    const Event = enum { @"pane.attached", @"pane.exited", @"workspace.changed", @"workspace.detached", @"host.changed", @"host.prompt" };
+    const ev = std.meta.stringToEnum(Event, method) orelse return;
+    switch (ev) {
+        .@"pane.attached" => {
+            const p = try std.json.parseFromValueLeaky(Json.PaneAttached, a, params, json_opts);
+            const command = try toUtf16(self.alloc, p.command);
             errdefer self.alloc.free(command);
-            const status = try readStatus(self.alloc, &r);
-            errdefer freeStatus(self.alloc, status);
-            const gop = try self.panes.getOrPut(self.alloc, f.id);
+            const status = try self.alloc.alloc(StatusRecord, p.status.len);
+            var made: usize = 0;
+            errdefer freeStatus(self.alloc, status[0..made]);
+            for (status, p.status) |*rec, src| {
+                rec.* = .{
+                    .id = try self.alloc.dupe(u8, src.id),
+                    .state = src.state,
+                    .progress = if (src.progress >= 0 and src.progress <= 100) @intCast(src.progress) else null,
+                };
+                made += 1;
+            }
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            const gop = try self.panes.getOrPut(self.alloc, p.id);
             if (gop.found_existing) switch (gop.value_ptr.*) {
                 .pending => |*old| old.deinit(self.alloc),
                 .live => {},
             };
             gop.value_ptr.* = .{ .pending = .{ .command = command, .status = status } };
         },
-        .draw, .image, .notice, .copied => if (self.panes.getPtr(f.id)) |slot| switch (slot.*) {
-            .pending => |*pend| try pend.keep(self.alloc, f),
-            .live => |sink| try deliver(sink, f),
+        .@"pane.exited" => {
+            const p = try std.json.parseFromValueLeaky(Json.PaneExited, a, params, json_opts);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            if (self.panes.fetchRemove(p.id)) |kv| switch (kv.value) {
+                .pending => |pend| {
+                    var pd = pend;
+                    pd.deinit(self.alloc);
+                },
+                .live => |sink| sink.ended(sink.ctx, null),
+            };
         },
-        .exit => if (self.panes.fetchRemove(f.id)) |kv| switch (kv.value) {
-            .pending => |pend| {
-                var p = pend;
-                p.deinit(self.alloc);
-            },
-            .live => |sink| sink.ended(sink.ctx, null),
-        },
-        .workspace => return self.workspaceChanged(&r),
-        .detached => {
-            const ws = try r.readU32();
-            const reason = try r.readStr();
-            if (ws == self.workspace) {
+        .@"workspace.changed" => try self.applyWorkspace(params),
+        .@"workspace.detached" => {
+            const p = try std.json.parseFromValueLeaky(Json.WorkspaceDetached, a, params, json_opts);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            if (p.id == self.workspace) {
                 var buf: [256]u8 = undefined;
-                self.loseAllLocked(std.fmt.bufPrint(&buf, "detached: {s}", .{reason}) catch "detached");
+                self.loseAllLocked(std.fmt.bufPrint(&buf, "detached: {s}", .{p.reason}) catch "detached");
             }
         },
-        .@"error" => {
-            const tag = try r.readU32();
-            const msg = try r.readStr();
-            log.warn("slime: {s}", .{msg});
-            if (tag == 0) self.lost_reason.set(msg);
+        .@"host.changed" => {
+            const h = try std.json.parseFromValueLeaky(Json.Host, a, params, json_opts);
+            const info = try HostInfo.fromJson(self.alloc, h);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            try self.hostEventLocked(.{ .state = info });
         },
-        .host_state => {
-            _ = try r.readU32(); // tag
-            const dest = try toUtf16(self.alloc, try r.readStr());
-            errdefer self.alloc.free(dest);
-            const state: HostStatus = @enumFromInt(try r.readU8());
-            const text = try toUtf16(self.alloc, try r.readStr());
-            errdefer self.alloc.free(text);
-            try self.hostEventLocked(.{ .state = .{ .host = f.id, .dest = dest, .state = state, .text = text } });
-        },
-        .prompt => {
-            const prompt = try Prompt.parse(self.alloc, f.payload);
+        .@"host.prompt" => {
+            const p = try std.json.parseFromValueLeaky(Json.HostPrompt, a, params, json_opts);
+            const prompt = try Prompt.fromJson(self.alloc, p);
             errdefer prompt.destroy();
-            try self.hostEventLocked(.{ .prompt = .{ .host = f.id, .prompt = prompt } });
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            try self.hostEventLocked(.{ .prompt = .{ .host = p.host, .prompt = prompt } });
         },
-        .hosts => {
-            const n = try r.readU32();
-            if (n > r.buf.len / 13) return error.Truncated;
-            const hosts = try self.alloc.alloc(HostInfo, n);
-            var made: usize = 0;
-            errdefer {
-                for (hosts[0..made]) |*h| h.deinit(self.alloc);
-                self.alloc.free(hosts);
-            }
-            for (hosts) |*h| {
-                const id = try r.readU32();
-                const dest = try toUtf16(self.alloc, try r.readStr());
-                errdefer self.alloc.free(dest);
-                const state: HostStatus = @enumFromInt(try r.readU8());
-                const text = try toUtf16(self.alloc, try r.readStr());
-                h.* = .{ .host = id, .dest = dest, .state = state, .text = text };
-                made += 1;
-            }
-            try self.hostEventLocked(.{ .hosts = hosts });
-        },
-        else => {},
     }
-    return 0;
+}
+
+/// A reply came: if it answers one of our requests for a pane, note the
+/// pane for the window; if it answers `hostList`, keep the hosts.
+fn replied(self: *Daemon, env: Json.Envelope) void {
+    const id = env.id orelse return;
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    if (std.mem.indexOfScalar(u32, self.requested.items, id)) |i| {
+        _ = self.requested.swapRemove(i);
+        if (env.result == .object) if (env.result.object.get("pane")) |pane| if (pane == .integer) {
+            self.created.append(self.alloc, std.math.cast(u32, pane.integer) orelse return) catch return;
+            if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
+        };
+        return;
+    }
+    if (std.mem.indexOfScalar(u32, self.host_lists.items, id)) |i| {
+        _ = self.host_lists.swapRemove(i);
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const list = std.json.parseFromValueLeaky(Json.HostList, arena.allocator(), env.result, json_opts) catch return;
+        const hosts = self.alloc.alloc(HostInfo, list.hosts.len) catch return;
+        var made: usize = 0;
+        errdefer {
+            for (hosts[0..made]) |*h| h.deinit(self.alloc);
+            self.alloc.free(hosts);
+        }
+        for (hosts, list.hosts) |*h, src| {
+            h.* = HostInfo.fromJson(self.alloc, src) catch return;
+            made += 1;
+        }
+        self.hostEventLocked(.{ .hosts = hosts }) catch {};
+    }
 }
 
 /// Keep a host event for the UI thread, which is told. Under the lock;
@@ -1088,70 +1200,48 @@ fn hostEventLocked(self: *Daemon, e: HostEvent) !void {
     if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
 }
 
-/// A Workspace message: panes in it that attached go to `arrivals`, in
-/// layout order, and its tabs replace `structure`. Returns its tag.
-fn workspaceChanged(self: *Daemon, r: *Reader) !u32 {
+/// A workspace's structure (rpc.Workspace), from workspace.changed or
+/// an attach's reply: panes in it that attached go to `arrivals`, in
+/// layout order, and its tabs replace `structure`.
+fn applyWorkspace(self: *Daemon, value: std.json.Value) !void {
     const st = try self.alloc.create(Structure);
     st.* = .{ .arena = .init(self.alloc), .tabs = &.{} };
     errdefer st.destroy(self.alloc);
-    var tree = r.*;
-    st.tabs = try readStructure(st.arena.allocator(), &tree);
+    const a = st.arena.allocator();
+    const ws = try std.json.parseFromValueLeaky(Json.Workspace, a, value, json_opts);
+    const tabs = try a.alloc(Structure.TabLayout, ws.tabs.len);
+    for (tabs, ws.tabs) |*out, t| out.* = .{ .id = t.id, .root = t.tree };
+    st.tabs = tabs;
 
-    const t = try r.readU32();
-    self.workspace = try r.readU32();
-    _ = try r.readStr(); // name
-    const requested = for (self.requested.items, 0..) |x, i| {
-        if (x == t) {
-            _ = self.requested.swapRemove(i);
-            break true;
-        }
-    } else false;
-    const tabs = try r.readU32();
-    for (0..tabs) |_| {
-        const tab = try r.readU32();
-        _ = try r.readStr(); // name
-        var ids: [64]u32 = undefined;
-        var n: usize = 0;
-        try readPanes(r, &ids, &n, 0);
-        for (ids[0..n]) |pane| {
-            const slot = self.panes.getPtr(pane) orelse continue;
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    self.workspace = ws.id;
+    for (tabs) |t| try self.arriveLocked(t.id, t.root);
+    if (self.structure) |old| old.destroy(self.alloc);
+    self.structure = st;
+    if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
+}
+
+/// Hand the pending panes of a tab's tree to `arrivals`, in order.
+fn arriveLocked(self: *Daemon, tab: u32, node: Node) !void {
+    switch (node) {
+        .pane => |pane| {
+            const slot = self.panes.getPtr(pane) orelse return;
             const pend = switch (slot.*) {
                 .pending => |*p| p,
-                .live => continue,
+                .live => return,
             };
-            if (pend.arrived) continue;
+            if (pend.arrived) return;
             try self.arrivals.append(self.alloc, .{
                 .pane = pane,
                 .tab = tab,
                 .command = pend.command,
                 .status = pend.status,
-                .requested = requested,
             });
             pend.arrived = true;
-        }
+        },
+        .split => |sp| for (sp.children) |c| try self.arriveLocked(tab, c.node),
     }
-    if (self.structure) |old| old.destroy(self.alloc);
-    self.structure = st;
-    if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
-    return t;
-}
-
-/// An Attached message's status records, at its end, owned.
-fn readStatus(a: Allocator, r: *Reader) ![]StatusRecord {
-    var it: StatusRecords = try .init(r);
-    const out = try a.alloc(StatusRecord, it.left);
-    var made: usize = 0;
-    errdefer {
-        for (out[0..made]) |rec| a.free(rec.id);
-        a.free(out);
-    }
-    for (out) |*rec| {
-        const got = it.next() orelse return error.Truncated;
-        rec.* = got;
-        rec.id = try a.dupe(u8, got.id);
-        made += 1;
-    }
-    return out;
 }
 
 /// Hand a pane's message to its session.
@@ -1192,65 +1282,6 @@ fn deliver(sink: Sink, f: Frame) !void {
     }
 }
 
-/// The tabs of a Workspace message, read from its tag on.
-fn readStructure(a: Allocator, r: *Reader) ![]const Structure.TabLayout {
-    _ = try r.readU32(); // tag
-    _ = try r.readU32(); // workspace
-    _ = try r.readStr(); // name
-    const n = try r.readU32();
-    if (n > r.buf.len) return error.Truncated;
-    const tabs = try a.alloc(Structure.TabLayout, n);
-    for (tabs) |*tab| {
-        tab.id = try r.readU32();
-        _ = try r.readStr(); // name
-        tab.root = try readNode(a, r, 0);
-    }
-    return tabs;
-}
-
-fn readNode(a: Allocator, r: *Reader, depth: usize) !Node {
-    if (depth > 32) return error.TooDeep;
-    switch (try r.readU8()) {
-        0 => return .{ .pane = try r.readU32() },
-        1 => {
-            const axis = std.enums.fromInt(Axis, try r.readU8()) orelse return error.BadLayout;
-            const n = try r.readU16();
-            if (n > r.buf.len) return error.Truncated;
-            const children = try a.alloc(Child, n);
-            for (children) |*c| {
-                c.share = try r.readU16();
-                c.node = try readNode(a, r, depth + 1);
-            }
-            return .{ .split = .{ .axis = axis, .children = children } };
-        },
-        else => return error.BadLayout,
-    }
-}
-
-/// The pane ids in a layout tree, in order. More than `ids` holds are
-/// left out.
-fn readPanes(r: *Reader, ids: []u32, n: *usize, depth: usize) !void {
-    if (depth > 32) return error.TooDeep;
-    switch (try r.readU8()) {
-        0 => {
-            const id = try r.readU32();
-            if (n.* < ids.len) {
-                ids[n.*] = id;
-                n.* += 1;
-            }
-        },
-        1 => {
-            _ = try r.readU8(); // axis
-            const count = try r.readU16();
-            for (0..count) |_| {
-                _ = try r.readU16(); // share
-                try readPanes(r, ids, n, depth + 1);
-            }
-        },
-        else => return error.BadLayout,
-    }
-}
-
 fn loseAll(self: *Daemon, why: []const u8) void {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
@@ -1270,28 +1301,15 @@ fn loseAllLocked(self: *Daemon, why: []const u8) void {
     self.panes.clearRetainingCapacity();
 }
 
-/// The id of the workspace detached last in a Workspaces payload, or 0.
-fn mostRecentDetached(payload: []const u8) !u32 {
-    var r: Reader = .{ .buf = payload };
+/// The id of the workspace detached last in a workspace.list result, or
+/// 0.
+fn mostRecentDetached(list: Json.WorkspaceList) u32 {
     var best: u32 = 0;
-    var best_at: u64 = 0;
-    const n = try r.readU32();
-    for (0..n) |_| {
-        const id = try r.readU32();
-        _ = try r.readStr(); // name
-        const attached = try r.readU8() != 0;
-        const at = try r.readU64();
-        const tabs = try r.readU32();
-        for (0..tabs) |_| {
-            _ = try r.readU32();
-            _ = try r.readStr();
-            var ids: [1]u32 = undefined;
-            var count: usize = 0;
-            try readPanes(&r, &ids, &count, 0);
-        }
-        if (!attached and (best == 0 or at > best_at)) {
-            best = id;
-            best_at = at;
+    var best_at: i64 = 0;
+    for (list.workspaces) |w| {
+        if (!w.attached and (best == 0 or w.detached_at > best_at)) {
+            best = w.id;
+            best_at = w.detached_at;
         }
     }
     return best;
@@ -1320,7 +1338,6 @@ fn handshake(self: *Daemon, buf: []u8) !void {
     const f = try self.pipe.readFrame(buf);
     if (f.type == .@"error") {
         var er: Reader = .{ .buf = f.payload };
-        _ = try er.readU32(); // tag
         self.failure.set(try er.readStr());
         return error.Refused;
     }
@@ -1340,8 +1357,6 @@ fn handshake(self: *Daemon, buf: []u8) !void {
     }
 }
 
-/// Open the daemon's pipe, first starting the daemon if `start_daemon` and none
-/// is running.
 fn openPipe(start_daemon: bool) !win32.HANDLE {
     var name_buf: WideBuf = .{};
     const name = try pipeName(&name_buf);
@@ -1578,6 +1593,10 @@ const WideBuf = struct {
 /// most of the time, would hold up every write behind it. Reads and
 /// writes each wait on their own event instead.
 const Pipe = struct {
+    /// Frames up to this size, as keys and calls are, go in one write
+    /// from the stack.
+    const input_chunk = 16 * 1024;
+
     read_h: win32.HANDLE,
     write_h: win32.HANDLE,
     /// For reads and writes.
@@ -1603,8 +1622,8 @@ const Pipe = struct {
         header[4] = @intFromEnum(msg);
         std.mem.writeInt(u32, header[5..9], id, .little);
         // One write for small frames, so a pipe trace shows whole frames.
-        if (payload.len <= Payload.input_chunk) {
-            var buf: [9 + Payload.input_chunk]u8 = undefined;
+        if (payload.len <= input_chunk) {
+            var buf: [9 + input_chunk]u8 = undefined;
             @memcpy(buf[0..9], &header);
             @memcpy(buf[9..][0..payload.len], payload);
             return self.writeAll(buf[0 .. 9 + payload.len]);
@@ -1669,60 +1688,6 @@ fn writeSize(b: *[12]u8, size: Size) void {
     std.mem.writeInt(u32, b[8..12], size.cell_height, .little);
 }
 
-fn writeArea(b: *[16]u8, area: Area) void {
-    std.mem.writeInt(u32, b[0..4], area.width, .little);
-    std.mem.writeInt(u32, b[4..8], area.height, .little);
-    std.mem.writeInt(u32, b[8..12], area.cell_width, .little);
-    std.mem.writeInt(u32, b[12..16], area.cell_height, .little);
-}
-
-/// A request's payload. Messages up to `input_chunk` bytes, as keys
-/// are, build on the stack.
-const Payload = struct {
-    const input_chunk = 16 * 1024;
-
-    list: std.ArrayList(u8) = .empty,
-
-    fn deinit(self: *Payload, alloc: Allocator) void {
-        self.list.deinit(alloc);
-    }
-
-    fn bytes(self: *const Payload) []const u8 {
-        return self.list.items;
-    }
-
-    fn putU32(self: *Payload, alloc: Allocator, v: u32) !void {
-        var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, v, .little);
-        try self.list.appendSlice(alloc, &b);
-    }
-
-    fn putU16(self: *Payload, alloc: Allocator, v: u16) !void {
-        var b: [2]u8 = undefined;
-        std.mem.writeInt(u16, &b, v, .little);
-        try self.list.appendSlice(alloc, &b);
-    }
-
-    fn putStr(self: *Payload, alloc: Allocator, s: []const u8) !void {
-        try self.putU32(alloc, @intCast(s.len));
-        try self.list.appendSlice(alloc, s);
-    }
-
-    fn putSize(self: *Payload, alloc: Allocator, size: Size) !void {
-        var b: [12]u8 = undefined;
-        writeSize(&b, size);
-        try self.list.appendSlice(alloc, &b);
-    }
-
-    fn putArea(self: *Payload, alloc: Allocator, area: Area) !void {
-        var b: [16]u8 = undefined;
-        writeArea(&b, area);
-        try self.list.appendSlice(alloc, &b);
-    }
-};
-
-/// Reads payload fields. Bytes past the known fields are ignored, so the
-/// daemon can add fields to a message.
 const Reader = struct {
     buf: []const u8,
 
@@ -1754,41 +1719,170 @@ const Reader = struct {
     }
 };
 
+/// A u32 length and bytes: a string in a binary payload.
+fn putStr(alloc: Allocator, list: *std.ArrayList(u8), s: []const u8) !void {
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(s.len), .little);
+    try list.appendSlice(alloc, &len);
+    try list.appendSlice(alloc, s);
+}
+
 test "a layout's shares are sent summing to the whole" {
     const alloc = std.testing.allocator;
     var inner = [_]Child{ .{ .share = 1, .node = .{ .pane = 2 } }, .{ .share = 1, .node = .{ .pane = 3 } }, .{ .share = 1, .node = .{ .pane = 4 } } };
     var outer = [_]Child{ .{ .share = 7000, .node = .{ .pane = 1 } }, .{ .share = 2000, .node = .{ .split = .{ .axis = .column, .children = &inner } } } };
-    var p: Payload = .{};
-    defer p.deinit(alloc);
-    try putNode(alloc, &p, .{ .split = .{ .axis = .row, .children = &outer } });
+    const root: Node = .{ .split = .{ .axis = .row, .children = &outer } };
+    const json = try std.json.Stringify.valueAlloc(alloc, root, .{});
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"split\":{\"axis\":\"row\",\"children\":[{\"share\":7777,\"node\":{\"pane\":1}}"));
 
-    var arena: std.heap.ArenaAllocator = .init(alloc);
-    defer arena.deinit();
-    var r: Reader = .{ .buf = p.bytes() };
-    const back = try readNode(arena.allocator(), &r, 0);
-    const row = back.split.children;
+    var parsed = try std.json.parseFromSlice(Node, alloc, json, json_opts);
+    defer parsed.deinit();
+    const row = parsed.value.split.children;
     try std.testing.expectEqual(@as(u16, 7777), row[0].share);
     try std.testing.expectEqual(@as(u16, 2223), row[1].share);
     const column = row[1].node.split.children;
+    try std.testing.expectEqual(Axis.column, row[1].node.split.axis);
     try std.testing.expectEqual(@as(u16, 3333), column[0].share);
     try std.testing.expectEqual(@as(u16, 3333), column[1].share);
     try std.testing.expectEqual(@as(u16, 3334), column[2].share);
     try std.testing.expectEqual(@as(u32, 4), column[2].node.pane);
 }
 
+test "a call is a JSON-RPC request as the daemon reads it" {
+    const alloc = std.testing.allocator;
+    const b = try encodeCall(alloc, 7, "pane.split", .{ .pane = 3, .direction = Direction.left, .share = 5000, .command = "pwsh" });
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":7,"method":"pane.split","params":{"pane":3,"direction":"left","share":5000,"command":"pwsh"}}
+    , b);
+    const none = try encodeCall(alloc, 3, "workspace.list", no_params);
+    defer alloc.free(none);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":3,"method":"workspace.list","params":{}}
+    , none);
+    const sub = try encodeCall(alloc, 1, "subscribe", .{ .events = .{"host.*"} });
+    defer alloc.free(sub);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":1,"method":"subscribe","params":{"events":["host.*"]}}
+    , sub);
+    const attach = try encodeCall(alloc, 2, "workspace.attach", .{ .id = 9, .area = Area{ .width = 720, .height = 432, .cell_width = 9, .cell_height = 18 } });
+    defer alloc.free(attach);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":2,"method":"workspace.attach","params":{"id":9,"area":{"width":720,"height":432,"cell_width":9,"cell_height":18}}}
+    , attach);
+}
+
+test "a workspace parses as the daemon sends it" {
+    // internal/rpc Workspace{ID: 9, Name: "main", Tabs: [{ID: 2, Name:
+    // "build", Tree: row(60% 3, 40% col(50% 4, 50% 5))}, {ID: 6, Tree: 7}]}.
+    const json =
+        \\{"id":9,"name":"main","tabs":[{"id":2,"name":"build","tree":{"split":{"axis":"row","children":[{"share":6000,"node":{"pane":3}},{"share":4000,"node":{"split":{"axis":"column","children":[{"share":5000,"node":{"pane":4}},{"share":5000,"node":{"pane":5}}]}}}]}}},{"id":6,"tree":{"pane":7}}]}
+    ;
+    var parsed = try std.json.parseFromSlice(Json.Workspace, std.testing.allocator, json, json_opts);
+    defer parsed.deinit();
+    const ws = parsed.value;
+    try std.testing.expectEqual(@as(u32, 9), ws.id);
+    try std.testing.expectEqual(@as(usize, 2), ws.tabs.len);
+    try std.testing.expectEqual(@as(u32, 2), ws.tabs[0].id);
+    const row = ws.tabs[0].tree.split;
+    try std.testing.expectEqual(Axis.row, row.axis);
+    try std.testing.expectEqual(@as(u32, 3), row.children[0].node.pane);
+    try std.testing.expectEqual(@as(u16, 6000), row.children[0].share);
+    try std.testing.expectEqual(@as(u32, 5), row.children[1].node.split.children[1].node.pane);
+    try std.testing.expectEqual(@as(u32, 7), ws.tabs[1].tree.pane);
+    try std.testing.expectEqualStrings("", ws.tabs[1].name);
+}
+
+test "pane and workspace events parse as the daemon sends them" {
+    const alloc = std.testing.allocator;
+    var at = try std.json.parseFromSlice(Json.PaneAttached, alloc,
+        \\{"id":3,"command":"pwsh -NoLogo","status":[{"id":"","state":1,"progress":40},{"id":"deploy/eu","state":3,"progress":-1}]}
+    , json_opts);
+    defer at.deinit();
+    try std.testing.expectEqual(@as(u32, 3), at.value.id);
+    try std.testing.expectEqualStrings("pwsh -NoLogo", at.value.command);
+    try std.testing.expectEqual(@as(usize, 2), at.value.status.len);
+    try std.testing.expectEqual(@as(i8, -1), at.value.status[1].progress);
+    try std.testing.expectEqualStrings("deploy/eu", at.value.status[1].id);
+
+    var ex = try std.json.parseFromSlice(Json.PaneExited, alloc,
+        \\{"id":3,"status":3221225786}
+    , json_opts);
+    defer ex.deinit();
+    try std.testing.expectEqual(@as(u32, 0xc000013a), ex.value.status);
+
+    var det = try std.json.parseFromSlice(Json.WorkspaceDetached, alloc,
+        \\{"id":9,"reason":"attached elsewhere"}
+    , json_opts);
+    defer det.deinit();
+    try std.testing.expectEqualStrings("attached elsewhere", det.value.reason);
+
+    var created = try std.json.parseFromSlice(Json.Created, alloc,
+        \\{"workspace":9,"tab":2,"pane":3}
+    , json_opts);
+    defer created.deinit();
+    try std.testing.expectEqual(@as(u32, 3), created.value.pane);
+
+    // A reply envelope, with a field this build doesn't know.
+    var env = try std.json.parseFromSlice(Json.Envelope, alloc,
+        \\{"jsonrpc":"2.0","id":7,"result":{"workspace":9,"tab":2,"pane":3},"later":true}
+    , json_opts);
+    defer env.deinit();
+    try std.testing.expectEqual(@as(?u32, 7), env.value.id);
+    try std.testing.expectEqual(@as(i64, 3), env.value.result.object.get("pane").?.integer);
+    var bad = try std.json.parseFromSlice(Json.Envelope, alloc,
+        \\{"jsonrpc":"2.0","id":8,"error":{"code":1000,"message":"no such pane"}}
+    , json_opts);
+    defer bad.deinit();
+    try std.testing.expectEqualStrings("no such pane", bad.value.@"error".?.message);
+}
+
 test "prompts parse as the Go side sends them" {
-    // internal/daemon Prompt{Kind: PromptPassword, Title: "T",
-    // Questions: [{Label: "pw: "}]}.
-    const payload = [_]u8{1} ++ [_]u8{ 1, 0, 0, 0, 'T' } ++ [_]u8{0} ** 12 ++ [_]u8{ 1, 0, 0, 0 } ++
-        [_]u8{ 4, 0, 0, 0, 'p', 'w', ':', ' ', 0 };
-    const p = try Prompt.parse(std.testing.allocator, &payload);
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(Json.HostPrompt, alloc,
+        \\{"host":11,"kind":"password","title":"T","questions":[{"label":"pw: "}]}
+    , json_opts);
+    defer parsed.deinit();
+    const p = try Prompt.fromJson(alloc, parsed.value);
     defer p.destroy();
     try std.testing.expectEqual(Prompt.Kind.password, p.kind);
     try std.testing.expectEqualSlices(u16, L("T"), p.title);
+    try std.testing.expectEqual(@as(usize, 0), p.text.len);
     try std.testing.expectEqual(@as(usize, 1), p.questions.len);
     try std.testing.expectEqualSlices(u16, L("pw: "), p.questions[0].label);
     try std.testing.expect(!p.questions[0].echo);
-    try std.testing.expectError(error.Truncated, Prompt.parse(std.testing.allocator, payload[0..20]));
+}
+
+test "a host's state parses as the Go side sends it" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(Json.Host, alloc,
+        \\{"id":12,"dest":"dev2","state":"failed","text":"Permission denied"}
+    , json_opts);
+    defer parsed.deinit();
+    var info = try HostInfo.fromJson(alloc, parsed.value);
+    defer info.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 12), info.host);
+    try std.testing.expectEqual(HostStatus.failed, info.state);
+    try std.testing.expectEqualSlices(u16, L("dev2"), info.dest);
+    try std.testing.expectEqualSlices(u16, L("Permission denied"), info.text);
+
+    var odd = try std.json.parseFromSlice(Json.Host, alloc,
+        \\{"id":13,"dest":"dev3","state":"hibernating"}
+    , json_opts);
+    defer odd.deinit();
+    var unknown = try HostInfo.fromJson(alloc, odd.value);
+    defer unknown.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0xff), @intFromEnum(unknown.state));
+}
+
+test "the most recently detached workspace comes from workspace.list" {
+    var parsed = try std.json.parseFromSlice(Json.WorkspaceList, std.testing.allocator,
+        \\{"workspaces":[{"id":1,"name":"a","attached":true,"tabs":[]},{"id":2,"name":"b","attached":false,"detached_at":1700000000000,"tabs":[]},{"id":3,"name":"c","attached":false,"detached_at":1700000005000,"tabs":[{"id":4,"tree":{"pane":5}}]}],"panes":[]}
+    , json_opts);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 3), mostRecentDetached(parsed.value));
+    try std.testing.expectEqual(@as(u32, 0), mostRecentDetached(.{}));
 }
 
 test "frames match the Go side's wire format" {

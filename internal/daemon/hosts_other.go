@@ -2,7 +2,11 @@
 
 package daemon
 
-import "io"
+import (
+	"io"
+
+	"github.com/aldehir/slime/internal/rpc"
+)
 
 // Hosts are connected from Windows only: the daemon here is the one on
 // a host, which carries no SSH client.
@@ -20,17 +24,22 @@ func (s *Server) hostClientGoneLocked(*conn) {}
 
 const noHosts = "this slime connects to no hosts (not Windows)"
 
-func (s *Server) hostDispatch(c *conn, id uint32, m Message) bool {
-	switch m := m.(type) {
-	case *HostConnect:
-		c.sendForce(0, &Error{Tag: m.Tag, Message: noHosts})
-	case *HostAnswer, *HostDisconnect:
-	case *HostList:
-		c.sendForce(0, &Hosts{})
-	default:
-		return false
-	}
-	return true
+func noHostsError() error { return rpc.Errorf(rpc.CodeUnsupported, "%s", noHosts) }
+
+func (s *Server) hostConnect(*callCtx, rpc.HostConnectParams) (*rpc.Host, error) {
+	return nil, noHostsError()
+}
+
+func (s *Server) hostAnswer(*callCtx, rpc.HostAnswerParams) (rpc.Empty, error) {
+	return rpc.Empty{}, noHostsError()
+}
+
+func (s *Server) hostDisconnect(*callCtx, rpc.HostParams) (rpc.Empty, error) {
+	return rpc.Empty{}, noHostsError()
+}
+
+func (s *Server) hostList(*callCtx, rpc.Empty) (*rpc.HostListResult, error) {
+	return &rpc.HostListResult{Hosts: []rpc.Host{}}, nil
 }
 
 func (s *Server) bridge(rw io.ReadWriteCloser, _ *Reader, _ uint32, _ *Bridge) {

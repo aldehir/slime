@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/aldehir/slime/internal/daemon"
 	"github.com/aldehir/slime/internal/remote"
+	"github.com/aldehir/slime/internal/rpc"
 )
 
 // hostOptions configures the daemon's hosts: the builds to install come
@@ -45,21 +47,26 @@ func hostCommands() []*cobra.Command {
 				return err
 			}
 			defer c.Close()
-			return hostConnect(c, args[0])
+			h, err := hostConnect(c, args[0])
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(h)
+			}
+			return nil
 		},
 	}, &cobra.Command{
 		Use:   "ls",
 		Short: "List the hosts the daemon knows and their state",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := connect(false)
-			if err != nil {
+			var hosts rpc.HostListResult
+			if err := call(rpc.HostList, nil, &hosts); err != nil {
 				return err
 			}
-			defer c.Close()
-			hosts, err := hostList(c)
-			if err != nil {
-				return err
+			if jsonOut {
+				return printJSON(hosts)
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			for _, h := range hosts.Hosts {
@@ -77,8 +84,8 @@ func hostCommands() []*cobra.Command {
 				return err
 			}
 			defer c.Close()
-			hosts, err := hostList(c)
-			if err != nil {
+			var hosts rpc.HostListResult
+			if err := c.Call(rpc.HostList, nil, &hosts); err != nil {
 				return err
 			}
 			var id uint32
@@ -90,86 +97,65 @@ func hostCommands() []*cobra.Command {
 			if id == 0 {
 				return fmt.Errorf("no host %q", args[0])
 			}
-			if err := c.Send(id, &daemon.HostDisconnect{}); err != nil {
-				return err
-			}
-			// Read something after it, so the daemon has it before we
-			// hang up.
-			_, err = hostList(c)
-			return err
+			return c.Call(rpc.HostDisconnect, rpc.HostParams{Host: id}, nil)
 		},
 	})
 	return []*cobra.Command{host}
 }
 
-// hostList asks for the hosts.
-func hostList(c *daemon.Client) (*daemon.Hosts, error) {
-	if err := c.Send(0, &daemon.HostList{}); err != nil {
+// hostConnect asks the daemon to connect to dest and follows it there,
+// answering the prompts on the console, until it's connected or has
+// failed.
+func hostConnect(c *daemon.Client, dest string) (*rpc.Host, error) {
+	// Before asking, so no change is missed.
+	if err := c.Call(rpc.Subscribe, rpc.SubscribeParams{Events: []string{rpc.EvHostChanged}}, nil); err != nil {
 		return nil, err
 	}
+	var h rpc.Host
+	if err := c.Call(rpc.HostConnect, rpc.HostConnectParams{Dest: dest}, &h); err != nil {
+		return nil, err
+	}
+	lastText := ""
 	for {
+		switch h.State {
+		case rpc.HostConnecting:
+			if h.Text != "" && h.Text != lastText {
+				fmt.Fprintln(os.Stderr, h.Text)
+				lastText = h.Text
+			}
+		case rpc.HostConnected:
+			fmt.Fprintf(os.Stderr, "connected to %s (host %d)\n", h.Dest, h.ID)
+			return &h, nil
+		default:
+			return nil, fmt.Errorf("%s: %s", h.State, h.Text)
+		}
 		_, m, err := c.Recv()
 		if err != nil {
 			return nil, err
 		}
-		switch m := m.(type) {
-		case *daemon.Hosts:
-			return m, nil
-		case *daemon.Error:
-			return nil, fmt.Errorf("slime: %s", m.Message)
+		name, params, ok := daemon.Notification(m)
+		if !ok {
+			continue
 		}
-	}
-}
-
-// hostConnect asks the daemon to connect to dest and follows it there,
-// answering the prompts on the console.
-func hostConnect(c *daemon.Client, dest string) error {
-	tag := c.NextTag()
-	if err := c.Send(0, &daemon.HostConnect{Tag: tag, Dest: dest}); err != nil {
-		return err
-	}
-	var id uint32
-	lastText := ""
-	for {
-		got, m, err := c.Recv()
-		if err != nil {
-			return err
-		}
-		switch m := m.(type) {
-		case *daemon.HostState:
-			if m.Tag == tag {
-				id = got
-			}
-			if got != id {
+		switch name {
+		case rpc.EvHostChanged:
+			var got rpc.Host
+			if err := json.Unmarshal(params, &got); err != nil || got.ID != h.ID {
 				continue
 			}
-			switch m.State {
-			case daemon.HostConnecting:
-				if m.Text != "" && m.Text != lastText {
-					fmt.Fprintln(os.Stderr, m.Text)
-					lastText = m.Text
-				}
-			case daemon.HostConnected:
-				fmt.Fprintf(os.Stderr, "connected to %s (host %d)\n", m.Dest, id)
-				return nil
-			default:
-				return fmt.Errorf("%s: %s", m.State, m.Text)
-			}
-		case *daemon.Prompt:
-			if got != id {
+			h = got
+		case rpc.EvHostPrompt:
+			var p rpc.HostPromptParams
+			if err := json.Unmarshal(params, &p); err != nil || p.Host != h.ID {
 				continue
 			}
-			ans, err := askConsole(m)
+			ans, err := askConsole(&p)
 			if err != nil {
-				c.Send(id, &daemon.HostAnswer{Choice: daemon.ChoiceCancel})
-				return err
+				c.Call(rpc.HostAnswer, rpc.HostAnswerParams{Host: h.ID, Choice: rpc.ChoiceCancel}, nil)
+				return nil, err
 			}
-			if err := c.Send(id, ans); err != nil {
-				return err
-			}
-		case *daemon.Error:
-			if m.Tag == tag {
-				return errors.New(m.Message)
+			if err := c.Call(rpc.HostAnswer, ans, nil); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -177,7 +163,7 @@ func hostConnect(c *daemon.Client, dest string) error {
 
 // askConsole shows a prompt on the console and reads the answers. A
 // prompt with no questions asks whether to go ahead (a host key).
-func askConsole(p *daemon.Prompt) (*daemon.HostAnswer, error) {
+func askConsole(p *rpc.HostPromptParams) (*rpc.HostAnswerParams, error) {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
 		return nil, errors.New("can't answer the host's prompts: stdin isn't a terminal")
@@ -188,6 +174,7 @@ func askConsole(p *daemon.Prompt) (*daemon.HostAnswer, error) {
 		}
 	}
 	in := bufio.NewReader(os.Stdin)
+	ans := &rpc.HostAnswerParams{Host: p.Host, Choice: rpc.ChoiceAccept}
 	if len(p.Questions) == 0 {
 		fmt.Fprint(os.Stderr, "Continue (yes/no)? ")
 		line, err := in.ReadString('\n')
@@ -195,11 +182,10 @@ func askConsole(p *daemon.Prompt) (*daemon.HostAnswer, error) {
 			return nil, err
 		}
 		if strings.TrimSpace(line) != "yes" {
-			return &daemon.HostAnswer{Choice: daemon.ChoiceCancel}, nil
+			ans.Choice = rpc.ChoiceCancel
 		}
-		return &daemon.HostAnswer{Choice: daemon.ChoiceAccept}, nil
+		return ans, nil
 	}
-	ans := &daemon.HostAnswer{Choice: daemon.ChoiceAccept}
 	for _, q := range p.Questions {
 		fmt.Fprint(os.Stderr, q.Label)
 		var line string

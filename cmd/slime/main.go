@@ -2,11 +2,13 @@
 // each pane's pty and terminal state, arranged in tabs and workspaces,
 // and a window attaches a workspace to draw the frames of its panes.
 // slime-gui is the window; the other commands here script workspaces and
-// look at them from a console.
+// look at them from a console, over the same control plane
+// (internal/rpc) the window uses.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,13 +26,21 @@ import (
 
 	"github.com/aldehir/slime/internal/daemon"
 	"github.com/aldehir/slime/internal/pty"
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
 )
+
+// jsonOut prints each command's result as the daemon sent it (--json).
+var jsonOut bool
 
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("slime: ")
 	if err := newCommand().Execute(); err != nil {
+		var rerr *rpc.Error
+		if errors.As(err, &rerr) {
+			log.Fatalf("%s (code %d)", rerr.Message, rerr.Code)
+		}
 		log.Fatal(err)
 	}
 }
@@ -43,8 +53,9 @@ func newCommand() *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
+	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "print results as JSON, as the daemon replies")
 	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
-		splitCommand(), peekCommand(), killCommand())
+		paneCommand(), callCommand())
 	root.AddCommand(hostCommands()...)
 	return root
 }
@@ -170,11 +181,14 @@ func lsCommand() *cobra.Command {
 				return err
 			}
 			defer c.Close()
-			l, err := c.List()
-			if err != nil {
+			var l rpc.WorkspaceListResult
+			if err := c.Call(rpc.WorkspaceList, nil, &l); err != nil {
 				return err
 			}
-			panes := map[uint32]daemon.PaneInfo{}
+			if jsonOut {
+				return printJSON(l)
+			}
+			panes := map[uint32]rpc.PaneDesc{}
 			for _, p := range l.Panes {
 				panes[p.ID] = p
 			}
@@ -206,15 +220,15 @@ func lsCommand() *cobra.Command {
 }
 
 // layoutString shows a tree compactly: row(60% 3, 40% col(50% 4, 50% 5)).
-func layoutString(n *daemon.Node) string {
+func layoutString(n *rpc.Node) string {
 	if n == nil {
 		return ""
 	}
-	if n.Pane != 0 {
+	if n.IsLeaf() {
 		return strconv.FormatUint(uint64(n.Pane), 10)
 	}
 	var b strings.Builder
-	if n.Axis == daemon.Row {
+	if n.Axis == rpc.Row {
 		b.WriteString("row(")
 	} else {
 		b.WriteString("col(")
@@ -230,7 +244,7 @@ func layoutString(n *daemon.Node) string {
 }
 
 func wsCommand() *cobra.Command {
-	ws := &cobra.Command{Use: "ws", Short: "Create, rename, and kill workspaces"}
+	ws := &cobra.Command{Use: "ws", Short: "Create, rename, kill, and describe workspaces"}
 	ws.AddCommand(&cobra.Command{
 		Use:   "new [name]",
 		Short: "Create a workspace, detached, and print its id",
@@ -241,16 +255,20 @@ func wsCommand() *cobra.Command {
 				return err
 			}
 			defer c.Close()
-			id, err := newWorkspace(c, strings.Join(args, ""))
-			if err != nil {
+			var w rpc.Workspace
+			if err := c.Call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Name: strings.Join(args, "")}, &w); err != nil {
 				return err
 			}
 			// Hanging up detaches it, but an empty workspace would go:
 			// give it a shell.
-			if _, err := tabNew(c, id, []string{""}, daemon.Right); err != nil {
+			created, err := tabNew(c, w.ID, []string{""}, rpc.Right)
+			if err != nil {
 				return err
 			}
-			fmt.Println(id)
+			if jsonOut {
+				return printJSON(created)
+			}
+			fmt.Println(w.ID)
 			return nil
 		},
 	}, &cobra.Command{
@@ -262,7 +280,7 @@ func wsCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return send(&daemon.WorkspaceRename{WS: id, Name: args[1]})
+			return call(rpc.WorkspaceRename, rpc.WorkspaceRenameParams{ID: id, Name: args[1]}, nil)
 		},
 	}, &cobra.Command{
 		Use:   "kill <workspace>",
@@ -273,7 +291,33 @@ func wsCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return send(&daemon.WorkspaceKill{WS: id})
+			return call(rpc.WorkspaceKill, rpc.WorkspaceParams{ID: id}, nil)
+		},
+	}, &cobra.Command{
+		Use:   "info <workspace>",
+		Short: "Describe a workspace",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			var d rpc.WorkspaceDesc
+			if err := call(rpc.WorkspaceInfo, rpc.WorkspaceParams{ID: id}, &d); err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(d)
+			}
+			state := "attached"
+			if !d.Attached {
+				state = "detached"
+			}
+			fmt.Printf("workspace %d\t%s\t%s\n", d.ID, d.Name, state)
+			for _, t := range d.Tabs {
+				fmt.Printf("  tab %d\t%s\t%s\n", t.ID, t.Name, layoutString(t.Tree))
+			}
+			return nil
 		},
 	})
 	return ws
@@ -291,11 +335,11 @@ func tabCommand() *cobra.Command {
 			"else a new one. Each command (CreateProcessW syntax; empty for the shell)\n" +
 			"gets a pane, sharing the tab equally along --split.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dir := daemon.Right
+			dir := rpc.Right
 			switch split {
 			case "right", "h":
 			case "down", "v":
-				dir = daemon.Down
+				dir = rpc.Down
 			default:
 				return fmt.Errorf("--split is right or down, not %q", split)
 			}
@@ -309,19 +353,26 @@ func tabCommand() *cobra.Command {
 			defer c.Close()
 			ws := wsID
 			if ws == 0 {
-				l, err := c.List()
-				if err != nil {
+				var l rpc.WorkspaceListResult
+				if err := c.Call(rpc.WorkspaceList, nil, &l); err != nil {
 					return err
 				}
-				if w := daemon.MostRecentDetached(l); w != nil {
+				if w := daemon.MostRecentDetached(&l); w != nil {
 					ws = w.ID
-				} else if ws, err = newWorkspace(c, ""); err != nil {
-					return err
+				} else {
+					var w rpc.Workspace
+					if err := c.Call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{}, &w); err != nil {
+						return err
+					}
+					ws = w.ID
 				}
 			}
 			created, err := tabNew(c, ws, args, dir)
 			if err != nil {
 				return err
+			}
+			if jsonOut {
+				return printJSON(created)
 			}
 			fmt.Println(created.Tab)
 			return nil
@@ -330,7 +381,7 @@ func tabCommand() *cobra.Command {
 	newTab.Flags().Uint32VarP(&wsID, "workspace", "w", 0, "workspace to start it in")
 	newTab.Flags().StringVar(&split, "split", "right", "how several commands share the tab: right (side by side) or down (stacked)")
 
-	tab := &cobra.Command{Use: "tab", Short: "Start, rename, and close tabs"}
+	tab := &cobra.Command{Use: "tab", Short: "Start, rename, close, and describe tabs"}
 	tab.AddCommand(newTab, &cobra.Command{
 		Use:   "rename <tab> <name>",
 		Short: "Rename a tab",
@@ -340,7 +391,7 @@ func tabCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return send(&daemon.TabRename{Tab: id, Name: args[1]})
+			return call(rpc.TabRename, rpc.TabRenameParams{ID: id, Name: args[1]}, nil)
 		},
 	}, &cobra.Command{
 		Use:   "close <tab>",
@@ -351,15 +402,37 @@ func tabCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return send(&daemon.TabClose{Tab: id})
+			return call(rpc.TabClose, rpc.TabParams{ID: id}, nil)
+		},
+	}, &cobra.Command{
+		Use:   "info <tab>",
+		Short: "Describe a tab: its workspace and layout",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			var t rpc.TabInfoResult
+			if err := call(rpc.TabInfo, rpc.TabParams{ID: id}, &t); err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(t)
+			}
+			fmt.Printf("tab %d\tworkspace %d\t%s\t%s\n", t.ID, t.Workspace, t.Name, layoutString(t.Tree))
+			return nil
 		},
 	})
 	return tab
 }
 
-func splitCommand() *cobra.Command {
-	var percent float64
-	cmd := &cobra.Command{
+func paneCommand() *cobra.Command {
+	var (
+		percent float64
+		asVT    bool
+	)
+	split := &cobra.Command{
 		Use:   "split <pane> right|down|left|up [command]",
 		Short: "Start a pane beside another, and print its id",
 		Args:  cobra.RangeArgs(2, 3),
@@ -368,42 +441,31 @@ func splitCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			dir, err := parseDirection(args[1])
-			if err != nil {
+			var dir rpc.Direction
+			if err := dir.UnmarshalText([]byte(args[1])); err != nil {
 				return err
 			}
 			if percent <= 0 || percent >= 100 {
 				return fmt.Errorf("--percent must be between 0 and 100")
 			}
-			c, err := connect(false)
-			if err != nil {
-				return err
-			}
-			defer c.Close()
-			tag := c.NextTag()
-			m := &daemon.Split{Tag: tag, Pane: pane, Dir: dir, Share: uint16(percent * 100)}
+			p := rpc.PaneSplitParams{Pane: pane, Direction: dir, Share: uint16(percent * 100)}
 			if len(args) == 3 {
-				m.Command = args[2]
+				p.Command = args[2]
 			}
-			if err := c.Send(0, m); err != nil {
+			var created rpc.Created
+			if err := call(rpc.PaneSplit, p, &created); err != nil {
 				return err
 			}
-			created, err := c.AwaitCreated(tag)
-			if err != nil {
-				return err
+			if jsonOut {
+				return printJSON(created)
 			}
 			fmt.Println(created.Pane)
 			return nil
 		},
 	}
-	cmd.Flags().Float64VarP(&percent, "percent", "p", 50, "how much of the pane's space the new one takes")
-	return cmd
-}
-
-func peekCommand() *cobra.Command {
-	var asVT bool
-	cmd := &cobra.Command{
-		Use:   "peek <pane>",
+	split.Flags().Float64VarP(&percent, "percent", "p", 50, "how much of the pane's space the new one takes")
+	text := &cobra.Command{
+		Use:   "text <pane>",
 		Short: "Print a pane's screen and scrollback, without taking it",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -411,29 +473,25 @@ func peekCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			c, err := connect(false)
-			if err != nil {
+			var r rpc.PaneTextResult
+			if err := call(rpc.PaneText, rpc.PaneTextParams{ID: pane, VT: asVT}, &r); err != nil {
 				return err
 			}
-			defer c.Close()
-			text, err := c.Peek(pane, asVT)
-			if err != nil {
-				return err
+			if jsonOut {
+				return printJSON(r)
 			}
 			if asVT {
-				_, err = os.Stdout.Write(text)
+				_, err = os.Stdout.WriteString(r.Text)
 				return err
 			}
-			fmt.Println(string(text))
+			fmt.Println(r.Text)
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&asVT, "vt", false, "print the VT that redraws it rather than plain text")
-	return cmd
-}
+	text.Flags().BoolVar(&asVT, "vt", false, "print the VT that redraws it rather than plain text")
 
-func killCommand() *cobra.Command {
-	return &cobra.Command{
+	pane := &cobra.Command{Use: "pane", Short: "Split, kill, write to, and read panes"}
+	pane.AddCommand(split, text, &cobra.Command{
 		Use:   "kill <pane>...",
 		Short: "End panes",
 		Args:  cobra.MinimumNArgs(1),
@@ -448,98 +506,118 @@ func killCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if err := c.Send(id, &daemon.PaneKill{}); err != nil {
+				if err := c.Call(rpc.PaneKill, rpc.PaneParams{ID: id}, nil); err != nil {
 					return err
 				}
 			}
-			// List after the kills so they're read before we hang up.
-			_, err = c.List()
-			return err
+			return nil
+		},
+	}, &cobra.Command{
+		Use:   "write <pane> <text>",
+		Short: "Send text to a pane's program as if typed (no newline is added)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			return call(rpc.PaneWrite, rpc.PaneWriteParams{ID: id, Text: args[1]}, nil)
+		},
+	}, &cobra.Command{
+		Use:   "info <pane>",
+		Short: "Describe a pane: its tab, command, title, size, and program status",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			var d rpc.PaneDesc
+			if err := call(rpc.PaneInfo, rpc.PaneParams{ID: id}, &d); err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(d)
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintf(w, "pane\t%d\nworkspace\t%d\ntab\t%d\ncommand\t%s\ntitle\t%s\npwd\t%s\nsize\t%dx%d\npid\t%d\ncreated\t%s\n",
+				d.ID, d.Workspace, d.Tab, d.Command, d.Title, d.Pwd, d.Cols, d.Rows, d.PID, time.UnixMilli(d.Created).Format(time.RFC3339))
+			for _, r := range d.Status {
+				fmt.Fprintf(w, "status\t%q state %d progress %d\n", r.ID, r.State, r.Progress)
+			}
+			return w.Flush()
+		},
+	})
+	return pane
+}
+
+func callCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "call <method> [params-json]",
+		Short: "Call any method on the daemon and print the raw reply",
+		Long: "Calls a method of the control plane (internal/rpc) with params given as JSON,\n" +
+			"and prints the result. Errors print their code and message.",
+		Args: cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var params json.RawMessage
+			if len(args) == 2 {
+				if !json.Valid([]byte(args[1])) {
+					return fmt.Errorf("params aren't valid JSON: %s", args[1])
+				}
+				params = json.RawMessage(args[1])
+			}
+			c, err := connect(false)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			var result json.RawMessage
+			if err := c.Call(args[0], params, &result); err != nil {
+				return err
+			}
+			return printJSON(result)
 		},
 	}
 }
 
-// send sends one message that has no reply, and waits until the daemon
-// has read it.
-func send(m daemon.Message) error {
+// printJSON prints v indented.
+func printJSON(v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(b))
+	return nil
+}
+
+// call connects, calls one method, and hangs up.
+func call(method string, params, result any) error {
 	c, err := connect(false)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	if err := c.Send(0, m); err != nil {
-		return err
-	}
-	// Errors come back before the list, which the daemon answers after.
-	if err := c.Send(0, &daemon.List{}); err != nil {
-		return err
-	}
-	for {
-		_, reply, err := c.Recv()
-		if err != nil {
-			return err
-		}
-		switch reply := reply.(type) {
-		case *daemon.Error:
-			return errors.New(reply.Message)
-		case *daemon.Workspaces:
-			return nil
-		}
-	}
-}
-
-// newWorkspace creates a workspace, owned by c until it hangs up.
-func newWorkspace(c *daemon.Client, name string) (uint32, error) {
-	tag := c.NextTag()
-	if err := c.Send(0, &daemon.WorkspaceNew{Tag: tag, Name: name}); err != nil {
-		return 0, err
-	}
-	created, err := c.AwaitCreated(tag)
-	if err != nil {
-		return 0, err
-	}
-	return created.WS, nil
+	return c.Call(method, params, result)
 }
 
 // tabNew starts a tab with a pane per command, sharing it equally along
 // dir: each split takes its share of what the last pane has left.
-func tabNew(c *daemon.Client, ws uint32, commands []string, dir daemon.Direction) (*daemon.Created, error) {
-	tag := c.NextTag()
-	if err := c.Send(0, &daemon.TabNew{Tag: tag, WS: ws, Command: commands[0]}); err != nil {
-		return nil, err
-	}
-	first, err := c.AwaitCreated(tag)
-	if err != nil {
+func tabNew(c *daemon.Client, ws uint32, commands []string, dir rpc.Direction) (*rpc.Created, error) {
+	var first rpc.Created
+	if err := c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: ws, Command: commands[0]}, &first); err != nil {
 		return nil, err
 	}
 	last := first.Pane
 	n := len(commands)
 	for k := 1; k < n; k++ {
-		tag := c.NextTag()
-		share := uint16(daemon.Whole * (n - k) / (n - k + 1))
-		if err := c.Send(0, &daemon.Split{Tag: tag, Pane: last, Dir: dir, Share: share, Command: commands[k]}); err != nil {
-			return nil, err
-		}
-		created, err := c.AwaitCreated(tag)
-		if err != nil {
+		share := uint16(rpc.Whole * (n - k) / (n - k + 1))
+		var created rpc.Created
+		if err := c.Call(rpc.PaneSplit, rpc.PaneSplitParams{Pane: last, Direction: dir, Share: share, Command: commands[k]}, &created); err != nil {
 			return nil, err
 		}
 		last = created.Pane
 	}
-	return first, nil
-}
-
-func workspaceOf(l *daemon.Workspaces, pane uint32) uint32 {
-	for _, ws := range l.Workspaces {
-		for _, t := range ws.Tabs {
-			for _, id := range t.Tree.Panes() {
-				if id == pane {
-					return ws.ID
-				}
-			}
-		}
-	}
-	return 0
+	return &first, nil
 }
 
 func parseID(s string) (uint32, error) {
@@ -548,20 +626,6 @@ func parseID(s string) (uint32, error) {
 		return 0, fmt.Errorf("bad id %q", s)
 	}
 	return uint32(id), nil
-}
-
-func parseDirection(s string) (daemon.Direction, error) {
-	switch s {
-	case "right":
-		return daemon.Right, nil
-	case "down":
-		return daemon.Down, nil
-	case "left":
-		return daemon.Left, nil
-	case "up":
-		return daemon.Up, nil
-	}
-	return 0, fmt.Errorf("direction is right, down, left, or up, not %q", s)
 }
 
 // connect dials the daemon and says hello. If start is set and none is

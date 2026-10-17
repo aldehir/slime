@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
 )
 
@@ -54,20 +55,18 @@ func TestUnixSocket(t *testing.T) {
 	command := `printf 'ready>'; while read l; do [ "$l" = exit ] && exit 3; printf 'got %s\r\nready>' "$l"; done`
 
 	w1 := dial()
-	tag := w1.c.NextTag()
-	w1.c.Send(0, &WorkspaceNew{Tag: tag})
-	a, err := w1.c.Await(tag, true)
+	var ws rpc.Workspace
+	if _, err := w1.call(rpc.WorkspaceNew, nil, &ws); err != nil {
+		t.Fatal(err)
+	}
+	w1.ws = &ws
+	var created rpc.Created
+	a, err := w1.call(rpc.TabNew, rpc.TabNewParams{Workspace: ws.ID, Command: command, Size: Size{Cols: 80, Rows: 24}}, &created)
 	if err != nil {
 		t.Fatal(err)
 	}
 	w1.absorb(a)
-	tag = w1.c.NextTag()
-	w1.c.Send(0, &TabNew{Tag: tag, WS: w1.ws.ID, Command: command, Size: Size{Cols: 80, Rows: 24}})
-	if a, err = w1.c.Await(tag, true); err != nil {
-		t.Fatal(err)
-	}
-	w1.absorb(a)
-	pane := a.Created.Pane
+	pane := created.Pane
 	w1.until(pane, "ready>")
 	w1.c.Send(pane, &Event{Data: evText("first\r")})
 	w1.until(pane, "got first")
@@ -75,21 +74,16 @@ func TestUnixSocket(t *testing.T) {
 	eventually(t, "detach", func() bool { return !h.attached(w1.ws.ID) })
 
 	w2 := dial()
-	list, err := w2.c.List()
-	if err != nil || len(list.Workspaces) != 1 || list.Workspaces[0].Attached {
+	var list rpc.WorkspaceListResult
+	if err := w2.c.Call(rpc.WorkspaceList, nil, &list); err != nil || len(list.Workspaces) != 1 || list.Workspaces[0].Attached {
 		t.Fatalf("list %+v, %v", list, err)
 	}
-	tag = w2.c.NextTag()
-	w2.c.Send(0, &WorkspaceAttach{Tag: tag, WS: list.Workspaces[0].ID, Area: Area{Width: 720, Height: 456, CellW: 9, CellH: 19}})
-	if a, err = w2.c.Await(tag, false); err != nil {
-		t.Fatal(err)
-	}
-	w2.absorb(a)
+	w2.attach(list.Workspaces[0].ID, Area{Width: 720, Height: 456, CellW: 9, CellH: 19})
 	w2.until(pane, "got first")
 	w2.c.Send(pane, &Event{Data: evText("second\r")})
 	w2.until(pane, "got second")
 	w2.c.Send(pane, &Event{Data: evText("exit\r")})
-	if _, e := next[*Exit](w2); e.Status != 3 {
+	if e := nextEvent[rpc.PaneExitedParams](w2, rpc.EvPaneExited); e.Status != 3 {
 		t.Errorf("exit status %d, want 3", e.Status)
 	}
 }

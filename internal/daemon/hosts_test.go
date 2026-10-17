@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/aldehir/slime/internal/pty"
 	"github.com/aldehir/slime/internal/remote"
+	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/sshbridge"
 	"github.com/aldehir/slime/internal/sshtest"
 )
@@ -219,31 +221,66 @@ func recv(t *testing.T, c *Client) (uint32, Message) {
 	return 0, nil
 }
 
-// hostConnect asks for dest and returns the host's id from the tagged
-// HostState.
+// subscribeHosts has c hear every host's changes.
+func subscribeHosts(t *testing.T, c *Client) {
+	t.Helper()
+	if err := c.Call(rpc.Subscribe, rpc.SubscribeParams{Events: []string{"host.*"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// hostConnect asks for dest, subscribed to what follows, and returns
+// the host's id from the reply.
 func hostConnect(t *testing.T, c *Client, dest string) uint32 {
 	t.Helper()
-	tag := c.NextTag()
-	c.Send(0, &HostConnect{Tag: tag, Dest: dest})
+	subscribeHosts(t, c)
+	var h rpc.Host
+	if err := c.Call(rpc.HostConnect, rpc.HostConnectParams{Dest: dest}, &h); err != nil {
+		t.Fatal(err)
+	}
+	if h.Dest != dest {
+		t.Fatalf("host.connect answered for %q, want %q", h.Dest, dest)
+	}
+	return h.ID
+}
+
+// hostEvent reads until a host.changed or host.prompt for host id.
+func hostEvent(t *testing.T, c *Client, id uint32) (state *rpc.Host, prompt *rpc.HostPromptParams) {
+	t.Helper()
 	for {
-		id, m := recv(t, c)
-		if st, ok := m.(*HostState); ok && st.Tag == tag {
-			if st.Dest != dest {
-				t.Fatalf("HostState for %q, want %q", st.Dest, dest)
+		_, m := recv(t, c)
+		name, params, ok := Notification(m)
+		if !ok {
+			continue
+		}
+		switch name {
+		case rpc.EvHostChanged:
+			var h rpc.Host
+			if err := json.Unmarshal(params, &h); err != nil {
+				t.Fatal(err)
 			}
-			return id
+			if h.ID == id {
+				return &h, nil
+			}
+		case rpc.EvHostPrompt:
+			var p rpc.HostPromptParams
+			if err := json.Unmarshal(params, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.Host == id {
+				return nil, &p
+			}
 		}
 	}
 }
 
 // awaitState reads until host id reaches want, collecting the status
 // lines on the way. A terminal state other than want fails.
-func awaitState(t *testing.T, c *Client, id uint32, want HostStatus) (texts []string, state *HostState) {
+func awaitState(t *testing.T, c *Client, id uint32, want HostStatus) (texts []string, state *rpc.Host) {
 	t.Helper()
 	for {
-		got, m := recv(t, c)
-		st, ok := m.(*HostState)
-		if !ok || got != id {
+		st, _ := hostEvent(t, c, id)
+		if st == nil {
 			continue
 		}
 		if st.State == want {
@@ -256,23 +293,24 @@ func awaitState(t *testing.T, c *Client, id uint32, want HostStatus) (texts []st
 	}
 }
 
-// awaitPrompt reads until a Prompt for host id, applying HostState
-// messages to nothing.
-func awaitPrompt(t *testing.T, c *Client, id uint32) *Prompt {
+// awaitPrompt reads until a prompt for host id, applying host.changed
+// to nothing.
+func awaitPrompt(t *testing.T, c *Client, id uint32) *rpc.HostPromptParams {
 	t.Helper()
 	for {
-		got, m := recv(t, c)
-		switch m := m.(type) {
-		case *Prompt:
-			if got == id {
-				return m
-			}
-		case *HostState:
-			if got == id && m.State != HostConnecting {
-				t.Fatalf("host %d: %s (%s), want a prompt", id, m.State, m.Text)
-			}
+		st, p := hostEvent(t, c, id)
+		if p != nil {
+			return p
+		}
+		if st.State != HostConnecting {
+			t.Fatalf("host %d: %s (%s), want a prompt", id, st.State, st.Text)
 		}
 	}
+}
+
+// answer replies to host id's prompt.
+func answer(c *Client, id uint32, choice rpc.Choice, answers ...string) error {
+	return c.Call(rpc.HostAnswer, rpc.HostAnswerParams{Host: id, Choice: choice, Answers: answers}, nil)
 }
 
 // login connects dest with the password and returns the host's id.
@@ -280,10 +318,12 @@ func (h *hostHarness) login(c *Client, dest string) uint32 {
 	h.t.Helper()
 	id := hostConnect(h.t, c, dest)
 	p := awaitPrompt(h.t, c, id)
-	if p.Kind != PromptPassword {
+	if p.Kind != rpc.PromptPassword {
 		h.t.Fatalf("prompt = %#v, want a password", p)
 	}
-	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	if err := answer(c, id, rpc.ChoiceAccept, hostPassword); err != nil {
+		h.t.Fatal(err)
+	}
 	awaitState(h.t, c, id, HostConnected)
 	return id
 }
@@ -354,15 +394,15 @@ func TestHostConnectPrompts(t *testing.T) {
 	id := hostConnect(t, c, "dev1")
 
 	p := awaitPrompt(t, c, id)
-	if p.Kind != PromptPassword || p.Title != "Sign in to 127.0.0.1" || len(p.Questions) != 1 ||
+	if p.Kind != rpc.PromptPassword || p.Title != "Sign in to 127.0.0.1" || len(p.Questions) != 1 ||
 		p.Questions[0].Label != "alde@127.0.0.1's password: " || p.Questions[0].Echo {
 		t.Errorf("prompt = %#v", p)
 	}
-	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{"wrong"}})
+	answer(c, id, rpc.ChoiceAccept, "wrong")
 	if p := awaitPrompt(t, c, id); p.Error == "" {
 		t.Errorf("retry has no error: %#v", p)
 	}
-	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	answer(c, id, rpc.ChoiceAccept, hostPassword)
 	texts, st := awaitState(t, c, id, HostConnected)
 	if st.Text != "" {
 		t.Errorf("connected with text %q", st.Text)
@@ -387,15 +427,13 @@ func TestHostConnectPrompts(t *testing.T) {
 	}
 }
 
-func hostList(t *testing.T, c *Client) []HostInfo {
+func hostList(t *testing.T, c *Client) []rpc.Host {
 	t.Helper()
-	c.Send(0, &HostList{})
-	for {
-		_, m := recv(t, c)
-		if hosts, ok := m.(*Hosts); ok {
-			return hosts.Hosts
-		}
+	var hosts rpc.HostListResult
+	if err := c.Call(rpc.HostList, nil, &hosts); err != nil {
+		t.Fatal(err)
 	}
+	return hosts.Hosts
 }
 
 func contains(ss []string, want string) bool {
@@ -413,7 +451,7 @@ func TestHostConnectRefused(t *testing.T) {
 	id := hostConnect(t, c, "dev1")
 	for range 3 {
 		awaitPrompt(t, c, id)
-		c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{"wrong"}})
+		answer(c, id, rpc.ChoiceAccept, "wrong")
 	}
 	_, st := awaitState(t, c, id, HostFailed)
 	if !strings.Contains(st.Text, "Permission denied") {
@@ -436,7 +474,7 @@ func TestHostConnectCancelled(t *testing.T) {
 	c := h.connect()
 	id := hostConnect(t, c, "dev1")
 	awaitPrompt(t, c, id)
-	c.Send(id, &HostAnswer{Choice: ChoiceCancel})
+	answer(c, id, rpc.ChoiceCancel)
 	if _, st := awaitState(t, c, id, HostFailed); st.Text != "cancelled" {
 		t.Errorf("failed with %q", st.Text)
 	}
@@ -456,13 +494,11 @@ func TestBridge(t *testing.T) {
 	if b.Hello.PID != uint32(os.Getpid()) {
 		t.Errorf("hello from pid %d", b.Hello.PID)
 	}
-	tag := b.NextTag()
-	b.Send(0, &WorkspaceNew{Tag: tag, Name: "remote"})
-	a, err := b.Await(tag, true)
-	if err != nil {
+	var ws rpc.Workspace
+	if err := b.Call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Name: "remote"}, &ws); err != nil {
 		t.Fatal(err)
 	}
-	if l := h.remote.list(); len(l.Workspaces) != 1 || l.Workspaces[0].ID != a.Created.WS || l.Workspaces[0].Name != "remote" {
+	if l := h.remote.list(); len(l.Workspaces) != 1 || l.Workspaces[0].ID != ws.ID || l.Workspaces[0].Name != "remote" {
 		t.Errorf("host daemon's workspaces = %+v", l.Workspaces)
 	}
 	if l := h.list(); len(l.Workspaces) != 0 {
@@ -478,7 +514,7 @@ func TestBridge(t *testing.T) {
 
 	// Hanging up on the bridge hangs up on the host's daemon.
 	b.Close()
-	eventually(t, "detach on the host", func() bool { return !h.remote.attached(a.Created.WS) })
+	eventually(t, "detach on the host", func() bool { return !h.remote.attached(ws.ID) })
 }
 
 func TestBridgeUnknownHost(t *testing.T) {
@@ -512,7 +548,7 @@ func TestHostDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Send(id, &HostDisconnect{})
+	c.Call(rpc.HostDisconnect, rpc.HostParams{Host: id}, nil)
 	if _, st := awaitState(t, c, id, HostGone); st.Text != "disconnected" {
 		t.Errorf("gone with %q", st.Text)
 	}
@@ -529,7 +565,7 @@ func TestHostDisconnectWhileConnecting(t *testing.T) {
 	c := h.connect()
 	id := hostConnect(t, c, "dev1")
 	awaitPrompt(t, c, id)
-	c.Send(id, &HostDisconnect{})
+	c.Call(rpc.HostDisconnect, rpc.HostParams{Host: id}, nil)
 	awaitState(t, c, id, HostGone)
 }
 
@@ -538,6 +574,7 @@ func TestHostDisconnectWhileConnecting(t *testing.T) {
 func TestHostClientHangsUpMidLogin(t *testing.T) {
 	h := newHostHarness(t, sshtest.Options{}, 0)
 	watcher := h.connect()
+	subscribeHosts(t, watcher)
 	c := h.connect()
 	id := hostConnect(t, c, "dev1")
 	awaitPrompt(t, c, id)
@@ -554,9 +591,11 @@ func TestHostAnswerFromAnotherClient(t *testing.T) {
 	c := h.connect()
 	id := hostConnect(t, c, "dev1")
 	awaitPrompt(t, c, id)
-	other.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	if err := answer(other, id, rpc.ChoiceAccept, hostPassword); err == nil {
+		t.Error("another client's answer was taken")
+	}
 	time.Sleep(100 * time.Millisecond)
-	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	answer(c, id, rpc.ChoiceAccept, hostPassword)
 	awaitState(t, c, id, HostConnected)
 }
 
@@ -589,7 +628,10 @@ func TestHostKeepsDaemonAlive(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 	c = dial()
-	c.Send(id, &HostDisconnect{})
+	subscribeHosts(t, c)
+	if err := c.Call(rpc.HostDisconnect, rpc.HostParams{Host: id}, nil); err != nil {
+		t.Fatal(err)
+	}
 	awaitState(t, c, id, HostGone)
 	c.Close()
 	select {
