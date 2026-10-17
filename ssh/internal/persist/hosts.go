@@ -13,6 +13,7 @@ import (
 
 	"github.com/aldehir/slime/ssh/internal/helper"
 	"github.com/aldehir/slime/ssh/internal/proto"
+	"github.com/aldehir/slime/ssh/internal/remote"
 )
 
 // Hosts: the SSH connections the daemon holds. Each host is logged in
@@ -28,6 +29,9 @@ type HostOptions struct {
 	// connect. Nil resolves it against the user's ssh config
 	// (helper.ResolveDestination).
 	Resolve func(dest string) (helper.Options, error)
+	// Remote holds the builds of slimed to install on hosts, when
+	// Resolve doesn't say. Nil means the ones beside the executable.
+	Remote *remote.Manifest
 }
 
 // hostTable is the hosts by id. Guarded by the server's lock.
@@ -141,6 +145,9 @@ func (s *Server) hostLogin(h *host, gen int, ctx context.Context) {
 	if err != nil {
 		s.hostFailed(h, gen, err.Error())
 		return
+	}
+	if opts.Remote == nil {
+		opts.Remote = s.hosts.opts.Remote
 	}
 	conn, err := helper.Dial(ctx, opts, &hostAsker{s: s, h: h, gen: gen, ctx: ctx})
 	if err != nil {

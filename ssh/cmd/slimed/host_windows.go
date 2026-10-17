@@ -13,7 +13,21 @@ import (
 	"golang.org/x/term"
 
 	"github.com/aldehir/slime/ssh/internal/persist"
+	"github.com/aldehir/slime/ssh/internal/remote"
 )
+
+// hostOptions configures the daemon's hosts: the builds to install come
+// from remoteDir, or from beside the executable.
+func hostOptions(remoteDir string) (persist.HostOptions, error) {
+	if remoteDir == "" {
+		return persist.HostOptions{}, nil
+	}
+	m, err := remote.Load(remoteDir)
+	if err != nil {
+		return persist.HostOptions{}, fmt.Errorf("--remote: %w", err)
+	}
+	return persist.HostOptions{Remote: m}, nil
+}
 
 // hostCommands connect, list, and disconnect the daemon's SSH hosts.
 func hostCommands() []*cobra.Command {

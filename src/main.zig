@@ -180,7 +180,7 @@ test {
     _ = @import("Slimed.zig");
     _ = @import("Tab.zig");
     _ = @import("ProgramStatus.zig");
-    _ = @import("SshConnection.zig");
+    _ = @import("Login.zig");
     _ = @import("chrome/Chrome.zig");
     _ = @import("chrome/sidebar.zig");
     _ = @import("chrome/panes.zig");

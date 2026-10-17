@@ -15,7 +15,6 @@ const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const input = @import("input.zig");
-const SshConnection = @import("SshConnection.zig");
 const Slimed = @import("Slimed.zig");
 const Config = @import("Config.zig");
 const Login = @import("Login.zig");
@@ -147,8 +146,10 @@ const Transport = union(enum) {
     /// connection's reader through our sink.
     slimed: Pane,
     /// Nothing yet: standing in for an SSH host's slimed panes until they
-    /// come, logging in meanwhile. Holds a reference to the connection.
-    waiting: *SshConnection,
+    /// come, logging in meanwhile. The host's destination, as the sidebar
+    /// remembers it (borrowed from the window's list, which keeps a host
+    /// while sessions use it).
+    waiting: []const u16,
 };
 
 const Pane = struct { conn: *Slimed, pane: u32 };
@@ -161,9 +162,9 @@ pub const Launch = union(enum) {
         conn: *Slimed,
         arrival: *const Slimed.Arrival,
     },
-    /// Nothing yet, on `conn`: see `Transport.waiting`.
+    /// Nothing yet, on host `dest`: see `Transport.waiting`.
     waiting: struct {
-        conn: *SshConnection,
+        dest: []const u16,
         title: []const u16,
     },
     /// Nothing: why nothing can run, titled `title`.
@@ -201,7 +202,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
         // A host's shell, which slimed lists with no command, goes by the
         // host until it sets a title.
         .slimed => |s| if (s.arrival.command.len == 0 and s.conn.host() != null)
-            s.conn.host().?.label()
+            s.conn.hostLabel()
         else
             programName(s.arrival.command),
         .waiting => |w| w.title,
@@ -243,8 +244,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
         },
         .waiting => |w| {
             try self.resizeScreen();
-            w.conn.retain();
-            self.transport = .{ .waiting = w.conn };
+            self.transport = .{ .waiting = w.dest };
         },
         .failed => |f| {
             try self.resizeScreen();
@@ -274,15 +274,14 @@ pub fn destroy(self: *Session) void {
     alloc.destroy(self);
 }
 
-/// Let go of the pane, or the connection waited on. The pane runs on in
-/// slimed; once released, the connection's reader no longer calls our
-/// sink.
+/// Let go of the pane. It runs on in slimed; once released, the
+/// connection's reader no longer calls our sink.
 fn stopTransport(self: *Session) void {
     const transport = self.transport orelse return;
     self.transport = null;
     switch (transport) {
         .slimed => |s| s.conn.release(s.pane),
-        .waiting => |conn| conn.release(),
+        .waiting => {},
     }
 }
 
@@ -572,12 +571,12 @@ pub fn slimedPane(self: *const Session) ?u32 {
     };
 }
 
-/// The SSH connection the session's pane runs on, if it's remote: its
-/// host's slimed's, or the one it waits on.
-pub fn sshConnection(self: *const Session) ?*SshConnection {
+/// The SSH host the session's pane runs on, if it's remote, as the
+/// sidebar remembers it: its slimed's host, or the one it waits on.
+pub fn hostDest(self: *const Session) ?[]const u16 {
     return switch (self.transport orelse return null) {
-        .slimed => |s| s.conn.host(),
-        .waiting => |conn| conn,
+        .slimed => |s| s.conn.hostDest(),
+        .waiting => |dest| dest,
     };
 }
 

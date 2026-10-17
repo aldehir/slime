@@ -20,7 +20,6 @@ const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
 const Tab = @import("Tab.zig");
-const SshConnection = @import("SshConnection.zig");
 const Slimed = @import("Slimed.zig");
 const Hosts = @import("Hosts.zig");
 const Login = @import("Login.zig");
@@ -45,10 +44,6 @@ pub const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
 /// Posted from a reader thread when the child writes the clipboard, or
 /// a copy's text comes.
 pub const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
-/// Posted from an SSH connection's reader thread when logging in has
-/// something to show. WPARAM is the channel (session) ID, or 0 once
-/// logged in.
-pub const WM_APP_SSH_LOGIN = win32.WM_APP + 3;
 /// Posted from a slimed connection's reader when panes arrive for
 /// sessions (`Slimed.take`), and when a host's has attached or failed
 /// to.
@@ -148,9 +143,15 @@ connect_field: ?Chrome.TextField = null,
 /// The connection to slimed: local sessions are panes of the workspace
 /// it holds for this window. Null if it couldn't be reached.
 slimed: ?*Slimed = null,
-/// Connections to slimed on SSH hosts: a host's sessions are panes of
-/// the workspace its slimed holds for this window.
+/// Connections to slimed on SSH hosts, bridged through the local daemon:
+/// a host's sessions are panes of the workspace its slimed holds for
+/// this window.
 remotes: std.ArrayList(Remote) = .empty,
+/// The hosts the local daemon knows, by its id for each, as it last
+/// reported them (`hostsChanged`). Matched to the remembered list by
+/// destination. Entries stay while the window lives: logins borrow their
+/// labels.
+host_states: std.ArrayList(HostEntry) = .empty,
 
 /// Until when the next tooltip shows at once. See `tip_warm_ms`.
 tip_warm_until: u64 = 0,
@@ -212,13 +213,25 @@ const Drop = struct {
     rect: Chrome.Rect,
 };
 
-/// A host's slimed, and the session standing in for its panes until
-/// they come.
+/// A host's slimed, bridged through the local daemon. A session stands in
+/// for its panes until they come (`standIn`).
 const Remote = struct {
     conn: *Slimed,
-    /// The id of the session that logs in and waits for the panes, until
-    /// they come or it's closed; then 0.
-    placeholder: u32,
+    /// The daemon's id for the host.
+    host: u32,
+};
+
+/// A host as the local daemon knows it.
+const HostEntry = struct {
+    id: u32,
+    /// As the sidebar remembers it. Owned.
+    dest: []const u16,
+    state: Slimed.HostStatus,
+    /// A status line while connecting, or why it ended. Owned.
+    text: []const u16,
+    /// This window asked the daemon to connect it, so its prompts come
+    /// here.
+    ours: bool = false,
 };
 
 /// Create the window, attaching the workspace slimed kept for it, or a
@@ -285,13 +298,14 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     }
 
     try self.reserveGroups();
+    // Hosts are reached through the local daemon too, so a host URL still
+    // attaches the local workspace, and opens the host beside it.
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
-    if (std.mem.startsWith(u16, command_line, ssh_scheme)) {
-        try self.openOnHost(try hosts.add(command_line));
-    } else {
-        try self.connectSlimed(command_line);
-    }
+    const on_host = std.mem.startsWith(u16, command_line, ssh_scheme);
+    try self.connectSlimed(if (on_host) local_command else command_line);
     errdefer self.destroyTabs();
+    if (self.slimed) |conn| conn.hostList();
+    if (on_host) try self.openOnHost(try hosts.add(command_line));
     self.showTitle();
 
     // Have the frame recomputed now that WM_NCCALCSIZE can be answered.
@@ -321,6 +335,11 @@ pub fn destroy(self: *Window) void {
     if (self.slimed) |conn| conn.deinit();
     for (self.remotes.items) |r| r.conn.deinit();
     self.remotes.deinit(self.alloc);
+    for (self.host_states.items) |e| {
+        self.alloc.free(e.dest);
+        self.alloc.free(e.text);
+    }
+    self.host_states.deinit(self.alloc);
     self.view_tabs.deinit(self.alloc);
     self.view_tab_panes.deinit(self.alloc);
     self.view_groups.deinit(self.alloc);
@@ -380,9 +399,9 @@ fn tabIndex(self: *const Window, t: *const Tab) ?usize {
 const Target = union(enum) {
     /// A pane of a workspace slimed holds for us.
     slimed: struct { conn: *Slimed, arrival: *const Slimed.Arrival },
-    /// Nothing yet, on a connection: standing in for its host's slimed
-    /// panes until they come.
-    waiting: *SshConnection,
+    /// Nothing yet, on a host (its destination as the sidebar remembers
+    /// it): standing in for its slimed's panes until they come.
+    waiting: []const u16,
     /// Why nothing can run, titled `title`.
     failed: struct { title: []const u16, why: []const u8 },
 };
@@ -607,7 +626,7 @@ fn spawnSession(self: *Window, target: Target) !void {
 fn createSession(self: *Window, target: Target, size: GridSize) !*Session {
     const launch: Session.Launch = switch (target) {
         .slimed => |sl| .{ .slimed = .{ .conn = sl.conn, .arrival = sl.arrival } },
-        .waiting => |c| .{ .waiting = .{ .conn = c, .title = c.label() } },
+        .waiting => |dest| .{ .waiting = .{ .dest = dest, .title = Hosts.label(dest) } },
         .failed => |f| .{ .failed = .{ .title = f.title, .why = f.why } },
     };
     return Session.create(self, self.nextSessionId(), launch, size.cols, size.rows);
@@ -630,9 +649,9 @@ fn reserveGroups(self: *Window) !void {
 /// The sidebar group `t` is listed in: 0 for Local, else 1 plus its
 /// host's index. Tabs are kept in group order.
 fn groupOf(self: *const Window, t: *const Tab) usize {
-    const conn = t.focus.sshConnection() orelse return 0;
+    const dest = t.focus.hostDest() orelse return 0;
     // A host isn't forgotten while sessions use it.
-    return 1 + (self.hosts.indexOf(conn.destination) orelse return 0);
+    return 1 + (self.hosts.indexOf(dest) orelse return 0);
 }
 
 /// Where a tab in group `g` goes: after the group's last.
@@ -642,16 +661,37 @@ fn groupEnd(self: *const Window, g: usize) usize {
     return i;
 }
 
-/// A live connection to host `h` that its sessions use, the active
-/// session's if it's one.
-fn hostConnection(self: *const Window, h: usize) ?*SshConnection {
-    if (self.tabs.items.len > 0) {
-        const active = self.activeTab();
-        if (self.groupOf(active) == h + 1) if (active.focus.sshConnection()) |c| if (c.isAlive()) return c;
+/// What the daemon knows of the host at `dest`, if anything.
+fn hostEntry(self: *Window, dest: []const u16) ?*HostEntry {
+    for (self.host_states.items) |*e| {
+        if (std.mem.eql(u16, e.dest, dest)) return e;
     }
-    for (self.tabs.items) |t| {
-        if (self.groupOf(t) != h + 1) continue;
-        if (t.focus.sshConnection()) |c| if (c.isAlive()) return c;
+    return null;
+}
+
+fn hostEntryById(self: *Window, id: u32) ?*HostEntry {
+    for (self.host_states.items) |*e| {
+        if (e.id == id) return e;
+    }
+    return null;
+}
+
+/// The daemon holds a connection to remembered host `h`, or is making
+/// one.
+fn hostLive(self: *Window, h: usize) bool {
+    const e = self.hostEntry(self.hosts.items.items[h]) orelse return false;
+    return e.state == .connected or e.state == .connecting;
+}
+
+/// The session standing in for host `dest`'s panes, while one does.
+fn standIn(self: *const Window, dest: []const u16) ?Found {
+    for (self.tabs.items, 0..) |t, i| {
+        var it = t.iterator();
+        while (it.next()) |s| {
+            if (s.ended or s.slimedPane() != null) continue;
+            const d = s.hostDest() orelse continue;
+            if (std.mem.eql(u16, d, dest)) return .{ .tab = i, .s = s };
+        }
     }
     return null;
 }
@@ -675,65 +715,92 @@ fn newSessionIn(self: *Window, g: usize) void {
 
 /// A session on remembered host `h`: a tab of the workspace the host's
 /// slimed holds for us, through the slimed we're attached to there, or
-/// else one we connect to, with a session standing in while that logs in
-/// and attaches. A host slimed can't run on gets a tab saying so; ssh.exe
+/// else one we bridge to, once the daemon has the host connected. Until
+/// then a session stands in, where logging in asks what it needs; the
+/// panes replace it once they come (`remoteChanged`). A host the daemon
+/// can't connect, or slimed can't run on, gets the reason there; ssh.exe
 /// in a local tab still reaches it.
 fn openOnHost(self: *Window, h: usize) !void {
-    if (self.remoteOn(h)) |r| switch (r.conn.attachState()) {
+    const dest = self.hosts.items.items[h];
+    if (self.remoteOn(dest)) |r| switch (r.conn.attachState()) {
         // The tab comes when its pane does (WM_APP_SLIMED).
         .attached => return r.conn.tabNew(&.{}, self.slimedSize()),
-        // Still logging in or attaching: show where.
+        // Still attaching: show where.
         .connecting => {
-            if (self.findSession(r.placeholder)) |found| self.activate(found.tab);
+            if (self.standIn(dest)) |found| self.activate(found.tab);
             return;
         },
         .failed => {},
     };
-    const conn = self.hostConnection(h) orelse return self.connectRemote(h, null);
-    if (!conn.slimed_unavailable) return self.connectRemote(h, conn);
-    try self.spawnSession(.{ .waiting = conn });
-    self.activeSession().showEnded("slimed can't run on this host; ssh to it from a local tab instead");
+    const slimed = self.slimed orelse {
+        try self.spawnSession(.{ .waiting = dest });
+        self.activeSession().showEnded("no local slimed to connect through");
+        return;
+    };
+    if (self.standIn(dest)) |found| {
+        // Logging in, or waiting for the daemon: show where.
+        self.activate(found.tab);
+        return;
+    }
+    if (self.hostEntry(dest)) |e| switch (e.state) {
+        .connected => return self.bridgeHost(e),
+        .connecting => {
+            // Another window is logging in; wait for it.
+            try self.spawnSession(.{ .waiting = dest });
+            return;
+        },
+        else => {},
+    };
+    try self.spawnSession(.{ .waiting = dest });
+    const s = self.activeSession();
+    _ = slimed.hostConnect(dest) catch |err| {
+        log.err("connecting to {f} failed: {}", .{ std.unicode.fmtUtf16Le(dest), err });
+        s.showEnded(@errorName(err));
+        return;
+    };
+    // The entry comes with the daemon's first state; until then the
+    // stand-in waits.
+    if (self.hostEntry(dest)) |e| e.ours = true;
+    s.login = Login.create(self.alloc, Hosts.label(dest)) catch null;
+    self.updateSpinner();
 }
 
-/// Our slimed on host `h` that's attached, or attaching, and not lost.
-fn remoteOn(self: *Window, h: usize) ?*Remote {
+/// Our slimed on host `dest` that's attached, or attaching, and not lost.
+fn remoteOn(self: *Window, dest: []const u16) ?*Remote {
     for (self.remotes.items) |*r| {
-        const dest = r.conn.host().?.destination;
-        if (self.hosts.indexOf(dest) != h) continue;
+        if (!std.mem.eql(u16, r.conn.hostDest().?, dest)) continue;
         if (r.conn.attachState() == .failed or r.conn.isLost()) continue;
         return r;
     }
     return null;
 }
 
-/// Connect to host `h`'s slimed, over `conn` or a new connection. A
-/// session stands in for its panes, in a tab of its own, where logging in
-/// asks what it needs; the panes replace it once they come (`remoteChanged`).
-fn connectRemote(self: *Window, h: usize, existing: ?*SshConnection) !void {
+/// Bridge to the slimed on host `e`, which the daemon has connected. A
+/// session stands in for its panes (one already, if logging in made it)
+/// until they come.
+fn bridgeHost(self: *Window, e: *HostEntry) !void {
     try self.remotes.ensureUnusedCapacity(self.alloc, 1);
-    const conn = existing orelse try SshConnection.spawn(self.alloc, self.hosts.items.items[h], .{ .hwnd = self.hwnd.?, .msg = WM_APP_SSH_LOGIN });
-    self.spawnSession(.{ .waiting = conn }) catch |err| {
-        // A new connection nothing uses.
-        conn.shutdownIfUnused();
-        return err;
+    const found = self.standIn(e.dest) orelse found: {
+        try self.spawnSession(.{ .waiting = e.dest });
+        break :found self.standIn(e.dest).?;
     };
-    const s = self.activeSession();
-    // The channel's id is the session's, so logging in asks there.
-    const remote = remote: {
-        const ch = conn.openSlimed(s.id, Session.sshTerm(self.config)) catch |err| break :remote err;
-        break :remote Slimed.connectRemote(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.frameInterval(), ch, self.slimedArea(), self.slimedSize());
-    } catch |err| {
-        log.err("connecting to slimed on {f} failed: {}", .{ std.unicode.fmtUtf16Le(conn.label()), err });
+    const s = found.s;
+    if (s.login != null) self.closeLogin(s);
+    const remote = Slimed.connectRemote(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.frameInterval(), e.id, e.dest, Session.sshTerm(self.config), self.slimedArea(), self.slimedSize()) catch |err| {
+        log.err("bridging to slimed on {f} failed: {}", .{ std.unicode.fmtUtf16Le(e.dest), err });
         s.showEnded(@errorName(err));
         return;
     };
-    self.remotes.appendAssumeCapacity(.{ .conn = remote, .placeholder = s.id });
+    self.remotes.appendAssumeCapacity(.{ .conn = remote, .host = e.id });
 }
 
-/// Take up what slimed connections posted: panes that arrived, and how
-/// attaching to hosts' went.
+/// Take up what slimed connections posted: panes that arrived, what the
+/// daemon said about hosts, and how attaching to hosts' went.
 fn slimedPosted(self: *Window) void {
-    if (self.slimed) |conn| self.slimedChanged(conn);
+    if (self.slimed) |conn| {
+        self.slimedChanged(conn);
+        self.hostsChanged(conn);
+    }
     var i: usize = 0;
     while (i < self.remotes.items.len) {
         switch (self.remotes.items[i].conn.attachState()) {
@@ -754,23 +821,19 @@ fn slimedPosted(self: *Window) void {
 /// we lost on the host, which showed the same panes as they were.
 fn remoteChanged(self: *Window, r: *Remote) void {
     self.slimedChanged(r.conn);
-    if (r.placeholder == 0) return;
-    const found = self.findSession(r.placeholder) orelse {
-        r.placeholder = 0;
-        return;
-    };
+    const dest = r.conn.hostDest().?;
+    const found = self.standIn(dest) orelse return;
     // In tabs of their own by now.
     const first = for (self.tabs.items) |t| {
         if (t.conn == r.conn) break t;
     } else return;
-    r.placeholder = 0;
     var show = found.tab == self.active;
     self.dropTab(found.tab);
     var i: usize = 0;
     while (i < self.tabs.items.len) {
         const old = self.tabs.items[i].conn;
-        if (old == null or old == r.conn or old.?.host() == null or !old.?.isLost() or
-            !std.mem.eql(u16, old.?.host().?.destination, r.conn.host().?.destination))
+        if (old == null or old == r.conn or old.?.hostDest() == null or !old.?.isLost() or
+            !std.mem.eql(u16, old.?.hostDest().?, dest))
         {
             i += 1;
             continue;
@@ -781,40 +844,24 @@ fn remoteChanged(self: *Window, r: *Remote) void {
     if (show) self.activate(self.tabIndex(first).?);
 }
 
-/// Host's slimed `remotes[i]` couldn't attach: hang up on it. Its
-/// stand-in says why: slimed can't run there, if the connection is up,
-/// else why logging in failed.
+/// Host's slimed `remotes[i]` couldn't attach: let it go. Its stand-in
+/// says why.
 fn remoteFailed(self: *Window, i: usize) void {
     const r = self.remotes.orderedRemove(i);
-    // After the stand-in is done with the failure's text, and has the
-    // connection from a channel of its own.
+    // After the stand-in is done with the failure's text.
     defer r.conn.deinit();
-    const s = (self.findSession(r.placeholder) orelse return).s;
-    const why = r.conn.failure.text();
+    const found = self.standIn(r.conn.hostDest().?) orelse return;
     self.dirty = true;
-    const conn = s.sshConnection() orelse return;
-    if (conn.isAlive() and conn.isConnected()) {
-        // Not again on this connection.
-        conn.slimed_unavailable = true;
-        var buf: [512]u8 = undefined;
-        s.showEnded(std.fmt.bufPrint(&buf, "slimed can't run here ({s}); ssh to it from a local tab instead", .{why}) catch why);
-        return;
-    }
-    if (s.login) |login| {
-        login.fail(why);
-        self.updateSpinner();
-    }
-    s.showEnded(why);
+    found.s.showEnded(r.conn.failure.text());
 }
 
-/// Hang up on hosts' slimeds nothing shows any more: one whose stand-in
+/// Let go of hosts' slimeds nothing shows any more: one whose stand-in
 /// was closed before its panes came, or whose tabs have all gone.
 fn pruneRemotes(self: *Window) void {
     var i: usize = 0;
     while (i < self.remotes.items.len) {
         const r = &self.remotes.items[i];
-        if (r.placeholder != 0 and self.findSession(r.placeholder) == null) r.placeholder = 0;
-        const shown = r.placeholder != 0 or for (self.tabs.items) |t| {
+        const shown = self.standIn(r.conn.hostDest().?) != null or for (self.tabs.items) |t| {
             if (t.conn == r.conn) break true;
         } else false;
         if (shown or r.conn.attachState() == .failed) {
@@ -823,6 +870,104 @@ fn pruneRemotes(self: *Window) void {
         }
         self.remotes.orderedRemove(i).conn.deinit();
     }
+}
+
+/// Take up what the daemon said about hosts: keep each host's state,
+/// show its prompts and status in the session standing in for it, and
+/// bridge to it once it's connected.
+fn hostsChanged(self: *Window, conn: *Slimed) void {
+    const events = conn.takeHosts();
+    defer {
+        for (events) |*e| e.deinit(self.alloc);
+        self.alloc.free(events);
+    }
+    for (events) |*e| switch (e.*) {
+        .hosts => |hosts| for (hosts) |h| self.hostState(h),
+        .state => |h| self.hostState(h),
+        .prompt => |p| {
+            const login = login: {
+                const entry = self.hostEntryById(p.host) orelse break :login null;
+                const found = self.standIn(entry.dest) orelse break :login null;
+                if (found.s == self.activeSession()) self.resetBlink();
+                break :login self.loginFor(found.s, entry);
+            } orelse {
+                // Nothing to show it in: give up on logging in.
+                conn.hostAnswer(p.host, .cancel, &.{}) catch {};
+                continue;
+            };
+            login.ask(p.prompt);
+            // The login owns it now.
+            e.* = .{ .hosts = &.{} };
+        },
+    };
+    self.updateSpinner();
+    self.dirty = true;
+}
+
+/// Record host `h`'s state, and act on it for the session standing in
+/// for the host, if one does.
+fn hostState(self: *Window, h: Slimed.HostInfo) void {
+    const e = self.hostEntryById(h.host) orelse e: {
+        const dest = self.alloc.dupe(u16, h.dest) catch return;
+        // A stand-in already logging in asked for this host.
+        const ours = if (self.standIn(dest)) |found| found.s.login != null else false;
+        self.host_states.append(self.alloc, .{ .id = h.host, .dest = dest, .state = h.state, .text = &.{}, .ours = ours }) catch {
+            self.alloc.free(dest);
+            return;
+        };
+        break :e &self.host_states.items[self.host_states.items.len - 1];
+    };
+    const text = self.alloc.dupe(u16, h.text) catch return;
+    self.alloc.free(e.text);
+    e.text = text;
+    e.state = h.state;
+    self.dirty = true;
+
+    const connecting = h.state == .connecting;
+    defer if (!connecting and h.state != .connected) {
+        e.ours = false;
+    };
+    const found = self.standIn(e.dest) orelse return;
+    const s = found.s;
+    switch (h.state) {
+        .connecting => {
+            // The stand-in that asked gets the prompts; any other just
+            // follows along.
+            const login = self.loginFor(s, e) orelse return;
+            if (e.text.len > 0) login.info(e.text);
+        },
+        .connected => {
+            if (self.remoteOn(e.dest) != null) return;
+            self.bridgeHost(e) catch |err| {
+                log.err("bridging to {f} failed: {}", .{ std.unicode.fmtUtf16Le(e.dest), err });
+                s.showEnded(@errorName(err));
+            };
+        },
+        .failed, .lost, .gone, _ => {
+            var buf: [512]u8 = undefined;
+            const why = std.unicode.utf16LeToUtf8(&buf, e.text) catch 0;
+            if (s.login) |login| login.fail(buf[0..why]);
+            s.showEnded(if (why > 0) buf[0..why] else "connection failed");
+        },
+    }
+}
+
+/// The login dialog of the session standing in for host `e`, made if it
+/// has none.
+fn loginFor(self: *Window, s: *Session, e: *const HostEntry) ?*Login {
+    if (s.login) |l| return l;
+    s.login = Login.create(self.alloc, Hosts.label(e.dest)) catch return null;
+    return s.login;
+}
+
+/// A stand-in is closing: if the daemon is logging in to its host for
+/// us, give up on that.
+fn standInClosing(self: *Window, s: *Session) void {
+    if (s.slimedPane() != null or s.ended) return;
+    const dest = s.hostDest() orelse return;
+    const e = self.hostEntry(dest) orelse return;
+    const slimed = self.slimed orelse return;
+    if (e.state == .connecting and e.ours) slimed.hostDisconnect(e.id);
 }
 
 /// What a new pane in `conn` runs: the local command, or for a host's,
@@ -1114,6 +1259,7 @@ fn closePane(self: *Window, ti: usize, s: *Session) void {
     const focused = ti == self.active and s == t.focus;
     if (focused) self.deactivate();
     _ = t.remove(self.alloc, s);
+    self.standInClosing(s);
     s.kill();
     s.destroy();
     _ = self.chrome.setHover(.none);
@@ -1130,12 +1276,18 @@ fn closeTab(self: *Window, i: usize) void {
     if (self.tabs.items.len <= 1) {
         // Closing the window only detaches slimed's panes.
         var it = self.tabs.items[i].iterator();
-        while (it.next()) |s| s.kill();
+        while (it.next()) |s| {
+            self.standInClosing(s);
+            s.kill();
+        }
         _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
         return;
     }
     var it = self.tabs.items[i].iterator();
-    while (it.next()) |s| s.kill();
+    while (it.next()) |s| {
+        self.standInClosing(s);
+        s.kill();
+    }
     self.dropTab(i);
     self.pruneRemotes();
 }
@@ -1482,18 +1634,19 @@ fn loginKey(self: *Window, vk: u32) bool {
 fn loginAction(self: *Window, action: Chrome.Dialog.Action) void {
     const s = self.activeSession();
     const login = s.login orelse return;
-    const conn = s.sshConnection() orelse return;
+    const slimed = self.slimed orelse return;
+    const e = self.hostEntry(s.hostDest() orelse return) orelse return;
     switch (action) {
         .accept, .skip => {
             var buf: [Chrome.Dialog.max_fields][]const u16 = undefined;
-            const choice: SshConnection.Choice = if (action == .accept) .accept else .skip;
-            conn.sendAnswer(s.id, choice, login.answers(&buf)) catch |err| log.warn("answering failed: {}", .{err});
+            const choice: Slimed.Choice = if (action == .accept) .accept else .skip;
+            slimed.hostAnswer(e.id, choice, login.answers(&buf)) catch |err| log.warn("answering failed: {}", .{err});
             login.answered();
         },
         .cancel => {
             // A prompt takes it as its answer; while the server works on
             // one, it gives up on logging in.
-            conn.sendAnswer(s.id, .cancel, &.{}) catch {};
+            slimed.hostAnswer(e.id, .cancel, &.{}) catch {};
             self.closeLogin(s);
         },
         .close => self.closeLogin(s),
@@ -1509,39 +1662,6 @@ fn closeLogin(self: *Window, s: *Session) void {
     _ = self.chrome.setHover(.none);
     self.updateSpinner();
     self.dirty = true;
-}
-
-/// The helper asked or reported something while logging in (WPARAM is
-/// the channel, 0 when it logged in).
-fn loginChanged(self: *Window, id: u32) void {
-    defer self.updateSpinner();
-    self.dirty = true;
-    if (id == 0) {
-        // Logged in: nothing more to show.
-        for (self.tabs.items) |t| {
-            var it = t.iterator();
-            while (it.next()) |s| {
-                const conn = s.sshConnection() orelse continue;
-                if (s.login != null and conn.isConnected()) self.closeLogin(s);
-            }
-        }
-        return;
-    }
-    const s = (self.findSession(id) orelse return).s;
-    const conn = s.sshConnection() orelse return;
-    var taken = conn.takeLogin();
-    defer taken.deinit(conn.alloc);
-    if (taken.prompt == null and taken.info == null) return;
-    const login = s.login orelse login: {
-        s.login = Login.create(self.alloc, conn.label()) catch return;
-        break :login s.login.?;
-    };
-    if (taken.info) |text| login.info(text);
-    if (taken.prompt) |prompt| {
-        login.ask(prompt);
-        taken.prompt = null;
-    }
-    if (s == self.activeSession()) self.resetBlink();
 }
 
 /// Run the spinner's timer while the active session's dialog waits.
@@ -1584,9 +1704,9 @@ fn view(self: *Window) Chrome.View {
     self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .tabs = 0, .kind = .local });
     for (self.hosts.items.items, 0..) |dest, h| {
         self.view_groups.appendAssumeCapacity(.{
-            .label = SshConnection.labelFor(dest),
+            .label = Hosts.label(dest),
             .tabs = 0,
-            .kind = if (self.hostConnection(h) != null) .connected else .disconnected,
+            .kind = if (self.hostLive(h)) .connected else .disconnected,
         });
     }
     for (self.tabs.items) |t| {
@@ -2290,11 +2410,6 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 return 0;
             }
             self.closePane(found.tab, s);
-            return 0;
-        },
-
-        WM_APP_SSH_LOGIN => {
-            self.loginChanged(@intCast(wparam));
             return 0;
         },
 

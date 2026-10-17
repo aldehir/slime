@@ -55,6 +55,7 @@ func serveCommand() *cobra.Command {
 		logPath   string
 		verbose   bool
 		conptyDir string
+		remoteDir string
 		termName  string
 	)
 	cmd := &cobra.Command{
@@ -83,10 +84,15 @@ func serveCommand() *cobra.Command {
 				pty.SetConptyDir(conptyDir)
 			}
 			pty.SetTerm(termName)
-			return serve(logger, idle)
+			hosts, err := hostOptions(remoteDir)
+			if err != nil {
+				return err
+			}
+			return serve(logger, idle, hosts)
 		},
 	}
 	cmd.Flags().StringVar(&conptyDir, "conpty", "", "directory holding conpty.dll (default: next to slimed.exe, else the system's)")
+	cmd.Flags().StringVar(&remoteDir, "remote", "", "directory holding the builds of slimed for hosts and their manifest (default: remote/ next to slimed.exe)")
 	cmd.Flags().StringVar(&termName, "term", "", "TERM for panes on Unix (default xterm-256color)")
 	cmd.Flags().DurationVar(&idle, "idle", 10*time.Second, "exit after this long with no workspaces and no clients (0 never)")
 	cmd.Flags().StringVar(&logPath, "log", "", "append logs to this file instead of stderr")
@@ -94,7 +100,7 @@ func serveCommand() *cobra.Command {
 	return cmd
 }
 
-func serve(logger *slog.Logger, idle time.Duration) error {
+func serve(logger *slog.Logger, idle time.Duration, hosts persist.HostOptions) error {
 	name, err := persist.Address()
 	if err != nil {
 		return err
@@ -109,7 +115,7 @@ func serve(logger *slog.Logger, idle time.Duration) error {
 		return err
 	}
 	defer rt.Close(ctx)
-	srv, err := persist.NewServer(rt, persist.Options{Log: logger, Idle: idle})
+	srv, err := persist.NewServer(rt, persist.Options{Log: logger, Idle: idle, Hosts: hosts})
 	if err != nil {
 		return err
 	}

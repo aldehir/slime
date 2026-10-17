@@ -1,26 +1,23 @@
-//! An SSH session's login as its dialog shows it: the helper's prompts
-//! and status lines (`SshConnection.Login`) turned into a `Dialog` for
-//! the user to answer, waiting while the server works on an answer, and
-//! failing with the reason if logging in doesn't work.
+//! Logging in to an SSH host as the stand-in session's dialog shows it:
+//! the daemon's prompts and status lines (`Slimed.HostEvent`) turned into
+//! a `Dialog` for the user to answer, waiting while the server works on
+//! an answer, and failing with the reason if logging in doesn't work.
 const Login = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const SshConnection = @import("SshConnection.zig");
+const Slimed = @import("Slimed.zig");
 const Dialog = @import("chrome/Dialog.zig");
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
 alloc: Allocator,
-/// The host, for titles and "Waiting for". Borrowed from the session's
-/// connection, which outlives it.
+/// The host, for titles and "Waiting for". Borrowed from the window's
+/// host table, which outlives it.
 host: []const u16,
 /// The prompt shown, which the dialog's strings point into.
-prompt: ?*SshConnection.Prompt = null,
+prompt: ?*Slimed.Prompt = null,
 dialog: Dialog,
-/// The status line came from the server, so it's the better reason if
-/// logging in fails next.
-status_from_server: bool = false,
 status_buf: [512]u16 = undefined,
 title_buf: [160]u16 = undefined,
 
@@ -39,7 +36,7 @@ pub fn destroy(self: *Login) void {
 }
 
 /// Show `prompt`, which the login now owns.
-pub fn ask(self: *Login, prompt: *SshConnection.Prompt) void {
+pub fn ask(self: *Login, prompt: *Slimed.Prompt) void {
     const old = self.prompt;
     self.prompt = prompt;
     var d: Dialog = .{
@@ -84,14 +81,13 @@ pub fn ask(self: *Login, prompt: *SshConnection.Prompt) void {
     for (prompt.questions) |q| d.addField(q.label, q.echo);
     if (d.field_count > 0) d.focus = .{ .field = 0 };
     self.dialog = d;
-    self.status_from_server = false;
     if (old) |o| o.destroy();
 }
 
-/// A status line from the server, shown while waiting.
+/// A status line while waiting: the server's, or the daemon's
+/// ("installing slimed").
 pub fn info(self: *Login, text: []const u16) void {
     self.setStatus(&.{text});
-    self.status_from_server = true;
 }
 
 /// The user answered: wait for what comes back.
@@ -99,14 +95,13 @@ pub fn answered(self: *Login) void {
     self.dialog.state = .waiting;
     self.dialog.focus = .none;
     self.setStatus(&.{ L("Waiting for "), self.host, L("\u{2026}") });
-    self.status_from_server = false;
 }
 
-/// Logging in failed for `why`, unless the server said why last.
+/// Logging in failed for `why`.
 pub fn fail(self: *Login, why: []const u8) void {
     self.dialog.state = .failed;
     self.dialog.focus = .none;
-    if (self.status_from_server) return;
+    if (why.len == 0) return;
     var buf: [256]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&buf, why[0..@min(why.len, buf.len)]) catch 0;
     self.setStatus(&.{buf[0..n]});

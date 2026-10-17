@@ -8,6 +8,8 @@ const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.hosts);
 
+const L = std.unicode.utf8ToUtf16LeStringLiteral;
+
 alloc: Allocator,
 io: std.Io,
 /// The file, or null with no config directory: then nothing is saved.
@@ -61,6 +63,12 @@ fn parse(self: *Hosts, text: []const u8) Allocator.Error!void {
     }
 }
 
+/// `dest` without its `ssh://`, for showing.
+pub fn label(dest: []const u16) []const u16 {
+    const scheme = L("ssh://");
+    return if (std.mem.startsWith(u16, dest, scheme)) dest[scheme.len..] else dest;
+}
+
 pub fn indexOf(self: *const Hosts, dest: []const u16) ?usize {
     for (self.items.items, 0..) |h, i| {
         if (std.mem.eql(u16, h, dest)) return i;
@@ -107,7 +115,10 @@ fn format(self: *const Hosts, text: *std.ArrayList(u8)) Allocator.Error!void {
     }
 }
 
-const L = std.unicode.utf8ToUtf16LeStringLiteral;
+test label {
+    try std.testing.expectEqualSlices(u16, L("alde@pi:2222"), label(L("ssh://alde@pi:2222")));
+    try std.testing.expectEqualSlices(u16, L("devbox"), label(L("devbox")));
+}
 
 test "parse and format" {
     var hosts: Hosts = .{ .alloc = std.testing.allocator, .io = undefined, .path = null };
