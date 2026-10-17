@@ -173,8 +173,9 @@ fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
 }
 
 /// The Go helpers, next to the exe: slime-ssh.exe for `ssh://` commands,
-/// and slimed.exe for `persist-sessions`. Go caches its own builds, so
-/// this runs `go build` every time rather than tracking the sources.
+/// and slimed.exe for `persist-sessions`. slime-ssh carries slimed for
+/// Linux, to install on hosts it connects to. Go caches its own builds,
+/// so this runs `go build` every time rather than tracking the sources.
 /// Without Go it warns and leaves them out, unless `-Dssh=true` asked for
 /// them.
 fn installGoHelpers(b: *std.Build, required: bool) void {
@@ -186,8 +187,6 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
         std.log.warn("go not found; building without slime-ssh and slimed (ssh:// commands and persist-sessions won't work)", .{});
         return;
     };
-    _ = goBuild(b, go, "slime-ssh");
-
     // slimed embeds libghostty-vt built as wasm (ssh/internal/vt), from a
     // nested build of the submodule, which tracks its own sources.
     const wasm = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-Demit-lib-vt", "-Dtarget=wasm32-freestanding", "-Doptimize=ReleaseSmall", "--prefix" });
@@ -197,6 +196,14 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
     const copy = b.addUpdateSourceFiles();
     copy.addCopyFileToSource(prefix.path(b, "bin/ghostty-vt.wasm"), "ssh/internal/vt/ghostty-vt.wasm");
     goBuild(b, go, "slimed").step.dependOn(&copy.step);
+
+    // slime-pack builds slimed for each Linux target into
+    // ssh/internal/payload/bin, which slime-ssh embeds.
+    const pack = b.addSystemCommand(&.{ go, "run", "./cmd/slime-pack" });
+    pack.setCwd(b.path("ssh"));
+    pack.has_side_effects = true;
+    pack.step.dependOn(&copy.step);
+    goBuild(b, go, "slime-ssh").step.dependOn(&pack.step);
 }
 
 /// `go build` of ssh/cmd/`name`, installed as `name`.exe.

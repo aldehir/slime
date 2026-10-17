@@ -2,6 +2,7 @@ package helper
 
 import (
 	"errors"
+	"log"
 	"strings"
 
 	"github.com/aldehir/slime/ssh/internal/prompt"
@@ -71,7 +72,7 @@ func (t termAsker) print(text string) { t.p.Print(text) }
 func (termAsker) dialog() bool        { return false }
 
 // dialogAsker asks through slime's dialog for channel id. Notices still
-// go to the channel's terminal.
+// go to the channel's terminal, or the log if it has none.
 type dialogAsker struct {
 	s    *Server
 	id   uint32
@@ -110,5 +111,12 @@ func (d *dialogAsker) info(text string) {
 	d.s.send(d.id, &proto.Info{Text: strings.TrimRight(text, "\r\n")})
 }
 
-func (d *dialogAsker) print(text string) { d.term.Print(text) }
-func (*dialogAsker) dialog() bool        { return true }
+func (d *dialogAsker) print(text string) {
+	if d.term == nil {
+		log.Printf("channel %d: %s", d.id, strings.TrimRight(text, "\r\n"))
+		return
+	}
+	d.term.Print(text)
+}
+
+func (*dialogAsker) dialog() bool { return true }

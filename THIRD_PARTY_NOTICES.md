@@ -102,6 +102,8 @@ under the MIT License, Copyright (c) Microsoft Corporation.
 `slime-ssh.exe` and `slimed.exe` are written in Go, and statically link
 the Go standard library and the modules below, unmodified. `slimed.exe`
 also embeds libghostty-vt (above), compiled to WebAssembly.
+`slime-ssh.exe` carries builds of `slimed` for Linux, which it installs
+on SSH hosts.
 
 The Go standard library, [golang.org/x/crypto](https://go.googlesource.com/crypto),
 [golang.org/x/sys](https://go.googlesource.com/sys), and
@@ -195,6 +197,35 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+[creack/pty](https://github.com/creack/pty), in the Linux builds of
+`slimed`:
+
+```
+Copyright (c) 2011 Keith Rarick
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall
+be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 [spf13/cobra](https://github.com/spf13/cobra), Copyright 2013-2023 The

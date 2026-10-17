@@ -1,2 +1,3 @@
 *.exe
 /internal/vt/ghostty-vt.wasm
+/internal/payload/bin/*.gz

@@ -27,6 +27,7 @@ func TestRoundTrip(t *testing.T) {
 		{1, &Info{Text: "Success. Logging you in..."}},
 		{1, &Open{In: 0x1234, Out: 0xdeadbeefcafe, Cols: 120, Rows: 40, Term: "xterm-256color", Cwd: "/home/alde/src", Width: 960, Height: 800}},
 		{1, &Open{Term: "xterm-256color"}},
+		{2, &OpenSlimed{In: 0x10, Out: 0x20, Term: "xterm-ghostty"}},
 		{7, &Resize{Cols: 80, Rows: 24}},
 		{7, &Resize{Cols: 80, Rows: 24, Width: 640, Height: 480}},
 		{7, &Close{}},

@@ -33,11 +33,12 @@ type Type uint8
 
 // slime to helper.
 const (
-	TypeHello  Type = 1
-	TypeOpen   Type = 2
-	TypeResize Type = 3
-	TypeClose  Type = 4
-	TypeAnswer Type = 5
+	TypeHello      Type = 1
+	TypeOpen       Type = 2
+	TypeResize     Type = 3
+	TypeClose      Type = 4
+	TypeAnswer     Type = 5
+	TypeOpenSlimed Type = 6
 )
 
 // Helper to slime.
@@ -100,6 +101,21 @@ type Open struct {
 	// Width and Height are the terminal's size in pixels, zero if
 	// unknown. Programs read them from the pty to size images.
 	Width, Height uint32
+}
+
+// OpenSlimed asks for a channel to the host's slimed (ssh/cmd/slimed),
+// installing it there first if needed. In and Out are pipes as Open's,
+// which carry slimed's protocol (internal/persist) rather than a
+// terminal. Term is the TERM its panes get, as Open's: xterm-ghostty
+// falls back where it can't be installed.
+//
+// It's answered by Opened once slimed runs, or by Error saying why it
+// can't (an OS no build is carried for, say), after which the
+// connection stays up for plain channels. Its pipes close either way
+// once it ends.
+type OpenSlimed struct {
+	In, Out uint64
+	Term    string
 }
 
 type Resize struct {
@@ -183,6 +199,7 @@ type Info struct{ Text string }
 
 func (*Hello) Type() Type        { return TypeHello }
 func (*Open) Type() Type         { return TypeOpen }
+func (*OpenSlimed) Type() Type   { return TypeOpenSlimed }
 func (*Resize) Type() Type       { return TypeResize }
 func (*Close) Type() Type        { return TypeClose }
 func (*HelloReply) Type() Type   { return TypeHelloReply }
@@ -230,6 +247,18 @@ func (m *Open) decode(d *decoder) {
 		m.Width = d.u32()
 		m.Height = d.u32()
 	}
+}
+
+func (m *OpenSlimed) encode(e *encoder) {
+	e.u64(m.In)
+	e.u64(m.Out)
+	e.str(m.Term)
+}
+
+func (m *OpenSlimed) decode(d *decoder) {
+	m.In = d.u64()
+	m.Out = d.u64()
+	m.Term = d.str()
 }
 
 func (m *Resize) encode(e *encoder) {
@@ -330,6 +359,8 @@ func Decode(f Frame) (Message, error) {
 		m = new(Hello)
 	case TypeOpen:
 		m = new(Open)
+	case TypeOpenSlimed:
+		m = new(OpenSlimed)
 	case TypeResize:
 		m = new(Resize)
 	case TypeClose:

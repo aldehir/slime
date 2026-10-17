@@ -105,6 +105,9 @@ type Server struct {
 	// ghosttyTerm is set when the host has xterm-ghostty, so channels
 	// that ask for it get it.
 	ghosttyTerm bool
+	// slimedExe is where slimed is on the host, once it's been found or
+	// installed there.
+	slimedExe string
 	// jumps carry client, first hop first.
 	jumps []*ssh.Client
 	// connDone is closed when client.Wait returns, with connErr.
@@ -129,6 +132,9 @@ type channel struct {
 	input *bufio.Reader
 	term  string
 	cwd   string
+	// slimed carries slimed's protocol rather than a terminal
+	// (OpenSlimed).
+	slimed bool
 
 	// Guarded by Server.mu.
 	//
@@ -238,6 +244,8 @@ func (s *Server) handle(f proto.Frame) {
 	switch m := m.(type) {
 	case *proto.Open:
 		s.open(f.ID, m)
+	case *proto.OpenSlimed:
+		s.openSlimed(f.ID, m)
 	case *proto.Resize:
 		s.resize(f.ID, winSize{m.Cols, m.Rows, m.Width, m.Height})
 	case *proto.Close:
@@ -255,7 +263,7 @@ func (s *Server) open(id uint32, m *proto.Open) {
 		s.send(id, &proto.Error{Message: err.Error()})
 		return
 	}
-	ch := &channel{
+	s.add(&channel{
 		id:    id,
 		in:    in,
 		out:   out,
@@ -263,10 +271,34 @@ func (s *Server) open(id uint32, m *proto.Open) {
 		term:  m.Term,
 		cwd:   m.Cwd,
 		size:  winSize{m.Cols, m.Rows, m.Width, m.Height},
+	})
+}
+
+func (s *Server) openSlimed(id uint32, m *proto.OpenSlimed) {
+	in, out, err := s.opts.OpenPipes(m.In, m.Out)
+	if err != nil {
+		s.send(id, &proto.Error{Message: err.Error()})
+		return
 	}
+	if s.features&proto.FeaturePrompts == 0 {
+		// Logging in on it would ask in its pipes, which aren't a
+		// terminal.
+		s.send(id, &proto.Error{Message: "slimed channels need prompts in slime's dialog"})
+		in.Close()
+		out.Close()
+		return
+	}
+	s.add(&channel{id: id, in: in, out: out, input: bufio.NewReader(in), term: m.Term, slimed: true})
+}
+
+// add takes a channel slime opened: it connects, waits for connecting,
+// or starts.
+func (s *Server) add(ch *channel) {
 	if ch.term == "" {
 		ch.term = defaultTerm
 	}
+	id := ch.id
+	in, out := ch.in, ch.out
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -375,10 +407,15 @@ func (s *Server) removePending(ch *channel) {
 // connect dials and authenticates, asking in slime's dialog or on ch's
 // terminal, then starts every channel opened meanwhile.
 func (s *Server) connect(ch *channel) {
-	term := prompt.New(ch.input, ch.out)
-	var a asker = termAsker{term}
-	if s.features&proto.FeaturePrompts != 0 {
-		a = &dialogAsker{s: s, id: ch.id, term: term}
+	var a asker
+	switch {
+	case ch.slimed:
+		// Its pipes aren't a terminal to print notices in.
+		a = &dialogAsker{s: s, id: ch.id}
+	case s.features&proto.FeaturePrompts != 0:
+		a = &dialogAsker{s: s, id: ch.id, term: prompt.New(ch.input, ch.out)}
+	default:
+		a = termAsker{prompt.New(ch.input, ch.out)}
 	}
 	client, err := s.dial(a)
 	// Before any shell starts, so they all get the same TERM.
@@ -545,8 +582,13 @@ func (s *Server) keepalive(client *ssh.Client) {
 }
 
 // start opens ch's session channel with a pty and a shell, then copies
-// input to it until the remote command ends.
+// input to it until the remote command ends; or for a slimed channel,
+// bridges it to slimed.
 func (s *Server) start(client *ssh.Client, ch *channel) {
+	if ch.slimed {
+		s.startSlimed(client, ch)
+		return
+	}
 	sess, err := client.NewSession()
 	if err != nil {
 		s.fail(ch, err)

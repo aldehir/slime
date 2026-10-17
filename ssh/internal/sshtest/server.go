@@ -51,6 +51,10 @@ type Options struct {
 	// Terminfo is how the host answers the helper's xterm-ghostty
 	// check.
 	Terminfo TerminfoMode
+	// Exec runs the exec requests the fake shell doesn't take (anything
+	// but the terminfo check and a cd before the shell), returning the
+	// exit status. Nil refuses them.
+	Exec func(command string, stdin io.Reader, stdout, stderr io.Writer) int
 }
 
 type TerminfoMode int
@@ -388,6 +392,11 @@ func (s *session) serve(reqs <-chan *ssh.Request) {
 					continue
 				}
 				dir, ok := ParseCwdCommand(e.Command)
+				if !ok && s.srv.opts.Exec != nil {
+					req.Reply(true, nil)
+					go s.exec(e.Command)
+					continue
+				}
 				if !ok {
 					req.Reply(false, nil)
 					continue
@@ -406,6 +415,13 @@ func (s *session) serve(reqs <-chan *ssh.Request) {
 			req.Reply(false, nil)
 		}
 	}
+}
+
+// exec runs command with Options.Exec.
+func (s *session) exec(command string) {
+	defer s.ch.Close()
+	status := s.srv.opts.Exec(command, s.ch, s.ch, s.ch.Stderr())
+	s.ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(status)}))
 }
 
 // terminfo answers the helper's xterm-ghostty check per
