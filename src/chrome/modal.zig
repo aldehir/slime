@@ -167,12 +167,12 @@ pub fn paint(c: *const Chrome, p: *Painter, area: Rect, d: *const Dialog, opts: 
     const l = layout(c, area, d);
     const r = l.box;
 
-    // A soft shadow: rings fading out, offset down.
-    var i: f32 = 6;
+    // A soft shadow all around: rings fading out.
+    var i: f32 = 4;
     while (i > 0) : (i -= 1) {
-        const spread = c.px(i * 2.5);
-        const ring: Rect = .{ .x = r.x - spread, .y = r.y - spread + c.px(8), .w = r.w + 2 * spread, .h = r.h + 2 * spread };
-        p.fillRounded(ring, c.px(radius) + spread, .{ 0, 0, 0, 0.05 });
+        const spread = c.px(i * 1.5);
+        const ring: Rect = .{ .x = r.x - spread, .y = r.y - spread, .w = r.w + 2 * spread, .h = r.h + 2 * spread };
+        p.fillRounded(ring, c.px(radius) + spread, .{ 0, 0, 0, 0.06 });
     }
     p.fillRounded(r, c.px(radius), t.dialog);
     const outline = if (d.danger) mixColor(t.dialog_outline, t.danger, 0.35) else t.dialog_outline;
@@ -242,7 +242,6 @@ fn paintButton(c: *const Chrome, p: *Painter, r: Rect, b: Dialog.Button, state: 
         },
         .normal => {
             p.fillRounded(r, rad, if (lit) t.surface_hover else t.surface);
-            p.strokeRounded(r.inset(c.stroke() / 2, c.stroke() / 2), rad, c.stroke(), t.dialog_outline);
             p.text(b.label, c.fonts.button, r, t.text);
         },
         .danger => {
