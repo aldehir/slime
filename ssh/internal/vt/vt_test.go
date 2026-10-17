@@ -91,9 +91,18 @@ func sameState(t testing.TB, a, b *Terminal) {
 	}
 }
 
-// TestFormatterLayout checks Text's hand-written struct offsets against
-// the module's own layout manifest.
-func TestFormatterLayout(t *testing.T) {
+type layoutField struct {
+	Offset int `json:"offset"`
+}
+
+type layoutType struct {
+	Size   int                    `json:"size"`
+	Fields map[string]layoutField `json:"fields"`
+}
+
+// layouts reads the module's own struct layout manifest.
+func layouts(t *testing.T) map[string]layoutType {
+	t.Helper()
 	term := newTerm(t, 10, 2)
 	p, err := term.call1(term.fn.typeJSON)
 	if err != nil {
@@ -110,26 +119,36 @@ func TestFormatterLayout(t *testing.T) {
 		}
 		raw = append(raw, c)
 	}
-	type field struct {
-		Offset int `json:"offset"`
-	}
-	type typ struct {
-		Size   int              `json:"size"`
-		Fields map[string]field `json:"fields"`
-	}
 	var manifest struct {
-		Types map[string]typ `json:"types"`
+		Types map[string]layoutType `json:"types"`
 	}
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	opts := manifest.Types["GhosttyFormatterTerminalOptions"]
-	extra := manifest.Types["GhosttyFormatterTerminalExtra"]
-	screen := manifest.Types["GhosttyFormatterScreenExtra"]
-	checks := []struct {
-		name      string
-		got, want int
-	}{
+	return manifest.Types
+}
+
+type layoutCheck struct {
+	name      string
+	got, want int
+}
+
+func checkLayout(t *testing.T, checks []layoutCheck) {
+	t.Helper()
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s: manifest %d, code uses %d", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestFormatterLayout checks Text's hand-written struct offsets.
+func TestFormatterLayout(t *testing.T) {
+	types := layouts(t)
+	opts := types["GhosttyFormatterTerminalOptions"]
+	extra := types["GhosttyFormatterTerminalExtra"]
+	screen := types["GhosttyFormatterScreenExtra"]
+	checkLayout(t, []layoutCheck{
 		{"options size", opts.Size, 40},
 		{"emit", opts.Fields["emit"].Offset, 4},
 		{"unwrap", opts.Fields["unwrap"].Offset, 8},
@@ -138,11 +157,129 @@ func TestFormatterLayout(t *testing.T) {
 		{"extra size", extra.Size, 24},
 		{"extra.screen", extra.Fields["screen"].Offset, 12},
 		{"screen size", screen.Size, 12},
+	})
+}
+
+// TestCallbackLayouts checks the structs the host callbacks fill.
+func TestCallbackLayouts(t *testing.T) {
+	types := layouts(t)
+	da := types["GhosttyDeviceAttributes"]
+	primary := types["GhosttyDeviceAttributesPrimary"]
+	size := types["GhosttySizeReportSize"]
+	checkLayout(t, []layoutCheck{
+		{"DA size", da.Size, daSize},
+		{"DA secondary", da.Fields["secondary"].Offset, daOffSecondary},
+		{"DA1 features", primary.Fields["features"].Offset, daOffFeatures},
+		{"DA1 num_features", primary.Fields["num_features"].Offset, daOffNumFeatures},
+		{"size rows", size.Fields["rows"].Offset, 0},
+		{"size columns", size.Fields["columns"].Offset, 2},
+		{"size cell_width", size.Fields["cell_width"].Offset, 4},
+		{"size cell_height", size.Fields["cell_height"].Offset, 8},
+	})
+}
+
+// recorder collects a terminal's events.
+type recorder struct {
+	reply  bytes.Buffer
+	bells  int
+	titles []string
+	pwds   []string
+}
+
+func record(term *Terminal) *recorder {
+	r := &recorder{}
+	term.SetEvents(Events{
+		Reply: func(p []byte) { r.reply.Write(p) },
+		Bell:  func() { r.bells++ },
+		TitleChanged: func() {
+			s, _ := term.Title()
+			r.titles = append(r.titles, s)
+		},
+		PwdChanged: func() {
+			s, _ := term.Pwd()
+			r.pwds = append(r.pwds, s)
+		},
+	})
+	return r
+}
+
+func TestReplies(t *testing.T) {
+	cases := []struct{ name, query, want string }{
+		{"DA1", "\x1b[c", "\x1b[?62;22c"},
+		{"DA2", "\x1b[>c", "\x1b[>1;0;0c"},
+		{"DSR cursor", "ab\x1b[6n", "\x1b[1;3R"},
+		{"size in cells", "\x1b[18t", "\x1b[8;24;80t"},
+		{"size in pixels", "\x1b[14t", "\x1b[4;480;800t"},
+		{"DECRQM", "\x1b[?25$p", "\x1b[?25;1$y"},
 	}
-	for _, c := range checks {
-		if c.got != c.want {
-			t.Errorf("%s: manifest %d, Text uses %d", c.name, c.got, c.want)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			term := newTerm(t, 20, 5)
+			if err := term.Resize(80, 24, 10, 20); err != nil {
+				t.Fatal(err)
+			}
+			r := record(term)
+			write(t, term, c.query)
+			if got := r.reply.String(); got != c.want {
+				t.Errorf("reply %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestTitlePwdBell(t *testing.T) {
+	term := newTerm(t, 20, 5)
+	r := record(term)
+	write(t, term, "\x1b]2;first\x07\x07\x1b]2;second\x1b\\")
+	write(t, term, "\x1b]7;file://host/home/alde\x07\x07")
+	if r.bells != 2 {
+		t.Errorf("bells %d, want 2", r.bells)
+	}
+	// Coalesced per Write: one call, after both titles were set.
+	if fmt.Sprint(r.titles) != "[second]" {
+		t.Errorf("titles %q", r.titles)
+	}
+	if fmt.Sprint(r.pwds) != "[file://host/home/alde]" {
+		t.Errorf("pwds %q", r.pwds)
+	}
+}
+
+// TestDecodedCallbacks checks a terminal restored from a snapshot answers
+// queries and keeps its title.
+func TestDecodedCallbacks(t *testing.T) {
+	term := newTerm(t, 20, 5)
+	write(t, term, "\x1b]2;kept\x07hi")
+	got := roundTrip(t, term)
+	if s, _ := got.Title(); s != "kept" {
+		t.Errorf("title %q after decode", s)
+	}
+	r := record(got)
+	write(t, got, "\x1b[6n")
+	if s := r.reply.String(); s != "\x1b[1;3R" {
+		t.Errorf("reply %q", s)
+	}
+}
+
+// TestChurn opens and closes terminals to catch leaks of instances or
+// trampolines.
+func TestChurn(t *testing.T) {
+	for range 200 {
+		term, err := runtime(t).New(80, 24)
+		if err != nil {
+			t.Fatal(err)
 		}
+		r := record(term)
+		write(t, term, "\x1b[c")
+		if r.reply.Len() == 0 {
+			t.Fatal("no reply")
+		}
+		term.Close()
+	}
+	shared.mu.Lock()
+	n := len(shared.terms)
+	shared.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d terminals still registered", n)
 	}
 }
 
@@ -160,7 +297,7 @@ func TestWriteText(t *testing.T) {
 
 func TestResize(t *testing.T) {
 	term := newTerm(t, 20, 5)
-	if err := term.Resize(100, 40); err != nil {
+	if err := term.Resize(100, 40, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if c, r, _ := term.Size(); c != 100 || r != 40 {

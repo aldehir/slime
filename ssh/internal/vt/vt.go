@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -39,6 +40,8 @@ const (
 	dataCursorX = 3
 	dataCursorY = 4
 	dataScreen  = 6
+	dataTitle   = 12
+	dataPwd     = 13
 
 	decoderOptMaxContinuation    = 0
 	decoderOptRetainContinuation = 1
@@ -66,6 +69,10 @@ type Runtime struct {
 	rt  wazero.Runtime
 	mod wazero.CompiledModule
 	log *slog.Logger
+
+	mu     sync.Mutex
+	nextID uint32
+	terms  map[uint32]*Terminal // by id, for the host callbacks
 }
 
 // NewRuntime compiles the embedded module. log receives libghostty-vt's
@@ -75,7 +82,11 @@ func NewRuntime(ctx context.Context, log *slog.Logger) (*Runtime, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	rt := wazero.NewRuntime(ctx)
-	r := &Runtime{rt: rt, log: log}
+	r := &Runtime{rt: rt, log: log, terms: map[uint32]*Terminal{}}
+	if err := r.hostModule(ctx); err != nil {
+		rt.Close(ctx)
+		return nil, err
+	}
 	_, err := rt.NewHostModuleBuilder("env").
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, ptr, n uint32) {
@@ -103,16 +114,26 @@ func (r *Runtime) Close(ctx context.Context) error { return r.rt.Close(ctx) }
 // Terminal is one libghostty-vt terminal. It isn't safe for concurrent
 // use.
 type Terminal struct {
-	ctx  context.Context
-	mod  api.Module
-	mem  api.Memory
-	fn   funcs
-	term uint32
+	ctx   context.Context
+	rt    *Runtime
+	id    uint32
+	mod   api.Module
+	tramp api.Module // installs the callbacks; see installCallbacks
+	mem   api.Memory
+	fn    funcs
+	term  uint32
 
 	// Guest scratch: out-parameters (16 bytes) and Write's input.
 	out     uint32
 	buf     uint32
 	bufSize uint32
+
+	events Events
+	pend   pending
+
+	// For size reports, which can't call back into the terminal.
+	cols, rows   uint16
+	cellW, cellH uint32
 }
 
 type funcs struct {
@@ -130,12 +151,17 @@ type funcs struct {
 
 func (r *Runtime) instantiate() (*Terminal, error) {
 	ctx := context.Background()
-	// An empty name lets the runtime hold any number of instances.
-	mod, err := r.rt.InstantiateModule(ctx, r.mod, wazero.NewModuleConfig().WithName(""))
+	r.mu.Lock()
+	r.nextID++
+	id := r.nextID
+	r.mu.Unlock()
+	// Named so the callback trampoline can import its table.
+	name := fmt.Sprintf("ghostty-vt-%d", id)
+	mod, err := r.rt.InstantiateModule(ctx, r.mod, wazero.NewModuleConfig().WithName(name))
 	if err != nil {
 		return nil, err
 	}
-	t := &Terminal{ctx: ctx, mod: mod, mem: mod.Memory()}
+	t := &Terminal{ctx: ctx, rt: r, id: id, mod: mod, mem: mod.Memory()}
 	var missing []string
 	get := func(name string) api.Function {
 		f := mod.ExportedFunction(name)
@@ -195,6 +221,9 @@ func (r *Runtime) New(cols, rows uint16) (*Terminal, error) {
 	if err == nil {
 		err = t.setSize(optContinuationMaxBytes, ContinuationLimit)
 	}
+	if err == nil {
+		err = t.finish()
+	}
 	if err != nil {
 		t.Close()
 		return nil, err
@@ -203,18 +232,38 @@ func (r *Runtime) New(cols, rows uint16) (*Terminal, error) {
 }
 
 // Decode restores a terminal from a snapshot, with continuation tracking
-// on as New leaves it.
+// on as New leaves it. Callbacks set in the snapshot's terminal aren't
+// part of it; the new terminal gets its own.
 func (r *Runtime) Decode(snapshot []byte) (*Terminal, error) {
 	t, err := r.instantiate()
 	if err != nil {
 		return nil, err
 	}
-	if err := t.decode(snapshot); err != nil {
+	err = t.decode(snapshot)
+	if err == nil {
+		err = t.finish()
+	}
+	if err != nil {
 		t.Close()
 		return nil, err
 	}
 	return t, nil
 }
+
+// finish registers a terminal for its callbacks once its handle exists.
+func (t *Terminal) finish() error {
+	var err error
+	if t.cols, t.rows, err = t.Size(); err != nil {
+		return err
+	}
+	t.rt.mu.Lock()
+	t.rt.terms[t.id] = t
+	t.rt.mu.Unlock()
+	return t.installCallbacks(t.rt, fmt.Sprintf("ghostty-vt-%d", t.id))
+}
+
+// SetEvents sets the handlers for what the terminal reports.
+func (t *Terminal) SetEvents(e Events) { t.events = e }
 
 func (t *Terminal) decode(snapshot []byte) error {
 	src, err := t.copyIn(snapshot)
@@ -254,12 +303,19 @@ func (t *Terminal) Close() error {
 	if t.mod == nil {
 		return nil
 	}
+	t.rt.mu.Lock()
+	delete(t.rt.terms, t.id)
+	t.rt.mu.Unlock()
+	if t.tramp != nil {
+		t.tramp.Close(t.ctx)
+	}
 	err := t.mod.Close(t.ctx)
 	t.mod = nil
 	return err
 }
 
-// Write feeds pty output to the terminal.
+// Write feeds pty output to the terminal, then delivers the events it
+// caused.
 func (t *Terminal) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -268,16 +324,49 @@ func (t *Terminal) Write(p []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := t.fn.termWrite.Call(t.ctx, uint64(t.term), uint64(src), uint64(len(p))); err != nil {
+	_, err = t.fn.termWrite.Call(t.ctx, uint64(t.term), uint64(src), uint64(len(p)))
+	t.deliver()
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
-// Resize changes the grid size. Cell pixel sizes are left at zero; the
-// daemon doesn't know the client's font.
-func (t *Terminal) Resize(cols, rows uint16) error {
-	return t.result("terminal_resize", t.fn.termResize, uint64(t.term), uint64(cols), uint64(rows), 0, 0)
+// Resize changes the grid size. The cell size in pixels is the client's
+// (zero if unknown); it only feeds pixel size reports.
+func (t *Terminal) Resize(cols, rows uint16, cellW, cellH uint32) error {
+	err := t.result("terminal_resize", t.fn.termResize,
+		uint64(t.term), uint64(cols), uint64(rows), uint64(cellW), uint64(cellH))
+	if err != nil {
+		return err
+	}
+	t.cols, t.rows, t.cellW, t.cellH = cols, rows, cellW, cellH
+	// Mode 2048 sends an in-band size report on resize.
+	t.deliver()
+	return nil
+}
+
+// Title is the title the program last set (OSC 0/2).
+func (t *Terminal) Title() (string, error) { return t.getString(dataTitle) }
+
+// Pwd is the working directory the shell last reported (OSC 7, 9, 1337),
+// as sent: OSC 7's is a file:// URI.
+func (t *Terminal) Pwd() (string, error) { return t.getString(dataPwd) }
+
+func (t *Terminal) getString(key uint64) (string, error) {
+	// GhosttyString: ptr, len. Borrowed from the terminal.
+	if err := t.result("terminal_get", t.fn.termGet, uint64(t.term), key, uint64(t.out)); err != nil {
+		return "", err
+	}
+	ptr, n := t.u32(t.out), t.u32(t.out+4)
+	if n == 0 {
+		return "", nil
+	}
+	b, ok := t.mem.Read(ptr, n)
+	if !ok {
+		return "", errors.New("vt: string out of bounds")
+	}
+	return string(b), nil
 }
 
 // Size reports the grid size.
