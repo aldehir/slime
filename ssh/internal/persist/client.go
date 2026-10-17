@@ -12,6 +12,7 @@ type Client struct {
 	rw    io.ReadWriteCloser
 	r     *Reader
 	mu    sync.Mutex // writes
+	tag   uint32
 	Hello HelloReply
 }
 
@@ -47,7 +48,7 @@ func (c *Client) Send(id uint32, m Message) error {
 	return err
 }
 
-// Recv reads the next message and the session it's for.
+// Recv reads the next message and the pane it's for.
 func (c *Client) Recv() (uint32, Message, error) {
 	f, err := c.r.Read()
 	if err != nil {
@@ -59,9 +60,15 @@ func (c *Client) Recv() (uint32, Message, error) {
 
 func (c *Client) Close() error { return c.rw.Close() }
 
-// List asks for the sessions. Only for a client that isn't attached:
-// it reads the reply in line.
-func (c *Client) List() ([]SessionInfo, error) {
+// NextTag returns a tag for a request.
+func (c *Client) NextTag() uint32 {
+	c.tag++
+	return c.tag
+}
+
+// List asks for the workspaces. The helpers below read replies in line,
+// so they're for a client that isn't also reading live output.
+func (c *Client) List() (*Workspaces, error) {
 	if err := c.Send(0, &List{}); err != nil {
 		return nil, err
 	}
@@ -71,45 +78,132 @@ func (c *Client) List() ([]SessionInfo, error) {
 			return nil, err
 		}
 		switch m := m.(type) {
-		case *Sessions:
-			return m.Sessions, nil
+		case *Workspaces:
+			return m, nil
 		case *Error:
 			return nil, fmt.Errorf("slimed: %s", m.Message)
 		}
 	}
 }
 
-// Attachment is a session's attach reply with its snapshot assembled.
-type Attachment struct {
-	ID       uint32
+// PaneState is a pane as attaching delivered it: its snapshot, and the
+// output that followed before the reply was complete.
+type PaneState struct {
 	Attached Attached
 	Snapshot []byte
+	Output   [][]byte
 }
 
-// ReadAttach reads the reply to New or Attach: Attached and the snapshot
-// chunks. Only for a client attaching one session at a time.
-func (c *Client) ReadAttach() (*Attachment, error) {
-	var a *Attachment
+// Attachment collects what attaching (or a request that adds a pane to
+// an attached workspace) delivered.
+type Attachment struct {
+	Workspace *Workspace
+	Panes     map[uint32]*PaneState
+	Created   *Created
+}
+
+// Await reads until the Workspace and Created (if want is set) replies
+// tagged tag have come, collecting pane snapshots and output on the way.
+func (c *Client) Await(tag uint32, wantCreated bool) (*Attachment, error) {
+	a := &Attachment{Panes: map[uint32]*PaneState{}}
+	for a.Workspace == nil || (wantCreated && a.Created == nil) {
+		id, m, err := c.Recv()
+		if err != nil {
+			return nil, err
+		}
+		switch m := m.(type) {
+		case *Attached:
+			a.Panes[id] = &PaneState{Attached: *m}
+		case *Snapshot:
+			if p := a.Panes[id]; p != nil {
+				p.Snapshot = append(p.Snapshot, m.Data...)
+			}
+		case *Output:
+			if p := a.Panes[id]; p != nil {
+				p.Output = append(p.Output, append([]byte(nil), m.Data...))
+			}
+		case *Workspace:
+			if m.Tag == tag {
+				a.Workspace = m
+			}
+		case *Created:
+			if m.Tag == tag {
+				a.Created = m
+			}
+		case *Error:
+			if m.Tag == tag {
+				return nil, fmt.Errorf("slimed: %s", m.Message)
+			}
+		}
+	}
+	return a, nil
+}
+
+// AwaitCreated reads until the Created reply tagged tag, for a client
+// that doesn't own the workspace it changed.
+func (c *Client) AwaitCreated(tag uint32) (*Created, error) {
+	for {
+		_, m, err := c.Recv()
+		if err != nil {
+			return nil, err
+		}
+		switch m := m.(type) {
+		case *Created:
+			if m.Tag == tag {
+				return m, nil
+			}
+		case *Error:
+			if m.Tag == tag {
+				return nil, fmt.Errorf("slimed: %s", m.Message)
+			}
+		}
+	}
+}
+
+// Peek returns a pane's snapshot without taking it.
+func (c *Client) Peek(pane uint32) (*PaneState, error) {
+	tag := c.NextTag()
+	if err := c.Send(pane, &Peek{Tag: tag}); err != nil {
+		return nil, err
+	}
+	var p *PaneState
 	for {
 		id, m, err := c.Recv()
 		if err != nil {
 			return nil, err
 		}
 		switch m := m.(type) {
-		case *Error:
-			return nil, fmt.Errorf("slimed: %s", m.Message)
 		case *Attached:
-			a = &Attachment{ID: id, Attached: *m, Snapshot: make([]byte, 0, m.SnapshotLen)}
-		case *Snapshot:
-			if a == nil || id != a.ID {
-				return nil, fmt.Errorf("persist: snapshot before attached")
+			if m.Tag == tag && id == pane {
+				p = &PaneState{Attached: *m}
 			}
-			a.Snapshot = append(a.Snapshot, m.Data...)
-		default:
-			return nil, fmt.Errorf("persist: unexpected type %d while attaching", m.Type())
+		case *Snapshot:
+			if p != nil && id == pane {
+				p.Snapshot = append(p.Snapshot, m.Data...)
+			}
+		case *Error:
+			if m.Tag == tag {
+				return nil, fmt.Errorf("slimed: %s", m.Message)
+			}
 		}
-		if a != nil && len(a.Snapshot) == int(a.Attached.SnapshotLen) {
-			return a, nil
+		if p != nil && len(p.Snapshot) == int(p.Attached.SnapshotLen) {
+			return p, nil
 		}
 	}
+}
+
+// MostRecentDetached picks the workspace detached last, the one a new
+// window takes: nil if none is detached.
+func MostRecentDetached(ws *Workspaces) *WorkspaceInfo {
+	var best *WorkspaceInfo
+	for i := range ws.Workspaces {
+		w := &ws.Workspaces[i]
+		if w.Attached {
+			continue
+		}
+		if best == nil || w.DetachedAt > best.DetachedAt {
+			best = w
+		}
+	}
+	return best
 }

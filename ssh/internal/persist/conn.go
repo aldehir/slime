@@ -24,40 +24,9 @@ type conn struct {
 	closed   bool // nothing more is sent
 	draining bool // close once the queue is empty
 
-	// Sessions this client is attached to. Taken inside a session's
-	// lock, never around one.
-	hmu  sync.Mutex
-	held map[uint32]*Session
-}
-
-func (c *conn) hold(s *Session) {
-	c.hmu.Lock()
-	c.held[s.id] = s
-	c.hmu.Unlock()
-}
-
-func (c *conn) unhold(s *Session) {
-	c.hmu.Lock()
-	delete(c.held, s.id)
-	c.hmu.Unlock()
-}
-
-func (c *conn) holding(id uint32) *Session {
-	c.hmu.Lock()
-	defer c.hmu.Unlock()
-	return c.held[id]
-}
-
-// takeHeld empties held and returns what was in it.
-func (c *conn) takeHeld() []*Session {
-	c.hmu.Lock()
-	defer c.hmu.Unlock()
-	var ss []*Session
-	for _, s := range c.held {
-		ss = append(ss, s)
-	}
-	clear(c.held)
-	return ss
+	// Workspaces this client is attached to. Guarded by the server's
+	// lock.
+	owned map[uint32]*workspace
 }
 
 type queued struct {
@@ -66,7 +35,7 @@ type queued struct {
 }
 
 func newConn(rw io.ReadWriteCloser, log *slog.Logger) *conn {
-	c := &conn{rw: rw, log: log, held: map[uint32]*Session{}}
+	c := &conn{rw: rw, log: log, owned: map[uint32]*workspace{}}
 	c.cond = sync.NewCond(&c.mu)
 	go c.writeLoop()
 	return c

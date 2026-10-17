@@ -1,7 +1,12 @@
 // Package persist is slimed: a daemon that owns ptys and the terminal
-// state of each (internal/vt), so sessions outlive the clients attached
-// to them. A client attaches with a snapshot of the terminal and then
-// gets the live output from where the snapshot ends.
+// state of each (internal/vt), so they outlive the windows showing them.
+//
+// Panes (a pty and its terminal) are arranged in tabs, each a layout
+// tree, and tabs are grouped in workspaces. A window attaches a whole
+// workspace, getting a snapshot of each pane's terminal and then its
+// live output from where the snapshot ends. The daemon owns the
+// structure; a window mirrors it, asking for changes and applying the
+// Workspace messages that come back.
 package persist
 
 import (
@@ -21,7 +26,11 @@ import (
 	"github.com/aldehir/slime/ssh/internal/vt"
 )
 
-// Server holds the sessions and serves clients.
+// Server holds the workspaces and serves clients.
+//
+// Its lock guards the structure: workspaces, tabs, their trees, which
+// panes exist, and who owns what. It's taken before a pane's lock,
+// never inside one.
 type Server struct {
 	vt    *vt.Runtime
 	spawn func(pty.Options) (pty.Pty, error)
@@ -30,23 +39,28 @@ type Server struct {
 
 	snapshotVersion uint16
 
-	mu       sync.Mutex
-	nextID   uint32
-	sessions map[uint32]*Session
-	conns    map[*conn]struct{}
-	idleT    *time.Timer
-	idleC    chan struct{} // closed when the idle timer fires
+	mu         sync.Mutex
+	nextID     uint32 // shared by workspaces, tabs, and panes
+	workspaces map[uint32]*workspace
+	tabs       map[uint32]*tab
+	panes      map[uint32]*Pane
+	conns      map[*conn]struct{}
+	idleT      *time.Timer
+	idleC      chan struct{} // closed when the idle timer fires
 }
 
 // Options configure a Server.
 type Options struct {
-	// Spawn starts a session's child; pty.Start if nil.
+	// Spawn starts a pane's child; pty.Start if nil.
 	Spawn func(pty.Options) (pty.Pty, error)
 	Log   *slog.Logger
-	// Idle is how long Serve waits with no sessions and no clients
+	// Idle is how long Serve waits with no workspaces and no clients
 	// before returning. Zero waits forever.
 	Idle time.Duration
 }
+
+// defaultSize is a pane's size when nothing says otherwise.
+var defaultSize = Size{Cols: 80, Rows: 24}
 
 func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 	if opts.Spawn == nil {
@@ -56,13 +70,15 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		opts.Log = slog.New(slog.DiscardHandler)
 	}
 	s := &Server{
-		vt:       rt,
-		spawn:    opts.Spawn,
-		log:      opts.Log,
-		idle:     opts.Idle,
-		sessions: map[uint32]*Session{},
-		conns:    map[*conn]struct{}{},
-		idleC:    make(chan struct{}),
+		vt:         rt,
+		spawn:      opts.Spawn,
+		log:        opts.Log,
+		idle:       opts.Idle,
+		workspaces: map[uint32]*workspace{},
+		tabs:       map[uint32]*tab{},
+		panes:      map[uint32]*Pane{},
+		conns:      map[*conn]struct{}{},
+		idleC:      make(chan struct{}),
 	}
 	// The snapshot envelope: 8 bytes of magic, then a u16 version.
 	t, err := rt.New(1, 1)
@@ -111,13 +127,13 @@ func (s *Server) checkIdleLocked() {
 	if s.idle == 0 {
 		return
 	}
-	idle := len(s.sessions) == 0 && len(s.conns) == 0
+	idle := len(s.workspaces) == 0 && len(s.panes) == 0 && len(s.conns) == 0
 	switch {
 	case idle && s.idleT == nil:
 		s.idleT = time.AfterFunc(s.idle, func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
-			if s.idleT != nil && len(s.sessions) == 0 && len(s.conns) == 0 {
+			if s.idleT != nil && len(s.workspaces) == 0 && len(s.panes) == 0 && len(s.conns) == 0 {
 				close(s.idleC)
 			}
 		})
@@ -139,11 +155,11 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 	s.checkIdleLocked()
 	s.mu.Unlock()
 	defer func() {
-		for _, ss := range c.takeHeld() {
-			ss.detach(c, "")
-		}
 		c.close()
 		s.mu.Lock()
+		for _, ws := range c.owned {
+			s.releaseLocked(ws, "")
+		}
 		delete(s.conns, c)
 		s.checkIdleLocked()
 		s.mu.Unlock()
@@ -192,123 +208,132 @@ func (s *Server) handshake(c *conn, r *Reader) bool {
 }
 
 func (s *Server) dispatch(c *conn, id uint32, m Message) {
+	fail := func(tag uint32, err error) {
+		if err != nil {
+			c.sendForce(0, &Error{Tag: tag, Message: err.Error()})
+		}
+	}
 	switch m := m.(type) {
 	case *List:
-		c.sendForce(0, &Sessions{Sessions: s.list()})
-	case *New:
-		s.newSession(c, m)
-	case *Attach:
-		ss := s.session(id)
-		if ss == nil {
-			c.sendForce(id, &Error{Tag: m.Tag, Message: "no such session"})
-			return
-		}
-		if err := ss.attach(c, m.Tag, m.Size); err != nil {
-			c.sendForce(id, &Error{Tag: m.Tag, Message: err.Error()})
-		}
-	case *Detach:
-		if ss := c.holding(id); ss != nil {
-			ss.detach(c, "")
+		c.sendForce(0, s.list())
+	case *WorkspaceNew:
+		s.workspaceNew(c, m)
+	case *WorkspaceAttach:
+		fail(m.Tag, s.workspaceAttach(c, m))
+	case *WorkspaceDetach:
+		s.workspaceDetach(c, m.WS)
+	case *WorkspaceKill:
+		fail(0, s.workspaceKill(m.WS))
+	case *WorkspaceRename:
+		fail(0, s.workspaceRename(m.WS, m.Name))
+	case *WorkspaceResize:
+		s.workspaceResize(c, m)
+	case *TabNew:
+		fail(m.Tag, s.tabNew(c, m))
+	case *TabClose:
+		fail(0, s.tabClose(m.Tab))
+	case *TabRename:
+		fail(0, s.tabRename(m.Tab, m.Name))
+	case *Split:
+		fail(m.Tag, s.split(c, m))
+	case *Layout:
+		fail(0, s.layout(m))
+	case *PaneKill:
+		if p := s.pane(id); p != nil {
+			p.kill()
 		}
 	case *Input:
-		if ss := c.holding(id); ss != nil {
-			ss.input(c, m.Data)
+		if p := s.pane(id); p != nil {
+			p.input(c, m.Data)
 		}
 	case *Resize:
-		if ss := c.holding(id); ss != nil {
-			ss.resize(c, m.Size)
+		if p := s.pane(id); p != nil {
+			p.resize(c, m.Size)
 		}
-	case *Kill:
-		if ss := s.session(id); ss != nil {
-			ss.kill()
+	case *Peek:
+		p := s.pane(id)
+		if p == nil {
+			fail(m.Tag, errors.New("no such pane"))
+			return
 		}
+		fail(m.Tag, p.peek(c, m.Tag))
 	default:
 		s.log.Warn("unexpected message", "type", m.Type())
 	}
 }
 
-func (s *Server) newSession(c *conn, m *New) {
-	size := m.Size
-	if size.Cols == 0 || size.Rows == 0 {
-		size.Cols, size.Rows = 80, 24
-	}
-	term, err := s.vt.New(size.Cols, size.Rows)
-	if err == nil {
-		err = term.Resize(size.Cols, size.Rows, size.CellW, size.CellH)
-		if err != nil {
-			term.Close()
-		}
-	}
-	if err == nil {
-		// Grapheme clustering (mode 2027), as slime's terminals start
-		// with it and ConPTY measures text so. Only the current value: the
-		// C API can't set the default a full reset (RIS) goes back to.
-		_, err = term.Write([]byte("\x1b[?2027h"))
-		if err != nil {
-			term.Close()
-		}
-	}
-	if err != nil {
-		c.sendForce(0, &Error{Tag: m.Tag, Message: err.Error()})
-		return
-	}
-	p, err := s.spawn(pty.Options{Command: m.Command, Dir: m.Cwd, Cols: size.Cols, Rows: size.Rows})
-	if err != nil {
-		term.Close()
-		c.sendForce(0, &Error{Tag: m.Tag, Message: err.Error()})
-		return
-	}
-	s.mu.Lock()
-	s.nextID++
-	ss := newSession(s, s.nextID, m.Command, size, p, term)
-	s.sessions[ss.id] = ss
-	s.checkIdleLocked()
-	s.mu.Unlock()
-	s.log.Info("session started", "session", ss.id, "command", m.Command, "pid", p.PID())
-
-	if err := ss.attach(c, m.Tag, Size{}); err != nil {
-		c.sendForce(ss.id, &Error{Tag: m.Tag, Message: err.Error()})
-	}
-	go ss.run()
-}
-
-func (s *Server) session(id uint32) *Session {
+func (s *Server) pane(id uint32) *Pane {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sessions[id]
+	return s.panes[id]
 }
 
-func (s *Server) remove(ss *Session) {
-	s.mu.Lock()
-	delete(s.sessions, ss.id)
-	s.checkIdleLocked()
-	s.mu.Unlock()
+func (s *Server) newIDLocked() uint32 {
+	s.nextID++
+	return s.nextID
 }
 
-func (s *Server) list() []SessionInfo {
-	s.mu.Lock()
-	ss := make([]*Session, 0, len(s.sessions))
-	for _, x := range s.sessions {
-		ss = append(ss, x)
+// startPane starts a child and its terminal, outside the server's lock:
+// spawning takes a while. The caller registers it, or kills it if
+// what it was for is gone by then.
+func (s *Server) startPane(command, cwd string, size Size) (pty.Pty, *vt.Terminal, error) {
+	if size.Cols == 0 || size.Rows == 0 {
+		size.Cols, size.Rows = defaultSize.Cols, defaultSize.Rows
 	}
-	s.mu.Unlock()
-	infos := make([]SessionInfo, len(ss))
-	for i, x := range ss {
-		infos[i] = x.info()
+	term, err := s.vt.New(size.Cols, size.Rows)
+	if err != nil {
+		return nil, nil, err
 	}
-	slices.SortFunc(infos, func(a, b SessionInfo) int { return cmp.Compare(a.ID, b.ID) })
-	return infos
+	if err := term.Resize(size.Cols, size.Rows, size.CellW, size.CellH); err != nil {
+		term.Close()
+		return nil, nil, err
+	}
+	// Grapheme clustering (mode 2027), as slime's terminals start with it
+	// and ConPTY measures text so. Only the current value: the C API
+	// can't set the default a full reset (RIS) goes back to.
+	if _, err := term.Write([]byte("\x1b[?2027h")); err != nil {
+		term.Close()
+		return nil, nil, err
+	}
+	p, err := s.spawn(pty.Options{Command: command, Dir: cwd, Cols: size.Cols, Rows: size.Rows})
+	if err != nil {
+		term.Close()
+		return nil, nil, err
+	}
+	return p, term, nil
 }
 
-// Close kills every session.
+func (s *Server) list() *Workspaces {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := &Workspaces{}
+	for _, ws := range s.workspaces {
+		info := WorkspaceInfo{ID: ws.id, Name: ws.name, Attached: ws.owner != nil, Tabs: ws.tabInfos()}
+		if !ws.detachedAt.IsZero() && ws.owner == nil {
+			info.DetachedAt = ws.detachedAt.UnixMilli()
+		}
+		out.Workspaces = append(out.Workspaces, info)
+		for _, t := range ws.tabs {
+			for _, id := range t.root.Panes() {
+				if p := s.panes[id]; p != nil {
+					out.Panes = append(out.Panes, p.info(t.id))
+				}
+			}
+		}
+	}
+	slices.SortFunc(out.Workspaces, func(a, b WorkspaceInfo) int { return cmp.Compare(a.ID, b.ID) })
+	return out
+}
+
+// Close kills every pane.
 func (s *Server) Close() {
 	s.mu.Lock()
-	ss := make([]*Session, 0, len(s.sessions))
-	for _, x := range s.sessions {
-		ss = append(ss, x)
+	ps := make([]*Pane, 0, len(s.panes))
+	for _, p := range s.panes {
+		ps = append(ps, p)
 	}
 	s.mu.Unlock()
-	for _, x := range ss {
-		x.pty.Close()
+	for _, p := range ps {
+		p.pty.Close()
 	}
 }

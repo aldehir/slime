@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aldehir/slime/ssh/internal/pty"
+	"github.com/aldehir/slime/ssh/internal/vt"
 )
 
 // TestHelperShell is the child for TestConPTY: a shell that echoes lines.
@@ -50,7 +51,8 @@ func TestConPTY(t *testing.T) {
 	t.Cleanup(func() { l.Close() })
 	t.Logf("bundled ConPTY: %v", pty.Bundled())
 
-	dial := func() *Client {
+	h := &harness{t: t, srv: srv}
+	dial := func() *window {
 		conn, err := Dial(context.Background(), name)
 		if err != nil {
 			t.Fatal(err)
@@ -60,9 +62,8 @@ func TestConPTY(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { c.Close() })
-		return c
+		return &window{t: t, h: h, c: c, terms: map[uint32]*vt.Terminal{}}
 	}
-	h := &harness{t: t, srv: srv}
 
 	os.Setenv("SLIMED_HELPER_SHELL", "1")
 	defer os.Unsetenv("SLIMED_HELPER_SHELL")
@@ -72,48 +73,56 @@ func TestConPTY(t *testing.T) {
 	}
 	command := syscall.EscapeArg(exe) + " -test.run=^TestHelperShell$"
 
-	c1 := dial()
-	c1.Send(0, &New{Tag: 1, Command: command, Size: Size{Cols: 80, Rows: 24}})
-	v1 := h.view(c1)
-	v1.until("ready>")
-	c1.Send(v1.id, &Input{Data: []byte("first\r")})
-	v1.until("got first")
-	c1.Close()
-	eventually(t, "detach", func() bool { return !srv.session(v1.id).info().Attached })
-
-	c2 := dial()
-	sessions, err := c2.List()
-	if err != nil || len(sessions) != 1 || sessions[0].Attached {
-		t.Fatalf("list %+v, %v", sessions, err)
+	w1 := dial()
+	tag := w1.c.NextTag()
+	w1.c.Send(0, &WorkspaceNew{Tag: tag})
+	a, err := w1.c.Await(tag, true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	v2 := h.attach(c2, v1.id)
-	if s := v2.text(); !strings.Contains(s, "got first") {
+	w1.absorb(a)
+	tag = w1.c.NextTag()
+	w1.c.Send(0, &TabNew{Tag: tag, WS: w1.ws.ID, Command: command, Size: Size{Cols: 80, Rows: 24}})
+	if a, err = w1.c.Await(tag, true); err != nil {
+		t.Fatal(err)
+	}
+	w1.absorb(a)
+	pane := a.Created.Pane
+	w1.until(pane, "ready>")
+	w1.c.Send(pane, &Input{Data: []byte("first\r")})
+	w1.until(pane, "got first")
+	w1.c.Close()
+	eventually(t, "detach", func() bool { return !h.attached(w1.ws.ID) })
+
+	w2 := dial()
+	list, err := w2.c.List()
+	if err != nil || len(list.Workspaces) != 1 || list.Workspaces[0].Attached {
+		t.Fatalf("list %+v, %v", list, err)
+	}
+	tag = w2.c.NextTag()
+	w2.c.Send(0, &WorkspaceAttach{Tag: tag, WS: list.Workspaces[0].ID, Area: Area{Width: 720, Height: 456, CellW: 9, CellH: 19}})
+	if a, err = w2.c.Await(tag, false); err != nil {
+		t.Fatal(err)
+	}
+	w2.absorb(a)
+	if s := w2.text(pane); !strings.Contains(s, "got first") {
 		t.Errorf("restored text %q", s)
 	}
 	win32 := false
-	for _, m := range v2.att.Modes {
+	for _, m := range a.Panes[pane].Attached.Modes {
 		if m.Mode == 9001 && !m.ANSI {
 			win32 = m.Enabled
 		}
 	}
-	t.Logf("modes in attach: %+v", v2.att.Modes)
+	t.Logf("modes in attach: %+v", a.Panes[pane].Attached.Modes)
 	if !win32 {
 		t.Error("win32-input-mode not reported")
 	}
 
-	c2.Send(v2.id, &Input{Data: []byte("second\r")})
-	v2.until("got second")
-	c2.Send(v2.id, &Input{Data: []byte("exit\r")})
-	for {
-		_, m, err := c2.Recv()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if e, ok := m.(*Exit); ok {
-			if e.Status != 3 {
-				t.Errorf("exit status %d, want 3", e.Status)
-			}
-			break
-		}
+	w2.c.Send(pane, &Input{Data: []byte("second\r")})
+	w2.until(pane, "got second")
+	w2.c.Send(pane, &Input{Data: []byte("exit\r")})
+	if _, e := next[*Exit](w2); e.Status != 3 {
+		t.Errorf("exit status %d, want 3", e.Status)
 	}
 }

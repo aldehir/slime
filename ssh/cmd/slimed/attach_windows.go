@@ -22,13 +22,13 @@ func consoleSize() (uint16, uint16, error) {
 	return uint16(cols), uint16(rows), err
 }
 
-// attach bridges this console to an attached session until it ends, is
-// taken away, or Ctrl+] detaches. A dev harness, as slime-ssh-drive is:
-// the console redraws from the snapshot through the VT formatter, then
-// gets the live output. The console answers the program's queries
-// itself, being a real terminal.
-func attach(c *persist.Client, a *persist.Attachment) error {
-	redraw, err := redrawSequence(a.Snapshot)
+// attach bridges this console to one pane of an attached workspace
+// until the pane ends, the workspace is taken away, or Ctrl+] detaches.
+// A dev harness, as slime-ssh-drive is: the console redraws from the
+// snapshot through the VT formatter, then gets the live output. The
+// console answers the program's queries itself, being a real terminal.
+func attach(c *persist.Client, ws, pane uint32, p *persist.PaneState) error {
+	redraw, err := redrawSequence(p.Snapshot)
 	if err != nil {
 		return err
 	}
@@ -37,9 +37,13 @@ func attach(c *persist.Client, a *persist.Attachment) error {
 	if err != nil {
 		return err
 	}
-	// Clear the screen and scrollback, then redraw both.
+	// Clear the screen and scrollback, then redraw both, then what came
+	// after the snapshot while attaching.
 	os.Stdout.WriteString("\x1b[H\x1b[2J\x1b[3J")
 	os.Stdout.Write(redraw)
+	for _, b := range p.Output {
+		os.Stdout.Write(b)
+	}
 
 	var (
 		mu     sync.Mutex
@@ -63,18 +67,21 @@ func attach(c *persist.Client, a *persist.Attachment) error {
 				finish("lost slimed: " + err.Error())
 				return
 			}
-			if id != a.ID {
-				continue
-			}
 			switch m := m.(type) {
 			case *persist.Output:
-				os.Stdout.Write(m.Data)
+				if id == pane {
+					os.Stdout.Write(m.Data)
+				}
 			case *persist.Exit:
-				finish(fmt.Sprintf("session %d exited with status %d", a.ID, m.Status))
-				return
+				if id == pane {
+					finish(fmt.Sprintf("pane %d exited with status %d", pane, m.Status))
+					return
+				}
 			case *persist.Detached:
-				finish(fmt.Sprintf("detached from session %d: %s", a.ID, m.Reason))
-				return
+				if m.WS == ws {
+					finish(fmt.Sprintf("detached from workspace %d: %s", ws, m.Reason))
+					return
+				}
 			case *persist.Error:
 				finish("slimed: " + m.Message)
 				return
@@ -95,7 +102,7 @@ func attach(c *persist.Client, a *persist.Attachment) error {
 				continue
 			}
 			cols, rows = c2, r2
-			c.Send(a.ID, &persist.Resize{Size: persist.Size{Cols: cols, Rows: rows}})
+			c.Send(pane, &persist.Resize{Size: persist.Size{Cols: cols, Rows: rows}})
 		}
 	}()
 
@@ -111,14 +118,14 @@ func attach(c *persist.Client, a *persist.Attachment) error {
 			for i, b := range in {
 				if b == detachKey {
 					if i > 0 {
-						c.Send(a.ID, &persist.Input{Data: append([]byte(nil), in[:i]...)})
+						c.Send(pane, &persist.Input{Data: append([]byte(nil), in[:i]...)})
 					}
-					c.Send(a.ID, &persist.Detach{})
-					finish(fmt.Sprintf("detached from session %d", a.ID))
+					c.Send(0, &persist.WorkspaceDetach{WS: ws})
+					finish(fmt.Sprintf("detached from workspace %d", ws))
 					return
 				}
 			}
-			c.Send(a.ID, &persist.Input{Data: append([]byte(nil), in...)})
+			c.Send(pane, &persist.Input{Data: append([]byte(nil), in...)})
 		}
 	}()
 

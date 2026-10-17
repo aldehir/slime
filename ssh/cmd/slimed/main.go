@@ -1,12 +1,13 @@
-// slimed keeps terminal sessions alive while no client is attached:
-// it owns their ptys and each one's terminal state, and a client
-// attaches with a snapshot of the terminal followed by live output.
-// slime is the client; the other commands here manage sessions and try
-// them out from a console.
+// slimed keeps terminals alive while no window shows them: it owns
+// each pane's pty and terminal state, arranged in tabs and workspaces,
+// and a window attaches a workspace with a snapshot of each pane
+// followed by live output. slime is the client; the other commands here
+// script workspaces and try them out from a console.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -35,12 +36,13 @@ func main() {
 func newCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "slimed",
-		Short:         "Keep terminal sessions alive between attaches",
+		Short:         "Keep terminals alive between attaches",
 		Version:       fmt.Sprintf("protocol %d", persist.Version),
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
-	root.AddCommand(serveCommand(), listCommand(), newSessionCommand(), attachCommand(), peekCommand(), killCommand())
+	root.AddCommand(serveCommand(), lsCommand(), wsCommand(), tabCommand(), splitCommand(),
+		attachCommand(), peekCommand(), killCommand())
 	return root
 }
 
@@ -80,7 +82,7 @@ func serveCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&conptyDir, "conpty", "", "directory holding conpty.dll (default: next to slimed.exe, else the system's)")
-	cmd.Flags().DurationVar(&idle, "idle", 10*time.Second, "exit after this long with no sessions and no clients (0 never)")
+	cmd.Flags().DurationVar(&idle, "idle", 10*time.Second, "exit after this long with no workspaces and no clients (0 never)")
 	cmd.Flags().StringVar(&logPath, "log", "", "append logs to this file instead of stderr")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "log libghostty-vt's debug output too")
 	return cmd
@@ -109,10 +111,10 @@ func serve(logger *slog.Logger, idle time.Duration) error {
 	return srv.Serve(l)
 }
 
-func listCommand() *cobra.Command {
+func lsCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "list",
-		Short: "List sessions",
+		Use:   "ls",
+		Short: "List workspaces, their tabs, and their panes",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := connect(false)
@@ -120,70 +122,243 @@ func listCommand() *cobra.Command {
 				return err
 			}
 			defer c.Close()
-			sessions, err := c.List()
+			l, err := c.List()
 			if err != nil {
 				return err
 			}
+			panes := map[uint32]persist.PaneInfo{}
+			for _, p := range l.Panes {
+				panes[p.ID] = p
+			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tSIZE\tATTACHED\tSTARTED\tPID\tTITLE")
-			for _, s := range sessions {
-				title := s.Title
-				if title == "" {
-					title = s.Command
+			for _, ws := range l.Workspaces {
+				state := "attached"
+				if !ws.Attached {
+					state = "detached"
+					if ws.DetachedAt != 0 {
+						state += " " + time.UnixMilli(ws.DetachedAt).Format("Jan 2 15:04")
+					}
 				}
-				fmt.Fprintf(w, "%d\t%dx%d\t%v\t%s\t%d\t%s\n", s.ID, s.Cols, s.Rows, s.Attached,
-					time.UnixMilli(s.Created).Format("Jan 2 15:04"), s.PID, title)
+				fmt.Fprintf(w, "workspace %d\t%s\t%s\n", ws.ID, ws.Name, state)
+				for _, t := range ws.Tabs {
+					fmt.Fprintf(w, "  tab %d\t%s\t%s\n", t.ID, t.Name, layoutString(t.Tree))
+					for _, id := range t.Tree.Panes() {
+						p := panes[id]
+						title := p.Title
+						if title == "" {
+							title = p.Command
+						}
+						fmt.Fprintf(w, "    pane %d\t%dx%d\tpid %d\t%s\n", id, p.Cols, p.Rows, p.PID, title)
+					}
+				}
 			}
 			return w.Flush()
 		},
 	}
 }
 
-func newSessionCommand() *cobra.Command {
-	var (
-		detached bool
-		cwd      string
-	)
-	cmd := &cobra.Command{
-		Use:   "new [command line]",
-		Short: "Start a session and attach to it",
+// layoutString shows a tree compactly: row(60% 3, 40% col(50% 4, 50% 5)).
+func layoutString(n *persist.Node) string {
+	if n == nil {
+		return ""
+	}
+	if n.Pane != 0 {
+		return strconv.FormatUint(uint64(n.Pane), 10)
+	}
+	var b strings.Builder
+	if n.Axis == persist.Row {
+		b.WriteString("row(")
+	} else {
+		b.WriteString("col(")
+	}
+	for i, c := range n.Children {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%g%% %s", float64(c.Share)/100, layoutString(c.Node))
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func wsCommand() *cobra.Command {
+	ws := &cobra.Command{Use: "ws", Short: "Create, rename, and kill workspaces"}
+	ws.AddCommand(&cobra.Command{
+		Use:   "new [name]",
+		Short: "Create a workspace, detached, and print its id",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := connect(true)
 			if err != nil {
 				return err
 			}
 			defer c.Close()
-			size := persist.Size{Cols: 80, Rows: 24}
-			if cols, rows, err := consoleSize(); err == nil && !detached {
-				size.Cols, size.Rows = cols, rows
-			}
-			err = c.Send(0, &persist.New{Command: strings.Join(args, " "), Cwd: cwd, Size: size})
+			id, err := newWorkspace(c, strings.Join(args, ""))
 			if err != nil {
 				return err
 			}
-			a, err := c.ReadAttach()
+			// Hanging up detaches it, but an empty workspace would go:
+			// give it a shell.
+			if _, err := tabNew(c, id, []string{""}, persist.Right); err != nil {
+				return err
+			}
+			fmt.Println(id)
+			return nil
+		},
+	}, &cobra.Command{
+		Use:   "rename <workspace> <name>",
+		Short: "Rename a workspace",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
 			if err != nil {
 				return err
 			}
-			if detached {
-				fmt.Println(a.ID)
-				return nil
+			return send(&persist.WorkspaceRename{WS: id, Name: args[1]})
+		},
+	}, &cobra.Command{
+		Use:   "kill <workspace>",
+		Short: "End a workspace and everything in it",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
+			if err != nil {
+				return err
 			}
-			return attach(c, a)
+			return send(&persist.WorkspaceKill{WS: id})
+		},
+	})
+	return ws
+}
+
+func tabCommand() *cobra.Command {
+	var (
+		wsID  uint32
+		split string
+	)
+	newTab := &cobra.Command{
+		Use:   "new [command]...",
+		Short: "Start a tab; with several commands, one pane each, side by side or stacked",
+		Long: "Starts a tab in a workspace: the one given, else the most recently detached,\n" +
+			"else a new one. Each command (CreateProcessW syntax; empty for the shell)\n" +
+			"gets a pane, sharing the tab equally along --split.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir := persist.Right
+			switch split {
+			case "right", "h":
+			case "down", "v":
+				dir = persist.Down
+			default:
+				return fmt.Errorf("--split is right or down, not %q", split)
+			}
+			if len(args) == 0 {
+				args = []string{""}
+			}
+			c, err := connect(true)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			ws := wsID
+			if ws == 0 {
+				l, err := c.List()
+				if err != nil {
+					return err
+				}
+				if w := persist.MostRecentDetached(l); w != nil {
+					ws = w.ID
+				} else if ws, err = newWorkspace(c, ""); err != nil {
+					return err
+				}
+			}
+			created, err := tabNew(c, ws, args, dir)
+			if err != nil {
+				return err
+			}
+			fmt.Println(created.Tab)
+			return nil
 		},
 	}
-	cmd.Flags().BoolVarP(&detached, "detached", "d", false, "don't attach; print the session's id")
-	cmd.Flags().StringVarP(&cwd, "cwd", "C", "", "directory to start in")
+	newTab.Flags().Uint32VarP(&wsID, "workspace", "w", 0, "workspace to start it in")
+	newTab.Flags().StringVar(&split, "split", "right", "how several commands share the tab: right (side by side) or down (stacked)")
+
+	tab := &cobra.Command{Use: "tab", Short: "Start, rename, and close tabs"}
+	tab.AddCommand(newTab, &cobra.Command{
+		Use:   "rename <tab> <name>",
+		Short: "Rename a tab",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			return send(&persist.TabRename{Tab: id, Name: args[1]})
+		},
+	}, &cobra.Command{
+		Use:   "close <tab>",
+		Short: "End a tab's panes",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			return send(&persist.TabClose{Tab: id})
+		},
+	})
+	return tab
+}
+
+func splitCommand() *cobra.Command {
+	var percent float64
+	cmd := &cobra.Command{
+		Use:   "split <pane> right|down|left|up [command]",
+		Short: "Start a pane beside another, and print its id",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pane, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			dir, err := parseDirection(args[1])
+			if err != nil {
+				return err
+			}
+			if percent <= 0 || percent >= 100 {
+				return fmt.Errorf("--percent must be between 0 and 100")
+			}
+			c, err := connect(false)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			tag := c.NextTag()
+			m := &persist.Split{Tag: tag, Pane: pane, Dir: dir, Share: uint16(percent * 100)}
+			if len(args) == 3 {
+				m.Command = args[2]
+			}
+			if err := c.Send(0, m); err != nil {
+				return err
+			}
+			created, err := c.AwaitCreated(tag)
+			if err != nil {
+				return err
+			}
+			fmt.Println(created.Pane)
+			return nil
+		},
+	}
+	cmd.Flags().Float64VarP(&percent, "percent", "p", 50, "how much of the pane's space the new one takes")
 	return cmd
 }
 
 func attachCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "attach <id>",
-		Short: "Attach to a session in this console (Ctrl+] detaches)",
+		Use:   "attach <pane>",
+		Short: "Show a pane in this console, taking its workspace (Ctrl+] detaches)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := parseID(args[0])
+			pane, err := parseID(args[0])
 			if err != nil {
 				return err
 			}
@@ -192,18 +367,37 @@ func attachCommand() *cobra.Command {
 				return err
 			}
 			defer c.Close()
+			l, err := c.List()
+			if err != nil {
+				return err
+			}
+			ws := workspaceOf(l, pane)
+			if ws == 0 {
+				return fmt.Errorf("no pane %d", pane)
+			}
 			var size persist.Size
 			if cols, rows, err := consoleSize(); err == nil {
 				size.Cols, size.Rows = cols, rows
 			}
-			if err := c.Send(id, &persist.Attach{Size: size}); err != nil {
+			tag := c.NextTag()
+			// A console has no pixel size: its grid, in one-pixel cells.
+			area := persist.Area{Width: uint32(size.Cols), Height: uint32(size.Rows), CellW: 1, CellH: 1}
+			if err := c.Send(0, &persist.WorkspaceAttach{Tag: tag, WS: ws, Area: area}); err != nil {
 				return err
 			}
-			a, err := c.ReadAttach()
+			a, err := c.Await(tag, false)
 			if err != nil {
 				return err
 			}
-			return attach(c, a)
+			p := a.Panes[pane]
+			if p == nil {
+				return fmt.Errorf("no snapshot for pane %d", pane)
+			}
+			// The pane may share its tab; here it has the whole console.
+			if size.Cols != 0 {
+				c.Send(pane, &persist.Resize{Size: size})
+			}
+			return attach(c, ws, pane, p)
 		},
 	}
 }
@@ -211,11 +405,11 @@ func attachCommand() *cobra.Command {
 func peekCommand() *cobra.Command {
 	var asVT bool
 	cmd := &cobra.Command{
-		Use:   "peek <id>",
-		Short: "Print a session's screen and scrollback (takes it from an attached client)",
+		Use:   "peek <pane>",
+		Short: "Print a pane's screen and scrollback, without taking it",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := parseID(args[0])
+			pane, err := parseID(args[0])
 			if err != nil {
 				return err
 			}
@@ -224,21 +418,17 @@ func peekCommand() *cobra.Command {
 				return err
 			}
 			defer c.Close()
-			if err := c.Send(id, &persist.Attach{}); err != nil {
-				return err
-			}
-			a, err := c.ReadAttach()
+			p, err := c.Peek(pane)
 			if err != nil {
 				return err
 			}
-			c.Send(id, &persist.Detach{})
 			ctx := context.Background()
 			rt, err := vt.NewRuntime(ctx, nil)
 			if err != nil {
 				return err
 			}
 			defer rt.Close(ctx)
-			t, err := rt.Decode(a.Snapshot)
+			t, err := rt.Decode(p.Snapshot)
 			if err != nil {
 				return err
 			}
@@ -265,8 +455,8 @@ func peekCommand() *cobra.Command {
 
 func killCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "kill <id>...",
-		Short: "End sessions",
+		Use:   "kill <pane>...",
+		Short: "End panes",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := connect(false)
@@ -279,7 +469,7 @@ func killCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if err := c.Send(id, &persist.Kill{}); err != nil {
+				if err := c.Send(id, &persist.PaneKill{}); err != nil {
 					return err
 				}
 			}
@@ -290,12 +480,109 @@ func killCommand() *cobra.Command {
 	}
 }
 
+// send sends one message that has no reply, and waits until the daemon
+// has read it.
+func send(m persist.Message) error {
+	c, err := connect(false)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if err := c.Send(0, m); err != nil {
+		return err
+	}
+	// Errors come back before the list, which the daemon answers after.
+	if err := c.Send(0, &persist.List{}); err != nil {
+		return err
+	}
+	for {
+		_, reply, err := c.Recv()
+		if err != nil {
+			return err
+		}
+		switch reply := reply.(type) {
+		case *persist.Error:
+			return errors.New(reply.Message)
+		case *persist.Workspaces:
+			return nil
+		}
+	}
+}
+
+// newWorkspace creates a workspace, owned by c until it hangs up.
+func newWorkspace(c *persist.Client, name string) (uint32, error) {
+	tag := c.NextTag()
+	if err := c.Send(0, &persist.WorkspaceNew{Tag: tag, Name: name}); err != nil {
+		return 0, err
+	}
+	created, err := c.AwaitCreated(tag)
+	if err != nil {
+		return 0, err
+	}
+	return created.WS, nil
+}
+
+// tabNew starts a tab with a pane per command, sharing it equally along
+// dir: each split takes its share of what the last pane has left.
+func tabNew(c *persist.Client, ws uint32, commands []string, dir persist.Direction) (*persist.Created, error) {
+	tag := c.NextTag()
+	if err := c.Send(0, &persist.TabNew{Tag: tag, WS: ws, Command: commands[0]}); err != nil {
+		return nil, err
+	}
+	first, err := c.AwaitCreated(tag)
+	if err != nil {
+		return nil, err
+	}
+	last := first.Pane
+	n := len(commands)
+	for k := 1; k < n; k++ {
+		tag := c.NextTag()
+		share := uint16(persist.Whole * (n - k) / (n - k + 1))
+		if err := c.Send(0, &persist.Split{Tag: tag, Pane: last, Dir: dir, Share: share, Command: commands[k]}); err != nil {
+			return nil, err
+		}
+		created, err := c.AwaitCreated(tag)
+		if err != nil {
+			return nil, err
+		}
+		last = created.Pane
+	}
+	return first, nil
+}
+
+func workspaceOf(l *persist.Workspaces, pane uint32) uint32 {
+	for _, ws := range l.Workspaces {
+		for _, t := range ws.Tabs {
+			for _, id := range t.Tree.Panes() {
+				if id == pane {
+					return ws.ID
+				}
+			}
+		}
+	}
+	return 0
+}
+
 func parseID(s string) (uint32, error) {
 	id, err := strconv.ParseUint(s, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("bad session id %q", s)
+	if err != nil || id == 0 {
+		return 0, fmt.Errorf("bad id %q", s)
 	}
 	return uint32(id), nil
+}
+
+func parseDirection(s string) (persist.Direction, error) {
+	switch s {
+	case "right":
+		return persist.Right, nil
+	case "down":
+		return persist.Down, nil
+	case "left":
+		return persist.Left, nil
+	case "up":
+		return persist.Up, nil
+	}
+	return 0, fmt.Errorf("direction is right, down, left, or up, not %q", s)
 }
 
 // connect dials the daemon. If start is set and none is running, it
