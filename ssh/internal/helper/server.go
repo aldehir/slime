@@ -5,10 +5,12 @@ package helper
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"slices"
 	"strings"
@@ -125,10 +127,11 @@ type channel struct {
 	cwd   string
 
 	// Guarded by Server.mu.
-	cols, rows uint16
-	// sess is set once the remote has a pty of size ptyCols×ptyRows.
-	sess             *ssh.Session
-	ptyCols, ptyRows uint16
+	//
+	// size is the latest size slime gave.
+	size winSize
+	// sess is set once the remote has a pty.
+	sess *ssh.Session
 	// closed is set when slime closes the channel; it no longer wants
 	// to hear about it.
 	closed bool
@@ -232,7 +235,7 @@ func (s *Server) handle(f proto.Frame) {
 	case *proto.Open:
 		s.open(f.ID, m)
 	case *proto.Resize:
-		s.resize(f.ID, m.Cols, m.Rows)
+		s.resize(f.ID, winSize{m.Cols, m.Rows, m.Width, m.Height})
 	case *proto.Close:
 		s.close(f.ID)
 	case *proto.Answer:
@@ -255,8 +258,7 @@ func (s *Server) open(id uint32, m *proto.Open) {
 		input: bufio.NewReader(in),
 		term:  m.Term,
 		cwd:   m.Cwd,
-		cols:  m.Cols,
-		rows:  m.Rows,
+		size:  winSize{m.Cols, m.Rows, m.Width, m.Height},
 	}
 	if ch.term == "" {
 		ch.term = defaultTerm
@@ -282,21 +284,18 @@ func (s *Server) open(id uint32, m *proto.Open) {
 	}
 }
 
-func (s *Server) resize(id uint32, cols, rows uint16) {
+func (s *Server) resize(id uint32, size winSize) {
 	s.mu.Lock()
 	ch := s.channels[id]
 	if ch == nil {
 		s.mu.Unlock()
 		return
 	}
-	ch.cols, ch.rows = cols, rows
+	ch.size = size
 	sess := ch.sess
-	if sess != nil {
-		ch.ptyCols, ch.ptyRows = cols, rows
-	}
 	s.mu.Unlock()
 	if sess != nil {
-		if err := sess.WindowChange(int(rows), int(cols)); err != nil {
+		if err := windowChange(sess, size); err != nil {
 			log.Printf("channel %d: window-change: %v", id, err)
 		}
 	}
@@ -548,7 +547,7 @@ func (s *Server) start(client *ssh.Client, ch *channel) {
 	}
 
 	s.mu.Lock()
-	cols, rows := ch.cols, ch.rows
+	size := ch.size
 	s.mu.Unlock()
 
 	modes := ssh.TerminalModes{
@@ -559,7 +558,7 @@ func (s *Server) start(client *ssh.Client, ch *channel) {
 		ssh.TTY_OP_ISPEED: 38400,
 		ssh.TTY_OP_OSPEED: 38400,
 	}
-	if err := sess.RequestPty(ch.term, int(rows), int(cols), modes); err != nil {
+	if err := requestPty(sess, ch.term, size, modes); err != nil {
 		sess.Close()
 		s.fail(ch, fmt.Errorf("pty request: %w", err))
 		return
@@ -576,10 +575,8 @@ func (s *Server) start(client *ssh.Client, ch *channel) {
 		return
 	}
 	ch.sess = sess
-	ch.ptyCols, ch.ptyRows = cols, rows
-	if ch.cols != cols || ch.rows != rows {
-		ch.ptyCols, ch.ptyRows = ch.cols, ch.rows
-		sess.WindowChange(int(ch.rows), int(ch.cols))
+	if ch.size != size {
+		windowChange(sess, ch.size)
 	}
 	s.mu.Unlock()
 
@@ -785,6 +782,40 @@ func exitMessage(err error) (m *proto.Exit, ok bool) {
 		return &proto.Exit{Status: -1}, true
 	}
 	return nil, false
+}
+
+// winSize is a terminal's size in cells and, if known, pixels.
+type winSize struct {
+	cols, rows    uint16
+	width, height uint32
+}
+
+// requestPty is Session.RequestPty with the pixel size, which that
+// leaves at zero.
+func requestPty(sess *ssh.Session, term string, size winSize, modes ssh.TerminalModes) error {
+	var list []byte
+	for _, op := range slices.Sorted(maps.Keys(modes)) {
+		list = append(list, op)
+		list = binary.BigEndian.AppendUint32(list, modes[op])
+	}
+	list = append(list, 0) // TTY_OP_END
+	ok, err := sess.SendRequest("pty-req", true, ssh.Marshal(&struct {
+		Term                         string
+		Columns, Rows, Width, Height uint32
+		Modes                        string
+	}{term, uint32(size.cols), uint32(size.rows), size.width, size.height, string(list)}))
+	if err == nil && !ok {
+		err = errors.New("refused")
+	}
+	return err
+}
+
+// windowChange is Session.WindowChange with the pixel size.
+func windowChange(sess *ssh.Session, size winSize) error {
+	_, err := sess.SendRequest("window-change", false, ssh.Marshal(&struct {
+		Columns, Rows, Width, Height uint32
+	}{uint32(size.cols), uint32(size.rows), size.width, size.height}))
+	return err
 }
 
 // cwdCommand starts the user's login shell in dir, or in their home if

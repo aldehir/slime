@@ -97,9 +97,15 @@ type Open struct {
 	Term       string
 	// Cwd, if set, is where the remote shell starts.
 	Cwd string
+	// Width and Height are the terminal's size in pixels, zero if
+	// unknown. Programs read them from the pty to size images.
+	Width, Height uint32
 }
 
-type Resize struct{ Cols, Rows uint16 }
+type Resize struct {
+	Cols, Rows    uint16
+	Width, Height uint32
+}
 
 type Close struct{}
 
@@ -208,6 +214,8 @@ func (m *Open) encode(e *encoder) {
 	e.u16(m.Rows)
 	e.str(m.Term)
 	e.str(m.Cwd)
+	e.u32(m.Width)
+	e.u32(m.Height)
 }
 
 func (m *Open) decode(d *decoder) {
@@ -217,16 +225,27 @@ func (m *Open) decode(d *decoder) {
 	m.Rows = d.u16()
 	m.Term = d.str()
 	m.Cwd = d.str()
+	// Added in the same version; older senders leave them out.
+	if d.has(8) {
+		m.Width = d.u32()
+		m.Height = d.u32()
+	}
 }
 
 func (m *Resize) encode(e *encoder) {
 	e.u16(m.Cols)
 	e.u16(m.Rows)
+	e.u32(m.Width)
+	e.u32(m.Height)
 }
 
 func (m *Resize) decode(d *decoder) {
 	m.Cols = d.u16()
 	m.Rows = d.u16()
+	if d.has(8) {
+		m.Width = d.u32()
+		m.Height = d.u32()
+	}
 }
 
 func (*Close) encode(*encoder) {}

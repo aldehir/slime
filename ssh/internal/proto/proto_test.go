@@ -25,9 +25,10 @@ func TestRoundTrip(t *testing.T) {
 		{1, &Answer{Choice: ChoiceAccept, Answers: []string{"1", "hunter2"}}},
 		{1, &Answer{Choice: ChoiceCancel, Answers: []string{}}},
 		{1, &Info{Text: "Success. Logging you in..."}},
-		{1, &Open{In: 0x1234, Out: 0xdeadbeefcafe, Cols: 120, Rows: 40, Term: "xterm-256color", Cwd: "/home/alde/src"}},
+		{1, &Open{In: 0x1234, Out: 0xdeadbeefcafe, Cols: 120, Rows: 40, Term: "xterm-256color", Cwd: "/home/alde/src", Width: 960, Height: 800}},
 		{1, &Open{Term: "xterm-256color"}},
 		{7, &Resize{Cols: 80, Rows: 24}},
+		{7, &Resize{Cols: 80, Rows: 24, Width: 640, Height: 480}},
 		{7, &Close{}},
 		{0, &HelloReply{Version: Version}},
 		{0, &Connected{}},
@@ -70,18 +71,41 @@ func TestRoundTrip(t *testing.T) {
 
 func TestWireFormat(t *testing.T) {
 	var buf bytes.Buffer
-	if err := NewWriter(&buf).Send(2, &Resize{Cols: 0x0102, Rows: 0x0304}); err != nil {
+	if err := NewWriter(&buf).Send(2, &Resize{Cols: 0x0102, Rows: 0x0304, Width: 0x05060708, Height: 0x090a0b0c}); err != nil {
 		t.Fatal(err)
 	}
 	want := []byte{
-		9, 0, 0, 0, // length
+		17, 0, 0, 0, // length
 		byte(TypeResize),
 		2, 0, 0, 0, // id
 		0x02, 0x01,
 		0x04, 0x03,
+		0x08, 0x07, 0x06, 0x05,
+		0x0c, 0x0b, 0x0a, 0x09,
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Errorf("wire = % x, want % x", buf.Bytes(), want)
+	}
+}
+
+// A sender from before the pixel size leaves it out; it reads as zero.
+func TestPixelSizeOptional(t *testing.T) {
+	m, err := Decode(Frame{Type: TypeResize, Payload: []byte{80, 0, 24, 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(m, &Resize{Cols: 80, Rows: 24}) {
+		t.Errorf("resize = %#v", m)
+	}
+
+	var e encoder
+	(&Open{In: 1, Out: 2, Cols: 80, Rows: 24, Term: "xterm-256color"}).encode(&e)
+	m, err = Decode(Frame{Type: TypeOpen, Payload: e.buf[:len(e.buf)-8]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := m.(*Open); o.Term != "xterm-256color" || o.Width != 0 || o.Height != 0 {
+		t.Errorf("open = %#v", o)
 	}
 }
 

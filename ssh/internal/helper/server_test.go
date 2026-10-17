@@ -187,14 +187,19 @@ func (h *harness) openPipes(in, out uint64) (io.ReadCloser, io.WriteCloser, erro
 
 // open sends an Open for channel id and returns slime's side of it.
 func (h *harness) open(id uint32, cols, rows uint16, cwd string) *term {
+	return h.openWith(id, &proto.Open{Cols: cols, Rows: rows, Cwd: cwd})
+}
+
+// openWith sends m for channel id, with the pipes filled in.
+func (h *harness) openWith(id uint32, m *proto.Open) *term {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	h.mu.Lock()
 	h.next += 2
-	in, out := h.next, h.next+1
-	h.ends[in], h.ends[out] = inR, outW
+	m.In, m.Out = h.next, h.next+1
+	h.ends[m.In], h.ends[m.Out] = inR, outW
 	h.mu.Unlock()
-	h.send(id, &proto.Open{In: in, Out: out, Cols: cols, Rows: rows, Cwd: cwd})
+	h.send(id, m)
 	return &term{t: h.t, keys: inW, screen: newScreen(outR)}
 }
 
@@ -314,6 +319,28 @@ func TestShell(t *testing.T) {
 	if err := h.expectServeReturn(); err != nil {
 		t.Errorf("Serve = %v", err)
 	}
+}
+
+// The pixel size reaches the remote pty, with the cells and alone.
+func TestPixelSize(t *testing.T) {
+	srv := startServer(t, sshtest.Options{Password: password})
+	h := newHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
+	tm := h.openWith(1, &proto.Open{Cols: 100, Rows: 30, Width: 800, Height: 600})
+	tm.expect(t, "password: ")
+	tm.typ(password + "\r")
+	h.expect(0, &proto.Connected{})
+	tm.expect(t, "$ ")
+	tm.typ("size\r")
+	tm.expect(t, "size=100x30 px=800x600")
+
+	h.send(1, &proto.Resize{Cols: 120, Rows: 40, Width: 960, Height: 800})
+	tm.typ("size\r")
+	tm.expect(t, "size=120x40 px=960x800")
+
+	// A new font size changes the pixels and not the grid.
+	h.send(1, &proto.Resize{Cols: 120, Rows: 40, Width: 1200, Height: 1000})
+	tm.typ("size\r")
+	tm.expect(t, "size=120x40 px=1200x1000")
 }
 
 func TestPasswordNotEchoed(t *testing.T) {

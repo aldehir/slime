@@ -318,9 +318,12 @@ type session struct {
 	mu         sync.Mutex
 	term       string
 	cols, rows int
-	modes      map[uint8]uint32
-	t          *term.Terminal
-	started    bool
+	// width and height are the pixel size, which the pty requests carry
+	// for programs that size images.
+	width, height int
+	modes         map[uint8]uint32
+	t             *term.Terminal
+	started       bool
 }
 
 func (s *session) serve(reqs <-chan *ssh.Request) {
@@ -338,6 +341,7 @@ func (s *session) serve(reqs <-chan *ssh.Request) {
 			}
 			s.mu.Lock()
 			s.term, s.cols, s.rows = p.Term, int(p.Cols), int(p.Rows)
+			s.width, s.height = int(p.Width), int(p.Height)
 			s.modes = parseModes([]byte(p.Modes))
 			s.mu.Unlock()
 			req.Reply(true, nil)
@@ -348,6 +352,7 @@ func (s *session) serve(reqs <-chan *ssh.Request) {
 			}
 			s.mu.Lock()
 			s.cols, s.rows = int(w.Cols), int(w.Rows)
+			s.width, s.height = int(w.Width), int(w.Height)
 			if s.t != nil {
 				s.t.SetSize(s.cols, s.rows)
 			}
@@ -384,7 +389,7 @@ func (s *session) serve(reqs <-chan *ssh.Request) {
 // run is the fake shell. Commands:
 //
 //	info       term, size, cwd, and the tty modes the helper sends
-//	size       the current size
+//	size       the current size, in cells and pixels
 //	flood N    N numbered lines
 //	exit [N]   exit with status N
 //	kill       end by signal KILL
@@ -410,13 +415,14 @@ func (s *session) run(cwd string) {
 		}
 		s.mu.Lock()
 		termName, cols, rows, modes := s.term, s.cols, s.rows, s.modes
+		width, height := s.width, s.height
 		s.mu.Unlock()
 		switch f[0] {
 		case "info":
 			fmt.Fprintf(t, "term=%s size=%dx%d cwd=%s iutf8=%d verase=%d\n",
 				termName, cols, rows, cwd, modes[ssh.IUTF8], modes[ssh.VERASE])
 		case "size":
-			fmt.Fprintf(t, "size=%dx%d\n", cols, rows)
+			fmt.Fprintf(t, "size=%dx%d px=%dx%d\n", cols, rows, width, height)
 		case "flood":
 			n, _ := strconv.Atoi(arg(f, 1))
 			for i := range n {
