@@ -317,14 +317,22 @@ pub const CAPSLOCK_ON = 0x0080;
 pub const ENHANCED_KEY = 0x0100;
 
 // Virtual keys
+pub const VK_BACK = 0x08;
+pub const VK_RETURN = 0x0D;
 pub const VK_SHIFT = 0x10;
 pub const VK_CONTROL = 0x11;
 pub const VK_MENU = 0x12;
 pub const VK_CAPITAL = 0x14;
+pub const VK_ESCAPE = 0x1B;
 pub const VK_TAB = 0x09;
 pub const VK_PRIOR = 0x21;
 pub const VK_NEXT = 0x22;
+pub const VK_END = 0x23;
+pub const VK_HOME = 0x24;
+pub const VK_LEFT = 0x25;
+pub const VK_RIGHT = 0x27;
 pub const VK_INSERT = 0x2D;
+pub const VK_DELETE = 0x2E;
 pub const VK_LWIN = 0x5B;
 pub const VK_RWIN = 0x5C;
 pub const VK_NUMPAD0 = 0x60;

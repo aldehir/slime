@@ -15,6 +15,7 @@ const com = win32.com;
 const dwrite = win32.dwrite;
 const Painter = @import("../renderer/Painter.zig");
 pub const Theme = @import("theme.zig").Theme;
+pub const TextField = @import("TextField.zig");
 
 pub const Rect = Painter.Rect;
 pub const Color = Painter.Color;
@@ -52,6 +53,8 @@ pub const Hit = union(enum) {
     toggle_mode,
     /// The button that opens a session in group `i`.
     new_session: usize,
+    /// The button that connects to a host, or its field.
+    connect,
     session: usize,
     close_session: usize,
     terminal,
@@ -68,6 +71,10 @@ pub const View = struct {
     groups: []const Group,
     sessions: []const Session,
     active: usize,
+    /// The host being typed after "Connect" was clicked, if it was.
+    connect: ?*const TextField = null,
+    /// The on phase of the caret's blink, while focused.
+    caret_visible: bool = false,
     /// The window has keyboard focus.
     focused: bool,
     maximized: bool,

@@ -1,6 +1,7 @@
 //! Sessions in a sidebar under the title bar, grouped by where they run:
 //! Local, then each SSH connection. A group's header has a button that
-//! opens another session there.
+//! opens another session there. A "Connect" button at the bottom turns
+//! into a field for a host to connect to.
 
 const std = @import("std");
 const Chrome = @import("Chrome.zig");
@@ -21,6 +22,8 @@ const row_height = 30;
 const row_gap = 4;
 /// Rows' close buttons and headers' new session buttons, in one column.
 const button_size = 20;
+const connect_height = 32;
+const pad_bottom = 12;
 const corner = 10;
 
 pub fn layout(c: *const Chrome, l: *Chrome.Layout) void {
@@ -34,9 +37,12 @@ pub fn layout(c: *const Chrome, l: *Chrome.Layout) void {
 
 pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.View, x: f32, y: f32) ?Hit {
     if (!l.list.contains(x, y)) return null;
+    if (connectRect(c, l).contains(x, y)) return .connect;
+    const rows = rowsArea(c, l);
+    if (!rows.contains(x, y)) return .none;
     var walk: Walk = .init(c, l, view);
     while (walk.next()) |item| {
-        if (item.rect.y >= l.list.bottom()) break;
+        if (item.rect.y >= rows.bottom()) break;
         if (!item.rect.contains(x, y)) continue;
         const on_button = rowButton(c, item.rect).contains(x, y);
         return switch (item.part) {
@@ -53,31 +59,105 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
     p.pushClip(l.list);
     defer p.popClip();
 
+    const rows = rowsArea(c, l);
+    p.pushClip(rows);
     var walk: Walk = .init(c, l, view);
     while (walk.next()) |item| {
-        if (item.rect.y >= l.list.bottom()) break;
+        if (item.rect.y >= rows.bottom()) break;
         switch (item.part) {
             .header => |g| paintHeader(c, p, item.rect, g, view.groups[g]),
             .row => |i| paintRow(c, p, item.rect, i, view.sessions[i], i == view.active),
         }
     }
-    paintStats(c, p, l, view.stats);
+    p.popClip();
+
+    const connect = connectRect(c, l);
+    if (view.connect) |field| {
+        paintField(c, p, connect, field, view.focused and view.caret_visible);
+    } else {
+        paintConnect(c, p, connect);
+    }
+    paintStats(c, p, l, connect.y, view.stats);
 }
 
-/// The frame stats at the bottom left, in line with the section headers.
-fn paintStats(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, stats: []const u16) void {
+/// "Connect", at the bottom of the list.
+fn connectRect(c: *const Chrome, l: *const Chrome.Layout) Rect {
+    const h = c.px(connect_height);
+    return .{
+        .x = l.list.x + c.px(pad_x),
+        .y = l.list.bottom() - c.px(pad_bottom) - h,
+        .w = @max(0, l.list.w - 2 * c.px(pad_x)),
+        .h = h,
+    };
+}
+
+/// Where groups and rows go: above "Connect".
+fn rowsArea(c: *const Chrome, l: *const Chrome.Layout) Rect {
+    const bottom = connectRect(c, l).y - c.px(section_gap);
+    return .{ .x = l.list.x, .y = l.list.y, .w = l.list.w, .h = @max(0, bottom - l.list.y) };
+}
+
+/// The frame stats at the bottom left, above `bottom`, in line with the
+/// section headers.
+fn paintStats(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, bottom: f32, stats: []const u16) void {
     if (stats.len == 0) return;
     const line_h = c.px(16);
     const lines: f32 = @floatFromInt(std.mem.countScalar(u16, stats, '\n') + 1);
     const x = l.list.x + c.px(pad_x) + c.px(2);
     var r: Rect = .{
         .x = x,
-        .y = l.list.bottom() - c.px(10) - lines * line_h,
+        .y = bottom - c.px(10) - lines * line_h,
         .w = @max(0, l.list.right() - c.px(pad_x) - x),
         .h = line_h,
     };
     var it = std.mem.splitScalar(u16, stats, '\n');
     while (it.next()) |line| : (r.y += line_h) p.text(line, c.fonts.mono, r, c.theme.text_muted);
+}
+
+fn paintConnect(c: *const Chrome, p: *Painter, r: Rect) void {
+    const bg = switch (c.buttonState(.connect)) {
+        .rest => c.theme.surface,
+        .hover, .pressed => c.theme.surface_hover,
+    };
+    p.fillRounded(r, c.px(6), bg);
+    // Lucide's plug spans 16 of its 24 units: 13 DIPs in this box, which
+    // puts the prongs on pixel centers.
+    const icon = c.px(20);
+    c.drawIcon(p, .plug, .{ .x = r.x + c.px(7), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, c.theme.text);
+    const label_x = r.x + c.px(32);
+    p.text(L("Connect…"), c.fonts.body, .{ .x = label_x, .y = r.y, .w = @max(0, r.right() - c.px(8) - label_x), .h = r.h }, c.theme.text);
+}
+
+/// The host field "Connect" turns into: its text scrolled to keep the
+/// caret in view, with the selection behind it.
+fn paintField(c: *const Chrome, p: *Painter, r: Rect, field: *const Chrome.TextField, caret: bool) void {
+    const radius = c.px(6);
+    p.fillRounded(r, radius, c.theme.surface);
+    p.strokeRounded(r.inset(c.stroke() / 2, c.stroke() / 2), radius, c.stroke(), c.theme.accent);
+
+    const inner = r.inset(c.px(10), 0);
+    const text = field.text();
+    const font = c.fonts.body;
+    if (text.len == 0) p.text(L("user@host:port"), font, inner, c.theme.text_inactive);
+
+    const caret_x = c.fonts.measure(text[0..field.caret], font);
+    // Room for the caret at the right edge.
+    const scroll = @max(0, caret_x - (inner.w - c.stroke()));
+    const x = inner.x - scroll;
+    p.pushClip(inner.inset(0, -r.h));
+    defer p.popClip();
+    const sel = field.selection();
+    if (sel.start != sel.end) {
+        const x0 = x + c.fonts.measure(text[0..sel.start], font);
+        const x1 = x + c.fonts.measure(text[0..sel.end], font);
+        p.fill(.{ .x = @round(x0), .y = r.y + c.px(7), .w = @round(x1) - @round(x0), .h = r.h - c.px(14) }, c.theme.selection);
+    }
+    // Laid out wider than it is, so it's never trimmed.
+    p.text(text, font, .{ .x = x, .y = r.y, .w = c.fonts.measure(text, font) + inner.w, .h = r.h }, c.theme.text);
+    if (caret) {
+        const cx = Chrome.crisp(x + caret_x, c.stroke());
+        p.line(cx, r.y + c.px(8), cx, r.bottom() - c.px(8), c.stroke(), c.theme.text_strong);
+    }
 }
 
 fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.View.Group) void {
@@ -237,6 +317,9 @@ test "groups, rows, and their buttons" {
     _ = walk.next().?;
     const second = walk.next().?.rect;
     try std.testing.expect(walk.next() == null);
+    const connect = connectRect(&c, &l);
+    try std.testing.expectEqual(l.list.bottom() - pad_bottom, connect.bottom());
+    try std.testing.expectEqual(Hit.connect, c.hitTest(&l, &view, connect.x + 1, connect.y + 1));
 
     try std.testing.expectEqual(Hit{ .session = 1 }, c.hitTest(&l, &view, second.x + 2, second.y + 2));
     const close = rowButton(&c, second);

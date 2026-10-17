@@ -121,6 +121,10 @@ focused: bool = false,
 /// The on phase of the cursor blink.
 blink_visible: bool = true,
 
+/// The host being typed after "Connect" was clicked. Takes the keyboard
+/// while set.
+connect_field: ?Chrome.TextField = null,
+
 /// The virtual key of the last key binding run, so its release isn't
 /// sent to the child either.
 bound_key: ?u32 = null,
@@ -605,6 +609,93 @@ fn blinkTick(self: *Window) void {
     // blinking later picks up the phase from here.
     const cursor = self.activeSession().render_state.cursor;
     if (cursor.visible and cursor.blinking) self.dirty = true;
+    if (self.connect_field != null) self.dirty = true;
+}
+
+/// Show the host field in place of "Connect".
+fn startConnect(self: *Window) void {
+    if (self.connect_field != null) return;
+    // Destinations go on the helper's command line unquoted.
+    self.connect_field = .{ .reject = std.unicode.utf8ToUtf16LeStringLiteral(" \t\"") };
+    self.resetBlink();
+    self.dirty = true;
+}
+
+fn cancelConnect(self: *Window) void {
+    if (self.connect_field == null) return;
+    self.connect_field = null;
+    self.dirty = true;
+}
+
+/// Connect to the host in the field, `ssh://` being implied, and close
+/// the field.
+fn submitConnect(self: *Window) void {
+    const field = &(self.connect_field orelse return);
+    const scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
+    var buf: [scheme.len + Chrome.TextField.max_len]u16 = undefined;
+    const host = field.text();
+    const dest = if (std.mem.startsWith(u16, host, scheme)) host else dest: {
+        @memcpy(buf[0..scheme.len], scheme);
+        @memcpy(buf[scheme.len..][0..host.len], host);
+        break :dest buf[0 .. scheme.len + host.len];
+    };
+    if (dest.len > scheme.len) {
+        self.spawnSession(.{ .destination = dest }) catch |err| log.err("connect failed: {}", .{err});
+    }
+    self.cancelConnect();
+}
+
+/// A key down while the host field is open. Returns false for keys it
+/// doesn't take.
+fn connectKey(self: *Window, vk: u32) bool {
+    const field = &(self.connect_field orelse return false);
+    const ctrl = win32.GetKeyState(win32.VK_CONTROL) < 0;
+    const shift = win32.GetKeyState(win32.VK_SHIFT) < 0;
+    switch (vk) {
+        win32.VK_RETURN => self.submitConnect(),
+        win32.VK_ESCAPE => self.cancelConnect(),
+        win32.VK_LEFT => field.press(.left, ctrl, shift),
+        win32.VK_RIGHT => field.press(.right, ctrl, shift),
+        win32.VK_HOME => field.press(.home, ctrl, shift),
+        win32.VK_END => field.press(.end, ctrl, shift),
+        win32.VK_BACK => field.press(.backspace, ctrl, false),
+        win32.VK_DELETE => if (shift) self.connectCopy(true) else field.press(.delete, ctrl, false),
+        win32.VK_INSERT => if (ctrl) self.connectCopy(false) else if (shift) self.connectPaste() else return false,
+        'A' => if (ctrl) field.press(.select_all, false, false) else return false,
+        'C' => if (ctrl) self.connectCopy(false) else return false,
+        'X' => if (ctrl) self.connectCopy(true) else return false,
+        'V' => if (ctrl) self.connectPaste() else return false,
+        else => return false,
+    }
+    // Drop the key's text (Enter's CR would reach the new session).
+    var m: win32.MSG = undefined;
+    while (win32.PeekMessageW(&m, self.hwnd, win32.WM_CHAR, win32.WM_DEADCHAR, win32.PM_REMOVE) != 0) {}
+    self.resetBlink();
+    self.dirty = true;
+    return true;
+}
+
+/// Copy the field's selection, cutting it if `cut`.
+fn connectCopy(self: *Window, cut: bool) void {
+    const field = &(self.connect_field orelse return);
+    const units = field.selected();
+    if (units.len == 0) return;
+    const text = std.unicode.utf16LeToUtf8Alloc(self.alloc, units) catch return;
+    defer self.alloc.free(text);
+    clipboard.set(self.hwnd.?, text) catch |err| return log.warn("copy failed: {}", .{err});
+    if (cut) field.press(.delete, false, false);
+}
+
+/// Paste the clipboard's first line into the field.
+fn connectPaste(self: *Window) void {
+    const field = &(self.connect_field orelse return);
+    const text = (clipboard.get(self.alloc, self.hwnd) catch |err| return log.warn("paste failed: {}", .{err})) orelse return;
+    defer self.alloc.free(text);
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, text, " \t\r\n"), '\n');
+    const line = lines.first();
+    const units = std.unicode.utf8ToUtf16LeAlloc(self.alloc, line) catch return;
+    defer self.alloc.free(units);
+    field.insert(units);
 }
 
 /// The chrome's view of the window's state.
@@ -628,6 +719,8 @@ fn view(self: *Window) Chrome.View {
     return .{
         .groups = self.view_groups.items,
         .sessions = self.view_sessions.items,
+        .connect = if (self.connect_field) |*f| f else null,
+        .caret_visible = self.blink_visible,
         .active = self.active,
         .focused = self.focused,
         .maximized = win32.IsZoomed(self.hwnd.?) != 0,
@@ -683,6 +776,8 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
     const hit = self.hitAt(pos);
     self.setHover(hit);
+    // Clicking anywhere else closes the host field.
+    if (press and hit != .connect) self.cancelConnect();
     if (hit == .terminal) {
         if (press) {
             // Capture the mouse while a button is down, so a drag past
@@ -730,6 +825,7 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             self.layout();
         },
         .new_session => |g| self.newSessionOn(self.groupConnection(g)),
+        .connect => self.startConnect(),
         .close_session => |i| self.closeSession(i),
         else => {},
     }
@@ -864,7 +960,8 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     if (stats) t = self.stats.lap(.update, t);
     self.cursor_shown = s.render_state.cursor.visible;
     try s.cells.build(self.alloc, &s.render_state, &self.grid, .{
-        .focused = self.focused,
+        // The host field has the keyboard while it's open.
+        .focused = self.focused and self.connect_field == null,
         .blink_visible = self.blink_visible,
     }, .{
         .cursor_color = self.config.@"cursor-color",
@@ -1129,6 +1226,13 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_KEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP => {
+            if (self.connect_field != null) {
+                if (msg == win32.WM_KEYDOWN and self.connectKey(@truncate(wparam))) return 0;
+                if (self.keyBinding(msg, wparam)) return 0;
+                // Keep alt+F4; the session gets nothing.
+                if (msg == win32.WM_SYSKEYDOWN and wparam == win32.VK_F4) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                return 0;
+            }
             if (self.keyBinding(msg, wparam)) return 0;
             if (self.activeSession().ended) {
                 if ((msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) and !input.isModifier(wparam, lparam)) {
@@ -1155,6 +1259,14 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_CHAR, win32.WM_SYSCHAR => {
+            if (self.connect_field) |*field| {
+                if (msg == win32.WM_CHAR) {
+                    field.insert(&.{@truncate(wparam)});
+                    self.resetBlink();
+                    self.dirty = true;
+                }
+                return 0;
+            }
             self.activeSession().charInput(@truncate(wparam));
             return 0;
         },

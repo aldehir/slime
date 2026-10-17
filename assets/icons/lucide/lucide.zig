@@ -3,6 +3,7 @@
 //! `currentColor`. Painter recolors and restrokes them as it draws.
 
 pub const panel_left = @embedFile("panel-left.svg");
+pub const plug = @embedFile("plug.svg");
 pub const plus = @embedFile("plus.svg");
 pub const terminal = @embedFile("terminal.svg");
 pub const x = @embedFile("x.svg");

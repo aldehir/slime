@@ -39,6 +39,8 @@ pub const Theme = struct {
     text_inactive: Color,
 
     accent: Color,
+    /// Selected text in a field.
+    selection: Color,
 
     pub fn init(bg: RGB, fg: RGB) Theme {
         const b = toColor(bg);
@@ -48,6 +50,8 @@ pub const Theme = struct {
         // side bars are, but less so on light backgrounds.
         const ground = mix(b, .{ 0, 0, 0, 1 }, if (light) 0.06 else 0.25);
         const extreme: Color = if (light) .{ 0, 0, 0, 1 } else .{ 1, 1, 1, 1 };
+        // The icon's mid blue, or its deep blue on light backgrounds.
+        const accent = Painter.rgb(if (light) 0x1f6fd1 else 0x3fa2f2);
         return .{
             .light = light,
             .ground = ground,
@@ -65,8 +69,8 @@ pub const Theme = struct {
             .text_strong = mix(f, extreme, 0.3),
             .text_muted = mix(ground, f, 0.58),
             .text_inactive = mix(ground, f, 0.42),
-            // The icon's mid blue, or its deep blue on light backgrounds.
-            .accent = Painter.rgb(if (light) 0x1f6fd1 else 0x3fa2f2),
+            .accent = accent,
+            .selection = withAlpha(accent, 0.35),
         };
     }
 };

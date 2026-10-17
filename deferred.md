@@ -107,9 +107,14 @@ opened from one of its sessions.
 The sidebar groups sessions by connection, under a header per host whose
 `+` opens another channel (or reconnects, if the connection is gone).
 
-- **A way to pick a host** other than the command: a "Connect" button
-  at the bottom of the sidebar that turns into a host field (with recent
-  hosts), adding a group. Needs a text box widget.
+- **Recent hosts** under the Connect field, to click instead of typing.
+  Needs somewhere to keep them.
+- **The mouse in text fields** (`chrome/TextField.zig`): clicking to
+  place the caret, dragging to select, double-click for a word. Only
+  the keyboard edits them.
+- **IME composition in text fields.** Committed text arrives as
+  WM_CHAR, but the candidate window isn't placed at the caret.
+- **The Connect field's key** to open it from the keyboard.
 - **Prompts in a dialog.** Fill in `TypePrompt` as a list of questions
   (label, echo) plus kind, title and instruction, answered or cancelled,
   covering passwords, passphrases, keyboard-interactive, and host keys.
