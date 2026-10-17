@@ -51,6 +51,9 @@ pub const Theme = struct {
     /// A dialog, raised from the terminal, and its edge.
     dialog: Color,
     dialog_outline: Color,
+    /// A pane's edge, over its terminal, and its shadow on the ground.
+    pane_border: Color,
+    pane_shadow: Color,
 
     pub fn init(bg: RGB, fg: RGB) Theme {
         const b = toColor(bg);
@@ -88,6 +91,9 @@ pub const Theme = struct {
             .scrim = .{ 0.05, 0.05, 0.08, if (light) 0.25 else 0.45 },
             .dialog = mix(b, f, if (light) 0.03 else 0.06),
             .dialog_outline = mix(b, f, 0.13),
+            .pane_border = withAlpha(f, if (light) 0.14 else 0.09),
+            // Shadows show less on a dark ground; they need more there.
+            .pane_shadow = .{ 0, 0, 0, if (light) 0.14 else 0.38 },
         };
     }
 };

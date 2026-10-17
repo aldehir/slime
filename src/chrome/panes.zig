@@ -1,6 +1,6 @@
-//! The active tab's panes, over the terminal area: each a rounded
-//! rectangle on the chrome's ground, with a title strip at its top that
-//! holds its title and icons (faint until the mouse is over one) to split
+//! The active tab's panes, over the terminal area. The renderer draws
+//! each as a rounded box with a border and a shadow; over it go a title
+//! strip at its top that holds its title and icons (faint until the mouse is over one) to split
 //! it to the right or down and zoom it to fill the tab. Panes without
 //! focus are dimmed.
 //!
@@ -17,8 +17,9 @@ const Hit = Chrome.Hit;
 const Pane = Chrome.View.Pane;
 
 // Sizes in DIPs.
-/// Between panes, and around them (`Chrome.paneArea`).
-pub const gap = 6;
+/// Between panes, and around them (`Chrome.paneArea`), with room for
+/// their shadows.
+pub const gap = 10;
 /// The title strip's height.
 pub const title_height = 30;
 const button_size = 24;
@@ -80,9 +81,6 @@ pub fn rect(c: *const Chrome, view: *const Chrome.View, hit: Hit) ?Rect {
 pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *const Chrome.View) void {
     const several = view.panes.len > 1;
     for (view.panes, 0..) |pane, i| {
-        // The renderer fills only the terminal; the strip is ours.
-        const strip = titleRect(c, pane);
-        p.fill(strip, pane.bg);
         paintTitle(c, p, pane, several);
         for (buttons(c, pane)) |b| {
             const hit = hitFor(b, i);
@@ -101,8 +99,7 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
                 .zoom => if (pane.zoomed) .minimize_2 else .maximize_2,
             }, buttonRect(c, pane, b).center(size, size), .{ t[0], t[1], t[2], alpha });
         }
-        if (several and !pane.focused) p.fill(pane.frame, .{ pane.bg[0], pane.bg[1], pane.bg[2], dim });
-        p.cornerMasks(pane.frame, l.corner, c.theme.ground);
+        if (several and !pane.focused) p.fillRounded(pane.frame, l.corner, .{ pane.bg[0], pane.bg[1], pane.bg[2], dim });
     }
 }
 
@@ -123,7 +120,7 @@ pub fn paintDrag(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *
     if (d.source) |i| if (i < view.panes.len) {
         const frame = view.panes[i].frame;
         const g = c.theme.ground;
-        p.fill(frame, .{ g[0], g[1], g[2], lifted });
+        p.fillRounded(frame, l.corner, .{ g[0], g[1], g[2], lifted });
         p.strokeRounded(frame, l.corner, c.stroke(), c.theme.outline);
     };
     if (d.drop) |drop| {

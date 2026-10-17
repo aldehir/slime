@@ -146,44 +146,6 @@ pub fn dot(self: *Painter, cx: f32, cy: f32, radius: f32, c: Color) void {
     self.ctx.fillEllipse(&.{ .point = .{ .x = cx, .y = cy }, .radiusX = radius, .radiusY = radius }, self.color(c));
 }
 
-pub const Corner = enum { top_left, top_right, bottom_left, bottom_right };
-
-/// Fill the outside of rounded corners on `r`: the parts of the `radius`
-/// squares in its corners that a rounded rectangle leaves out.
-pub fn cornerMasks(self: *Painter, r: Rect, radius: f32, c: Color) void {
-    if (radius <= 0) return;
-    for (std.enums.values(Corner)) |corner| self.cornerMask(r, corner, radius, c);
-}
-
-/// Fill the outside of `r`'s rounded corner `corner`.
-pub fn cornerMask(self: *Painter, r: Rect, corner: Corner, radius: f32, c: Color) void {
-    // From the corner, along its horizontal edge, then around to its
-    // vertical one. Mirroring one axis turns the arc the other way.
-    const right = corner == .top_right or corner == .bottom_right;
-    const bottom = corner == .bottom_left or corner == .bottom_right;
-    const x = if (right) r.right() else r.x;
-    const y = if (bottom) r.bottom() else r.y;
-    const sx: f32 = if (right) -1 else 1;
-    const sy: f32 = if (bottom) -1 else 1;
-    var geometry: ?*d2d1.IPathGeometry = null;
-    com.check(self.factory.createPathGeometry(&geometry), "ID2D1Factory::CreatePathGeometry") catch return;
-    defer com.releaseOpt(&geometry);
-    var sink: ?*d2d1.IGeometrySink = null;
-    com.check(geometry.?.open(&sink), "ID2D1PathGeometry::Open") catch return;
-    defer com.releaseOpt(&sink);
-
-    sink.?.beginFigure(.{ .x = x, .y = y }, d2d1.FIGURE_BEGIN_FILLED);
-    sink.?.addLine(.{ .x = x + sx * radius, .y = y });
-    sink.?.addArc(&.{
-        .point = .{ .x = x, .y = y + sy * radius },
-        .size = .{ .width = radius, .height = radius },
-        .sweepDirection = if (sx * sy > 0) d2d1.SWEEP_DIRECTION_COUNTER_CLOCKWISE else d2d1.SWEEP_DIRECTION_CLOCKWISE,
-    });
-    sink.?.endFigure(d2d1.FIGURE_END_CLOSED);
-    com.check(sink.?.close(), "ID2D1GeometrySink::Close") catch return;
-    self.ctx.fillGeometry(geometry.?, self.color(c));
-}
-
 /// Draw text laid out by `format` (alignment, trimming) in `r`, clipped
 /// to it.
 pub fn text(self: *Painter, str: []const u16, format: *dwrite.ITextFormat, r: Rect, c: Color) void {

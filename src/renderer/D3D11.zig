@@ -74,6 +74,8 @@ lcd_atlas: AtlasTexture = .{},
 
 /// The placement being drawn (see `drawImages`).
 image_placement: *d3d11.IBuffer,
+/// The pane box being drawn (see `drawBox`).
+box: *d3d11.IBuffer,
 
 d2d_factory: *d2d1.IFactory1,
 d2d_device: *d2d1.IDevice,
@@ -133,6 +135,26 @@ pub const Frame = struct {
     panes: []const Pane,
     /// Behind the panes, where none is.
     background: [4]f32,
+    /// How each pane's box looks.
+    box: BoxStyle,
+};
+
+/// A pane's box: a rounded rectangle in its terminal's background, with
+/// a border inside its edge and shadows under it. Colors are straight
+/// RGBA; sizes are pixels.
+pub const BoxStyle = struct {
+    radius: f32,
+    border_width: f32,
+    border: [4]f32,
+    shadows: []const Shadow,
+
+    pub const Shadow = struct {
+        color: [4]f32,
+        /// The blur's standard deviation.
+        sigma: f32,
+        /// How far down it falls.
+        offset: f32,
+    };
 };
 
 /// What to draw of a terminal, and where.
@@ -140,6 +162,8 @@ pub const Pane = struct {
     cells: *const cells.Cells,
     images: *image.Images,
     textures: *ImageTextures,
+    /// All of the pane, which its box fills.
+    frame: Painter.Rect,
     /// The terminal's part of the window, which clips it.
     viewport: Painter.Rect,
     /// The grid's top-left in the viewport.
@@ -229,6 +253,15 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias
     }, &image_placement), "ID3D11Device::CreateBuffer(image placement)");
     errdefer com.releaseOpt(&image_placement);
 
+    var box: ?*d3d11.IBuffer = null;
+    try com.check(device.?.createBuffer(&.{
+        .ByteWidth = @sizeOf(Box),
+        .Usage = d3d11.USAGE_DYNAMIC,
+        .BindFlags = d3d11.BIND_CONSTANT_BUFFER,
+        .CPUAccessFlags = d3d11.CPU_ACCESS_WRITE,
+    }, &box), "ID3D11Device::CreateBuffer(box)");
+    errdefer com.releaseOpt(&box);
+
     const d2d = try createD2d(device.?, antialias);
     errdefer d2d.deinit();
 
@@ -245,6 +278,7 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias
         .pipeline = pipeline,
         .uniforms = uniforms.?,
         .image_placement = image_placement.?,
+        .box = box.?,
         .d2d_factory = d2d.factory,
         .d2d_device = d2d.device,
         .d2d_context = d2d.context,
@@ -272,6 +306,7 @@ pub fn deinit(self: *D3D11) void {
     if (self.capture) |c| c.deinit();
     (D2d{ .factory = self.d2d_factory, .device = self.d2d_device, .context = self.d2d_context, .brush = self.brush }).deinit();
     com.release(self.image_placement);
+    com.release(self.box);
     self.lcd_atlas.deinit();
     self.color_atlas.deinit();
     self.atlas.deinit();
@@ -405,10 +440,39 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
     ctx.clearState();
     ctx.omSetRenderTargets(&.{rtv});
     ctx.clearRenderTargetView(rtv, &f.background);
+    // Every shadow before any pane, so none falls on a neighbor.
+    for (f.panes) |pane| for (f.box.shadows) |shadow| {
+        const b = pane.frame;
+        const reach = 3 * shadow.sigma;
+        const box_rect: Painter.Rect = .{ .x = b.x, .y = b.y + shadow.offset, .w = b.w, .h = b.h };
+        try self.drawBox(self.pipeline.shadow_ps, .{
+            .target_size = .{ @floatFromInt(self.width), @floatFromInt(self.height) },
+            .radius = f.box.radius,
+            .border_width = 0,
+            .bounds = rectArray(box_rect.inset(-reach, -reach)),
+            .box = rectArray(box_rect),
+            .fill = .{ 0, 0, 0, 0 },
+            .border = .{ 0, 0, 0, 0 },
+            .shadow = premultiply(shadow.color),
+            .shadow_sigma = shadow.sigma,
+        });
+    };
     // Each pane's data replaces the last's in the same buffers, which
     // discarding maps rename, so draws already queued keep theirs.
     for (f.panes) |pane| {
         const v = pane.viewport;
+        if (pane.frame.w < 1 or pane.frame.h < 1) continue;
+        try self.drawBox(self.pipeline.box_ps, .{
+            .target_size = .{ @floatFromInt(self.width), @floatFromInt(self.height) },
+            .radius = f.box.radius,
+            .border_width = f.box.border_width,
+            .bounds = rectArray(pane.frame),
+            .box = rectArray(pane.frame),
+            .fill = pane.cells.uniforms(f.metrics, .{ 0, 0, 1, 1 }, .{ 0, 0 }).default_bg,
+            .border = premultiply(f.box.border),
+            .shadow = .{ 0, 0, 0, 0 },
+            .shadow_sigma = 0,
+        });
         if (v.w < 1 or v.h < 1) continue;
         try self.bg_cells.upload(self.device, ctx, std.mem.sliceAsBytes(pane.cells.bg.items));
         try self.instances.upload(self.device, ctx, std.mem.sliceAsBytes(pane.cells.instances.items));
@@ -440,20 +504,57 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
     try com.check(hr, "IDXGISwapChain::Present");
 }
 
-/// A pane's default background, then the grid's passes, with kitty
-/// images before, between, and after them, clipped to the viewport.
+/// Shader constants for a pane's box. Must match `Box` in shaders.hlsl.
+const Box = extern struct {
+    target_size: [2]f32,
+    radius: f32,
+    border_width: f32,
+    bounds: [4]f32,
+    box: [4]f32,
+    fill: [4]f32,
+    border: [4]f32,
+    shadow: [4]f32,
+    shadow_sigma: f32,
+    _pad: [3]f32 = .{ 0, 0, 0 },
+
+    comptime {
+        std.debug.assert(@sizeOf(Box) % 16 == 0);
+    }
+};
+
+fn rectArray(r: Painter.Rect) [4]f32 {
+    return .{ r.x, r.y, r.w, r.h };
+}
+
+fn premultiply(c: [4]f32) [4]f32 {
+    return .{ c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3] };
+}
+
+/// One quad of a pane's box or shadow, over the whole render target.
+fn drawBox(self: *D3D11, ps: *d3d11.IPixelShader, b: Box) Error!void {
+    const ctx = self.context;
+    var mapped: d3d11.MAPPED_SUBRESOURCE = undefined;
+    try com.check(ctx.map(self.box.resource(), d3d11.MAP_WRITE_DISCARD, &mapped), "Map(box)");
+    @as(*Box, @ptrCast(@alignCast(mapped.pData.?))).* = b;
+    ctx.unmap(self.box.resource());
+    ctx.rsSetViewports(&.{.{ .TopLeftX = 0, .TopLeftY = 0, .Width = @floatFromInt(self.width), .Height = @floatFromInt(self.height) }});
+    ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx.vsSetShader(self.pipeline.box_vs);
+    ctx.vsSetConstantBuffers(2, &.{self.box});
+    ctx.psSetShader(ps);
+    ctx.psSetConstantBuffers(2, &.{self.box});
+    ctx.omSetBlendState(self.pipeline.blend);
+    ctx.draw(4, 0);
+}
+
+/// The grid's passes, with kitty images before, between, and after them,
+/// clipped to the viewport, over the pane's box.
 fn drawGrid(self: *D3D11, f: Pane) Error!void {
     const ctx = self.context;
     const frame = f.cells;
     const images = f.images;
     const v = f.viewport;
     ctx.rsSetViewports(&.{.{ .TopLeftX = v.x, .TopLeftY = v.y, .Width = v.w, .Height = v.h }});
-    ctx.iaSetPrimitiveTopology(d3d11.PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx.vsSetShader(self.pipeline.bg_vs);
-    ctx.psSetShader(self.pipeline.fill_ps);
-    ctx.psSetConstantBuffers(0, &.{self.uniforms});
-    ctx.omSetBlendState(null);
-    ctx.draw(3, 0);
     try self.drawImages(images, f.textures, .below_bg);
 
     if (frame.bg.items.len > 0) {
@@ -782,7 +883,9 @@ fn createDevice(device: *?*d3d11.IDevice, context: *?*d3d11.IDeviceContext) Erro
 const Pipeline = struct {
     bg_vs: *d3d11.IVertexShader,
     bg_ps: *d3d11.IPixelShader,
-    fill_ps: *d3d11.IPixelShader,
+    box_vs: *d3d11.IVertexShader,
+    box_ps: *d3d11.IPixelShader,
+    shadow_ps: *d3d11.IPixelShader,
     text_vs: *d3d11.IVertexShader,
     text_ps: *d3d11.IPixelShader,
     image_vs: *d3d11.IVertexShader,
@@ -794,7 +897,9 @@ const Pipeline = struct {
     fn init(device: *d3d11.IDevice) Error!Pipeline {
         var bg_vs: ?*d3d11.IVertexShader = null;
         var bg_ps: ?*d3d11.IPixelShader = null;
-        var fill_ps: ?*d3d11.IPixelShader = null;
+        var box_vs: ?*d3d11.IVertexShader = null;
+        var box_ps: ?*d3d11.IPixelShader = null;
+        var shadow_ps: ?*d3d11.IPixelShader = null;
         var text_vs: ?*d3d11.IVertexShader = null;
         var text_ps: ?*d3d11.IPixelShader = null;
         var image_vs: ?*d3d11.IVertexShader = null;
@@ -805,7 +910,9 @@ const Pipeline = struct {
         errdefer {
             com.releaseOpt(&bg_vs);
             com.releaseOpt(&bg_ps);
-            com.releaseOpt(&fill_ps);
+            com.releaseOpt(&box_vs);
+            com.releaseOpt(&box_ps);
+            com.releaseOpt(&shadow_ps);
             com.releaseOpt(&text_vs);
             com.releaseOpt(&text_ps);
             com.releaseOpt(&image_vs);
@@ -817,7 +924,9 @@ const Pipeline = struct {
 
         try createShader(device, "bg_vs", &bg_vs);
         try createShader(device, "bg_ps", &bg_ps);
-        try createShader(device, "fill_ps", &fill_ps);
+        try createShader(device, "box_vs", &box_vs);
+        try createShader(device, "box_ps", &box_ps);
+        try createShader(device, "shadow_ps", &shadow_ps);
         try createShader(device, "text_vs", &text_vs);
         try createShader(device, "text_ps", &text_ps);
         try createShader(device, "image_vs", &image_vs);
@@ -848,7 +957,9 @@ const Pipeline = struct {
         return .{
             .bg_vs = bg_vs.?,
             .bg_ps = bg_ps.?,
-            .fill_ps = fill_ps.?,
+            .box_vs = box_vs.?,
+            .box_ps = box_ps.?,
+            .shadow_ps = shadow_ps.?,
             .text_vs = text_vs.?,
             .text_ps = text_ps.?,
             .image_vs = image_vs.?,
@@ -862,7 +973,9 @@ const Pipeline = struct {
     fn deinit(self: *Pipeline) void {
         com.release(self.bg_vs);
         com.release(self.bg_ps);
-        com.release(self.fill_ps);
+        com.release(self.box_vs);
+        com.release(self.box_ps);
+        com.release(self.shadow_ps);
         com.release(self.text_vs);
         com.release(self.text_ps);
         com.release(self.image_vs);

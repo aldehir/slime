@@ -1760,10 +1760,12 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
             .cells = &s.cells,
             .images = &s.images,
             .textures = &s.textures,
+            .frame = s.frame,
             .viewport = s.rect,
             .grid_offset = .{ @floatFromInt(s.pad.left), @floatFromInt(s.pad.top) },
         });
     }
+    var shadows: [2]Renderer.BoxStyle.Shadow = undefined;
     try r.draw(self.alloc, .{
         .atlas = &self.grid.atlas,
         .color_atlas = &self.grid.color_atlas,
@@ -1772,11 +1774,32 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         .panes = self.frame_panes.items,
         // The chrome's ground, around and between the panes.
         .background = self.chrome.theme.ground,
+        .box = self.paneBox(&shadows),
     }, Ui{ .window = self, .view = self.view() });
     if (stats) {
         _ = self.stats.lap(.draw, t);
         self.stats.frames += 1;
     }
+}
+
+/// How the renderer draws each pane: rounded as the chrome's corners,
+/// with a hairline border and two shadows, one tight at its edge and one
+/// soft around it. `shadows` holds them. A blur reaches about 3 sigma, so
+/// the soft one fades out within the gap between panes rather than
+/// running under the sidebar, which would cut it off.
+fn paneBox(self: *const Window, shadows: *[2]Renderer.BoxStyle.Shadow) Renderer.BoxStyle {
+    const c = &self.chrome;
+    const s = c.theme.pane_shadow;
+    shadows.* = .{
+        .{ .color = s, .sigma = c.px(1), .offset = c.px(1) },
+        .{ .color = .{ s[0], s[1], s[2], s[3] * 0.7 }, .sigma = c.px(3), .offset = c.px(2) },
+    };
+    return .{
+        .radius = self.chrome_layout.corner,
+        .border_width = c.stroke(),
+        .border = c.theme.pane_border,
+        .shadows = shadows,
+    };
 }
 
 /// Take the last second's stats for the chrome to show.
