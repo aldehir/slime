@@ -47,6 +47,7 @@ const (
 	decoderOptRetainContinuation = 1
 
 	formatPlain = 0
+	formatVT    = 1
 )
 
 // ContinuationLimit is how many bytes of an unfinished escape sequence a
@@ -406,45 +407,71 @@ func (t *Terminal) Snapshot() ([]byte, error) {
 // Text formats the active screen as plain text, scrollback included,
 // with soft-wrapped lines joined and trailing blanks trimmed.
 func (t *Terminal) Text() (string, error) {
-	// GhosttyFormatterTerminalOptions, wasm32 layout (formatterOptions in
-	// vt_test.go checks it against ghostty_type_json).
-	const (
-		optsSize   = 40
-		offEmit    = 4
-		offUnwrap  = 8
-		offTrim    = 9
-		offExtra   = 12
-		offScreen  = offExtra + 12
-		extraSize  = 24
-		screenSize = 12
-	)
-	opts, err := t.malloc(optsSize)
+	b, err := t.format(formatPlain)
+	return string(b), err
+}
+
+// VT formats the active screen, scrollback included, as the VT sequences
+// that redraw it on a cleared terminal of the same size: styles, then
+// the cursor, modes, scrolling region, tab stops, and keyboard state.
+func (t *Terminal) VT() ([]byte, error) { return t.format(formatVT) }
+
+// GhosttyFormatterTerminalOptions, wasm32 layout (TestFormatterLayout
+// checks it against ghostty_type_json).
+const (
+	fmtOptsSize   = 40
+	fmtOffEmit    = 4
+	fmtOffUnwrap  = 8
+	fmtOffTrim    = 9
+	fmtOffExtra   = 12
+	fmtOffScreen  = fmtOffExtra + 12
+	fmtExtraSize  = 24
+	fmtScreenSize = 12
+	// The bools after each extra struct's size field: palette, modes,
+	// scrolling region, tab stops, pwd, keyboard; then the screen's
+	// cursor, style, hyperlink, protection, kitty keyboard, charsets.
+	fmtExtraBools  = 6
+	fmtScreenBools = 6
+)
+
+func (t *Terminal) format(emit uint32) ([]byte, error) {
+	opts, err := t.malloc(fmtOptsSize)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer t.call(t.fn.free, uint64(opts), optsSize)
-	zero := make([]byte, optsSize)
-	t.mem.Write(opts, zero)
-	t.mem.WriteUint32Le(opts, optsSize)
-	t.mem.WriteUint32Le(opts+offEmit, formatPlain)
-	t.mem.WriteByte(opts+offUnwrap, 1)
-	t.mem.WriteByte(opts+offTrim, 1)
-	t.mem.WriteUint32Le(opts+offExtra, extraSize)
-	t.mem.WriteUint32Le(opts+offScreen, screenSize)
+	defer t.call(t.fn.free, uint64(opts), fmtOptsSize)
+	t.mem.Write(opts, make([]byte, fmtOptsSize))
+	t.mem.WriteUint32Le(opts, fmtOptsSize)
+	t.mem.WriteUint32Le(opts+fmtOffEmit, emit)
+	t.mem.WriteUint32Le(opts+fmtOffExtra, fmtExtraSize)
+	t.mem.WriteUint32Le(opts+fmtOffScreen, fmtScreenSize)
+	if emit == formatPlain {
+		t.mem.WriteByte(opts+fmtOffUnwrap, 1)
+		t.mem.WriteByte(opts+fmtOffTrim, 1)
+	} else {
+		// Every extra but pwd (OSC 7 would claim our host's directory).
+		for i := range uint32(fmtExtraBools) {
+			if i != 4 {
+				t.mem.WriteByte(opts+fmtOffExtra+4+i, 1)
+			}
+		}
+		for i := range uint32(fmtScreenBools) {
+			t.mem.WriteByte(opts+fmtOffScreen+4+i, 1)
+		}
+	}
 
 	slot, err := t.call1(t.fn.allocOpaque)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer t.call(t.fn.freeOpaque, slot)
 	// Structs passed by value go by pointer in the wasm32 C ABI.
 	if err := t.result("formatter_terminal_new", t.fn.fmtNew, 0, slot, uint64(t.term), uint64(opts)); err != nil {
-		return "", err
+		return nil, err
 	}
 	f := uint64(t.u32(uint32(slot)))
 	defer t.call(t.fn.fmtFree, f)
-	b, err := t.allocOut("formatter_format_alloc", t.fn.fmtFormat, f, 0)
-	return string(b), err
+	return t.allocOut("formatter_format_alloc", t.fn.fmtFormat, f, 0)
 }
 
 // allocOut calls an `_alloc` function whose last two parameters are

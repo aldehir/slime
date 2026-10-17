@@ -157,7 +157,28 @@ func TestFormatterLayout(t *testing.T) {
 		{"extra size", extra.Size, 24},
 		{"extra.screen", extra.Fields["screen"].Offset, 12},
 		{"screen size", screen.Size, 12},
+		{"extra.palette", extra.Fields["palette"].Offset, 4},
+		{"extra.pwd", extra.Fields["pwd"].Offset, 8},
+		{"extra.keyboard", extra.Fields["keyboard"].Offset, 4 + fmtExtraBools - 1},
+		{"screen.cursor", screen.Fields["cursor"].Offset, 4},
+		{"screen.charsets", screen.Fields["charsets"].Offset, 4 + fmtScreenBools - 1},
 	})
+}
+
+// TestVT redraws a terminal from its VT output onto a fresh one.
+func TestVT(t *testing.T) {
+	src := newTerm(t, 30, 6)
+	write(t, src, "plain\r\n\x1b[1;31mbold red\x1b[0m and \x1b[4munder\x1b[0m\r\n\x1b[?7l\x1b[4;10Hmid")
+	b, err := src.VT()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := newTerm(t, 30, 6)
+	write(t, dst, string(b))
+	sameState(t, src, dst)
+	if !bytes.Contains(b, []byte("\x1b[")) {
+		t.Errorf("no escape sequences in %q", b)
+	}
 }
 
 // TestCallbackLayouts checks the structs the host callbacks fill.
@@ -166,7 +187,13 @@ func TestCallbackLayouts(t *testing.T) {
 	da := types["GhosttyDeviceAttributes"]
 	primary := types["GhosttyDeviceAttributesPrimary"]
 	size := types["GhosttySizeReportSize"]
+	seq := types["GhosttyTerminalUnknownSequence"]
+	mode := types["GhosttyTerminalUnknownModeSequence"]
 	checkLayout(t, []layoutCheck{
+		{"unknown value", seq.Fields["value"].Offset, unknownOffMode},
+		{"unknown mode.mode", unknownOffMode + mode.Fields["mode"].Offset, unknownOffMode},
+		{"unknown mode.ansi", unknownOffMode + mode.Fields["ansi"].Offset, unknownOffANSI},
+		{"unknown mode.enabled", unknownOffMode + mode.Fields["enabled"].Offset, unknownOffEnabled},
 		{"DA size", da.Size, daSize},
 		{"DA secondary", da.Fields["secondary"].Offset, daOffSecondary},
 		{"DA1 features", primary.Fields["features"].Offset, daOffFeatures},
@@ -241,6 +268,21 @@ func TestTitlePwdBell(t *testing.T) {
 	}
 	if fmt.Sprint(r.pwds) != "[file://host/home/alde]" {
 		t.Errorf("pwds %q", r.pwds)
+	}
+}
+
+func TestUnknownModes(t *testing.T) {
+	term := newTerm(t, 20, 5)
+	var got []Mode
+	term.SetEvents(Events{UnknownMode: func(mode uint16, ansi, enabled bool) {
+		got = append(got, Mode{mode, ansi, enabled})
+	}})
+	// 1004 is known (focus events), so only 9001 is reported from the
+	// first; then an ANSI mode libghostty-vt doesn't know.
+	write(t, term, "\x1b[?9001;1004h\x1b[?9001l\x1b[77h")
+	want := []Mode{{9001, false, true}, {9001, false, false}, {77, true, true}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("modes %v, want %v", got, want)
 	}
 }
 

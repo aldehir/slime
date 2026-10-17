@@ -22,6 +22,18 @@ type Events struct {
 	// read the new value with Title or Pwd.
 	TitleChanged func()
 	PwdChanged   func()
+
+	// UnknownMode reports each set or reset of a mode libghostty-vt
+	// doesn't implement, in order: ConPTY's win32-input-mode (DEC 9001),
+	// for one. ansi is false for DEC private modes (CSI ?).
+	UnknownMode func(mode uint16, ansi, enabled bool)
+}
+
+// Mode is a set or reset of a mode libghostty-vt doesn't implement.
+type Mode struct {
+	Mode    uint16
+	ANSI    bool
+	Enabled bool
 }
 
 // Callback options (GhosttyTerminalOption) and the order the trampoline
@@ -37,9 +49,19 @@ var callbacks = []struct {
 	{"pwd_changed", 25, 1},
 	{"device_attributes", 8, 2},
 	{"size", 6, 2},
+	{"unknown_sequence", 35, 3},
 }
 
 const optUserdata = 0
+
+// GhosttyTerminalUnknownSequence, wasm32 layout (TestCallbackLayouts):
+// a u32 tag, then the union at its 8-byte alignment.
+const (
+	unknownTagMode    = 2
+	unknownOffMode    = 8
+	unknownOffANSI    = 10
+	unknownOffEnabled = 11
+)
 
 // pending is what callbacks recorded during one Write.
 type pending struct {
@@ -47,6 +69,7 @@ type pending struct {
 	bell  int
 	title bool
 	pwd   bool
+	modes []Mode
 }
 
 // Primary and secondary device attributes, as slime answers them:
@@ -119,6 +142,20 @@ func (r *Runtime) hostModule(ctx context.Context) error {
 			t.mem.WriteUint32Le(out+8, t.cellH)
 			return 1
 		}).Export("size")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _, ud, seq uint32) {
+			t := r.lookup(ud)
+			if t == nil {
+				return
+			}
+			if tag, _ := t.mem.ReadUint32Le(seq); tag != unknownTagMode {
+				return
+			}
+			mode, _ := t.mem.ReadUint16Le(seq + unknownOffMode)
+			ansi, _ := t.mem.ReadByte(seq + unknownOffANSI)
+			enabled, _ := t.mem.ReadByte(seq + unknownOffEnabled)
+			t.pend.modes = append(t.pend.modes, Mode{mode, ansi != 0, enabled != 0})
+		}).Export("unknown_sequence")
 	_, err := b.Instantiate(ctx)
 	return err
 }
@@ -175,7 +212,12 @@ func (t *Terminal) termSetValue(opt, v uint64) error {
 // deliver hands what the last Write's callbacks recorded to the handlers.
 func (t *Terminal) deliver() {
 	p := t.pend
-	t.pend = pending{reply: p.reply[:0]}
+	t.pend = pending{reply: p.reply[:0], modes: p.modes[:0]}
+	for _, m := range p.modes {
+		if t.events.UnknownMode != nil {
+			t.events.UnknownMode(m.Mode, m.ANSI, m.Enabled)
+		}
+	}
 	if len(p.reply) > 0 && t.events.Reply != nil {
 		t.events.Reply(p.reply)
 	}
@@ -208,10 +250,12 @@ func trampoline(module string) []byte {
 	n := len(callbacks)
 
 	var types []byte
-	types = append(types, 4)
+	const installType = 4
+	types = append(types, installType+1)
 	types = append(types, 0x60, 4, i32, i32, i32, i32, 0) // write_pty
 	types = append(types, 0x60, 2, i32, i32, 0)           // bell, title, pwd
 	types = append(types, 0x60, 3, i32, i32, i32, 1, i32) // DA, size
+	types = append(types, 0x60, 3, i32, i32, i32, 0)      // unknown_sequence
 	types = append(types, 0x60, 0, byte(n))               // install
 	for range n {
 		types = append(types, i32)
@@ -228,7 +272,7 @@ func trampoline(module string) []byte {
 	imports = name(imports, "__indirect_function_table")
 	imports = append(imports, 0x01, funcref, 0x00, 0x00) // table, min 0, no max
 
-	funcs := []byte{1, 3} // one function of type 3
+	funcs := []byte{1, installType}
 
 	var exports []byte
 	exports = append(exports, 1)
