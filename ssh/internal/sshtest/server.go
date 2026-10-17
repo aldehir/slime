@@ -209,11 +209,14 @@ func (s *Server) duo(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChalle
 		return nil, errors.New("no answer")
 	case ans[0] == "1":
 		time.Sleep(s.opts.PushDelay)
-		return nil, nil
-	case IsOTP(ans[0]):
-		return nil, nil
+	case !IsOTP(ans[0]):
+		return nil, errors.New("wrong passcode")
 	}
-	return nil, errors.New("wrong passcode")
+	// pam_duo's status, which sshd sends as a round with no questions.
+	if _, err := client("", "Success. Logging you in...", nil, nil); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // IsOTP reports whether s looks like a Yubico OTP: 44 modhex characters.

@@ -86,12 +86,17 @@ const (
 type Server struct {
 	opts Options
 	w    *proto.Writer
+	// features are slime's, from its Hello.
+	features uint32
 
 	mu       sync.Mutex
 	state    state
 	channels map[uint32]*channel
 	// pending were opened while connecting; they start once connected.
 	pending []*channel
+	// answers takes slime's Answer to the Prompt shown, while there is
+	// one.
+	answers chan proto.Answer
 	netConn net.Conn
 	client  *ssh.Client
 	// jumps carry client, first hop first.
@@ -137,13 +142,15 @@ func Serve(opts Options, in io.Reader, out io.Writer) error {
 	}
 	r := proto.NewReader(in)
 	w := proto.NewWriter(out)
-	if err := handshake(r, w); err != nil {
+	features, err := handshake(r, w)
+	if err != nil {
 		return err
 	}
 
 	s := &Server{
 		opts:     opts,
 		w:        w,
+		features: features,
 		channels: map[uint32]*channel{},
 		connDone: make(chan struct{}),
 		done:     make(chan struct{}),
@@ -184,28 +191,29 @@ func Serve(opts Options, in io.Reader, out io.Writer) error {
 	}
 }
 
-// handshake reads slime's Hello and replies with ours. A version
-// mismatch is an error after the reply, so slime learns ours.
-func handshake(r *proto.Reader, w *proto.Writer) error {
+// handshake reads slime's Hello and replies with ours, returning
+// slime's features. A version mismatch is an error after the reply, so
+// slime learns ours.
+func handshake(r *proto.Reader, w *proto.Writer) (uint32, error) {
 	f, err := r.Read()
 	if err != nil {
-		return fmt.Errorf("reading hello: %w", err)
+		return 0, fmt.Errorf("reading hello: %w", err)
 	}
 	m, err := proto.Decode(f)
 	if err != nil {
-		return fmt.Errorf("decoding hello: %w", err)
+		return 0, fmt.Errorf("decoding hello: %w", err)
 	}
 	hello, ok := m.(*proto.Hello)
 	if !ok {
-		return fmt.Errorf("expected hello, got %T", m)
+		return 0, fmt.Errorf("expected hello, got %T", m)
 	}
 	if err := w.Send(0, &proto.HelloReply{Version: proto.Version}); err != nil {
-		return err
+		return 0, err
 	}
 	if hello.Version != proto.Version {
-		return fmt.Errorf("slime speaks protocol %d, we speak %d", hello.Version, proto.Version)
+		return 0, fmt.Errorf("slime speaks protocol %d, we speak %d", hello.Version, proto.Version)
 	}
-	return nil
+	return hello.Features, nil
 }
 
 func (s *Server) send(id uint32, m proto.Message) {
@@ -227,6 +235,8 @@ func (s *Server) handle(f proto.Frame) {
 		s.resize(f.ID, m.Cols, m.Rows)
 	case *proto.Close:
 		s.close(f.ID)
+	case *proto.Answer:
+		s.answer(m)
 	default:
 		log.Printf("channel %d: unexpected %T", f.ID, m)
 	}
@@ -324,6 +334,23 @@ func (s *Server) close(id uint32) {
 	}
 }
 
+// answer hands slime's answer to the prompt waiting for it. A cancel
+// with none waiting (the server is busy with the last answer) gives up
+// on logging in.
+func (s *Server) answer(m *proto.Answer) {
+	s.mu.Lock()
+	answers := s.answers
+	s.answers = nil
+	connecting := s.state == stateConnecting
+	s.mu.Unlock()
+	switch {
+	case answers != nil:
+		answers <- *m
+	case connecting && m.Choice == proto.ChoiceCancel:
+		s.finish(nil, "cancelled")
+	}
+}
+
 func (s *Server) isPending(ch *channel) bool {
 	for _, p := range s.pending {
 		if p == ch {
@@ -342,11 +369,15 @@ func (s *Server) removePending(ch *channel) {
 	}
 }
 
-// connect dials and authenticates, prompting on ch's terminal, then
-// starts every channel opened meanwhile.
+// connect dials and authenticates, asking in slime's dialog or on ch's
+// terminal, then starts every channel opened meanwhile.
 func (s *Server) connect(ch *channel) {
-	p := prompt.New(ch.input, ch.out)
-	client, err := s.dial(p)
+	term := prompt.New(ch.input, ch.out)
+	var a asker = termAsker{term}
+	if s.features&proto.FeaturePrompts != 0 {
+		a = &dialogAsker{s: s, id: ch.id, term: term}
+	}
+	client, err := s.dial(a)
 
 	s.mu.Lock()
 	if err != nil || s.state == stateClosing {
@@ -381,8 +412,8 @@ func (s *Server) connect(ch *channel) {
 }
 
 // dial connects and logs in to each jump host in turn, and through them
-// to the destination, prompting on p.
-func (s *Server) dial(p *prompt.Prompter) (*ssh.Client, error) {
+// to the destination, asking through a.
+func (s *Server) dial(a asker) (*ssh.Client, error) {
 	hops := append(slices.Clone(s.opts.Jumps), Hop{
 		Dest:           s.opts.Dest,
 		Identities:     s.opts.Identities,
@@ -420,7 +451,7 @@ func (s *Server) dial(p *prompt.Prompter) (*ssh.Client, error) {
 			return nil, fmt.Errorf("jump host %s can't reach %s: %w", hops[i-1].Dest.Host, addr, err)
 		}
 
-		client, err := s.login(conn, hop, signers, p)
+		client, err := s.login(conn, hop, signers, a)
 		if err != nil {
 			conn.Close()
 			closeJumps()
@@ -441,27 +472,28 @@ func (s *Server) dial(p *prompt.Prompter) (*ssh.Client, error) {
 }
 
 // login checks hop's host key and logs in over conn.
-func (s *Server) login(conn net.Conn, hop Hop, agentSigners []ssh.Signer, p *prompt.Prompter) (*ssh.Client, error) {
+func (s *Server) login(conn net.Conn, hop Hop, agentSigners []ssh.Signer, a asker) (*ssh.Client, error) {
 	addr := hop.Dest.Addr()
 	hk := &hostKeys{
 		files:  s.opts.KnownHosts,
 		global: s.opts.GlobalKnownHosts,
 		strict: s.opts.StrictHostKeyChecking,
 		hash:   s.opts.HashKnownHosts,
-		p:      p,
+		ui:     a,
 	}
 	check, algos, err := hk.callback(addr)
 	if err != nil {
 		return nil, err
 	}
-	auth := newAuthenticator(p, hop.Dest, agentSigners, loadKeys(hop.Identities), hop.IdentitiesOnly)
+	auth := newAuthenticator(a, hop.Dest, agentSigners, loadKeys(hop.Identities), hop.IdentitiesOnly)
 	config := &ssh.ClientConfig{
 		User:              hop.Dest.User,
 		AuthCallback:      auth.callback,
 		HostKeyCallback:   check,
 		HostKeyAlgorithms: algos,
 		BannerCallback: func(msg string) error {
-			return p.Print(msg)
+			a.print(msg)
+			return nil
 		},
 	}
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
@@ -686,6 +718,8 @@ func failReason(err error) string {
 		return errHostKeyRejected.Error()
 	case errors.Is(err, prompt.ErrInterrupted):
 		return "interrupted"
+	case errors.Is(err, errCancelled):
+		return "cancelled"
 	}
 	return err.Error()
 }

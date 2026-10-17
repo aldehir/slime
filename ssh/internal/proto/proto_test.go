@@ -16,6 +16,15 @@ func TestRoundTrip(t *testing.T) {
 		m  Message
 	}{
 		{0, &Hello{Version: Version}},
+		{0, &Hello{Version: Version, Features: FeaturePrompts}},
+		{1, &Prompt{Kind: PromptInteractive, Title: "Sign in to bastion", Text: "One\nTwo", Questions: []Question{
+			{Label: "Duo two-factor login\n\nPasscode or option (1-3): ", Echo: true},
+			{Label: "Password: "},
+		}}},
+		{1, &Prompt{Kind: PromptChangedHost, Title: "t", Detail: "d", Error: "e", Questions: []Question{}}},
+		{1, &Answer{Choice: ChoiceAccept, Answers: []string{"1", "hunter2"}}},
+		{1, &Answer{Choice: ChoiceCancel, Answers: []string{}}},
+		{1, &Info{Text: "Success. Logging you in..."}},
 		{1, &Open{In: 0x1234, Out: 0xdeadbeefcafe, Cols: 120, Rows: 40, Term: "xterm-256color", Cwd: "/home/alde/src"}},
 		{1, &Open{Term: "xterm-256color"}},
 		{7, &Resize{Cols: 80, Rows: 24}},
@@ -123,8 +132,17 @@ func TestUnknownType(t *testing.T) {
 	if _, err := Decode(Frame{Type: 200}); !errors.Is(err, ErrUnknownType) {
 		t.Errorf("err = %v, want ErrUnknownType", err)
 	}
-	if _, err := Decode(Frame{Type: TypePrompt}); !errors.Is(err, ErrUnknownType) {
-		t.Errorf("reserved prompt: err = %v, want ErrUnknownType", err)
+}
+
+// A list can't claim more items than its bytes could hold.
+func TestHugeListCount(t *testing.T) {
+	payload := []byte{byte(PromptPassword)}
+	for range 4 {
+		payload = binary.LittleEndian.AppendUint32(payload, 0) // empty strings
+	}
+	payload = binary.LittleEndian.AppendUint32(payload, 0xffffffff)
+	if _, err := Decode(Frame{Type: TypePrompt, Payload: payload}); !errors.Is(err, ErrTruncated) {
+		t.Errorf("err = %v, want ErrTruncated", err)
 	}
 }
 

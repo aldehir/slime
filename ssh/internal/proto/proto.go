@@ -37,6 +37,7 @@ const (
 	TypeOpen   Type = 2
 	TypeResize Type = 3
 	TypeClose  Type = 4
+	TypeAnswer Type = 5
 )
 
 // Helper to slime.
@@ -47,8 +48,16 @@ const (
 	TypeExit         Type = 68
 	TypeError        Type = 69
 	TypeDisconnected Type = 70
-	// TypePrompt is reserved for structured auth prompts.
-	TypePrompt Type = 71
+	TypePrompt       Type = 71
+	TypeInfo         Type = 72
+)
+
+// Features slime can take, in its Hello.
+const (
+	// FeaturePrompts: login questions come as Prompt and Info for slime
+	// to show in a dialog, answered with Answer. Without it they are
+	// asked in the channel's terminal.
+	FeaturePrompts uint32 = 1 << 0
 )
 
 var (
@@ -72,7 +81,12 @@ type Message interface {
 	decode(*decoder)
 }
 
-type Hello struct{ Version uint32 }
+type Hello struct {
+	Version uint32
+	// Features is a set of Feature flags. Absent (zero) from slimes
+	// that predate it.
+	Features uint32
+}
 
 // Open asks for a new channel. In and Out are the helper's ends of the
 // channel's pipes, duplicated into the helper's process: it reads the
@@ -108,6 +122,59 @@ type Error struct{ Message string }
 
 type Disconnected struct{ Reason string }
 
+// PromptKind says what a Prompt asks, for slime to pick its icon and
+// buttons.
+type PromptKind uint8
+
+const (
+	PromptPassword PromptKind = iota + 1
+	PromptPassphrase
+	PromptInteractive
+	PromptUnknownHost
+	PromptChangedHost
+)
+
+// Question is one field to fill in. Label may run over several lines,
+// as keyboard-interactive prompts do; its last line names the field.
+type Question struct {
+	Label string
+	Echo  bool
+}
+
+// Prompt asks the user something while logging in, on the channel that
+// is connecting. Text is the body, Detail is shown in a monospace box
+// (a key's path, fingerprints), and Error says why the last answer
+// didn't work.
+type Prompt struct {
+	Kind                       PromptKind
+	Title, Text, Detail, Error string
+	Questions                  []Question
+}
+
+// Choice is the button a prompt was answered with.
+type Choice uint8
+
+const (
+	// ChoiceCancel gives up: on logging in for most prompts, on the
+	// host for host key prompts.
+	ChoiceCancel Choice = iota
+	// ChoiceAccept submits the answers, or trusts the host key.
+	ChoiceAccept
+	// ChoiceSkip moves on without this key (passphrase prompts).
+	ChoiceSkip
+)
+
+// Answer replies to the last Prompt, one answer per question. A cancel
+// with no Prompt waiting gives up on logging in.
+type Answer struct {
+	Choice  Choice
+	Answers []string
+}
+
+// Info is a status line from the server while logging in, like PAM's
+// ("Success. Logging you in...").
+type Info struct{ Text string }
+
 func (*Hello) Type() Type        { return TypeHello }
 func (*Open) Type() Type         { return TypeOpen }
 func (*Resize) Type() Type       { return TypeResize }
@@ -118,9 +185,21 @@ func (*Opened) Type() Type       { return TypeOpened }
 func (*Exit) Type() Type         { return TypeExit }
 func (*Error) Type() Type        { return TypeError }
 func (*Disconnected) Type() Type { return TypeDisconnected }
+func (*Prompt) Type() Type       { return TypePrompt }
+func (*Answer) Type() Type       { return TypeAnswer }
+func (*Info) Type() Type         { return TypeInfo }
 
-func (m *Hello) encode(e *encoder) { e.u32(m.Version) }
-func (m *Hello) decode(d *decoder) { m.Version = d.u32() }
+func (m *Hello) encode(e *encoder) {
+	e.u32(m.Version)
+	e.u32(m.Features)
+}
+
+func (m *Hello) decode(d *decoder) {
+	m.Version = d.u32()
+	if d.has(4) {
+		m.Features = d.u32()
+	}
+}
 
 func (m *Open) encode(e *encoder) {
 	e.u64(m.In)
@@ -178,6 +257,52 @@ func (m *Error) decode(d *decoder) { m.Message = d.str() }
 func (m *Disconnected) encode(e *encoder) { e.str(m.Reason) }
 func (m *Disconnected) decode(d *decoder) { m.Reason = d.str() }
 
+func (m *Prompt) encode(e *encoder) {
+	e.u8(uint8(m.Kind))
+	e.str(m.Title)
+	e.str(m.Text)
+	e.str(m.Detail)
+	e.str(m.Error)
+	e.u32(uint32(len(m.Questions)))
+	for _, q := range m.Questions {
+		e.str(q.Label)
+		e.bool(q.Echo)
+	}
+}
+
+func (m *Prompt) decode(d *decoder) {
+	m.Kind = PromptKind(d.u8())
+	m.Title = d.str()
+	m.Text = d.str()
+	m.Detail = d.str()
+	m.Error = d.str()
+	n := d.count(5)
+	m.Questions = make([]Question, n)
+	for i := range m.Questions {
+		m.Questions[i] = Question{Label: d.str(), Echo: d.bool()}
+	}
+}
+
+func (m *Answer) encode(e *encoder) {
+	e.u8(uint8(m.Choice))
+	e.u32(uint32(len(m.Answers)))
+	for _, a := range m.Answers {
+		e.str(a)
+	}
+}
+
+func (m *Answer) decode(d *decoder) {
+	m.Choice = Choice(d.u8())
+	n := d.count(4)
+	m.Answers = make([]string, n)
+	for i := range m.Answers {
+		m.Answers[i] = d.str()
+	}
+}
+
+func (m *Info) encode(e *encoder) { e.str(m.Text) }
+func (m *Info) decode(d *decoder) { m.Text = d.str() }
+
 // Decode turns a frame's payload into its message.
 func Decode(f Frame) (Message, error) {
 	var m Message
@@ -202,6 +327,12 @@ func Decode(f Frame) (Message, error) {
 		m = new(Error)
 	case TypeDisconnected:
 		m = new(Disconnected)
+	case TypePrompt:
+		m = new(Prompt)
+	case TypeAnswer:
+		m = new(Answer)
+	case TypeInfo:
+		m = new(Info)
 	default:
 		return nil, fmt.Errorf("%w %d", ErrUnknownType, f.Type)
 	}
@@ -280,6 +411,16 @@ func (w *Writer) Send(id uint32, m Message) error {
 
 type encoder struct{ buf []byte }
 
+func (e *encoder) u8(v uint8) { e.buf = append(e.buf, v) }
+
+func (e *encoder) bool(v bool) {
+	if v {
+		e.u8(1)
+	} else {
+		e.u8(0)
+	}
+}
+
 func (e *encoder) u16(v uint16) { e.buf = binary.LittleEndian.AppendUint16(e.buf, v) }
 func (e *encoder) u32(v uint32) { e.buf = binary.LittleEndian.AppendUint32(e.buf, v) }
 func (e *encoder) u64(v uint64) { e.buf = binary.LittleEndian.AppendUint64(e.buf, v) }
@@ -307,6 +448,33 @@ func (d *decoder) take(n int) []byte {
 	b := d.buf[:n]
 	d.buf = d.buf[n:]
 	return b
+}
+
+// has says whether n more bytes are left, for fields a peer may not
+// send.
+func (d *decoder) has(n int) bool { return d.err == nil && len(d.buf) >= n }
+
+func (d *decoder) u8() uint8 {
+	if b := d.take(1); b != nil {
+		return b[0]
+	}
+	return 0
+}
+
+func (d *decoder) bool() bool { return d.u8() != 0 }
+
+// count reads a list's length, which can't be more than the bytes left
+// allow at minSize bytes an item.
+func (d *decoder) count(minSize int) int {
+	n := d.u32()
+	if d.err != nil {
+		return 0
+	}
+	if uint64(n)*uint64(minSize) > uint64(len(d.buf)) {
+		d.err = ErrTruncated
+		return 0
+	}
+	return int(n)
 }
 
 func (d *decoder) u16() uint16 {

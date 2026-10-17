@@ -14,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/aldehir/slime/ssh/internal/prompt"
+	"github.com/aldehir/slime/ssh/internal/proto"
 )
 
 // errSkipKey is a passphrase prompt left empty: skip the key, as ssh
@@ -38,8 +39,10 @@ func (e *deniedError) Error() string {
 // x/crypto runs its own loop with this as the AuthCallback, which lets
 // one method name ("publickey") come up more than once.
 type authenticator struct {
-	p    *prompt.Prompter
+	ui   asker
 	dest Destination
+	// passwords counts password prompts, to say when one is a retry.
+	passwords int
 
 	methods []ssh.AuthMethod
 	names   []string
@@ -51,8 +54,8 @@ type authenticator struct {
 }
 
 // identitiesOnly leaves out agent keys that aren't among keys.
-func newAuthenticator(p *prompt.Prompter, dest Destination, agentSigners []ssh.Signer, keys []*keyFile, identitiesOnly bool) *authenticator {
-	a := &authenticator{p: p, dest: dest}
+func newAuthenticator(ui asker, dest Destination, agentSigners []ssh.Signer, keys []*keyFile, identitiesOnly bool) *authenticator {
+	a := &authenticator{ui: ui, dest: dest}
 
 	// Keys that need no prompt go together; each locked key is its own
 	// method, since a skipped passphrase fails the method it's in.
@@ -78,7 +81,10 @@ func newAuthenticator(p *prompt.Prompter, dest Destination, agentSigners []ssh.S
 		a.add("publickey", ssh.PublicKeys(plain...))
 	}
 	for _, k := range locked {
-		k.readLine = a.readLine
+		k.ask = func(q *question) (proto.Answer, error) {
+			q.Title = "Unlock key for " + dest.Host
+			return a.ask(q)
+		}
 		a.add("publickey", ssh.PublicKeys(k))
 	}
 	if !identitiesOnly {
@@ -116,37 +122,72 @@ func (a *authenticator) callback(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, er
 	return nil, &deniedError{user: a.dest.User, host: a.dest.Host, allowed: ctx.AllowedMethods}
 }
 
-// readLine prompts, noting when the user gives up.
-func (a *authenticator) readLine(q string, echo bool) (string, error) {
-	s, err := a.p.ReadLine(q, echo)
-	if errors.Is(err, prompt.ErrInterrupted) || errors.Is(err, io.EOF) {
+// ask asks the user, noting when they give up.
+func (a *authenticator) ask(q *question) (proto.Answer, error) {
+	ans, err := a.ui.ask(q)
+	if err == nil && ans.Choice == proto.ChoiceCancel {
+		err = errCancelled
+	}
+	if errors.Is(err, prompt.ErrInterrupted) || errors.Is(err, io.EOF) || errors.Is(err, errCancelled) {
 		a.abort = err
 	}
-	return s, err
+	return ans, err
 }
 
+// interactive answers a keyboard-interactive round. One with no
+// questions is a status line, like PAM's info messages.
 func (a *authenticator) interactive(name, instruction string, questions []string, echos []bool) ([]string, error) {
+	var lines []string
 	for _, text := range []string{name, instruction} {
-		if text != "" {
-			if !strings.HasSuffix(text, "\n") {
-				text += "\n"
-			}
-			a.p.Print(text)
+		if text = strings.TrimRight(text, "\r\n"); text != "" {
+			lines = append(lines, text)
 		}
 	}
-	answers := make([]string, len(questions))
-	for i, q := range questions {
-		ans, err := a.readLine(q, echos[i])
-		if err != nil {
-			return nil, err
+	if len(questions) == 0 {
+		if len(lines) > 0 {
+			a.ui.info(strings.Join(lines, "\n"))
 		}
-		answers[i] = ans
+		return nil, nil
 	}
-	return answers, nil
+
+	// Servers rarely name a round; PAM never does.
+	title := strings.TrimSpace(name)
+	if title == "" {
+		title = "Sign in to " + a.dest.Host
+	}
+	q := &question{
+		Prompt: proto.Prompt{
+			Kind:  proto.PromptInteractive,
+			Title: title,
+			Text:  strings.TrimRight(instruction, "\r\n"),
+		},
+		termText: strings.Join(lines, "\n"),
+	}
+	for i, text := range questions {
+		q.Questions = append(q.Questions, proto.Question{Label: text, Echo: echos[i]})
+	}
+	ans, err := a.ask(q)
+	if err != nil {
+		return nil, err
+	}
+	return ans.Answers, nil
 }
 
 func (a *authenticator) password() (string, error) {
-	return a.readLine(fmt.Sprintf("%s@%s's password: ", a.dest.User, a.dest.Host), false)
+	q := &question{Prompt: proto.Prompt{
+		Kind:      proto.PromptPassword,
+		Title:     "Sign in to " + a.dest.Host,
+		Questions: []proto.Question{{Label: fmt.Sprintf("%s@%s's password: ", a.dest.User, a.dest.Host)}},
+	}}
+	if a.passwords > 0 {
+		q.Error = "Permission denied, try again."
+	}
+	a.passwords++
+	ans, err := a.ask(q)
+	if err != nil {
+		return "", err
+	}
+	return ans.Answers[0], nil
 }
 
 // keyFile is an identity file. An unencrypted one has signer set when
@@ -155,11 +196,11 @@ func (a *authenticator) password() (string, error) {
 // keys the host doesn't know. A public key file only picks a key from
 // the agent, as ssh allows.
 type keyFile struct {
-	path     string
-	pub      ssh.PublicKey
-	signer   ssh.Signer
-	pubOnly  bool
-	readLine func(q string, echo bool) (string, error)
+	path    string
+	pub     ssh.PublicKey
+	signer  ssh.Signer
+	pubOnly bool
+	ask     func(q *question) (proto.Answer, error)
 }
 
 // loadKeyFile reads path. A missing file is (nil, nil): the defaults
@@ -224,13 +265,21 @@ func (k *keyFile) unlock() error {
 	if err != nil {
 		return err
 	}
-	q := fmt.Sprintf("Enter passphrase for key '%s': ", k.path)
+	q := &question{
+		Prompt: proto.Prompt{
+			Kind:      proto.PromptPassphrase,
+			Detail:    k.path,
+			Questions: []proto.Question{{Label: "Passphrase"}},
+		},
+		terminal: []string{fmt.Sprintf("Enter passphrase for key '%s': ", k.path)},
+	}
 	for range 3 {
-		pass, err := k.readLine(q, false)
+		ans, err := k.ask(q)
 		if err != nil {
 			return err
 		}
-		if pass == "" {
+		pass := ans.Answers[0]
+		if ans.Choice == proto.ChoiceSkip || pass == "" {
 			return errSkipKey
 		}
 		signer, err := ssh.ParsePrivateKeyWithPassphrase(data, []byte(pass))
@@ -238,7 +287,8 @@ func (k *keyFile) unlock() error {
 			k.signer = signer
 			return nil
 		}
-		q = fmt.Sprintf("Bad passphrase, try again for '%s': ", k.path)
+		q.Error = "Bad passphrase, try again."
+		q.terminal[0] = fmt.Sprintf("Bad passphrase, try again for '%s': ", k.path)
 	}
 	return fmt.Errorf("%s: bad passphrase", k.path)
 }

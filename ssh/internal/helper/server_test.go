@@ -66,6 +66,17 @@ func knownHostsFile(t *testing.T, lines ...string) string {
 
 func newHarness(t *testing.T, srv *sshtest.Server, knownHosts string, mods ...func(*Options)) *harness {
 	t.Helper()
+	return startHarness(t, srv, knownHosts, 0, mods...)
+}
+
+// newDialogHarness plays a slime that shows login prompts in a dialog.
+func newDialogHarness(t *testing.T, srv *sshtest.Server, knownHosts string, mods ...func(*Options)) *harness {
+	t.Helper()
+	return startHarness(t, srv, knownHosts, proto.FeaturePrompts, mods...)
+}
+
+func startHarness(t *testing.T, srv *sshtest.Server, knownHosts string, features uint32, mods ...func(*Options)) *harness {
+	t.Helper()
 	h := &harness{
 		t:        t,
 		msgs:     make(chan message, 64),
@@ -106,7 +117,7 @@ func newHarness(t *testing.T, srv *sshtest.Server, knownHosts string, mods ...fu
 	}()
 	t.Cleanup(func() { ctlInW.Close() })
 
-	h.send(0, &proto.Hello{Version: proto.Version})
+	h.send(0, &proto.Hello{Version: proto.Version, Features: features})
 	h.expect(0, &proto.HelloReply{Version: proto.Version})
 	return h
 }
