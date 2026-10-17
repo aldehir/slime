@@ -97,15 +97,13 @@ slime ships `conpty.dll` and `OpenConsole.exe` from the
 package, built from [microsoft/terminal](https://github.com/microsoft/terminal)
 under the MIT License, Copyright (c) Microsoft Corporation.
 
-## slime-ssh and slimed
+## slimed
 
-`slime-ssh.exe` and `slimed.exe` are written in Go, and statically link
-the Go standard library and the modules below, unmodified. `slimed`
-also links libghostty-vt (above) as a static library, with the C
-runtime Zig provides for each target: MinGW-w64's on Windows, musl on
-Linux (see below).
-Builds of `slimed` for Linux sit beside them in `remote/`, to install
-on SSH hosts.
+`slimed.exe` is written in Go, and statically links the Go standard
+library and the modules below, unmodified. It also links libghostty-vt
+(above) as a static library, with the C runtime Zig provides for each
+target: MinGW-w64's on Windows, musl on Linux (see below). Builds of
+`slimed` for Linux sit beside it in `remote/`, to install on SSH hosts.
 
 The Go standard library, [golang.org/x/crypto](https://go.googlesource.com/crypto),
 [golang.org/x/sys](https://go.googlesource.com/sys), and

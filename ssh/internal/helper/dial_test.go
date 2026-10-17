@@ -17,7 +17,6 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/aldehir/slime/ssh/internal/prompt"
-	"github.com/aldehir/slime/ssh/internal/proto"
 	"github.com/aldehir/slime/ssh/internal/sshtest"
 )
 
@@ -27,7 +26,7 @@ type dialer struct {
 	t       *testing.T
 	dialog  bool
 	prompts chan *Query
-	answers chan proto.Answer
+	answers chan Answer
 	fails   chan error
 	infos   chan string
 	cancel  context.CancelFunc
@@ -42,13 +41,13 @@ type dialResult struct {
 	err  error
 }
 
-func (d *dialer) Ask(q *Query) (proto.Answer, error) {
+func (d *dialer) Ask(q *Query) (Answer, error) {
 	d.prompts <- q
 	select {
 	case a := <-d.answers:
-		return padAnswers(a, len(q.Questions)), nil
+		return PadAnswers(a, len(q.Questions)), nil
 	case err := <-d.fails:
-		return proto.Answer{}, err
+		return Answer{}, err
 	}
 }
 
@@ -86,7 +85,7 @@ func startDialer(t *testing.T, srv *sshtest.Server, knownHosts string, dialog bo
 		t:       t,
 		dialog:  dialog,
 		prompts: make(chan *Query, 16),
-		answers: make(chan proto.Answer, 16),
+		answers: make(chan Answer, 16),
 		fails:   make(chan error, 16),
 		infos:   make(chan string, 16),
 		result:  make(chan dialResult, 1),
@@ -119,7 +118,7 @@ func startDialer(t *testing.T, srv *sshtest.Server, knownHosts string, dialog bo
 }
 
 // expectPrompt waits for the next prompt, of kind.
-func (d *dialer) expectPrompt(kind proto.PromptKind) *Query {
+func (d *dialer) expectPrompt(kind PromptKind) *Query {
 	d.t.Helper()
 	select {
 	case q := <-d.prompts:
@@ -136,8 +135,8 @@ func (d *dialer) expectPrompt(kind proto.PromptKind) *Query {
 	return nil
 }
 
-func (d *dialer) answer(choice proto.Choice, answers ...string) {
-	d.answers <- proto.Answer{Choice: choice, Answers: answers}
+func (d *dialer) answer(choice Choice, answers ...string) {
+	d.answers <- Answer{Choice: choice, Answers: answers}
 }
 
 func (d *dialer) expectInfo(text string) {
@@ -211,27 +210,27 @@ func expectWait(t *testing.T, conn *Conn, substr string) {
 // dialPassword logs in with the password, terminal style.
 func dialPassword(t *testing.T, d *dialer) *Conn {
 	t.Helper()
-	q := d.expectPrompt(proto.PromptPassword)
+	q := d.expectPrompt(PromptPassword)
 	if q.Questions[0].Label != "alde@127.0.0.1's password: " {
 		t.Errorf("prompt = %#v", q.Prompt)
 	}
-	d.answer(proto.ChoiceAccept, password)
+	d.answer(ChoiceAccept, password)
 	return d.expectConnected()
 }
 
 func TestDialPassword(t *testing.T) {
 	srv := startServer(t, sshtest.Options{Password: password})
 	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	q := d.expectPrompt(proto.PromptPassword)
-	want := []proto.Question{{Label: "alde@127.0.0.1's password: "}}
+	q := d.expectPrompt(PromptPassword)
+	want := []Question{{Label: "alde@127.0.0.1's password: "}}
 	if q.Title != "Sign in to 127.0.0.1" || q.Error != "" || len(q.Questions) != 1 || q.Questions[0] != want[0] {
 		t.Errorf("first prompt = %#v", q.Prompt)
 	}
-	d.answer(proto.ChoiceAccept, "wrong")
-	if q := d.expectPrompt(proto.PromptPassword); q.Error == "" {
+	d.answer(ChoiceAccept, "wrong")
+	if q := d.expectPrompt(PromptPassword); q.Error == "" {
 		t.Errorf("retry has no error: %#v", q.Prompt)
 	}
-	d.answer(proto.ChoiceAccept, password)
+	d.answer(ChoiceAccept, password)
 	conn := d.expectConnected()
 	if conn.Dest().Host != "127.0.0.1" {
 		t.Errorf("dest = %+v", conn.Dest())
@@ -252,8 +251,8 @@ func TestDialPassword(t *testing.T) {
 func TestDialCancel(t *testing.T) {
 	srv := startServer(t, sshtest.Options{Password: password})
 	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	d.expectPrompt(proto.PromptPassword)
-	d.answer(proto.ChoiceCancel)
+	d.expectPrompt(PromptPassword)
+	d.answer(ChoiceCancel)
 	d.expectFailed("cancelled")
 }
 
@@ -262,7 +261,7 @@ func TestDialCancel(t *testing.T) {
 func TestDialContextCancelled(t *testing.T) {
 	srv := startServer(t, sshtest.Options{Password: password})
 	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	d.expectPrompt(proto.PromptPassword)
+	d.expectPrompt(PromptPassword)
 	d.cancel()
 	// Our asker doesn't watch the context; the closed connection ends
 	// the handshake instead, so the prompt has to be answered.
@@ -272,8 +271,8 @@ func TestDialContextCancelled(t *testing.T) {
 	priv, pub := newKey(t)
 	srv = startServer(t, sshtest.Options{KeyThenDuo: true, AuthorizedKeys: []ssh.PublicKey{pub}, PushDelay: 2 * time.Second})
 	d = startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withAgent(t, priv))
-	d.expectPrompt(proto.PromptInteractive)
-	d.answer(proto.ChoiceAccept, "1")
+	d.expectPrompt(PromptInteractive)
+	d.answer(ChoiceAccept, "1")
 	start := time.Now()
 	d.cancel()
 	d.expectFailed("cancelled")
@@ -287,13 +286,13 @@ func TestDialDuo(t *testing.T) {
 	priv, pub := newKey(t)
 	srv := startServer(t, sshtest.Options{KeyThenDuo: true, AuthorizedKeys: []ssh.PublicKey{pub}})
 	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withAgent(t, priv))
-	q := d.expectPrompt(proto.PromptInteractive)
+	q := d.expectPrompt(PromptInteractive)
 	if q.Title != "Sign in to 127.0.0.1" || len(q.Questions) != 1 || !q.Questions[0].Echo ||
 		!strings.Contains(q.Questions[0].Label, "Duo two-factor login for alde") ||
 		!strings.HasSuffix(q.Questions[0].Label, "Passcode or option (1-1): ") {
 		t.Errorf("prompt = %#v", q.Prompt)
 	}
-	d.answer(proto.ChoiceAccept, otp)
+	d.answer(ChoiceAccept, otp)
 	d.expectInfo("Success. Logging you in...")
 	d.expectConnected()
 }
@@ -302,10 +301,10 @@ func TestDialKeyThenDuoWithEncryptedKey(t *testing.T) {
 	priv, pub := newKey(t)
 	srv := startServer(t, sshtest.Options{KeyThenDuo: true, AuthorizedKeys: []ssh.PublicKey{pub}})
 	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withIdentities(writeKey(t, priv, passphrase)))
-	d.expectPrompt(proto.PromptPassphrase)
-	d.answer(proto.ChoiceAccept, passphrase)
-	d.expectPrompt(proto.PromptInteractive)
-	d.answer(proto.ChoiceAccept, "1")
+	d.expectPrompt(PromptPassphrase)
+	d.answer(ChoiceAccept, passphrase)
+	d.expectPrompt(PromptInteractive)
+	d.answer(ChoiceAccept, "1")
 	d.expectInfo("Success. Logging you in...")
 	d.expectConnected()
 }
@@ -315,16 +314,16 @@ func TestDialPassphrase(t *testing.T) {
 	srv := startServer(t, sshtest.Options{AuthorizedKeys: []ssh.PublicKey{pub}})
 	path := writeKey(t, priv, passphrase)
 	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withIdentities(path))
-	q := d.expectPrompt(proto.PromptPassphrase)
+	q := d.expectPrompt(PromptPassphrase)
 	if q.Detail != path || q.Title != "Unlock key for 127.0.0.1" || q.Terminal[0] != "Enter passphrase for key '"+path+"': " {
 		t.Errorf("prompt = %#v", q)
 	}
-	d.answer(proto.ChoiceAccept, "wrong")
-	q = d.expectPrompt(proto.PromptPassphrase)
+	d.answer(ChoiceAccept, "wrong")
+	q = d.expectPrompt(PromptPassphrase)
 	if q.Error == "" || !strings.HasPrefix(q.Terminal[0], "Bad passphrase, try again") {
 		t.Errorf("retry = %#v", q)
 	}
-	d.answer(proto.ChoiceAccept, passphrase)
+	d.answer(ChoiceAccept, passphrase)
 	d.expectConnected()
 }
 
@@ -333,15 +332,15 @@ func TestDialPassphraseSkip(t *testing.T) {
 	priv, pub := newKey(t)
 	srv := startServer(t, sshtest.Options{Password: password, AuthorizedKeys: []ssh.PublicKey{pub}})
 	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withIdentities(writeKey(t, priv, passphrase)))
-	d.expectPrompt(proto.PromptPassphrase)
-	d.answer(proto.ChoiceSkip, "")
-	d.expectPrompt(proto.PromptPassword)
-	d.answer(proto.ChoiceAccept, password)
+	d.expectPrompt(PromptPassphrase)
+	d.answer(ChoiceSkip, "")
+	d.expectPrompt(PromptPassword)
+	d.answer(ChoiceAccept, password)
 	d.expectConnected()
 
 	d = startDial(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withIdentities(writeKey(t, priv, passphrase)))
-	d.expectPrompt(proto.PromptPassphrase)
-	d.answer(proto.ChoiceAccept, "")
+	d.expectPrompt(PromptPassphrase)
+	d.answer(ChoiceAccept, "")
 	dialPassword(t, d)
 }
 
@@ -357,8 +356,8 @@ func TestDialEncryptedRSAKey(t *testing.T) {
 	}
 	srv := startServer(t, sshtest.Options{AuthorizedKeys: []ssh.PublicKey{pub}})
 	d := startDial(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withIdentities(writeKey(t, priv, passphrase)))
-	d.expectPrompt(proto.PromptPassphrase)
-	d.answer(proto.ChoiceAccept, passphrase)
+	d.expectPrompt(PromptPassphrase)
+	d.answer(ChoiceAccept, passphrase)
 	d.expectConnected()
 }
 
@@ -374,7 +373,7 @@ func TestDialCtrlCAtPassphraseAborts(t *testing.T) {
 	priv, pub := newKey(t)
 	srv := startServer(t, sshtest.Options{Password: password, AuthorizedKeys: []ssh.PublicKey{pub}})
 	d := startDial(t, srv, knownHostsFile(t, srv.KnownHostsLine()), withIdentities(writeKey(t, priv, passphrase)))
-	d.expectPrompt(proto.PromptPassphrase)
+	d.expectPrompt(PromptPassphrase)
 	d.fails <- prompt.ErrInterrupted
 	d.expectFailed("interrupted")
 }
@@ -457,12 +456,12 @@ func TestDialUnknownHostTrusted(t *testing.T) {
 	srv := startServer(t, sshtest.Options{AuthorizedKeys: []ssh.PublicKey{pub}})
 	kh := knownHostsFile(t)
 	d := startDialog(t, srv, kh, withAgent(t, priv))
-	q := d.expectPrompt(proto.PromptUnknownHost)
+	q := d.expectPrompt(PromptUnknownHost)
 	fp := ssh.FingerprintSHA256(srv.Signer.PublicKey())
 	if !strings.Contains(q.Detail, fp) || len(q.Questions) != 0 || !strings.Contains(q.Text, kh) {
 		t.Errorf("prompt = %#v, want fingerprint %s", q.Prompt, fp)
 	}
-	d.answer(proto.ChoiceAccept)
+	d.answer(ChoiceAccept)
 	d.expectConnected()
 	data, err := os.ReadFile(kh)
 	if err != nil || strings.TrimSpace(string(data)) != srv.KnownHostsLine() {
@@ -474,8 +473,8 @@ func TestDialUnknownHostCancelled(t *testing.T) {
 	srv := startServer(t, sshtest.Options{Password: password})
 	kh := knownHostsFile(t)
 	d := startDialog(t, srv, kh)
-	d.expectPrompt(proto.PromptUnknownHost)
-	d.answer(proto.ChoiceCancel)
+	d.expectPrompt(PromptUnknownHost)
+	d.answer(ChoiceCancel)
 	d.expectFailed("host key verification failed")
 	if _, err := os.Stat(kh); err == nil {
 		t.Error("known_hosts was written")
@@ -494,11 +493,11 @@ func TestDialUnknownHostTerminal(t *testing.T) {
 		!strings.Contains(s, "ED25519 key fingerprint is "+ssh.FingerprintSHA256(srv.Signer.PublicKey())) {
 		t.Errorf("screen:\n%s", s)
 	}
-	d.answer(proto.ChoiceAccept, "maybe")
+	d.answer(ChoiceAccept, "maybe")
 	if q := d.expectPrompt(0); q.Questions[0].Label != "Please type 'yes', 'no' or the fingerprint: " {
 		t.Errorf("prompt = %#v", q.Prompt)
 	}
-	d.answer(proto.ChoiceAccept, "yes")
+	d.answer(ChoiceAccept, "yes")
 	dialPassword(t, d)
 	if !strings.Contains(d.screen(), "Permanently added") {
 		t.Errorf("screen:\n%s", d.screen())
@@ -507,7 +506,7 @@ func TestDialUnknownHostTerminal(t *testing.T) {
 	// Saying no refuses.
 	d = startDial(t, srv, knownHostsFile(t))
 	d.expectPrompt(0)
-	d.answer(proto.ChoiceAccept, "no")
+	d.answer(ChoiceAccept, "no")
 	d.expectFailed("host key verification failed")
 }
 
@@ -524,11 +523,11 @@ func changedKeyDialer(t *testing.T, dialog bool, mods ...func(*Options)) (*diale
 func TestDialChangedHostConnectAnyway(t *testing.T) {
 	d, srv, kh := changedKeyDialer(t, true)
 	before, _ := os.ReadFile(kh)
-	q := d.expectPrompt(proto.PromptChangedHost)
+	q := d.expectPrompt(PromptChangedHost)
 	if !strings.Contains(q.Detail, ssh.FingerprintSHA256(srv.Signer.PublicKey())) || !strings.Contains(q.Detail, kh) {
 		t.Errorf("prompt = %#v", q.Prompt)
 	}
-	d.answer(proto.ChoiceAccept)
+	d.answer(ChoiceAccept)
 	d.expectConnected()
 	// Only this once: the warning comes back next time.
 	if after, _ := os.ReadFile(kh); string(after) != string(before) {
@@ -538,8 +537,8 @@ func TestDialChangedHostConnectAnyway(t *testing.T) {
 
 func TestDialChangedHostClosed(t *testing.T) {
 	d, _, _ := changedKeyDialer(t, true)
-	d.expectPrompt(proto.PromptChangedHost)
-	d.answer(proto.ChoiceCancel)
+	d.expectPrompt(PromptChangedHost)
+	d.answer(ChoiceCancel)
 	d.expectFailed("host key verification failed")
 }
 
@@ -577,8 +576,8 @@ func TestDialStrictHostKeyCheckingAcceptNew(t *testing.T) {
 // accept-new still refuses a changed key.
 func TestDialAcceptNewRefusesChangedKey(t *testing.T) {
 	d, _, _ := changedKeyDialer(t, true, func(o *Options) { o.StrictHostKeyChecking = "accept-new" })
-	d.expectPrompt(proto.PromptChangedHost)
-	d.answer(proto.ChoiceCancel)
+	d.expectPrompt(PromptChangedHost)
+	d.answer(ChoiceCancel)
 	d.expectFailed("host key verification failed")
 }
 
@@ -626,8 +625,8 @@ func TestDialJumpHost(t *testing.T) {
 	d := startDial(t, srv, knownHostsFile(t, srv.KnownHostsLine(), jump.KnownHostsLine()), func(o *Options) {
 		o.Jumps = []Hop{{Dest: Destination{User: "alde", Host: "127.0.0.1", Port: jump.Port()}}}
 	})
-	d.expectPrompt(proto.PromptPassword)
-	d.answer(proto.ChoiceAccept, "jump-pw")
+	d.expectPrompt(PromptPassword)
+	d.answer(ChoiceAccept, "jump-pw")
 	conn := dialPassword(t, d)
 	conn.Close()
 	if err := conn.Wait(); err != nil {
@@ -641,8 +640,8 @@ func TestDialJumpHostWithoutForwarding(t *testing.T) {
 	d := startDial(t, srv, knownHostsFile(t, srv.KnownHostsLine(), jump.KnownHostsLine()), func(o *Options) {
 		o.Jumps = []Hop{{Dest: Destination{User: "alde", Host: "127.0.0.1", Port: jump.Port()}}}
 	})
-	d.expectPrompt(proto.PromptPassword)
-	d.answer(proto.ChoiceAccept, "jump-pw")
+	d.expectPrompt(PromptPassword)
+	d.answer(ChoiceAccept, "jump-pw")
 	d.expectFailed("jump host 127.0.0.1 can't reach")
 }
 
@@ -653,8 +652,8 @@ func TestDialJumpHostLoginFails(t *testing.T) {
 		o.Jumps = []Hop{{Dest: Destination{User: "alde", Host: "127.0.0.1", Port: jump.Port()}}}
 	})
 	for range 3 {
-		d.expectPrompt(proto.PromptPassword)
-		d.answer(proto.ChoiceAccept, "wrong")
+		d.expectPrompt(PromptPassword)
+		d.answer(ChoiceAccept, "wrong")
 	}
 	d.expectFailed("jump host 127.0.0.1: alde@127.0.0.1: Permission denied")
 }

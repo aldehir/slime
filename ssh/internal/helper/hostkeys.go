@@ -13,8 +13,6 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
-
-	"github.com/aldehir/slime/ssh/internal/proto"
 )
 
 var errHostKeyRejected = errors.New("host key verification failed")
@@ -91,8 +89,8 @@ func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 
 	fp := ssh.FingerprintSHA256(key)
 	if h.ui.Dialog() {
-		q := &Query{Prompt: proto.Prompt{
-			Kind:   proto.PromptUnknownHost,
+		q := &Query{Prompt: Prompt{
+			Kind:   PromptUnknownHost,
 			Title:  "First connection to " + displayHost(hostname),
 			Text:   "slime hasn't seen this host's key before. If you can, check the fingerprint against one from the server's admin before trusting it.",
 			Detail: keyName(key) + " " + fp,
@@ -104,7 +102,7 @@ func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 		if err != nil {
 			return err
 		}
-		if ans.Choice != proto.ChoiceAccept {
+		if ans.Choice != ChoiceAccept {
 			return errHostKeyRejected
 		}
 		h.add(hostname, key)
@@ -114,7 +112,7 @@ func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
 		displayHost(hostname), keyName(key), fp))
 	q := "Are you sure you want to continue connecting (yes/no/[fingerprint])? "
 	for {
-		ans, err := h.ui.Ask(&Query{Prompt: proto.Prompt{Questions: []proto.Question{{Label: q, Echo: true}}}})
+		ans, err := h.ui.Ask(&Query{Prompt: Prompt{Questions: []Question{{Label: q, Echo: true}}}})
 		if err != nil {
 			return err
 		}
@@ -151,8 +149,8 @@ func (h *hostKeys) changed(hostname string, key ssh.PublicKey, known knownhosts.
 		h.warnChanged(hostname, key, known)
 		return errHostKeyRejected
 	}
-	q := &Query{Prompt: proto.Prompt{
-		Kind:  proto.PromptChangedHost,
+	q := &Query{Prompt: Prompt{
+		Kind:  PromptChangedHost,
 		Title: displayHost(hostname) + "'s host key has changed",
 		Text:  "Someone could be intercepting the connection, or the server may have been reinstalled. Only connect if you know why it changed.",
 		Detail: fmt.Sprintf("Expected (%s line %d)\n%s %s\nOffered now\n%s %s",
@@ -163,7 +161,7 @@ func (h *hostKeys) changed(hostname string, key ssh.PublicKey, known knownhosts.
 	if err != nil {
 		return err
 	}
-	if ans.Choice != proto.ChoiceAccept {
+	if ans.Choice != ChoiceAccept {
 		return errHostKeyRejected
 	}
 	log.Printf("host key for %s changed; connecting anyway", displayHost(hostname))

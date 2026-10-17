@@ -125,14 +125,17 @@ cell and Unicode placeholders (`U=1`, `U+10EEEE` cells) are drawn.
 
 ## SSH
 
-`command = ssh://[user@]host[:port]` (or `slime ssh://...`) runs sessions
-through `slime-ssh.exe` (ssh/), one connection shared by every session
-opened from one of its sessions.
+`command = ssh://[user@]host[:port]` (or `slime ssh://...`) opens a
+host: the local slimed logs in (ssh/internal/helper), puts its Linux
+build of slimed there from `remote/` beside the exe, and bridges the
+window to it. The connection is the daemon's: every window shares it,
+and it stays when the last window closes, so the next one finds the
+host connected without logging in. `slimed host connect|ls|disconnect`
+drive it from a console.
 
 The sidebar lists every host connected to before (`hosts` in the config
 directory), grouping sessions under them. A host's header button
-connects (a plug) or, once connected, opens another channel on the
-connection (`+`). A host with no sessions can be forgotten with the ×
+connects (a plug) or, once connected, opens another tab there (`+`). A host with no sessions can be forgotten with the ×
 that shows on hover.
 
 Icon buttons name themselves in a tooltip once the mouse rests on them
@@ -152,12 +155,12 @@ one.
 - **Long keyboard-interactive rounds.** One past eight questions is cut
   short.
 
-- **Logging in, in the header.** A host shows `+` from the moment its
-  helper starts, before it's logged in. Sessions left from a dead
-  connection aren't dimmed.
+- **Logging in, in the header.** A host shows `+` from the moment the
+  daemon starts connecting, before it's logged in. Sessions left from a
+  dead connection aren't dimmed.
 - **The new session key hint** went with the "New session" button.
   Ctrl+Shift+T opens one in the active session's group.
-- **More of `~/.ssh/config`.** The helper reads Host blocks and
+- **More of `~/.ssh/config`.** The daemon reads Host blocks and
   Include, and acts on `HostName`, `User`, `Port`, `IdentityFile`,
   `IdentitiesOnly`, `IdentityAgent`, the known hosts settings,
   `ConnectTimeout`, `ServerAlive*`, and `ProxyJump`. `Match` blocks
@@ -165,7 +168,9 @@ one.
   jump host's own `ProxyJump` isn't followed. Certificates
   (`CertificateFile`) and `HostKeyAlias` are ignored.
 - **Agent forwarding, port forwarding, SFTP.**
-- **Helper logs in GUI builds** go nowhere: there is no stderr to pass.
+- **Launching with an `ssh://` URL** attaches the local workspace too,
+  since hosts are reached through the local daemon; the host opens
+  beside it.
 
 ## Persistent workspaces
 
@@ -184,15 +189,15 @@ beside another, along a side of the tab, or into another's place.
 attached or not. If slimed can't be started, a tab says why.
 
 On SSH hosts it's the same daemon, built for Linux on x86-64 and
-carried in slime-ssh, which installs it as
-`~/.cache/slime/slimed-<build>` and bridges a channel to `slimed
-connect` (its socket is `/tmp/slimed-<uid>/sock`). Until the host's
-panes come, a session stands in for them, where logging in asks what it
-needs. Where slimed can't run (another OS, no gzip, a full disk), the
-stand-in says why, and so do the host's later tabs on that connection;
-ssh.exe in a local tab still reaches the host. A dropped connection
-leaves its panes saying so; the host's button reconnects, reattaches,
-and replaces them.
+carried in `remote/` beside the exe. The local slimed installs it as
+`~/.cache/slime/slimed-<build>` and splices each window's second
+connection to `slimed connect` there (its socket is
+`/tmp/slimed-<uid>/sock`). Until the host's panes come, a session stands
+in for them, where logging in asks what it needs. Where slimed can't
+run (another OS, no gzip, a full disk), connecting fails and the
+stand-in says why; ssh.exe in a local tab still reaches the host. A
+dropped connection leaves its panes saying so; the host's button
+reconnects, reattaches, and replaces them.
 
 - **Losing the local slimed** leaves its panes saying so, and new local
   tabs say so too until the next window, which starts a new daemon.
@@ -253,10 +258,12 @@ and replaces them.
 - **A host's panes take the environment of the SSH session that started
   its daemon**, so `SSH_CONNECTION` and the like go stale once that
   connection's gone.
-- **Login notices on a slimed connection** (banners, "Permanently
-  added") go to slime-ssh's log, there being no terminal yet to print
-  them in.
-- **Nothing reconnects by itself** when a host's connection drops.
+- **Login notices** (banners, "Permanently added") go to slimed's log,
+  there being no terminal yet to print them in.
+- **Nothing reconnects by itself** when a host's connection drops. The
+  daemon has the destination and could retry and reopen the bridges.
+- **Idle hosts stay connected** for as long as the daemon runs, even
+  with no window showing them.
 - **Several windows on one workspace.** Attaching takes a workspace from
   whoever has it. Sharing needs a rule for whose replies to device
   queries reach the program (clients would send them as their own frame

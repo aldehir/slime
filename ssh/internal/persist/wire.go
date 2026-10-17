@@ -8,9 +8,8 @@ import (
 	"io"
 )
 
-// The wire protocol between slime and slimed. Frames are slime-ssh's
-// (internal/proto): a little-endian u32 length of what follows, a u8
-// type, a u32 pane id (0 when the message isn't about one pane; a host
+// The wire protocol between slime and slimed. A frame is a little-endian
+// u32 length of what follows, a u8 type, a u32 pane id (0 when the message isn't about one pane; a host
 // id in the messages about one host), and a payload of fixed-size integers and strings (u32 length + bytes).
 // Decoders ignore bytes after the fields they know, so a later version
 // can append fields.

@@ -3,75 +3,51 @@ package helper
 import (
 	"testing"
 
-	"github.com/aldehir/slime/ssh/internal/proto"
 	"github.com/aldehir/slime/ssh/internal/sshtest"
 	"github.com/aldehir/slime/ssh/internal/terminfo"
 )
 
-// loginAs logs in on channel 1 asking for TERM term.
-func loginAs(t *testing.T, h *harness, term string) *term {
+// dialTerminfo logs in to a host whose terminfo answers per mode.
+func dialTerminfo(t *testing.T, mode sshtest.TerminfoMode) (*Conn, *sshtest.Server) {
 	t.Helper()
-	tm := h.openWith(1, &proto.Open{Cols: 80, Rows: 24, Term: term})
-	tm.expect(t, "password: ")
-	tm.typ(password + "\r")
-	h.expect(0, &proto.Connected{})
-	h.expect(1, &proto.Opened{})
-	tm.expect(t, "$ ")
-	return tm
+	srv := startServer(t, sshtest.Options{Password: password, Terminfo: mode})
+	d := startDial(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
+	return dialPassword(t, d), srv
 }
 
 func TestTerminfoAlreadyInstalled(t *testing.T) {
-	srv := startServer(t, sshtest.Options{Password: password, Terminfo: sshtest.TerminfoInstalled})
-	h := newHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	tm := loginAs(t, h, terminfo.Name)
-	tm.typ("info\r")
-	tm.expect(t, "term=xterm-ghostty ")
+	conn, srv := dialTerminfo(t, sshtest.TerminfoInstalled)
+	if !conn.InstallTerminfo() {
+		t.Error("not installed")
+	}
 	if srv.Compiled() != "" {
 		t.Error("compiled an entry the host already had")
+	}
+	if got := conn.Term(terminfo.Name); got != terminfo.Name {
+		t.Errorf("Term = %q", got)
 	}
 }
 
 func TestTerminfoCompiled(t *testing.T) {
-	srv := startServer(t, sshtest.Options{Password: password, Terminfo: sshtest.TerminfoTic})
-	h := newHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	tm := loginAs(t, h, terminfo.Name)
-	tm.typ("info\r")
-	tm.expect(t, "term=xterm-ghostty ")
+	conn, srv := dialTerminfo(t, sshtest.TerminfoTic)
+	if !conn.InstallTerminfo() {
+		t.Error("not installed")
+	}
 	if got := srv.Compiled(); got != terminfo.Source {
 		t.Errorf("tic got %d bytes, want the %d-byte entry", len(got), len(terminfo.Source))
 	}
-
-	// Later channels on the connection get it without checking again.
-	tm2 := h.openWith(2, &proto.Open{Cols: 80, Rows: 24, Term: terminfo.Name})
-	h.expect(2, &proto.Opened{})
-	tm2.expect(t, "$ ")
-	tm2.typ("info\r")
-	tm2.expect(t, "term=xterm-ghostty ")
 }
 
 func TestTerminfoFallback(t *testing.T) {
-	srv := startServer(t, sshtest.Options{Password: password, Terminfo: sshtest.TerminfoMissing})
-	h := newHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	tm := loginAs(t, h, terminfo.Name)
-	tm.typ("info\r")
-	tm.expect(t, "term=xterm-256color ")
-
-	tm2 := h.openWith(2, &proto.Open{Cols: 80, Rows: 24, Term: terminfo.Name})
-	h.expect(2, &proto.Opened{})
-	tm2.expect(t, "$ ")
-	tm2.typ("info\r")
-	tm2.expect(t, "term=xterm-256color ")
-}
-
-// Asking for another TERM leaves the host alone.
-func TestTerminfoNotAsked(t *testing.T) {
-	srv := startServer(t, sshtest.Options{Password: password, Terminfo: sshtest.TerminfoTic})
-	h := newHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	tm := loginAs(t, h, "xterm-256color")
-	tm.typ("info\r")
-	tm.expect(t, "term=xterm-256color ")
-	if srv.Compiled() != "" {
-		t.Error("compiled an entry nobody asked for")
+	conn, _ := dialTerminfo(t, sshtest.TerminfoMissing)
+	if conn.InstallTerminfo() {
+		t.Error("installed with no tic")
+	}
+	if got := conn.Term(terminfo.Name); got != terminfo.Fallback {
+		t.Errorf("Term = %q", got)
+	}
+	if got := conn.Term("screen"); got != "screen" {
+		t.Errorf("Term(screen) = %q", got)
 	}
 }
 

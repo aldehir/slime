@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/aldehir/slime/ssh/internal/persist"
-	"github.com/aldehir/slime/ssh/internal/proto"
 	"github.com/aldehir/slime/ssh/internal/sshtest"
 	"github.com/aldehir/slime/ssh/internal/vt"
 )
@@ -56,7 +55,7 @@ func shellHost(t *testing.T) (run func(string, io.Reader, io.Writer, io.Writer) 
 	}, home
 }
 
-// rw joins slime's ends of a slimed channel.
+// rw joins slime's ends of a slimed session.
 type rw struct {
 	io.Writer
 	io.Reader
@@ -69,13 +68,15 @@ func (c rw) Close() error { return c.close() }
 // talking to the host's slimed.
 func dialSlimed(t *testing.T, srv *sshtest.Server, knownHosts string) *persist.Client {
 	t.Helper()
-	h := newDialogHarness(t, srv, knownHosts)
-	in, out := h.openSlimedPipes(1, terminfoName)
-	h.expectPrompt(proto.PromptPassword)
-	h.answer(proto.ChoiceAccept, password)
-	h.expect(0, &proto.Connected{})
-	h.expect(1, &proto.Opened{})
-	c, err := persist.NewClient(rw{in, out, func() error { out.Close(); return in.Close() }})
+	d := startDialog(t, srv, knownHosts)
+	d.expectPrompt(PromptPassword)
+	d.answer(ChoiceAccept, password)
+	conn := d.expectConnected()
+	b, err := startBridge(t, conn, terminfoName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := persist.NewClient(rw{b.in, b.out, func() error { b.out.Close(); return b.in.Close() }})
 	if err != nil {
 		t.Fatal(err)
 	}

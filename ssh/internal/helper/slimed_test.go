@@ -3,137 +3,86 @@ package helper
 import (
 	"bytes"
 	"compress/gzip"
-	"fmt"
+	"errors"
 	"io"
-	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+	"time"
 
-	"github.com/aldehir/slime/ssh/internal/proto"
-	"github.com/aldehir/slime/ssh/internal/remote"
 	"github.com/aldehir/slime/ssh/internal/sshtest"
 )
 
-// fakeHost answers the helper's slimed commands as a host with uname
-// would, installing builds in memory.
-type fakeHost struct {
-	uname string
-	// installErr, if set, is what installing writes to stderr before
-	// failing.
-	installErr string
-
-	mu        sync.Mutex
-	probes    int
-	installed map[string][]byte
-	connects  []string
-}
-
-func (f *fakeHost) exec(command string, stdin io.Reader, stdout, stderr io.Writer) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	args := shArgs(command)
-	switch {
-	case strings.Contains(command, "uname -sm"):
-		f.probes++
-		fmt.Fprintf(stdout, "%s\n/home/alde/.cache/slime\n", f.uname)
-		for name := range f.installed {
-			fmt.Fprintf(stdout, "%s\n", strings.TrimPrefix(name, "/home/alde/.cache/slime/"))
-		}
-		return 0
-	case strings.Contains(command, "gzip -dc"):
-		if f.installErr != "" {
-			fmt.Fprintln(stderr, f.installErr)
-			return 1
-		}
-		zr, err := gzip.NewReader(stdin)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		exe, err := io.ReadAll(zr)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		if f.installed == nil {
-			f.installed = map[string][]byte{}
-		}
-		f.installed[args[0]] = exe
-		return 0
-	case strings.Contains(command, " connect --term "):
-		f.connects = append(f.connects, args[1])
-		f.mu.Unlock()
-		defer f.mu.Lock()
-		// An echo for slimed: what comes in goes back out.
-		io.Copy(stdout, stdin)
-		return 0
+func gunzip(r io.Reader) ([]byte, error) {
+	zr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
 	}
-	fmt.Fprintf(stderr, "sh: %s: not found\n", command)
-	return 127
+	return io.ReadAll(zr)
 }
 
-// shArgs are the arguments after the script in a shCommand.
-func shArgs(command string) []string {
-	var args []string
-	for _, q := range strings.Split(command, "' '")[1:] {
-		args = append(args, strings.Trim(q, "'"))
-	}
-	return args
+// dialHost logs in to a server backed by host with the password.
+func dialHost(t *testing.T, host *fakeHost) *Conn {
+	t.Helper()
+	srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
+	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
+	d.expectPrompt(PromptPassword)
+	d.answer(ChoiceAccept, password)
+	return d.expectConnected()
 }
 
-// openSlimed sends an OpenSlimed for channel id and returns slime's
-// side of it.
-func (h *harness) openSlimed(id uint32, termName string) *term {
-	in, out := h.openSlimedPipes(id, termName)
-	return &term{t: h.t, keys: in, screen: newScreen(out)}
+// bridge is slime's end of a `slimed connect` session: what it writes
+// goes to the host's slimed, and what slimed sends comes back.
+type bridge struct {
+	in  *io.PipeWriter
+	out *io.PipeReader
+	sl  *Slimed
 }
 
-// openSlimedPipes is openSlimed with slime's ends as they are: what it
-// writes to slimed, and what slimed sends back.
-func (h *harness) openSlimedPipes(id uint32, termName string) (*io.PipeWriter, *io.PipeReader) {
+func startBridge(t *testing.T, conn *Conn, term string) (*bridge, error) {
+	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	h.mu.Lock()
-	h.next += 2
-	m := &proto.OpenSlimed{In: h.next, Out: h.next + 1, Term: termName}
-	h.ends[m.In], h.ends[m.Out] = inR, outW
-	h.mu.Unlock()
-	h.send(id, m)
-	return inW, outR
+	sl, err := conn.StartSlimed(term, inR, outW, nil)
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		sl.Wait()
+		outW.Close()
+	}()
+	return &bridge{in: inW, out: outR, sl: sl}, nil
 }
 
-// testRemote is the manifest zig build wrote, or an empty one when it
-// hasn't.
-var testRemote = sync.OnceValue(func() *remote.Manifest {
-	m, err := remote.Load(filepath.Join("..", "..", "..", "zig-out", "bin", remote.Dir))
-	if err != nil {
-		return &remote.Manifest{}
-	}
-	return m
-})
-
-func needPayload(t *testing.T) {
-	if _, ok := testRemote().For("linux", "amd64"); !ok {
-		t.Skip("no slimed build to install (zig build writes zig-out/bin/remote)")
+// echo writes s and expects it back.
+func (b *bridge) echo(t *testing.T, s string) {
+	t.Helper()
+	go b.in.Write([]byte(s))
+	buf := make([]byte, len(s))
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(b.out, buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil || string(buf) != s {
+			t.Fatalf("echoed %q, %v; want %q", buf, err, s)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("nothing echoed for %q", s)
 	}
 }
 
 func TestSlimedInstallsThenBridges(t *testing.T) {
 	needPayload(t)
 	host := &fakeHost{uname: "Linux x86_64"}
-	srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
-	h := newDialogHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	sl := h.openSlimed(1, "")
+	conn := dialHost(t, host)
 
-	// Logging in asks in the dialog, on the slimed channel.
-	h.expectPrompt(proto.PromptPassword)
-	h.answer(proto.ChoiceAccept, password)
-	h.expect(0, &proto.Connected{})
-	h.expect(1, &proto.Opened{})
-
-	sl.typ("hello slimed")
-	sl.expect(t, "hello slimed")
+	b, err := startBridge(t, conn, "xterm-ghostty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.echo(t, "hello slimed")
 	build, _ := testRemote().For("linux", "amd64")
 	exe := "/home/alde/.cache/slime/slimed-" + build.ID
 	host.mu.Lock()
@@ -143,15 +92,17 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 	if !ok || !bytes.HasPrefix(got, []byte("\x7fELF")) {
 		t.Fatalf("installed %v at %s (have %v)", ok, exe, host.installed)
 	}
+	// No terminfo on this host, so TERM falls back.
 	if len(connects) != 1 || connects[0] != "xterm-256color" {
 		t.Errorf("connected with TERM %q", connects)
 	}
 
-	// Another slimed channel on the connection finds it without looking.
-	sl2 := h.openSlimed(2, "")
-	h.expect(2, &proto.Opened{})
-	sl2.typ("again")
-	sl2.expect(t, "again")
+	// Another session on the connection finds it without looking.
+	b2, err := startBridge(t, conn, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2.echo(t, "again")
 	host.mu.Lock()
 	probes := host.probes
 	host.mu.Unlock()
@@ -159,9 +110,16 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 		t.Errorf("probed %d times", probes)
 	}
 
-	// Closing hangs up on slimed.
-	h.send(2, &proto.Close{})
-	sl2.expectEOF(t)
+	// Hanging up our end ends slimed there cleanly.
+	b2.in.Close()
+	if err := b2.sl.Wait(); err != nil {
+		t.Errorf("Wait after hanging up = %v", err)
+	}
+	// Closing the session ends it too.
+	b.sl.Close()
+	if _, err := b.out.Read(make([]byte, 1)); err == nil {
+		t.Error("output still open after Close")
+	}
 }
 
 func TestSlimedFoundNotInstalled(t *testing.T) {
@@ -169,13 +127,10 @@ func TestSlimedFoundNotInstalled(t *testing.T) {
 	build, _ := testRemote().For("linux", "amd64")
 	exe := "/home/alde/.cache/slime/slimed-" + build.ID
 	host := &fakeHost{uname: "Linux x86_64", installed: map[string][]byte{exe: nil}}
-	srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
-	h := newDialogHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	h.openSlimed(1, "")
-	h.expectPrompt(proto.PromptPassword)
-	h.answer(proto.ChoiceAccept, password)
-	h.expect(0, &proto.Connected{})
-	h.expect(1, &proto.Opened{})
+	conn := dialHost(t, host)
+	if got, err := conn.EnsureSlimed(nil); err != nil || got != exe {
+		t.Fatalf("EnsureSlimed = %q, %v; want %q", got, err, exe)
+	}
 	host.mu.Lock()
 	defer host.mu.Unlock()
 	if host.installed[exe] != nil {
@@ -183,9 +138,9 @@ func TestSlimedFoundNotInstalled(t *testing.T) {
 	}
 }
 
-// Where slimed can't run, the channel fails and says why, and the
-// connection stays up for a plain shell.
-func TestSlimedUnsupportedFallsBack(t *testing.T) {
+// Where slimed can't run, setting it up fails and says why; the
+// connection stays up.
+func TestSlimedUnsupported(t *testing.T) {
 	for _, tc := range []struct {
 		name, uname, installErr, want string
 	}{
@@ -198,33 +153,53 @@ func TestSlimedUnsupportedFallsBack(t *testing.T) {
 				needPayload(t)
 			}
 			host := &fakeHost{uname: tc.uname, installErr: tc.installErr}
-			srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
-			h := newDialogHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-			sl := h.openSlimed(1, "")
-			h.expectPrompt(proto.PromptPassword)
-			h.answer(proto.ChoiceAccept, password)
-			h.expect(0, &proto.Connected{})
-			m := h.nextOn(1)
-			if e, ok := m.(*proto.Error); !ok || !strings.Contains(e.Message, tc.want) {
-				t.Fatalf("got %#v, want an Error with %q", m, tc.want)
+			conn := dialHost(t, host)
+			var status []string
+			_, err := conn.EnsureSlimed(func(s string) { status = append(status, s) })
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("EnsureSlimed = %v, want %q", err, tc.want)
 			}
-			sl.expectEOF(t)
-
-			tm := h.open(2, 80, 24, "")
-			h.expect(2, &proto.Opened{})
-			tm.expect(t, "$ ")
+			if tc.installErr != "" && (len(status) != 1 || status[0] != "installing slimed") {
+				t.Errorf("status = %q", status)
+			}
+			select {
+			case <-conn.Done():
+				t.Error("the connection ended")
+			default:
+			}
 		})
 	}
 }
 
-func TestSlimedNeedsPrompts(t *testing.T) {
-	srv := startServer(t, sshtest.Options{Password: password})
-	h := newHarness(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
-	sl := h.openSlimed(1, "")
-	if e, ok := h.nextOn(1).(*proto.Error); !ok || !strings.Contains(e.Message, "dialog") {
-		t.Fatalf("got %#v", e)
+// slimed failing on the host (it couldn't start its daemon, say) is a
+// SlimedError with its last line of stderr.
+func TestSlimedFails(t *testing.T) {
+	needPayload(t)
+	host := &failingHost{fakeHost{uname: "Linux x86_64"}}
+	srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
+	d := startDialog(t, srv, knownHostsFile(t, srv.KnownHostsLine()))
+	d.expectPrompt(PromptPassword)
+	d.answer(ChoiceAccept, password)
+	conn := d.expectConnected()
+	sl, err := conn.StartSlimed("", strings.NewReader(""), io.Discard, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	sl.expectEOF(t)
+	var failed *SlimedError
+	if err := sl.Wait(); !errors.As(err, &failed) || failed.Why != "slimed: no socket directory" {
+		t.Errorf("Wait = %v", err)
+	}
+}
+
+// failingHost's slimed exits with an error instead of bridging.
+type failingHost struct{ fakeHost }
+
+func (f *failingHost) exec(command string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if strings.Contains(command, " connect --term ") {
+		io.WriteString(stderr, "slimed: no socket directory\n")
+		return 1
+	}
+	return f.fakeHost.exec(command, stdin, stdout, stderr)
 }
 
 func TestGoPlatform(t *testing.T) {

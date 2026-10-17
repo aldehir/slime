@@ -1,3 +1,6 @@
+// Package helper logs in to SSH hosts for slimed (Dial) and runs slimed
+// on them (Conn.StartSlimed), asking the user what logging in needs
+// through an Asker.
 package helper
 
 import (
@@ -14,8 +17,58 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/aldehir/slime/ssh/internal/prompt"
+	"github.com/aldehir/slime/ssh/internal/remote"
 	"github.com/aldehir/slime/ssh/internal/terminfo"
 )
+
+const defaultTerm = terminfo.Fallback
+
+// Options say how to connect to a host.
+type Options struct {
+	// Dest has its user and port filled in.
+	Dest Destination
+	// Identities are key files to offer, in order; missing files are
+	// skipped. The agent signs for any it holds.
+	Identities []string
+	// IdentitiesOnly offers the agent's keys only when they are among
+	// Identities.
+	IdentitiesOnly bool
+	// Jumps are hosts to go through to reach Dest, first to last
+	// (ProxyJump).
+	Jumps []Hop
+
+	// KnownHosts are the user's known_hosts files, the first of which
+	// gets newly accepted keys. GlobalKnownHosts are only read.
+	KnownHosts       []string
+	GlobalKnownHosts []string
+	// StrictHostKeyChecking is "ask" (or ""), "yes", "accept-new", or
+	// "no". "no" adds new keys as accept-new does but still refuses
+	// changed ones.
+	StrictHostKeyChecking string
+	// HashKnownHosts writes accepted hosts hashed.
+	HashKnownHosts bool
+
+	// ConnectTimeout bounds the TCP connect. Zero is the system's.
+	ConnectTimeout time.Duration
+	// KeepaliveInterval, when set, asks the server for a reply that
+	// often, and gives up on the connection after KeepaliveCountMax go
+	// unanswered (ServerAliveInterval, ServerAliveCountMax).
+	KeepaliveInterval time.Duration
+	KeepaliveCountMax int
+
+	// DialAgent connects to an SSH agent. Nil means no agent.
+	DialAgent func() (io.ReadWriteCloser, error)
+	// Remote holds the builds of slimed to install on hosts. Nil means
+	// the ones beside the executable (remote.Beside).
+	Remote *remote.Manifest
+}
+
+// Hop is a host to log in to on the way to the destination.
+type Hop struct {
+	Dest           Destination
+	Identities     []string
+	IdentitiesOnly bool
+}
 
 // Conn is a connection to a host, logged in. It ends when the host hangs
 // up, the keepalives go unanswered, or Close is called; Wait says which.

@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/aldehir/slime/ssh/internal/helper"
-	"github.com/aldehir/slime/ssh/internal/proto"
 	"github.com/aldehir/slime/ssh/internal/remote"
 )
 
@@ -349,12 +348,12 @@ type hostAsker struct {
 	ctx context.Context
 }
 
-func (a *hostAsker) Ask(q *helper.Query) (proto.Answer, error) {
+func (a *hostAsker) Ask(q *helper.Query) (helper.Answer, error) {
 	answers := make(chan HostAnswer, 1)
 	a.s.mu.Lock()
 	if a.h.gen != a.gen || a.h.state != HostConnecting {
 		a.s.mu.Unlock()
-		return proto.Answer{}, helper.ErrCancelled
+		return helper.Answer{}, helper.ErrCancelled
 	}
 	a.h.answers = answers
 	client := a.h.client
@@ -380,12 +379,9 @@ func (a *hostAsker) Ask(q *helper.Query) (proto.Answer, error) {
 	client.sendForce(a.h.id, p)
 	select {
 	case ans := <-answers:
-		// One answer per question, whatever the client sent.
-		got := proto.Answer{Choice: proto.Choice(ans.Choice), Answers: ans.Answers}
-		got.Answers = append(got.Answers, make([]string, max(0, len(q.Questions)-len(got.Answers)))...)[:len(q.Questions)]
-		return got, nil
+		return helper.PadAnswers(helper.Answer{Choice: helper.Choice(ans.Choice), Answers: ans.Answers}, len(q.Questions)), nil
 	case <-a.ctx.Done():
-		return proto.Answer{}, helper.ErrCancelled
+		return helper.Answer{}, helper.ErrCancelled
 	}
 }
 

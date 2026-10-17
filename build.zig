@@ -90,8 +90,8 @@ pub fn build(b: *std.Build) void {
     exe.entry = .{ .symbol_name = "mainCRTStartup" };
     b.installArtifact(exe);
     installConpty(b);
-    const ssh = b.option(bool, "ssh", "Build the slime-ssh and slimed helpers (need Go; default: if Go is found)");
-    if (ssh orelse true) installGoHelpers(b, ssh != null);
+    const remote = b.option(bool, "remote", "Build slimed and its builds for SSH hosts (need Go; default: if Go is found)");
+    if (remote orelse true) installGoHelpers(b, remote != null);
 
     // Themes for the `theme` config key, in `themes` next to the exe.
     if (b.lazyDependency("iterm2_themes", .{})) |themes| {
@@ -175,19 +175,18 @@ fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
     test_step.dependOn(&check.step);
 }
 
-/// The Go helpers, next to the exe: slimed.exe, which runs every
-/// session, and slime-ssh.exe for SSH hosts, with slimed for Linux in
-/// `remote/` to install on hosts. Go caches its own builds,
-/// so this runs `go build` every time rather than tracking the sources.
-/// Without Go it warns and leaves them out, unless `-Dssh=true` asked for
-/// them.
+/// The daemon, next to the exe: slimed.exe, which runs every session
+/// and connects to SSH hosts, with slimed for Linux in `remote/` for it
+/// to install on them. Go caches its own builds, so this runs `go build`
+/// every time rather than tracking the sources. Without Go it warns and
+/// leaves them out, unless `-Dremote=true` asked for them.
 fn installGoHelpers(b: *std.Build, required: bool) void {
     const go = b.findProgram(&.{"go"}, &.{}) catch {
         if (required) {
-            b.getInstallStep().dependOn(&b.addFail("go not found; -Dssh=true needs it to build slime-ssh and slimed").step);
+            b.getInstallStep().dependOn(&b.addFail("go not found; -Dremote=true needs it to build slimed").step);
             return;
         }
-        std.log.warn("go not found; building without slime-ssh and slimed (slime will have nothing to run sessions in)", .{});
+        std.log.warn("go not found; building without slimed (slime will have nothing to run sessions in)", .{});
         return;
     };
     // slimed links libghostty-vt with cgo (ssh/internal/vt), as a static
@@ -210,7 +209,6 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
     }
     goBuild(b, go, "slimed").step.dependOn(&copy.step);
     installRemote(b, go, &copy.step);
-    _ = goBuild(b, go, "slime-ssh");
 }
 
 /// The systems slimed is built for to install on SSH hosts, with the

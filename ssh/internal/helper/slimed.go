@@ -7,11 +7,11 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/aldehir/slime/ssh/internal/proto"
 	"github.com/aldehir/slime/ssh/internal/remote"
 )
 
@@ -102,6 +102,8 @@ func (c *Conn) EnsureSlimed(status func(string)) (string, error) {
 type Slimed struct {
 	sess   *ssh.Session
 	stderr tail
+	once   sync.Once
+	err    error
 }
 
 // SlimedError is slimed on the host ending with a failure: it couldn't
@@ -137,19 +139,24 @@ func (c *Conn) StartSlimed(term string, stdin io.Reader, stdout io.Writer, statu
 
 // Wait waits for slimed to end: nil when it exited cleanly (the other
 // end hung up), a SlimedError when it failed, or the connection's error
-// when that ended first.
+// when that ended first. Every call returns the same answer.
 func (s *Slimed) Wait() error {
+	s.once.Do(func() { s.err = s.wait() })
+	return s.err
+}
+
+func (s *Slimed) wait() error {
 	err := s.sess.Wait()
-	exit, ok := exitMessage(err)
+	ex, ok := exitStatus(err)
 	var missing *ssh.ExitMissingError
 	switch {
 	case !ok, errors.As(err, &missing):
 		// The channel closed without a status: the connection failed.
 		return err
-	case exit.Status == 0:
+	case ex.status == 0:
 		return nil
 	}
-	why := s.stderr.String(exit)
+	why := s.stderr.String(ex)
 	if !strings.HasPrefix(why, "slimed: ") {
 		why = "slimed: " + why
 	}
@@ -158,77 +165,6 @@ func (s *Slimed) Wait() error {
 
 // Close ends the session; Wait returns.
 func (s *Slimed) Close() error { return s.sess.Close() }
-
-// startSlimed is Serve's slimed channel: it runs slimed on the host and
-// bridges ch's pipes to it until one end hangs up.
-func (s *Server) startSlimed(ch *channel) {
-	s.mu.Lock()
-	closed := ch.closed || s.state == stateClosing
-	s.mu.Unlock()
-	if closed {
-		s.drop(ch)
-		s.finishIfIdle()
-		return
-	}
-	sl, err := s.conn.StartSlimed(ch.term, ch.input, ch.out, nil)
-	if err != nil {
-		s.slimedFailed(ch, err)
-		return
-	}
-	s.mu.Lock()
-	if ch.closed || s.state == stateClosing {
-		s.mu.Unlock()
-		sl.Close()
-		s.drop(ch)
-		s.finishIfIdle()
-		return
-	}
-	ch.sl = sl
-	s.mu.Unlock()
-	log.Printf("channel %d: slimed", ch.id)
-	s.send(ch.id, &proto.Opened{})
-
-	err = sl.Wait()
-	s.mu.Lock()
-	closed = ch.closed
-	s.mu.Unlock()
-	var failed *SlimedError
-	ended := err == nil || errors.As(err, &failed)
-	if ended && !closed {
-		if failed != nil {
-			s.send(ch.id, &proto.Error{Message: failed.Why})
-		} else {
-			s.send(ch.id, &proto.Exit{Status: 0})
-		}
-	}
-	s.drop(ch)
-	if !ended && !closed {
-		// The connection failed; once it has ended, finishIfIdle says
-		// why.
-		<-s.conn.Done()
-	}
-	s.finishIfIdle()
-}
-
-// slimedFailed reports that slimed couldn't start for ch and drops it.
-// The connection stays up with no channels: slime opens a plain one in
-// its place, or hangs up.
-func (s *Server) slimedFailed(ch *channel, err error) {
-	log.Printf("channel %d: no slimed: %v", ch.id, err)
-	s.mu.Lock()
-	report := !ch.closed && s.state != stateClosing
-	s.mu.Unlock()
-	if report {
-		s.send(ch.id, &proto.Error{Message: err.Error()})
-	}
-	s.drop(ch)
-	s.mu.Lock()
-	closed := ch.closed
-	s.mu.Unlock()
-	if closed {
-		s.finishIfIdle()
-	}
-}
 
 // goPlatform maps `uname -sm` to Go's names for it.
 func goPlatform(uname string) (goos, goarch string, ok bool) {
@@ -279,8 +215,8 @@ func run(client *ssh.Client, command string, stdin io.Reader, timeout time.Durat
 	select {
 	case err := <-done:
 		if err != nil {
-			exit, _ := exitMessage(err)
-			return nil, errors.New(stderr.String(exit))
+			ex, _ := exitStatus(err)
+			return nil, errors.New(stderr.String(ex))
 		}
 		return stdout.Bytes(), nil
 	case <-time.After(timeout):
@@ -316,18 +252,49 @@ func (t *tail) Write(p []byte) (int, error) {
 
 // String is the last line written, or how the command ended if it wrote
 // nothing.
-func (t *tail) String(exit *proto.Exit) string {
+func (t *tail) String(ex *exit) string {
 	lines := strings.Split(strings.TrimSpace(string(t.b)), "\n")
 	if last := strings.TrimSpace(lines[len(lines)-1]); last != "" {
 		return last
 	}
 	switch {
-	case exit == nil:
+	case ex == nil:
 		return "the connection failed"
-	case exit.Signal != "":
-		return "killed by signal " + exit.Signal
+	case ex.signal != "":
+		return "killed by signal " + ex.signal
 	}
-	return fmt.Sprintf("exited with status %d", exit.Status)
+	return fmt.Sprintf("exited with status %d", ex.status)
 }
 
 var _ io.Writer = (*tail)(nil)
+
+// exit is how a remote command ended. status is -1 when it was killed
+// by signal.
+type exit struct {
+	status int32
+	signal string
+}
+
+// exitStatus turns Session.Wait's result into an exit. ok is false when
+// the session ended without one because the connection failed.
+func exitStatus(err error) (e *exit, ok bool) {
+	var exitErr *ssh.ExitError
+	var missing *ssh.ExitMissingError
+	switch {
+	case err == nil:
+		return &exit{status: 0}, true
+	case errors.As(err, &exitErr):
+		if sig := exitErr.Signal(); sig != "" {
+			return &exit{status: -1, signal: sig}, true
+		}
+		return &exit{status: int32(exitErr.ExitStatus())}, true
+	case errors.As(err, &missing):
+		return &exit{status: -1}, true
+	}
+	return nil, false
+}
+
+// shellQuote makes s one sh word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}

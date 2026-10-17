@@ -14,7 +14,6 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/aldehir/slime/ssh/internal/prompt"
-	"github.com/aldehir/slime/ssh/internal/proto"
 )
 
 // errSkipKey is a passphrase prompt left empty: skip the key, as ssh
@@ -81,7 +80,7 @@ func newAuthenticator(ui Asker, dest Destination, agentSigners []ssh.Signer, key
 		a.add("publickey", ssh.PublicKeys(plain...))
 	}
 	for _, k := range locked {
-		k.ask = func(q *Query) (proto.Answer, error) {
+		k.ask = func(q *Query) (Answer, error) {
 			q.Title = "Unlock key for " + dest.Host
 			return a.ask(q)
 		}
@@ -123,9 +122,9 @@ func (a *authenticator) callback(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, er
 }
 
 // ask asks the user, noting when they give up.
-func (a *authenticator) ask(q *Query) (proto.Answer, error) {
+func (a *authenticator) ask(q *Query) (Answer, error) {
 	ans, err := a.ui.Ask(q)
-	if err == nil && ans.Choice == proto.ChoiceCancel {
+	if err == nil && ans.Choice == ChoiceCancel {
 		err = ErrCancelled
 	}
 	if errors.Is(err, prompt.ErrInterrupted) || errors.Is(err, io.EOF) || errors.Is(err, ErrCancelled) {
@@ -156,15 +155,15 @@ func (a *authenticator) interactive(name, instruction string, questions []string
 		title = "Sign in to " + a.dest.Host
 	}
 	q := &Query{
-		Prompt: proto.Prompt{
-			Kind:  proto.PromptInteractive,
+		Prompt: Prompt{
+			Kind:  PromptInteractive,
 			Title: title,
 			Text:  strings.TrimRight(instruction, "\r\n"),
 		},
 		TermText: strings.Join(lines, "\n"),
 	}
 	for i, text := range questions {
-		q.Questions = append(q.Questions, proto.Question{Label: text, Echo: echos[i]})
+		q.Questions = append(q.Questions, Question{Label: text, Echo: echos[i]})
 	}
 	ans, err := a.ask(q)
 	if err != nil {
@@ -174,10 +173,10 @@ func (a *authenticator) interactive(name, instruction string, questions []string
 }
 
 func (a *authenticator) password() (string, error) {
-	q := &Query{Prompt: proto.Prompt{
-		Kind:      proto.PromptPassword,
+	q := &Query{Prompt: Prompt{
+		Kind:      PromptPassword,
 		Title:     "Sign in to " + a.dest.Host,
-		Questions: []proto.Question{{Label: fmt.Sprintf("%s@%s's password: ", a.dest.User, a.dest.Host)}},
+		Questions: []Question{{Label: fmt.Sprintf("%s@%s's password: ", a.dest.User, a.dest.Host)}},
 	}}
 	if a.passwords > 0 {
 		q.Error = "Permission denied, try again."
@@ -200,7 +199,7 @@ type keyFile struct {
 	pub     ssh.PublicKey
 	signer  ssh.Signer
 	pubOnly bool
-	ask     func(q *Query) (proto.Answer, error)
+	ask     func(q *Query) (Answer, error)
 }
 
 // loadKeyFile reads path. A missing file is (nil, nil): the defaults
@@ -266,10 +265,10 @@ func (k *keyFile) unlock() error {
 		return err
 	}
 	q := &Query{
-		Prompt: proto.Prompt{
-			Kind:      proto.PromptPassphrase,
+		Prompt: Prompt{
+			Kind:      PromptPassphrase,
 			Detail:    k.path,
-			Questions: []proto.Question{{Label: "Passphrase"}},
+			Questions: []Question{{Label: "Passphrase"}},
 		},
 		Terminal: []string{fmt.Sprintf("Enter passphrase for key '%s': ", k.path)},
 	}
@@ -279,7 +278,7 @@ func (k *keyFile) unlock() error {
 			return err
 		}
 		pass := ans.Answers[0]
-		if ans.Choice == proto.ChoiceSkip || pass == "" {
+		if ans.Choice == ChoiceSkip || pass == "" {
 			return errSkipKey
 		}
 		signer, err := ssh.ParsePrivateKeyWithPassphrase(data, []byte(pass))
