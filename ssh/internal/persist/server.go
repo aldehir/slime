@@ -302,13 +302,6 @@ func (s *Server) startPane(command, cwd string, size Size) (pty.Pty, *vt.Termina
 		term.Close()
 		return nil, nil, err
 	}
-	// Grapheme clustering (mode 2027), as slime's terminals start with it
-	// and ConPTY measures text so. Only the current value: the C API
-	// can't set the default a full reset (RIS) goes back to.
-	if _, err := term.Write([]byte("\x1b[?2027h")); err != nil {
-		term.Close()
-		return nil, nil, err
-	}
 	p, err := s.spawn(pty.Options{
 		Command: command,
 		Dir:     cwd,

@@ -16,6 +16,8 @@ package vt
 // In callbacks.c, which can see the exported Go callbacks.
 extern GhosttyResult slime_install_callbacks(GhosttyTerminal t, uintptr_t userdata);
 extern void slime_install_log(void);
+// In slime.zig.
+extern void slime_vt_terminal_defaults(GhosttyTerminal t, bool fresh);
 */
 import "C"
 
@@ -114,7 +116,7 @@ func (r *Runtime) New(cols, rows uint16) (*Terminal, error) {
 	limit := C.size_t(ContinuationLimit)
 	err := check("terminal_set", C.ghostty_terminal_set(term, C.GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES, unsafe.Pointer(&limit)))
 	if err == nil {
-		err = t.finish()
+		err = t.finish(true)
 	}
 	if err != nil {
 		t.Close()
@@ -149,15 +151,18 @@ func (r *Runtime) Decode(snapshot []byte) (*Terminal, error) {
 		return nil, err
 	}
 	t := &Terminal{term: term}
-	if err := t.finish(); err != nil {
+	if err := t.finish(false); err != nil {
 		t.Close()
 		return nil, err
 	}
 	return t, nil
 }
 
-// finish registers a terminal for its callbacks once its handle exists.
-func (t *Terminal) finish() error {
+// finish gives a terminal slime's defaults and registers it for its
+// callbacks once its handle exists. A fresh one takes the default modes
+// too; a restored one keeps its program's.
+func (t *Terminal) finish(fresh bool) error {
+	C.slime_vt_terminal_defaults(t.term, C.bool(fresh))
 	var err error
 	if t.cols, t.rows, err = t.Size(); err != nil {
 		return err

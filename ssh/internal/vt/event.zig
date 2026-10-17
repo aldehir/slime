@@ -21,7 +21,9 @@
 //!     geometry: u32 cell width, cell height, padding left, top, right,
 //!               bottom, pane width, height (pixels)
 //!     settings: u32 double-click interval (ms), u16 n, n * u32 word
-//!               boundary codepoints
+//!               boundary codepoints, then the default colors: rgb
+//!               background, foreground, u8 has cursor color, rgb
+//!               cursor color, rgb palette[256]
 //!     cancel:   (a selection drag lost the mouse)
 //!
 //! A win32 record is win32-input-mode's: u16 vk, u16 scan code, u16 char,
@@ -84,6 +86,7 @@ pub fn Codec(comptime vt: type) type {
         const MouseButton = vt.input.MouseButton;
         const MouseAction = vt.input.MouseAction;
         const ModsInt = @typeInfo(Mods).@"struct".backing_integer.?;
+        const RGB = vt.color.RGB;
 
         /// The most win32 records one key carries: one per UTF-16 unit of
         /// its text.
@@ -122,6 +125,17 @@ pub fn Codec(comptime vt: type) type {
         pub const Settings = struct {
             double_click_ms: u32,
             word_boundary: []const u21,
+            /// The colors OSC 4/10/11/12 override and their resets
+            /// return to: slime's config.
+            colors: Colors,
+        };
+
+        pub const Colors = struct {
+            background: RGB,
+            foreground: RGB,
+            /// Null takes the cursor's color from its cell.
+            cursor: ?RGB,
+            palette: vt.color.Palette,
         };
 
         pub const Event = union(Kind) {
@@ -193,6 +207,12 @@ pub fn Codec(comptime vt: type) type {
                     const n = @min(s.word_boundary.len, std.math.maxInt(u16));
                     try w.writeInt(u16, @intCast(n), .little);
                     for (s.word_boundary[0..n]) |cp| try w.writeInt(u32, cp, .little);
+                    const c = &s.colors;
+                    try writeRgb(w, c.background);
+                    try writeRgb(w, c.foreground);
+                    try w.writeByte(@intFromBool(c.cursor != null));
+                    try writeRgb(w, c.cursor orelse .{});
+                    for (c.palette) |p| try writeRgb(w, p);
                 },
                 .cancel => {},
             }
@@ -280,7 +300,18 @@ pub fn Codec(comptime vt: type) type {
                     for (scratch.word_boundary[0..n]) |*cp| {
                         cp.* = std.math.cast(u21, try r.takeInt(u32, .little)) orelse return error.BadEvent;
                     }
-                    break :settings .{ .settings = .{ .double_click_ms = ms, .word_boundary = scratch.word_boundary[0..n] } };
+                    const c = &scratch.colors;
+                    c.background = try readRgb(&r);
+                    c.foreground = try readRgb(&r);
+                    const has_cursor = try r.takeByte() != 0;
+                    const cursor = try readRgb(&r);
+                    c.cursor = if (has_cursor) cursor else null;
+                    for (&c.palette) |*p| p.* = try readRgb(&r);
+                    break :settings .{ .settings = .{
+                        .double_click_ms = ms,
+                        .word_boundary = scratch.word_boundary[0..n],
+                        .colors = c.*,
+                    } };
                 },
                 .cancel => .cancel,
             };
@@ -290,6 +321,7 @@ pub fn Codec(comptime vt: type) type {
         pub const Scratch = struct {
             win32: [max_win32]Win32Key = undefined,
             word_boundary: [256]u21 = undefined,
+            colors: Colors = undefined,
         };
 
         fn writeF32(w: *std.Io.Writer, v: f32) !void {
@@ -298,6 +330,15 @@ pub fn Codec(comptime vt: type) type {
 
         fn readF32(r: *std.Io.Reader) !f32 {
             return @bitCast(try r.takeInt(u32, .little));
+        }
+
+        fn writeRgb(w: *std.Io.Writer, c: RGB) !void {
+            try w.writeAll(&.{ c.r, c.g, c.b });
+        }
+
+        fn readRgb(r: *std.Io.Reader) !RGB {
+            const b = try r.takeArray(3);
+            return .{ .r = b[0], .g = b[1], .b = b[2] };
         }
     };
 }

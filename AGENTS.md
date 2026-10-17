@@ -2,6 +2,10 @@
 
 A Windows terminal on **libghostty-vt** (`ghostty/` submodule) with our own
 Win32 window, Direct3D 11 renderer, and DirectWrite text stack, in Zig.
+The terminals run in **slimed** (`ssh/cmd/slimed`, Go, libghostty-vt
+through cgo), locally or on SSH hosts; slime draws the frames it sends
+(`ssh/internal/vt/frame.zig`) and sends input back as events
+(`event.zig`).
 
 ## Build
 

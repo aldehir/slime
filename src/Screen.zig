@@ -7,6 +7,7 @@ const frame = @import("frame");
 
 pub const Codec = frame.Codec(ghostty_vt);
 pub const Screen = Codec.Screen;
+pub const Flags = frame.Flags;
 
 /// Input to send slimed: the codec it decodes with (event.zig).
 pub const event = @import("event");
@@ -193,6 +194,15 @@ test "events round trip" {
         .{ .vk = 65, .scancode = 30, .char = 'a', .down = true, .control_state = 8, .repeat = 2 },
         .{ .vk = 65, .scancode = 30, .char = 'b', .down = false },
     };
+    var colors: Events.Colors = .{
+        .background = .{ .r = 1, .g = 2, .b = 3 },
+        .foreground = .{ .r = 250, .g = 251, .b = 252 },
+        .cursor = .{ .r = 9, .g = 8, .b = 7 },
+        .palette = ghostty_vt.color.default,
+    };
+    colors.palette[255] = .{ .r = 4, .g = 5, .b = 6 };
+    var no_cursor = colors;
+    no_cursor.cursor = null;
     const cases = [_]Events.Event{
         .{ .key = .{
             .event = .{
@@ -214,7 +224,8 @@ test "events round trip" {
         .{ .wheel = .{ .horizontal = true, .rotation = -240, .lines_per_notch = event.lines_page, .mods = .{ .super = true }, .x = 1, .y = 2 } },
         .{ .copy = 0xabcdef },
         .{ .geometry = .{ .cell_width = 9, .cell_height = 19, .padding = .{ .left = 1, .top = 2, .right = 3, .bottom = 4 }, .width = 800, .height = 600 } },
-        .{ .settings = .{ .double_click_ms = 400, .word_boundary = &.{ ' ', '\u{2502}', '$' } } },
+        .{ .settings = .{ .double_click_ms = 400, .word_boundary = &.{ ' ', '\u{2502}', '$' }, .colors = colors } },
+        .{ .settings = .{ .double_click_ms = 500, .word_boundary = &.{}, .colors = no_cursor } },
         .cancel,
     };
     for (cases) |ev| {
@@ -239,6 +250,7 @@ test "events round trip" {
             .settings => |s| {
                 try testing.expectEqual(s.double_click_ms, got.settings.double_click_ms);
                 try testing.expectEqualSlices(u21, s.word_boundary, got.settings.word_boundary);
+                try testing.expectEqualDeep(s.colors, got.settings.colors);
             },
             else => try testing.expectEqualDeep(ev, got),
         }

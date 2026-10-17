@@ -40,7 +40,7 @@ const (
 type framing struct {
 	view     *vt.View // made at the first attach by a client that draws
 	seq      uint32   // the last frame's
-	inFlight int      // frames sent and not yet acked
+	acked    uint32   // the last frame acked; the ones after are in flight
 	changed  bool     // the terminal changed since the last frame
 	full     bool     // the next frame has everything: a new attach
 	lastSent time.Time
@@ -115,9 +115,16 @@ func (p *Pane) attachFramesLocked(c *conn) error {
 		Command: p.command,
 		Status:  p.status.records(),
 	})
+	// What the client would otherwise only learn when they change.
+	if title, _ := p.term.Title(); title != "" {
+		c.sendForce(p.id, &Notice{Kind: NoticeTitle, Text: title})
+	}
+	if pwd, _ := p.term.Pwd(); pwd != "" {
+		c.sendForce(p.id, &Notice{Kind: NoticePwd, Text: pwd})
+	}
 	p.autoscrollLocked(false)
 	p.fr.seq = 0
-	p.fr.inFlight = 0
+	p.fr.acked = 0
 	p.fr.full = true
 	p.fr.changed = true
 	p.fr.holdFrom = time.Time{}
@@ -126,14 +133,16 @@ func (p *Pane) attachFramesLocked(c *conn) error {
 	return nil
 }
 
-// ack frees room for another frame, if c is the pane's client.
+// ack frees room for more frames, if c is the pane's client: an Ack
+// covers its frame and every one before it, so a client may ack only the
+// last frame it drew.
 func (p *Pane) ack(c *conn, seq uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.client != c || p.fr.inFlight == 0 || seq > p.fr.seq {
+	if p.client != c || seq <= p.fr.acked || seq > p.fr.seq {
 		return
 	}
-	p.fr.inFlight--
+	p.fr.acked = seq
 	if p.fr.changed {
 		p.wakeFramer()
 	}
@@ -143,7 +152,7 @@ func (p *Pane) ack(c *conn, seq uint32) {
 // arranges to look again when one will be.
 func (p *Pane) frameLocked() {
 	c := p.client
-	if c == nil || !c.frames || p.done || !p.fr.changed || p.fr.inFlight >= maxInFlight {
+	if c == nil || !c.frames || p.done || !p.fr.changed || p.fr.seq-p.fr.acked >= maxInFlight {
 		// An Ack, a change, or an attach wakes the framer again.
 		return
 	}
@@ -171,7 +180,6 @@ func (p *Pane) frameLocked() {
 	p.fr.seq++
 	// Frames are bounded by maxInFlight rather than the queue's cap.
 	c.sendForce(p.id, &Draw{Seq: p.fr.seq, Data: data})
-	p.fr.inFlight++
 	p.fr.changed = false
 	p.fr.full = false
 	p.fr.lastSent = now

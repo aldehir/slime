@@ -1,6 +1,7 @@
-//! Converts a terminal RenderState into GPU-ready data: one background
-//! color per cell, and a list of quads (glyphs and solid rectangles for
-//! the cursor and text decorations). Independent of the graphics API.
+//! Converts a pane's screen (slimed's frames, applied) into GPU-ready
+//! data: one background color per cell, and a list of quads (glyphs and
+//! solid rectangles for the cursor and text decorations). Independent of
+//! the graphics API.
 //!
 //! Rows are cached by content, so a frame only rebuilds the rows that
 //! changed and then copies every row's quads into place.
@@ -10,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const font = @import("../font/font.zig");
 const TerminalColor = @import("../Config.zig").TerminalColor;
+const Screen = @import("../Screen.zig").Screen;
 
 const RenderState = ghostty_vt.RenderState;
 const RGB = ghostty_vt.color.RGB;
@@ -114,13 +116,13 @@ pub const Cells = struct {
         self.* = undefined;
     }
 
-    /// Rebuild the frame from the render state, reusing cached rows
-    /// whose content hasn't changed. Rasterizes any glyphs not yet in
-    /// the atlas.
+    /// Rebuild the frame from the screen, reusing cached rows whose
+    /// content hasn't changed. Rasterizes any glyphs not yet in the
+    /// atlas.
     pub fn build(
         self: *Cells,
         alloc: Allocator,
-        state: *const RenderState,
+        state: *const Screen,
         grid: *font.Grid,
         cursor: CursorOptions,
         config: ColorOptions,
@@ -157,19 +159,13 @@ pub const Cells = struct {
             try self.instances.append(alloc, rect(m, pos.x, pos.y, 0, m.cell_width, m.cell_height, cursor_color));
         };
 
-        const rows = state.row_data.slice();
-        for (
-            rows.items(.cells)[0..self.rows],
-            rows.items(.selection)[0..self.rows],
-            0..,
-        ) |row_cells, selection, y_usize| {
+        for (state.row_data.items[0..self.rows], 0..) |*screen_row, y_usize| {
             const y: u32 = @intCast(y_usize);
-            const cells = row_cells.slice();
             const row: Row = .{
-                .raws = cells.items(.raw)[0..self.cols],
-                .styles = cells.items(.style),
-                .graphemes = cells.items(.grapheme),
-                .selection = selection,
+                .raws = screen_row.raws.items[0..self.cols],
+                .styles = screen_row.styles.items,
+                .graphemes = screen_row.graphemes.items,
+                .selection = screen_row.selection,
                 .cursor_x = if (cursor_pos) |pos| (if (pos.y == y) pos.x else null) else null,
                 .cursor_block = cursor_style == .block,
             };
@@ -391,7 +387,7 @@ const Row = struct {
     styles: []const ghostty_vt.Style,
     /// Valid only for cells with graphemes.
     graphemes: []const []const u21,
-    selection: @FieldType(RenderState.Row, "selection"),
+    selection: @FieldType(Screen.Row, "selection"),
     /// The cursor's column, if it's drawn on this row.
     cursor_x: ?u32,
     cursor_block: bool,
@@ -455,7 +451,7 @@ fn cellColors(style: ghostty_vt.Style, raw: ghostty_vt.Cell, colors: *const Rend
 
 /// The cursor to draw, or null for none. The same priority as Ghostty's
 /// renderer: hidden by the terminal, then unfocused, then blink.
-fn cursorStyle(state: *const RenderState, opts: CursorOptions) ?ghostty_vt.CursorStyle {
+fn cursorStyle(state: *const Screen, opts: CursorOptions) ?ghostty_vt.CursorStyle {
     if (state.cursor.viewport == null or !state.cursor.visible) return null;
     if (!opts.focused) return .block_hollow;
     if (state.cursor.blinking and !opts.blink_visible) return null;

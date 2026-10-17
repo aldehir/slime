@@ -175,8 +175,8 @@ fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
     test_step.dependOn(&check.step);
 }
 
-/// The Go helpers, next to the exe: slime-ssh.exe for `ssh://` commands,
-/// and slimed.exe for `persist-sessions`. slime-ssh carries slimed for
+/// The Go helpers, next to the exe: slimed.exe, which runs every
+/// session, and slime-ssh.exe for SSH hosts. slime-ssh carries slimed for
 /// Linux, to install on hosts it connects to. Go caches its own builds,
 /// so this runs `go build` every time rather than tracking the sources.
 /// Without Go it warns and leaves them out, unless `-Dssh=true` asked for
@@ -187,7 +187,7 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
             b.getInstallStep().dependOn(&b.addFail("go not found; -Dssh=true needs it to build slime-ssh and slimed").step);
             return;
         }
-        std.log.warn("go not found; building without slime-ssh and slimed (ssh:// commands and persist-sessions won't work)", .{});
+        std.log.warn("go not found; building without slime-ssh and slimed (slime will have nothing to run sessions in)", .{});
         return;
     };
     // slimed links libghostty-vt with cgo (ssh/internal/vt), as a static

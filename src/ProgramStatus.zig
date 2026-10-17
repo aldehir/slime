@@ -5,8 +5,9 @@
 //! progress, since its program is gone; `done` and `error` stay until
 //! the program replaces or clears them.
 //!
-//! The terminal parses and checks the reports (`program_status` effect);
-//! this keeps the records and sums them up for the sidebar.
+//! slimed's terminal parses and checks the reports, and slimed keeps the
+//! records, sending them whole when they change; a session puts them
+//! back here (`restore`) and sums them up for the sidebar.
 const ProgramStatus = @This();
 
 const std = @import("std");
@@ -66,8 +67,7 @@ pub fn report(self: *ProgramStatus, r: Report) void {
     self.set(id, state, r.readOption(.progress));
 }
 
-/// Put back a record kept elsewhere (by slimed while no window was
-/// attached), as a report of it would set it.
+/// Put back a record slimed kept, as a report of it would set it.
 pub fn restore(self: *ProgramStatus, id: []const u8, state: State, progress: ?u8) void {
     self.set(id, state, progress);
 }

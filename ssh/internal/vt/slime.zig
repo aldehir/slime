@@ -133,6 +133,25 @@ export fn slime_vt_view_free(v: ?*View, t: Terminal) void {
     alloc.destroy(self);
 }
 
+/// Give a terminal slime's defaults: mode 2027 clusters multi-codepoint
+/// graphemes (emoji sequences, combining marks) into one cell, as the
+/// Ghostty app does, and a null cursor blink blinks, including after a
+/// DECSCUSR 0, RIS, or DECSTR. `fresh` sets the modes too, for a new
+/// terminal; a restored one keeps what its program set.
+///
+/// The pointer is an arrow until the program asks for another shape
+/// with OSC 22: an I-beam (Ghostty's default) looks wrong over TUIs. An
+/// empty OSC 22 still resets it to the I-beam. A restored terminal can't
+/// tell the default I-beam from one the program asked for, and takes the
+/// arrow.
+export fn slime_vt_terminal_defaults(t: Terminal, fresh: bool) void {
+    const term = zigTerminal(t) orelse return;
+    term.modes.default.grapheme_cluster = true;
+    if (fresh) term.modes.set(.grapheme_cluster, true);
+    term.setDefaultCursorBlink(null);
+    if (fresh or term.mouse_shape == .text) term.mouse_shape = .default;
+}
+
 /// Why the next frame should wait: 0 for no reason, 1 while the program
 /// is partway through an update (synchronized output, mode 2026), 2 when
 /// it hid the cursor the last frame showed. ConPTY passes console writes
@@ -317,6 +336,13 @@ fn handle(self: *View, t: *vt.Terminal, win32_input: bool, ev: Events.Event, res
             self.double_click_ms = s.double_click_ms;
             self.word_boundary.clearRetainingCapacity();
             try self.word_boundary.appendSlice(alloc, s.word_boundary);
+            // Keeping what the program changed (OSC 4/10/11/12).
+            const colors = &t.colors;
+            colors.background.default = s.colors.background;
+            colors.foreground.default = s.colors.foreground;
+            colors.cursor.default = s.colors.cursor;
+            try colors.palette.changeDefault(t.gpa(), s.colors.palette);
+            result.changed = true;
         },
         .cancel => if (self.selecting) endSelection(self, t, null),
     }

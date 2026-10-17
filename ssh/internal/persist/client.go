@@ -99,8 +99,9 @@ type PaneState struct {
 	Attached Attached
 	Snapshot []byte
 	Output   [][]byte
-	// Frames, for a client that draws them.
-	Draws []*Draw
+	// Frames and notices, for a client that draws them.
+	Draws   []*Draw
+	Notices []*Notice
 }
 
 // Attachment collects what attaching (or a request that adds a pane to
@@ -134,6 +135,10 @@ func (c *Client) Await(tag uint32, wantCreated bool) (*Attachment, error) {
 		case *Draw:
 			if p := a.Panes[id]; p != nil {
 				p.Draws = append(p.Draws, &Draw{Seq: m.Seq, Data: append([]byte(nil), m.Data...)})
+			}
+		case *Notice:
+			if p := a.Panes[id]; p != nil {
+				p.Notices = append(p.Notices, m)
 			}
 		case *Workspace:
 			if m.Tag == tag {

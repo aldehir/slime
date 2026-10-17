@@ -141,6 +141,27 @@ func TestFramesInFlight(t *testing.T) {
 	}
 }
 
+// TestFramesAckCovers checks that an Ack covers the frames before it,
+// as a client acks only the last frame it drew.
+func TestFramesAckCovers(t *testing.T) {
+	h := newHarness(t)
+	d := newDrawer(t, h)
+	p := h.pty(0)
+	d.draw(5 * time.Second)
+	p.emit("a")
+	second := d.draw(5 * time.Second)
+	if second == nil {
+		t.Fatal("no second frame")
+	}
+	d.ack(second)
+	for i, s := range []string{"b", "c"} {
+		p.emit(s)
+		if f := d.draw(5 * time.Second); f == nil || f.Seq != uint32(3+i) {
+			t.Fatalf("frame after acking the second: %+v, want seq %d", f, 3+i)
+		}
+	}
+}
+
 // TestFramesSyncHold checks that synchronized output holds frames until
 // it ends.
 func TestFramesSyncHold(t *testing.T) {
@@ -192,7 +213,7 @@ func TestFramesReattach(t *testing.T) {
 	h := newHarness(t)
 	d := newDrawer(t, h)
 	d.ack(d.draw(5 * time.Second))
-	h.pty(0).emit("kept")
+	h.pty(0).emit("\x1b]0;its title\x07kept")
 	d.draw(5 * time.Second)
 	ws := h.list().Workspaces[0].ID
 
@@ -205,8 +226,14 @@ func TestFramesReattach(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	tag := c.NextTag()
 	c.Send(0, &WorkspaceAttach{Tag: tag, WS: ws})
-	if _, err := c.Await(tag, false); err != nil {
+	att, err := c.Await(tag, false)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The title it set before, which the new client has no other way to
+	// learn.
+	if ns := att.Panes[d.pane].Notices; len(ns) != 1 || ns[0].Kind != NoticeTitle || ns[0].Text != "its title" {
+		t.Errorf("notices at attach %+v, want the title", ns)
 	}
 	d2 := &drawer{t: t, c: c, conn: b, pane: d.pane}
 	f := d2.draw(5 * time.Second)

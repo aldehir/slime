@@ -169,49 +169,14 @@ pub const Choice = enum(u8) {
 pub const Channel = struct {
     conn: *SshConnection,
     id: u32,
-    /// Our ends: keys go in `input`, the remote's output comes out of
-    /// `output`.
+    /// Our ends, which carry slimed's protocol (Slimed.connectRemote):
+    /// we write `input`, and read `output`.
     input: win32.HANDLE,
     output: win32.HANDLE,
     /// Set once `ending` is known.
     done: win32.HANDLE,
     /// Guarded by the connection's lock until `done` is set.
     ending: Ending = .{},
-
-    /// Read output. Blocks until some is available; returns 0 at EOF,
-    /// which comes after the helper reports how the channel ended.
-    pub fn read(self: *Channel, buf: []u8) !usize {
-        var n: u32 = 0;
-        const len: u32 = @intCast(@min(buf.len, std.math.maxInt(u32)));
-        if (win32.ReadFile(self.output, buf.ptr, len, &n, null) == 0) {
-            if (win32.GetLastError() == win32.ERROR_BROKEN_PIPE) return 0;
-            return win32.lastError("ReadFile");
-        }
-        return n;
-    }
-
-    /// Write input. Called from both the UI thread and the reader
-    /// thread (query replies), like `Pty.write`.
-    pub fn write(self: *Channel, data: []const u8) void {
-        writeAll(self.input, data) catch {};
-    }
-
-    /// Resize the remote pty, in cells and pixels. Programs read the
-    /// pixel size to size images.
-    pub fn resize(self: *Channel, cols: u16, rows: u16, width_px: u32, height_px: u32) void {
-        var p: Payload = .{};
-        p.putU16(cols);
-        p.putU16(rows);
-        p.putU32(width_px);
-        p.putU32(height_px);
-        self.conn.send(.resize, self.id, p.bytes()) catch {};
-    }
-
-    /// Wait for the helper to say how the channel ended, which it does
-    /// just before closing the channel's output.
-    pub fn waitEnded(self: *Channel, ms: u32) void {
-        _ = win32.WaitForSingleObject(self.done, ms);
-    }
 
     /// How the channel ended, waiting up to `ms` to hear; null if that
     /// isn't known by then. Any thread.
@@ -220,8 +185,8 @@ pub const Channel = struct {
         return &self.ending;
     }
 
-    /// Ask the helper to close the channel. `read` returns 0 once it has.
-    /// UI thread only.
+    /// Ask the helper to close the channel, which ends `output` once it
+    /// has. UI thread only.
     pub fn close(self: *Channel) void {
         const conn = self.conn;
         conn.send(.close, self.id, &.{}) catch {};
@@ -411,29 +376,12 @@ pub fn isAlive(self: *SshConnection) bool {
     return self.alive;
 }
 
-/// Open a channel with a shell, in `cwd` if given, on a pty of the given
-/// size in cells and pixels. `term` is the TERM to ask for; the helper
-/// falls back from xterm-ghostty on hosts it can't install that on. `id`
-/// must be unique and nonzero. UI thread only.
-pub fn open(self: *SshConnection, id: u32, term: []const u8, cols: u16, rows: u16, width_px: u32, height_px: u32, cwd: ?[]const u8) !*Channel {
-    var p: Payload = .{};
-    p.putU64(0);
-    p.putU64(0);
-    p.putU16(cols);
-    p.putU16(rows);
-    p.putStr(term);
-    p.putStr(cwd orelse "");
-    p.putU32(width_px);
-    p.putU32(height_px);
-    if (p.overflow) return error.NameTooLong;
-    return self.openWith(.open, id, &p);
-}
-
 /// Open a channel to the host's slimed, whose pipes carry its protocol
 /// (Slimed.connectRemote). The helper installs slimed first if the host
-/// lacks it. If slimed can't run there, the channel ends saying why, and
-/// the connection stays up for `open`. `term` is the TERM its panes get,
-/// as `open`'s. UI thread only.
+/// lacks it. If slimed can't run there, the channel ends saying why.
+/// `term` is the TERM its panes get: xterm-ghostty falls back to
+/// xterm-256color on hosts the helper can't install its terminfo on.
+/// `id` must be unique and nonzero. UI thread only.
 pub fn openSlimed(self: *SshConnection, id: u32, term: []const u8) !*Channel {
     var p: Payload = .{};
     p.putU64(0);

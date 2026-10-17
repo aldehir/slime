@@ -63,11 +63,16 @@ than being piecemealed with MessageBox and the like.
   general (OSC 8 hyperlinks, regex links, ctrl+click to open).
 - **Ctrl+triple-click selects a command's output.** Needs shell
   integration (OSC 133).
-- **Kitty paste events** (mode 5522). Our paste encodes text itself
+- **Kitty paste events** (mode 5522). slimed encodes pastes itself
   rather than going through libghostty-vt's `handler.paste`, so programs
   that ask for paste events get plain pastes.
-- **Large pastes** are written to the pty on the UI thread, which blocks
-  until the child reads them.
+- **Large pastes** go to slimed as one event, so one over 8 MiB (the
+  protocol's largest message) is dropped. slimed writes them to the pty
+  outside the pane's lock, but its connection reader waits until the
+  child reads them.
+- **OSC 52 reads** aren't answered. The terminal is in slimed, which
+  would have to ask the window for the clipboard and wait for it inside
+  the program's write.
 
 ## Rendering
 
@@ -89,7 +94,11 @@ than being piecemealed with MessageBox and the like.
 
 ## Kitty graphics
 
-Images placed at the cursor are drawn, in kitty's three z layers.
+Not drawn since sessions moved into slimed: its frames don't carry
+images. The plan is to send each image once, as a message of its own,
+and its placements with each frame; `renderer/image.zig` already draws
+placements in kitty's three z layers, from a terminal. Before the move,
+images placed at the cursor were drawn. Once they are again:
 
 - **Unicode placeholders** (`U=1`, `U+10EEEE` cells) and **relative
   placements** (`P=`/`Q=`). Ghostty's `renderer/image.zig` has the
@@ -136,8 +145,7 @@ one.
 - **The Connect field's key** to open it from the keyboard.
 - **Long keyboard-interactive rounds.** One past eight questions is cut
   short.
-- **Notices during login** (`Warning: Permanently added ...`, banners)
-  still print in the session's terminal, behind the dialog.
+
 - **Logging in, in the header.** A host shows `+` from the moment its
   helper starts, before it's logged in. Sessions left from a dead
   connection aren't dimmed.
@@ -155,27 +163,43 @@ one.
 
 ## Persistent workspaces
 
-`persist-sessions = true` runs local sessions in slimed (ssh/cmd/slimed),
-a daemon that holds every pane's ConPTY and terminal state, arranged in
-tabs (each a layout tree) and workspaces. A window attaches the workspace
-detached last, or a new one, and mirrors it: closing the window detaches
-the workspace, closing a pane ends it. Each sidebar row is a tab, drawn as
-its tree of panes, each under a title strip whose buttons split it or zoom
-it. Dragging the gap between panes resizes them; dragging a pane by its
-strip moves it beside another, along a side of the tab, or into
-another's place.
+Every session runs in slimed (ssh/cmd/slimed), a daemon that holds each
+pane's ConPTY and terminal, arranged in tabs (each a layout tree) and
+workspaces. slime draws what it sends: frames of each pane's screen
+(ssh/internal/vt/frame.zig), with scrollback, selection, and copying
+done in the daemon; keys, the mouse, and the wheel go back as events
+(event.zig). A window attaches the workspace detached last, or a new
+one, and mirrors it: closing the window detaches the workspace, closing
+a pane ends it. Each sidebar row is a tab, drawn as its tree of panes,
+each under a title strip whose buttons split it or zoom it. Dragging the
+gap between panes resizes them; dragging a pane by its strip moves it
+beside another, along a side of the tab, or into another's place.
 `slimed tab new`, `split`, and the rest change a workspace from scripts,
-attached or not. Off by default, and only slimed's tabs split.
+attached or not. If slimed can't be started, a tab says why.
 
-On SSH hosts it's the same daemon, built for Linux (x86-64 and arm64)
-and carried in slime-ssh, which installs it as
+On SSH hosts it's the same daemon, built for Linux on x86-64 and
+carried in slime-ssh, which installs it as
 `~/.cache/slime/slimed-<build>` and bridges a channel to `slimed
 connect` (its socket is `/tmp/slimed-<uid>/sock`). Until the host's
 panes come, a session stands in for them, where logging in asks what it
 needs. Where slimed can't run (another OS, no gzip, a full disk), the
-stand-in becomes a plain shell, saying why, and so do the host's later
-sessions on that connection. A dropped connection leaves its panes
-saying so; the host's button reconnects, reattaches, and replaces them.
+stand-in says why, and so do the host's later tabs on that connection;
+ssh.exe in a local tab still reaches the host. A dropped connection
+leaves its panes saying so; the host's button reconnects, reattaches,
+and replaces them.
+
+- **Losing the local slimed** leaves its panes saying so, and new local
+  tabs say so too until the next window, which starts a new daemon.
+- **Frames pace to the display slime started on.** The refresh period
+  goes to slimed when connecting, not when the window moves to another
+  display.
+- **A frame that fails to apply** (out of memory, or a bad one) leaves
+  the pane wrong until the next full frame, which nothing asks for.
+- **The pwd (OSC 7) and the bell** come from slimed but aren't used: a
+  new tab doesn't start in the focused pane's directory, and the bell
+  does nothing.
+- **Search and link detection** would run in slimed, over the terminal
+  it holds, with matches marked in frames as the selection is.
 
 - **A pane can't be dragged to another tab**, or out into a tab of its
   own: slimed's Layout only rearranges a tab's own panes, so that needs
@@ -202,23 +226,21 @@ saying so; the host's button reconnects, reattaches, and replaces them.
 - **Daemon copies pile up.** slime runs slimed from a copy in
   `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
   doesn't block the next install, and never deletes old ones.
-- **A full reset (RIS) in a pane** drops grapheme clustering on the
-  daemon's copy of its terminal: libghostty-vt's C API can't set default
-  modes, so slimed sets mode 2027's current value only. The next attach
-  then shows that pane without clustering.
+
 - **New panes take slimed's environment**, from whichever slime started
   it, not the window's.
-- **Only Linux hosts.** macOS and the BSDs get plain shells: slimed
-  builds for darwin with GOOS alone, but slime-pack doesn't carry it,
-  and it's untested there.
+- **Only Linux hosts on x86-64.** Others get a tab saying slimed can't
+  run there: slimed would need libghostty-vt built for them with Zig,
+  and slime-pack doesn't carry them.
 - **Nothing shows while a host's slimed starts.** The stand-in is blank
   between logging in and the panes coming, which on a first install
   includes sending about 3 MiB.
 - **Builds pile up on hosts**, one `slimed-<build>` per slime build in
   `~/.cache/slime`, never removed.
 - **A host's daemon from an older build keeps serving.** A slime whose
-  protocol or snapshot format differs gets plain shells there until that
-  daemon exits, which is when its panes have all ended.
+  protocol or frame layout differs can't attach there until that daemon
+  exits, which is when its panes have all ended.
+
 - **Hosts can still end the daemon.** It runs in a session of its own,
   but systemd-logind with `KillUserProcesses=yes` ends it with the
   user's last login, as it does tmux.

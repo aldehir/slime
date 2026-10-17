@@ -36,13 +36,14 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("slime");
 /// The icon resource in src/slime.rc.
 const icon_id = 1;
 
-/// Posted from a thread pool wait when a session's child exits, or from
-/// its reader thread when an SSH session's channel ends. WPARAM is the
-/// session's ID, as for the messages below.
+/// Posted from slimed's reader when a session's pane ends: its child
+/// exited, or the pane was lost to us. WPARAM is the session's ID, as for
+/// the messages below.
 pub const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
 /// Posted from a reader thread when the child sets the title.
 pub const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
-/// Posted from a reader thread when the child writes the clipboard.
+/// Posted from a reader thread when the child writes the clipboard, or
+/// a copy's text comes.
 pub const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
 /// Posted from an SSH connection's reader thread when logging in has
 /// something to show. WPARAM is the channel (session) ID, or 0 once
@@ -60,8 +61,6 @@ const stats_timer_id = 1;
 /// Draws pending output while DefWindowProc's modal move/size loop runs
 /// instead of ours.
 const sizemove_timer_id = 2;
-/// Scrolls the viewport while a selection drag is above or below it.
-pub const autoscroll_timer_id = 3;
 /// Blinks the cursor while the window has focus.
 const blink_timer_id = 4;
 /// Steps a login dialog's spinner while it waits.
@@ -79,12 +78,6 @@ const split_right_key = binding.label(&binding.defaults, .{ .new_split = .right 
 const split_down_key = binding.label(&binding.defaults, .{ .new_split = .down });
 const zoom_key = binding.label(&binding.defaults, .toggle_split_zoom);
 
-/// How long a frame waits for a cursor that output just hid to come
-/// back. See `updateHold`.
-const cursor_hold_ms = 4;
-/// How long synchronized output (mode 2026) can hold frames back before
-/// we reset it, Ghostty's `sync_reset_ms`.
-const sync_hold_ms = 1000;
 /// How long after a resize output from a background session isn't
 /// activity: ConPTY redraws on every resize.
 const resize_quiet_ms = 500;
@@ -132,8 +125,8 @@ shown: std.ArrayList(*Session) = .empty,
 /// Scratch for `render`.
 frame_panes: std.ArrayList(Renderer.Pane) = .empty,
 
-/// Auto-reset event every session's reader thread sets after feeding
-/// output to its terminal. The message loop waits on it alongside
+/// Auto-reset event slimed's readers set after handing a session a
+/// frame (or program status). The message loop waits on it alongside
 /// messages and calls `outputArrived`. Not a posted message: those are
 /// retrieved before input and timers, so a steady stream of them starves
 /// the keyboard.
@@ -141,14 +134,6 @@ output_event: win32.HANDLE,
 
 /// Something changed since the last frame. UI thread only.
 dirty: bool = false,
-
-/// Why frames are being held back, if they are. `hold_timer` fires when
-/// the hold runs out. UI thread only.
-hold: Hold = .none,
-hold_timer: win32.HANDLE,
-
-/// The last frame showed the terminal's cursor (blinking aside).
-cursor_shown: bool = false,
 
 /// The window has keyboard focus.
 focused: bool = false,
@@ -160,11 +145,11 @@ blink_visible: bool = true,
 /// while set.
 connect_field: ?Chrome.TextField = null,
 
-/// The connection to slimed, with `persist-sessions`: local sessions are
-/// panes of the workspace it holds for this window.
+/// The connection to slimed: local sessions are panes of the workspace
+/// it holds for this window. Null if it couldn't be reached.
 slimed: ?*Slimed = null,
-/// Connections to slimed on SSH hosts, with `persist-sessions`: a host's
-/// sessions are panes of the workspace its slimed holds for this window.
+/// Connections to slimed on SSH hosts: a host's sessions are panes of
+/// the workspace its slimed holds for this window.
 remotes: std.ArrayList(Remote) = .empty,
 
 /// Until when the next tooltip shows at once. See `tip_warm_ms`.
@@ -236,17 +221,10 @@ const Remote = struct {
     placeholder: u32,
 };
 
-const Hold = enum {
-    none,
-    /// The cursor the last frame showed was hidden.
-    cursor,
-    /// Synchronized output (mode 2026) is set.
-    sync,
-};
-
-/// Create the window with one session running `command_line`
-/// (CreateProcessW syntax, or an `ssh://` URL, which is remembered in
-/// `hosts`). Local sessions opened later run `local_command`.
+/// Create the window, attaching the workspace slimed kept for it, or a
+/// new one running `command_line` (CreateProcessW syntax). An `ssh://`
+/// URL opens that host instead, and is remembered in `hosts`. Local
+/// sessions opened later run `local_command`.
 pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts, command_line: []const u16, local_command: []const u16) !*Window {
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
@@ -256,14 +234,6 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     const output_event = win32.CreateEventW(null, win32.FALSE, win32.FALSE, null) orelse
         return win32.lastError("CreateEventW");
     errdefer _ = win32.CloseHandle(output_event);
-    // Manual reset, so a hold that ran out stays due until it's handled.
-    const hold_timer = win32.CreateWaitableTimerExW(
-        null,
-        null,
-        win32.CREATE_WAITABLE_TIMER_MANUAL_RESET | win32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-        win32.TIMER_ALL_ACCESS,
-    ) orelse return win32.lastError("CreateWaitableTimerExW");
-    errdefer _ = win32.CloseHandle(hold_timer);
     self.* = .{
         .alloc = alloc,
         .io = io,
@@ -271,7 +241,6 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
         .local_command = local_command,
         .hosts = hosts,
         .output_event = output_event,
-        .hold_timer = hold_timer,
         .grid = undefined,
         .chrome = undefined,
     };
@@ -319,8 +288,8 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     if (std.mem.startsWith(u16, command_line, ssh_scheme)) {
         try self.openOnHost(try hosts.add(command_line));
-    } else if (!(config.@"persist-sessions" and self.connectSlimed(command_line))) {
-        try self.spawnSession(.{ .command = command_line });
+    } else {
+        try self.connectSlimed(command_line);
     }
     errdefer self.destroyTabs();
     self.showTitle();
@@ -360,7 +329,6 @@ pub fn destroy(self: *Window) void {
     self.shown.deinit(self.alloc);
     self.frame_panes.deinit(self.alloc);
     _ = win32.CloseHandle(self.output_event);
-    _ = win32.CloseHandle(self.hold_timer);
     self.alloc.destroy(self);
 }
 
@@ -408,27 +376,24 @@ fn tabIndex(self: *const Window, t: *const Tab) ?usize {
     return std.mem.indexOfScalar(*Tab, self.tabs.items, @constCast(t));
 }
 
-/// Where a new session runs.
+/// What a new session shows.
 const Target = union(enum) {
-    /// A command line on this machine, CreateProcessW syntax.
-    command: []const u16,
-    /// A shell on remembered host `i`: on a live connection its sessions
-    /// use, else a new one.
-    host: usize,
     /// A pane of a workspace slimed holds for us.
     slimed: struct { conn: *Slimed, arrival: *const Slimed.Arrival },
     /// Nothing yet, on a connection: standing in for its host's slimed
     /// panes until they come.
     waiting: *SshConnection,
+    /// Why nothing can run, titled `title`.
+    failed: struct { title: []const u16, why: []const u8 },
 };
 
-/// With `persist-sessions`: connect to slimed and attach the workspace
-/// detached last (a new one running `command` if none), making a tab of
-/// each of its tabs. Returns whether any came.
-fn connectSlimed(self: *Window, command: []const u16) bool {
-    const conn = Slimed.connect(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.slimedArea(), self.slimedSize(), command) catch |err| {
-        log.err("connecting to slimed failed: {}; sessions won't outlive the window", .{err});
-        return false;
+/// Connect to slimed and attach the workspace detached last (a new one
+/// running `command` if none), making a tab of each of its tabs. If that
+/// fails, a tab says why.
+fn connectSlimed(self: *Window, command: []const u16) !void {
+    const conn = Slimed.connect(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.frameInterval(), self.slimedArea(), self.slimedSize(), command) catch |err| {
+        log.err("connecting to slimed failed: {}", .{err});
+        return self.spawnFailed("couldn't start slimed", err);
     };
     self.slimed = conn;
     self.slimedChanged(conn);
@@ -437,9 +402,24 @@ fn connectSlimed(self: *Window, command: []const u16) bool {
         self.destroyTabs();
         conn.deinit();
         self.slimed = null;
-        return false;
+        return self.spawnFailed("couldn't read from slimed", err);
     };
-    return self.tabs.items.len > 0;
+    if (self.tabs.items.len == 0) return self.spawnFailed("slimed showed nothing", error.NoPanes);
+}
+
+/// A local tab saying why nothing could run in it: `what`, failing with
+/// `err`.
+fn spawnFailed(self: *Window, what: []const u8, err: anyerror) !void {
+    var buf: [256]u8 = undefined;
+    const why = std.fmt.bufPrint(&buf, "{s}: {t}", .{ what, err }) catch what;
+    try self.spawnSession(.{ .failed = .{ .title = std.unicode.utf8ToUtf16LeStringLiteral("slime"), .why = why } });
+}
+
+/// The least time between a pane's frames to ask slimed for, in
+/// microseconds: the display's refresh period.
+fn frameInterval(self: *const Window) u32 {
+    const r = &(self.renderer orelse return 0);
+    return std.math.cast(u32, @divTrunc(r.refresh_period, 10)) orelse 0;
 }
 
 /// Take up what `conn` sent: make sessions of the panes that arrived,
@@ -623,37 +603,14 @@ fn spawnSession(self: *Window, target: Target) !void {
     self.activate(at);
 }
 
-/// Start a session on `target` with a grid of `size`. One that joins a
-/// connection doesn't log in again, and starts in the directory the
-/// active session's shell last reported (OSC 7) if that's on the same
-/// connection.
+/// Start a session on `target` with a grid of `size`.
 fn createSession(self: *Window, target: Target, size: GridSize) !*Session {
-    var new_conn: ?*SshConnection = null;
-    const conn: ?*SshConnection = switch (target) {
-        .command, .slimed, .waiting => null,
-        .host => |h| self.hostConnection(h) orelse conn: {
-            new_conn = try SshConnection.spawn(self.alloc, self.hosts.items.items[h], .{ .hwnd = self.hwnd.?, .msg = WM_APP_SSH_LOGIN });
-            break :conn new_conn;
-        },
-    };
-    var cwd_buf: [4096]u8 = undefined;
-    const launch: Session.Launch = if (conn) |c| .{ .ssh = .{
-        .conn = c,
-        .title = c.label(),
-        .cwd = if (self.tabs.items.len > 0 and self.activeSession().sshConnection() == c)
-            self.activeSession().pwd(&cwd_buf)
-        else
-            null,
-    } } else switch (target) {
-        .command => |command| .{ .command = command },
+    const launch: Session.Launch = switch (target) {
         .slimed => |sl| .{ .slimed = .{ .conn = sl.conn, .arrival = sl.arrival } },
         .waiting => |c| .{ .waiting = .{ .conn = c, .title = c.label() } },
-        .host => unreachable,
+        .failed => |f| .{ .failed = .{ .title = f.title, .why = f.why } },
     };
-    return Session.create(self, self.nextSessionId(), launch, size.cols, size.rows) catch |err| {
-        if (new_conn) |c| c.shutdownIfUnused();
-        return err;
-    };
+    return Session.create(self, self.nextSessionId(), launch, size.cols, size.rows);
 }
 
 /// A new session id. Channel ids are session ids, and the helper takes 0
@@ -706,42 +663,36 @@ fn newSession(self: *Window) void {
 
 /// A tab in sidebar group `g`: a local one, or one on a host.
 fn newSessionIn(self: *Window, g: usize) void {
-    // In slimed, the tab comes when its pane does (WM_APP_SLIMED).
-    if (g == 0) if (self.slimed) |conn| {
-        conn.tabNew(self.local_command, self.slimedSize()) catch |err| {
-            log.err("new tab in slimed failed: {}; running it directly", .{err});
-            self.spawnSession(.{ .command = self.local_command }) catch |e| log.err("new session failed: {}", .{e});
-        };
-        return;
-    };
-    if (g == 0) {
-        self.spawnSession(.{ .command = self.local_command }) catch |err| log.err("new session failed: {}", .{err});
-    } else {
-        self.openOnHost(g - 1) catch |err| log.err("new session failed: {}", .{err});
+    if (g != 0) return self.openOnHost(g - 1) catch |err| log.err("new session failed: {}", .{err});
+    // The tab comes when its pane does (WM_APP_SLIMED).
+    const conn = self.slimed orelse return self.connectSlimed(self.local_command) catch |err| log.err("new session failed: {}", .{err});
+    if (conn.isLost()) {
+        // Its tabs say how; slimed comes back with the next window.
+        return self.spawnFailed("lost slimed", error.Disconnected) catch |err| log.err("new session failed: {}", .{err});
     }
+    conn.tabNew(self.local_command, self.slimedSize()) catch |err| log.err("new tab in slimed failed: {}", .{err});
 }
 
-/// A session on remembered host `h`. With `persist-sessions` it's a tab
-/// of the workspace the host's slimed holds for us: through the slimed
-/// we're attached to there, or else one we connect to, with a session
-/// standing in while that logs in and attaches. Where slimed can't run
-/// it's a shell of its own, as it is without the option.
+/// A session on remembered host `h`: a tab of the workspace the host's
+/// slimed holds for us, through the slimed we're attached to there, or
+/// else one we connect to, with a session standing in while that logs in
+/// and attaches. A host slimed can't run on gets a tab saying so; ssh.exe
+/// in a local tab still reaches it.
 fn openOnHost(self: *Window, h: usize) !void {
-    if (self.config.@"persist-sessions") {
-        if (self.remoteOn(h)) |r| switch (r.conn.attachState()) {
-            // The tab comes when its pane does (WM_APP_SLIMED).
-            .attached => return r.conn.tabNew(&.{}, self.slimedSize()),
-            // Still logging in or attaching: show where.
-            .connecting => {
-                if (self.findSession(r.placeholder)) |found| self.activate(found.tab);
-                return;
-            },
-            .failed => {},
-        };
-        const conn = self.hostConnection(h);
-        if (conn == null or !conn.?.slimed_unavailable) return self.connectRemote(h, conn);
-    }
-    try self.spawnSession(.{ .host = h });
+    if (self.remoteOn(h)) |r| switch (r.conn.attachState()) {
+        // The tab comes when its pane does (WM_APP_SLIMED).
+        .attached => return r.conn.tabNew(&.{}, self.slimedSize()),
+        // Still logging in or attaching: show where.
+        .connecting => {
+            if (self.findSession(r.placeholder)) |found| self.activate(found.tab);
+            return;
+        },
+        .failed => {},
+    };
+    const conn = self.hostConnection(h) orelse return self.connectRemote(h, null);
+    if (!conn.slimed_unavailable) return self.connectRemote(h, conn);
+    try self.spawnSession(.{ .waiting = conn });
+    self.activeSession().showEnded("slimed can't run on this host; ssh to it from a local tab instead");
 }
 
 /// Our slimed on host `h` that's attached, or attaching, and not lost.
@@ -770,10 +721,10 @@ fn connectRemote(self: *Window, h: usize, existing: ?*SshConnection) !void {
     // The channel's id is the session's, so logging in asks there.
     const remote = remote: {
         const ch = conn.openSlimed(s.id, Session.sshTerm(self.config)) catch |err| break :remote err;
-        break :remote Slimed.connectRemote(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, ch, self.slimedArea(), self.slimedSize());
+        break :remote Slimed.connectRemote(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.frameInterval(), ch, self.slimedArea(), self.slimedSize());
     } catch |err| {
-        log.err("connecting to slimed on {f} failed: {}; running a shell instead", .{ std.unicode.fmtUtf16Le(conn.label()), err });
-        s.startShell(self.nextSessionId()) catch |e| s.showEnded(@errorName(e));
+        log.err("connecting to slimed on {f} failed: {}", .{ std.unicode.fmtUtf16Le(conn.label()), err });
+        s.showEnded(@errorName(err));
         return;
     };
     self.remotes.appendAssumeCapacity(.{ .conn = remote, .placeholder = s.id });
@@ -831,8 +782,8 @@ fn remoteChanged(self: *Window, r: *Remote) void {
 }
 
 /// Host's slimed `remotes[i]` couldn't attach: hang up on it. Its
-/// stand-in runs a shell instead, saying why, if the connection is up;
-/// else it shows why logging in failed, as a shell's session would.
+/// stand-in says why: slimed can't run there, if the connection is up,
+/// else why logging in failed.
 fn remoteFailed(self: *Window, i: usize) void {
     const r = self.remotes.orderedRemove(i);
     // After the stand-in is done with the failure's text, and has the
@@ -845,8 +796,8 @@ fn remoteFailed(self: *Window, i: usize) void {
     if (conn.isAlive() and conn.isConnected()) {
         // Not again on this connection.
         conn.slimed_unavailable = true;
-        s.notice("slimed can't run here ({s}), so this shell ends with the connection", .{why});
-        s.startShell(self.nextSessionId()) catch |err| s.showEnded(@errorName(err));
+        var buf: [512]u8 = undefined;
+        s.showEnded(std.fmt.bufPrint(&buf, "slimed can't run here ({s}); ssh to it from a local tab instead", .{why}) catch why);
         return;
     }
     if (s.login) |login| {
@@ -1233,9 +1184,6 @@ fn activated(self: *Window) void {
         p.unseen.store(false, .release);
     }
     if (self.focused) s.reportFocus(true);
-    // Holds were for the last pane's updates.
-    self.hold = .none;
-    self.cursor_shown = false;
     self.resetBlink();
     self.updateSpinner();
     self.showTitle();
@@ -1263,7 +1211,6 @@ pub fn outputArrived(self: *Window) void {
             if (i == self.active) {
                 if (!t.shows(s)) continue;
                 self.dirty = true;
-                if (s == t.focus) self.updateHold();
             } else if (!s.activity and !quiet) {
                 s.activity = true;
                 self.dirty = true;
@@ -1281,12 +1228,10 @@ pub fn needsFrame(self: *const Window) bool {
 }
 
 pub fn frameGate(self: *const Window) win32.HANDLE {
-    if (self.hold != .none) return self.hold_timer;
     return self.renderer.?.frameGate();
 }
 
 pub fn frameGateFired(self: *Window, gate: win32.HANDLE) void {
-    if (gate == self.hold_timer) return self.holdExpired();
     const r = &self.renderer.?;
     // The pace timer only moves us on to waiting for the swap chain.
     if (gate != r.frame_waitable) return;
@@ -1294,52 +1239,6 @@ pub fn frameGateFired(self: *Window, gate: win32.HANDLE) void {
     // A synchronous render (resize, WM_PAINT) may have drawn it already;
     // the acquired frame then waits for the next change.
     if (self.dirty) self.render();
-}
-
-/// Hold frames back while the child is partway through an update: while
-/// synchronized output (mode 2026) is set, and briefly after it hides
-/// the cursor the last frame showed. ConPTY passes console writes on as
-/// they're made, so PSReadLine's `?25l`, line redraw, and `?25h` often
-/// arrive in separate reads; drawing between them flashes a frame
-/// without the cursor on every key.
-fn updateHold(self: *Window) void {
-    const s = self.activeSession();
-    s.lockTerminal();
-    const sync = s.terminal.modes.get(.synchronized_output);
-    const cursor_hidden = !s.terminal.modes.get(.cursor_visible);
-    s.unlockTerminal();
-
-    const hold: Hold = if (sync) .sync else if (cursor_hidden and self.cursor_shown) .cursor else .none;
-    if (hold == self.hold) return;
-    self.hold = hold;
-    const ms: i64 = switch (hold) {
-        .none => return,
-        .cursor => cursor_hold_ms,
-        .sync => sync_hold_ms,
-    };
-    // Negative due times are relative, in 100 ns units. Setting the timer
-    // also unsignals it.
-    const due = -ms * 10_000;
-    _ = win32.SetWaitableTimer(self.hold_timer, &due, 0, null, null, win32.FALSE);
-}
-
-/// Draw the held frame anyway.
-fn holdExpired(self: *Window) void {
-    // The timer may have been set again since it fired.
-    if (win32.WaitForSingleObject(self.hold_timer, 0) != win32.WAIT_OBJECT_0) return;
-    switch (self.hold) {
-        .none => {},
-        .cursor => self.cursor_shown = false,
-        // Ghostty resets the mode too, so a child that never ends its
-        // update can't freeze the screen.
-        .sync => {
-            const s = self.activeSession();
-            s.lockTerminal();
-            s.terminal.modes.set(.synchronized_output, false);
-            s.unlockTerminal();
-        },
-    }
-    self.hold = .none;
 }
 
 /// Run the key binding a key press triggers (see `binding.defaults`).
@@ -1444,7 +1343,7 @@ fn blinkTick(self: *Window) void {
     self.blink_visible = !self.blink_visible;
     // Only redraw if the last frame's cursor blinks. One that starts
     // blinking later picks up the phase from here.
-    const cursor = self.activeSession().render_state.cursor;
+    const cursor = self.activeSession().screen.cursor;
     if (cursor.visible and cursor.blinking) self.dirty = true;
     if (self.connect_field != null) self.dirty = true;
 }
@@ -2026,7 +1925,9 @@ fn gridSize(self: *const Window) GridSize {
     };
 }
 
-pub fn cellSizePx(self: *const Window) std.meta.Child(@FieldType(ghostty_vt.Terminal.Resize, "cell_size_px")) {
+pub const CellSize = struct { width: u32, height: u32 };
+
+pub fn cellSizePx(self: *const Window) CellSize {
     const m = self.grid.metrics;
     return .{ .width = m.cell_width, .height = m.cell_height };
 }
@@ -2064,18 +1965,12 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     var it = tab.iterator();
     while (it.next()) |s| {
         if (!tab.shows(s)) continue;
-        {
-            s.lockTerminal();
-            defer s.unlockTerminal();
-            try s.render_state.update(self.alloc, &s.terminal);
-            try s.images.update(self.alloc, &s.terminal);
-        }
+        s.applyFrames();
         if (stats) t = self.stats.lap(.update, t);
         // Panes without focus show a hollow cursor, as an unfocused
         // window's does.
         const focus = s == tab.focus;
-        if (focus) self.cursor_shown = s.render_state.cursor.visible;
-        try s.cells.build(self.alloc, &s.render_state, &self.grid, .{
+        try s.cells.build(self.alloc, &s.screen, &self.grid, .{
             // The host field or a login dialog has the keyboard while open.
             .focused = focus and self.focused and self.connect_field == null and s.login == null,
             .blink_visible = self.blink_visible,
@@ -2106,6 +2001,9 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         .background = self.chrome.theme.ground,
         .box = self.paneBox(&shadows),
     }, Ui{ .window = self, .view = self.view() });
+    // More frames may come for what's drawn.
+    it = tab.iterator();
+    while (it.next()) |s| if (tab.shows(s)) s.drawn();
     if (stats) {
         _ = self.stats.lap(.draw, t);
         self.stats.frames += 1;
@@ -2359,7 +2257,6 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         win32.WM_TIMER => {
             switch (wparam) {
                 stats_timer_id => if (build_options.stats) self.showStats(),
-                autoscroll_timer_id => self.activeSession().autoscrollTick(),
                 blink_timer_id => self.blinkTick(),
                 spinner_timer_id => {
                     self.spinner_step +%= 1;
@@ -2386,25 +2283,12 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         WM_APP_CHILD_EXITED => {
             const found = self.findSession(@intCast(wparam)) orelse return 0;
             const s = found.s;
-            // So does a slimed session lost to us while it runs.
+            // A slimed pane lost to us while it runs stays to say why.
             if (s.slimedLoss()) |loss| {
                 if (!s.ended) s.showEnded(loss.text());
                 self.dirty = true;
                 return 0;
             }
-            // A failed SSH channel (login, connection, or open) stays to
-            // say why. A shell that exited closes like a local one.
-            if (s.sshEnding()) |ending| if (!ending.exited) {
-                if (s.login) |login| {
-                    // Cancelling closed the dialog already, so this is
-                    // the server's doing.
-                    login.fail(ending.text());
-                    self.updateSpinner();
-                }
-                s.showEnded(ending.text());
-                self.dirty = true;
-                return 0;
-            };
             self.closePane(found.tab, s);
             return 0;
         },
@@ -2560,12 +2444,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 .terminal => |i| self.shownPane(i),
                 else => null,
             };
-            if (pane) |s| {
-                s.lockTerminal();
-                const shape = s.terminal.mouse_shape;
-                s.unlockTerminal();
-                cursor = mouseCursor(shape);
-            }
+            if (pane) |s| cursor = mouseCursor(s.mouseShape());
+
             _ = win32.SetCursor(win32.LoadCursorW(null, cursor));
             return win32.TRUE;
         },

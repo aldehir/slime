@@ -11,6 +11,7 @@ const Key = ghostty_vt.input.Key;
 const KeyEvent = ghostty_vt.input.KeyEvent;
 const Mods = ghostty_vt.input.KeyMods;
 const MouseButton = ghostty_vt.input.MouseButton;
+const Win32Key = @import("event").Win32Key;
 
 /// Build the event for a WM_(SYS)KEYDOWN or WM_(SYS)KEYUP. `text` is the
 /// UTF-8 the key produced (from the WM_(SYS)CHAR messages TranslateMessage
@@ -94,44 +95,21 @@ pub fn mouseMods(wparam: win32.WPARAM) Mods {
     };
 }
 
-/// One Win32 key event for win32-input-mode (mode 9001), which ConPTY
-/// asks for so it can hand console programs the exact KEY_EVENT_RECORD
-/// instead of guessing one from VT input:
-/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`.
-pub const Win32KeyEvent = struct {
-    vk: u16 = 0,
-    scancode: u16 = 0,
-    /// UTF-16 code unit the key produced, or 0.
-    char: u16 = 0,
-    down: bool,
-    control_state: u32 = 0,
-    repeat: u16 = 1,
-
-    /// The event for a WM_(SYS)KEYDOWN or WM_(SYS)KEYUP. `char` is one
-    /// unit of the text it produced.
-    pub fn fromKey(msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM, char: u16) Win32KeyEvent {
-        const flags: usize = @bitCast(lparam);
-        return .{
-            .vk = @truncate(wparam),
-            .scancode = @truncate((flags >> 16) & 0xFF),
-            .char = char,
-            .down = msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN,
-            .control_state = controlKeyState(flags & (1 << 24) != 0),
-            .repeat = @max(win32.loword(lparam), 1),
-        };
-    }
-
-    pub fn encode(self: Win32KeyEvent, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("\x1b[{d};{d};{d};{d};{d};{d}_", .{
-            self.vk,
-            self.scancode,
-            self.char,
-            @intFromBool(self.down),
-            self.control_state,
-            self.repeat,
-        });
-    }
-};
+/// A WM_(SYS)KEYDOWN or WM_(SYS)KEYUP as win32-input-mode (mode 9001)
+/// has it, which ConPTY asks for so it can hand console programs the
+/// exact KEY_EVENT_RECORD instead of guessing one from VT input. `char`
+/// is one unit of the text it produced.
+pub fn win32Key(msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM, char: u16) Win32Key {
+    const flags: usize = @bitCast(lparam);
+    return .{
+        .vk = @truncate(wparam),
+        .scancode = @truncate((flags >> 16) & 0xFF),
+        .char = char,
+        .down = msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN,
+        .control_state = controlKeyState(flags & (1 << 24) != 0),
+        .repeat = @max(win32.loword(lparam), 1),
+    };
+}
 
 /// The character a key makes in the current layout and modifier state.
 /// Releases get no WM_CHAR, but the console and Windows Terminal report
@@ -352,11 +330,11 @@ test keyFromScancode {
     try std.testing.expectEqual(Key.numpad_up, keyFromScancode(0x48, false, 0x26));
 }
 
-test Win32KeyEvent {
+test Win32Key {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     // ctrl+[ on a US layout: VK_OEM_4, scancode 0x1A, ESC, left ctrl.
-    try (Win32KeyEvent{
+    try (Win32Key{
         .vk = 0xDB,
         .scancode = 0x1A,
         .char = 0x1B,

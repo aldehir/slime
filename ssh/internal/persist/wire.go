@@ -221,8 +221,8 @@ type Resize struct{ Size Size }
 // Attached (with Tag) and the snapshot, and nothing live follows.
 type Peek struct{ Tag uint32 }
 
-// Ack says the client drew the pane's Draw Seq, which frees room for
-// another (see Pane's framing).
+// Ack says the client drew the pane's Draw Seq and those before it,
+// which frees room for more (see Pane's framing).
 type Ack struct{ Seq uint32 }
 
 // Event is input for the pane in the frame's id, from a CapFrames

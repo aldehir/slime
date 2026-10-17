@@ -3,17 +3,17 @@
 //! tabs and tabs in workspaces; a window attaches one workspace and
 //! mirrors it. The protocol is ssh/internal/persist's (wire.go).
 //!
-//! Attaching delivers each pane's snapshot, for its session to decode
-//! into its own terminal, and then the pane's output from exactly where
-//! the snapshot ends. One reader thread reads the connection and hands
-//! each pane's output to its session through a `Sink`.
+//! slimed runs each pane's terminal; we draw what it sends (CapFrames):
+//! frames of the pane's screen, and notices of what else it did (a new
+//! title, a clipboard write). Input goes back as events, which slimed
+//! handles against the terminal. One reader thread reads the connection
+//! and hands each pane's messages to its session through a `Sink`.
 //!
 //! Panes that arrive while the reader runs (a new tab, or one a script
-//! added) collect their snapshot and early output on the reader thread,
-//! then wait in `arrivals` for the UI thread, which is told with the
-//! `notify` message. Adopting one replays what was buffered under the
-//! connection's lock before the pane goes live, so nothing is lost or
-//! reordered at the handoff.
+//! added) keep what comes for them on the reader thread, then wait in
+//! `arrivals` for the UI thread, which is told with the `notify` message.
+//! Adopting one replays what was kept under the connection's lock before
+//! the pane goes live, so nothing is lost or reordered at the handoff.
 //!
 //! The local daemon is reached through its named pipe (`connect`). An SSH
 //! host's runs there, and is reached through a channel slime-ssh bridges
@@ -23,9 +23,9 @@ const Slimed = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const SshConnection = @import("SshConnection.zig");
+const Screen = @import("Screen.zig");
 
 const log = std.log.scoped(.slimed);
 
@@ -33,7 +33,10 @@ const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
 /// ssh/internal/persist's Version.
 const protocol_version = 1;
-const max_frame = 1 << 20;
+/// ssh/internal/persist's MaxFrame: a full frame goes whole.
+const max_frame = 8 << 20;
+/// Hello's CapFrames: we draw frames rather than run terminals.
+const cap_frames = 1 << 0;
 /// Long enough for long-path-aware installs.
 const max_path = 32 * 1024;
 const daemon_name = L("slimed.exe");
@@ -56,6 +59,8 @@ const MsgType = enum(u8) {
     input = 15,
     resize = 16,
     peek = 17,
+    ack = 18,
+    event = 19,
     hello_reply = 65,
     workspaces = 66,
     workspace = 67,
@@ -66,6 +71,9 @@ const MsgType = enum(u8) {
     detached = 72,
     @"error" = 73,
     created = 74,
+    draw = 75,
+    copied = 76,
+    notice = 77,
     _,
 };
 
@@ -73,8 +81,8 @@ alloc: Allocator,
 pipe: Pipe,
 notify: Notify,
 reader: ?std.Thread = null,
-/// Frames are written from the UI thread (keys, resizes, requests) and
-/// the reader thread (query replies); each goes out whole.
+/// Frames are written from the UI thread and, while a host's attaches,
+/// its reader; each goes out whole.
 write_lock: win32.SRWLOCK = .{},
 /// The attached workspace.
 workspace: u32 = 0,
@@ -93,6 +101,9 @@ failure: Failure = .{},
 /// What a host's reader attaches with.
 area: Area = undefined,
 size: Size = undefined,
+/// The least time between a pane's frames we ask for, in microseconds:
+/// the display's refresh period.
+frame_interval: u32 = 0,
 /// The reader posts `notify` when panes arrive: from `start` for the
 /// local daemon, and once attached for a host's.
 posting: std.atomic.Value(bool) = .init(false),
@@ -153,33 +164,69 @@ pub const Size = struct {
     cell_height: u32,
 };
 
-/// Where a live pane's output and end go: its session.
+/// Where a live pane's messages go: its session. Each runs on the reader
+/// thread (or the UI thread, while adopting), under the connection's
+/// lock, and its slices are only valid during the call.
 pub const Sink = struct {
     ctx: *anyopaque,
-    /// Output for the pane's terminal.
-    output: *const fn (ctx: *anyopaque, data: []const u8) void,
+    /// A frame of the pane's screen (frame.zig), to apply in order and
+    /// `ack` once drawn.
+    draw: *const fn (ctx: *anyopaque, seq: u32, data: []const u8) void,
+    notice: *const fn (ctx: *anyopaque, n: Notice) void,
+    /// The selection's text, answering a copy event: empty with none.
+    copied: *const fn (ctx: *anyopaque, tag: u32, text: []const u8) void,
     /// The pane is gone from us: its child exited (`why` null), or the
     /// workspace or connection was lost (why says how).
     ended: *const fn (ctx: *anyopaque, why: ?[]const u8) void,
 };
 
-/// A pane whose snapshot is in, for the UI thread to make a session of.
+/// What a pane did besides change its screen (wire.go's Notice).
+pub const Notice = struct {
+    kind: Kind,
+    /// The new title or pwd (OSC 7's is a file:// URI), or the
+    /// clipboard's new text (empty to clear it).
+    text: []const u8,
+    /// Every program status record, for `status`.
+    status: StatusRecords,
+
+    pub const Kind = enum(u8) { title = 1, pwd = 2, bell = 3, clipboard = 4, status = 5, _ };
+};
+
+/// Program status records as a message carries them, oldest update
+/// first. The ids `next` returns point into the message.
+pub const StatusRecords = struct {
+    r: Reader,
+    left: u32,
+
+    fn init(r: *Reader) !StatusRecords {
+        const n = r.readU32() catch 0;
+        if (n > r.buf.len / 6) return error.Truncated;
+        return .{ .r = r.*, .left = n };
+    }
+
+    pub fn next(self: *StatusRecords) ?StatusRecord {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        const id = self.r.readStr() catch return null;
+        const state = self.r.readU8() catch return null;
+        const progress = self.r.readU8() catch return null;
+        return .{ .id = id, .state = state, .progress = if (progress <= 100) progress else null };
+    }
+};
+
+/// A pane whose attach is in, for the UI thread to make a session of.
 pub const Arrival = struct {
     pane: u32,
     tab: u32,
-    /// Owned, in the connection's allocator; so is `command`.
-    snapshot: []u8,
+    /// Owned, in the connection's allocator.
     command: []const u16,
-    /// win32-input-mode, which a snapshot doesn't carry.
-    win32_input: bool,
-    /// What its programs report doing (OSC 7501), which a snapshot
-    /// doesn't carry either, oldest update first. Owned.
+    /// What its programs report doing (OSC 7501), oldest update first.
+    /// Owned.
     status: []StatusRecord,
     /// From our own TabNew or Split, so the window shows it.
     requested: bool,
 
     pub fn deinit(self: *Arrival, alloc: Allocator) void {
-        alloc.free(self.snapshot);
         alloc.free(self.command);
         freeStatus(alloc, self.status);
     }
@@ -188,7 +235,7 @@ pub const Arrival = struct {
 /// A program status record as the daemon keeps it (wire.go's
 /// StatusRecord). `state` numbers as `ProgramStatus.State`.
 pub const StatusRecord = struct {
-    /// Owned.
+    /// Owned in an `Arrival`.
     id: []const u8,
     state: u8,
     /// 0 to 100, or null for none.
@@ -252,37 +299,55 @@ pub const Taken = struct {
 };
 
 const Slot = union(enum) {
-    /// Snapshot coming in, or in and waiting for the UI thread; output
-    /// that comes meanwhile is kept for adoption.
+    /// Attached, and waiting for the UI thread; what comes for it
+    /// meanwhile is kept for adoption.
     pending: Pending,
     live: Sink,
 };
 
 const Pending = struct {
-    want: ?usize = null,
-    snapshot: std.ArrayList(u8) = .empty,
-    output: std.ArrayList(u8) = .empty,
+    /// Messages for the sink, each u8 type, u32 length, payload.
+    kept: std.ArrayList(u8) = .empty,
     command: []const u16 = &.{},
-    win32_input: bool = false,
     status: []StatusRecord = &.{},
     /// Handed to `arrivals` already.
     arrived: bool = false,
 
     fn deinit(self: *Pending, alloc: Allocator) void {
-        self.snapshot.deinit(alloc);
-        self.output.deinit(alloc);
+        self.kept.deinit(alloc);
         if (!self.arrived) {
             alloc.free(self.command);
             freeStatus(alloc, self.status);
+        }
+    }
+
+    fn keep(self: *Pending, alloc: Allocator, f: Frame) !void {
+        var head: [5]u8 = undefined;
+        head[0] = @intFromEnum(f.type);
+        std.mem.writeInt(u32, head[1..5], @intCast(f.payload.len), .little);
+        try self.kept.ensureUnusedCapacity(alloc, head.len + f.payload.len);
+        self.kept.appendSliceAssumeCapacity(&head);
+        self.kept.appendSliceAssumeCapacity(f.payload);
+    }
+
+    /// Hand what was kept to `sink`.
+    fn replay(self: *const Pending, sink: Sink) void {
+        var rest = self.kept.items;
+        while (rest.len >= 5) {
+            const len = std.mem.readInt(u32, rest[1..5], .little);
+            const f: Frame = .{ .type = @enumFromInt(rest[0]), .id = 0, .payload = rest[5..][0..len] };
+            deliver(sink, f) catch |err| log.warn("bad message {d} from slimed: {}", .{ rest[0], err });
+            rest = rest[5 + len ..];
         }
     }
 };
 
 /// Connect, starting the daemon if it isn't running, and attach the most
 /// recently detached workspace, or a new one with a tab running
-/// `command`. The workspace's panes wait in `arrivals`; `start` the
-/// reader after adopting them. UI thread.
-pub fn connect(alloc: Allocator, notify: Notify, area: Area, size: Size, command: []const u16) !*Slimed {
+/// `command`. Panes' frames come at most every `frame_interval` µs. The
+/// workspace's panes wait in `arrivals`; `start` the reader after
+/// adopting them. UI thread.
+pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16) !*Slimed {
     var pipe: Pipe = try .open(true);
     errdefer pipe.close();
     const buf = try alloc.alloc(u8, max_frame);
@@ -290,7 +355,7 @@ pub fn connect(alloc: Allocator, notify: Notify, area: Area, size: Size, command
 
     const self = try alloc.create(Slimed);
     errdefer alloc.destroy(self);
-    self.* = .{ .alloc = alloc, .pipe = pipe, .notify = notify };
+    self.* = .{ .alloc = alloc, .pipe = pipe, .notify = notify, .frame_interval = frame_interval };
     errdefer self.freeState();
     try self.attachFirst(buf, area, size, command);
     return self;
@@ -302,7 +367,7 @@ pub fn connect(alloc: Allocator, notify: Notify, area: Area, size: Size, command
 /// host's shell, and posts `notify` once `state` says how that went. The
 /// panes then wait in `arrivals`. Takes the channel, even on failure. UI
 /// thread.
-pub fn connectRemote(alloc: Allocator, notify: Notify, channel: *SshConnection.Channel, area: Area, size: Size) !*Slimed {
+pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, channel: *SshConnection.Channel, area: Area, size: Size) !*Slimed {
     errdefer {
         channel.close();
         channel.deinit();
@@ -317,6 +382,7 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, channel: *SshConnection.C
         .state = .init(.connecting),
         .area = area,
         .size = size,
+        .frame_interval = frame_interval,
     };
     self.reader = try std.Thread.spawn(.{}, remoteLoop, .{self});
     return self;
@@ -327,7 +393,7 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, channel: *SshConnection.C
 /// the reader routes frames.
 fn attachFirst(self: *Slimed, buf: []u8, area: Area, size: Size, command: []const u16) !void {
     const alloc = self.alloc;
-    try handshake(&self.pipe, buf);
+    try handshake(&self.pipe, buf, self.frame_interval);
 
     // Most recently detached, from the list.
     try self.send(.list, 0, &.{});
@@ -472,7 +538,7 @@ pub fn take(self: *Slimed) Taken {
 }
 
 /// Make `sink` the pane's: what came while it waited goes first, then
-/// the live output. UI thread.
+/// what comes live. UI thread.
 pub fn adopt(self: *Slimed, pane: u32, sink: Sink) void {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
@@ -483,7 +549,7 @@ pub fn adopt(self: *Slimed, pane: u32, sink: Sink) void {
     };
     switch (slot.*) {
         .pending => |*pend| {
-            if (pend.output.items.len > 0) sink.output(sink.ctx, pend.output.items);
+            pend.replay(sink);
             pend.deinit(self.alloc);
         },
         .live => {},
@@ -505,15 +571,19 @@ pub fn release(self: *Slimed, pane: u32) void {
     };
 }
 
-/// Send input to a pane. Called from both the UI thread and the reader
-/// thread (query replies), like `Pty.write`.
-pub fn write(self: *Slimed, pane: u32, data: []const u8) void {
-    var rest = data;
-    while (rest.len > 0) {
-        const n = @min(rest.len, Payload.input_chunk);
-        self.send(.input, pane, rest[0..n]) catch return;
-        rest = rest[n..];
-    }
+/// Send a pane an event (event.zig), which must fit a message. UI
+/// thread.
+pub fn event(self: *Slimed, pane: u32, data: []const u8) void {
+    if (data.len > max_frame - 5) return log.warn("dropped a {d}-byte event: too big", .{data.len});
+    self.send(.event, pane, data) catch {};
+}
+
+/// Say the pane's frame `seq` and those before it are drawn, which lets
+/// more come. UI thread.
+pub fn ack(self: *Slimed, pane: u32, seq: u32) void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, seq, .little);
+    self.send(.ack, pane, &b) catch {};
 }
 
 pub fn resize(self: *Slimed, pane: u32, size: Size) void {
@@ -709,38 +779,23 @@ fn handle(self: *Slimed, f: Frame) !u32 {
     switch (f.type) {
         .attached => {
             _ = try r.readU32(); // tag
-            const len = try r.readU32();
-            var win32_input = false;
+            if (try r.readU32() != 0) return error.UnwantedSnapshot;
             const modes = try r.readU32();
-            for (0..modes) |_| {
-                const mode = try r.readU16();
-                const ansi = try r.readU8() != 0;
-                const enabled = try r.readU8() != 0;
-                if (mode == 9001 and !ansi) win32_input = enabled;
-            }
+            _ = try r.take(@as(usize, modes) * 4);
             const command = toUtf16(self.alloc, r.readStr() catch "") catch return error.OutOfMemory;
             errdefer self.alloc.free(command);
             const status = try readStatus(self.alloc, &r);
             errdefer freeStatus(self.alloc, status);
-            var pend: Pending = .{ .want = len, .command = command, .win32_input = win32_input, .status = status };
-            try pend.snapshot.ensureTotalCapacityPrecise(self.alloc, len);
             const gop = try self.panes.getOrPut(self.alloc, f.id);
             if (gop.found_existing) switch (gop.value_ptr.*) {
                 .pending => |*old| old.deinit(self.alloc),
                 .live => {},
             };
-            gop.value_ptr.* = .{ .pending = pend };
+            gop.value_ptr.* = .{ .pending = .{ .command = command, .status = status } };
         },
-        .snapshot => if (self.panes.getPtr(f.id)) |slot| switch (slot.*) {
-            .pending => |*pend| {
-                if (pend.snapshot.items.len + f.payload.len > pend.want orelse 0) return error.BadSnapshot;
-                pend.snapshot.appendSliceAssumeCapacity(f.payload);
-            },
-            .live => {},
-        },
-        .output => if (self.panes.getPtr(f.id)) |slot| switch (slot.*) {
-            .pending => |*pend| try pend.output.appendSlice(self.alloc, f.payload),
-            .live => |sink| sink.output(sink.ctx, f.payload),
+        .draw, .notice, .copied => if (self.panes.getPtr(f.id)) |slot| switch (slot.*) {
+            .pending => |*pend| try pend.keep(self.alloc, f),
+            .live => |sink| try deliver(sink, f),
         },
         .exit => if (self.panes.fetchRemove(f.id)) |kv| switch (kv.value) {
             .pending => |pend| {
@@ -767,9 +822,8 @@ fn handle(self: *Slimed, f: Frame) !u32 {
     return 0;
 }
 
-/// A Workspace message: panes in it whose snapshots are in go to
-/// `arrivals`, in layout order, and its tabs replace `structure`. Returns
-/// its tag.
+/// A Workspace message: panes in it that attached go to `arrivals`, in
+/// layout order, and its tabs replace `structure`. Returns its tag.
 fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
     const st = try self.alloc.create(Structure);
     st.* = .{ .arena = .init(self.alloc), .tabs = &.{} };
@@ -799,15 +853,11 @@ fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
                 .pending => |*p| p,
                 .live => continue,
             };
-            if (pend.arrived or pend.want == null or pend.snapshot.items.len != pend.want.?) continue;
-            const snapshot = try pend.snapshot.toOwnedSlice(self.alloc);
-            errdefer self.alloc.free(snapshot);
+            if (pend.arrived) continue;
             try self.arrivals.append(self.alloc, .{
                 .pane = pane,
                 .tab = tab,
-                .snapshot = snapshot,
                 .command = pend.command,
-                .win32_input = pend.win32_input,
                 .status = pend.status,
                 .requested = requested,
             });
@@ -820,26 +870,43 @@ fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
     return t;
 }
 
-/// An Attached message's status records, at its end. A daemon too old to
-/// send them sends none.
+/// An Attached message's status records, at its end, owned.
 fn readStatus(a: Allocator, r: *Reader) ![]StatusRecord {
-    const n = r.readU32() catch return &.{};
-    if (n > r.buf.len / 6) return error.Truncated;
-    const out = try a.alloc(StatusRecord, n);
+    var it: StatusRecords = try .init(r);
+    const out = try a.alloc(StatusRecord, it.left);
     var made: usize = 0;
     errdefer {
         for (out[0..made]) |rec| a.free(rec.id);
         a.free(out);
     }
     for (out) |*rec| {
-        const id = try a.dupe(u8, try r.readStr());
-        errdefer a.free(id);
-        const state = try r.readU8();
-        const progress = try r.readU8();
-        rec.* = .{ .id = id, .state = state, .progress = if (progress <= 100) progress else null };
+        const got = it.next() orelse return error.Truncated;
+        rec.* = got;
+        rec.id = try a.dupe(u8, got.id);
         made += 1;
     }
     return out;
+}
+
+/// Hand a pane's message to its session.
+fn deliver(sink: Sink, f: Frame) !void {
+    var r: Reader = .{ .buf = f.payload };
+    switch (f.type) {
+        .draw => {
+            const seq = try r.readU32();
+            sink.draw(sink.ctx, seq, r.buf);
+        },
+        .notice => {
+            const kind: Notice.Kind = @enumFromInt(try r.readU8());
+            const text = try r.readStr();
+            sink.notice(sink.ctx, .{ .kind = kind, .text = text, .status = try .init(&r) });
+        },
+        .copied => {
+            const tag = try r.readU32();
+            sink.copied(sink.ctx, tag, try r.readStr());
+        },
+        else => {},
+    }
 }
 
 /// The tabs of a Workspace message, read from its tag on.
@@ -959,22 +1026,28 @@ fn toUtf16(a: Allocator, s: []const u8) ![]const u16 {
     };
 }
 
-/// Say hello, and check the daemon writes snapshots we can read.
-fn handshake(pipe: *Pipe, buf: []u8) !void {
-    var hello: [4]u8 = undefined;
-    std.mem.writeInt(u32, &hello, protocol_version, .little);
+/// Say hello, asking for frames every `frame_interval` µs, and check the
+/// daemon's frames are laid out as ours.
+fn handshake(pipe: *Pipe, buf: []u8, frame_interval: u32) !void {
+    var hello: [12]u8 = undefined;
+    std.mem.writeInt(u32, hello[0..4], protocol_version, .little);
+    std.mem.writeInt(u32, hello[4..8], cap_frames, .little);
+    std.mem.writeInt(u32, hello[8..12], frame_interval, .little);
     try pipe.send(.hello, 0, &hello);
     const f = try pipe.readFrame(buf);
     if (f.type != .hello_reply) return error.BadReply;
     var r: Reader = .{ .buf = f.payload };
     const version = try r.readU32();
-    const snapshot_version = try r.readU16();
+    _ = try r.readU16(); // snapshot version
+    _ = try r.readU32(); // pid
+    // A daemon too old to say draws no frames.
+    const frame_layout = r.readU64() catch 0;
     if (version != protocol_version) {
         log.err("slimed speaks protocol {d}, we speak {d}", .{ version, protocol_version });
         return error.VersionMismatch;
     }
-    if (snapshot_version != ghostty_vt.snapshot.envelope.version) {
-        log.err("slimed writes snapshot format {d}, we read {d}", .{ snapshot_version, ghostty_vt.snapshot.envelope.version });
+    if (frame_layout != Screen.Codec.layout_id) {
+        log.err("slimed's frames are laid out as {x}, ours as {x}", .{ frame_layout, Screen.Codec.layout_id });
         return error.VersionMismatch;
     }
 }
@@ -1103,8 +1176,10 @@ fn startDaemon() !void {
         const len = win32.GetEnvironmentVariableW(L("LOCALAPPDATA"), &appdata, appdata.len);
         if (len == 0 or len >= appdata.len) break :copy;
         var attrs: win32.WIN32_FILE_ATTRIBUTE_DATA = undefined;
-        if (win32.GetFileAttributesExW(try src.z(), win32.GetFileExInfoStandard, &attrs) == 0)
+        if (win32.GetFileAttributesExW(try src.z(), win32.GetFileExInfoStandard, &attrs) == 0) {
+            if (win32.GetLastError() == win32.ERROR_FILE_NOT_FOUND) return error.SlimedNotFound;
             return win32.lastError("GetFileAttributesExW(slimed.exe)");
+        }
 
         var base: WideBuf = .{};
         try base.put(appdata[0..len]);
@@ -1321,8 +1396,8 @@ fn writeArea(b: *[16]u8, area: Area) void {
     std.mem.writeInt(u32, b[12..16], area.cell_height, .little);
 }
 
-/// A request's payload. Input goes in chunks of `input_chunk` bytes, so
-/// the frames for keys and pastes build on the stack.
+/// A request's payload. Messages up to `input_chunk` bytes, as keys
+/// are, build on the stack.
 const Payload = struct {
     const input_chunk = 16 * 1024;
 
