@@ -31,8 +31,9 @@ func (e *deniedError) Error() string {
 }
 
 // authenticator offers login methods in ssh's order, skipping any the
-// server doesn't allow: agent keys and unencrypted key files, then each
-// passphrase-protected key, then keyboard-interactive, then password.
+// server doesn't allow: the identity files' keys (signed by the agent
+// when it holds them), then the agent's other keys, then
+// keyboard-interactive, then password.
 //
 // x/crypto runs its own loop with this as the AuthCallback, which lets
 // one method name ("publickey") come up more than once.
@@ -49,24 +50,46 @@ type authenticator struct {
 	abort error
 }
 
-func newAuthenticator(p *prompt.Prompter, dest Destination, agentSigners []ssh.Signer, keys []*keyFile) *authenticator {
+// identitiesOnly leaves out agent keys that aren't among keys.
+func newAuthenticator(p *prompt.Prompter, dest Destination, agentSigners []ssh.Signer, keys []*keyFile, identitiesOnly bool) *authenticator {
 	a := &authenticator{p: p, dest: dest}
 
 	// Keys that need no prompt go together; each locked key is its own
 	// method, since a skipped passphrase fails the method it's in.
-	plain := slices.Clone(agentSigners)
+	var plain []ssh.Signer
+	var locked []*keyFile
+	used := make([]bool, len(agentSigners))
 	for _, k := range keys {
-		if k.signer != nil {
+		if i := slices.IndexFunc(agentSigners, func(s ssh.Signer) bool { return sameKey(s.PublicKey(), k.pub) }); i >= 0 {
+			if !used[i] {
+				plain = append(plain, agentSigners[i])
+				used[i] = true
+			}
+			continue
+		}
+		switch {
+		case k.signer != nil:
 			plain = append(plain, k.signer)
+		case !k.pubOnly:
+			locked = append(locked, k)
 		}
 	}
 	if len(plain) > 0 {
 		a.add("publickey", ssh.PublicKeys(plain...))
 	}
-	for _, k := range keys {
-		if k.signer == nil {
-			k.readLine = a.readLine
-			a.add("publickey", ssh.PublicKeys(k))
+	for _, k := range locked {
+		k.readLine = a.readLine
+		a.add("publickey", ssh.PublicKeys(k))
+	}
+	if !identitiesOnly {
+		var rest []ssh.Signer
+		for i, s := range agentSigners {
+			if !used[i] {
+				rest = append(rest, s)
+			}
+		}
+		if len(rest) > 0 {
+			a.add("publickey", ssh.PublicKeys(rest...))
 		}
 	}
 	a.add("keyboard-interactive", ssh.RetryableAuthMethod(ssh.KeyboardInteractive(a.interactive), 3))
@@ -129,11 +152,13 @@ func (a *authenticator) password() (string, error) {
 // keyFile is an identity file. An unencrypted one has signer set when
 // loaded. An encrypted one is offered by its public key and unlocked
 // only when the server accepts it, so there's no passphrase prompt for
-// keys the host doesn't know.
+// keys the host doesn't know. A public key file only picks a key from
+// the agent, as ssh allows.
 type keyFile struct {
 	path     string
 	pub      ssh.PublicKey
 	signer   ssh.Signer
+	pubOnly  bool
 	readLine func(q string, echo bool) (string, error)
 }
 
@@ -153,6 +178,9 @@ func loadKeyFile(path string) (*keyFile, error) {
 	}
 	var missing *ssh.PassphraseMissingError
 	if !errors.As(err, &missing) {
+		if pub, _, _, _, perr := ssh.ParseAuthorizedKey(data); perr == nil {
+			return &keyFile{path: path, pub: pub, pubOnly: true}, nil
+		}
 		return nil, err
 	}
 	pub := missing.PublicKey
@@ -215,9 +243,8 @@ func (k *keyFile) unlock() error {
 	return fmt.Errorf("%s: bad passphrase", k.path)
 }
 
-// loadKeys reads the identity files, leaving out keys the agent already
-// offers.
-func loadKeys(paths []string, agentSigners []ssh.Signer) []*keyFile {
+// loadKeys reads the identity files that exist.
+func loadKeys(paths []string) []*keyFile {
 	var keys []*keyFile
 	for _, path := range paths {
 		k, err := loadKeyFile(path)
@@ -225,17 +252,15 @@ func loadKeys(paths []string, agentSigners []ssh.Signer) []*keyFile {
 			log.Printf("identity %s: %v", path, err)
 			continue
 		}
-		if k == nil {
-			continue
-		}
-		dup := slices.ContainsFunc(agentSigners, func(s ssh.Signer) bool {
-			return bytes.Equal(s.PublicKey().Marshal(), k.pub.Marshal())
-		})
-		if !dup {
+		if k != nil {
 			keys = append(keys, k)
 		}
 	}
 	return keys
+}
+
+func sameKey(a, b ssh.PublicKey) bool {
+	return bytes.Equal(a.Marshal(), b.Marshal())
 }
 
 // agentSigners lists the agent's keys. The connection stays open for

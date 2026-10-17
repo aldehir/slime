@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
@@ -18,11 +19,18 @@ import (
 var errHostKeyRejected = errors.New("host key verification failed")
 
 // hostKeys checks host keys against known_hosts files the way OpenSSH
-// does: unknown hosts are asked about, changed keys are refused.
+// does: unknown hosts are asked about (per StrictHostKeyChecking),
+// changed keys are refused.
 type hostKeys struct {
-	// files are read in order; accepted keys are added to the first.
-	files []string
-	p     *prompt.Prompter
+	// files are the user's, read in order; accepted keys are added to
+	// the first. global are only read.
+	files  []string
+	global []string
+	// strict is StrictHostKeyChecking: "ask" or "", "yes",
+	// "accept-new", or "no".
+	strict string
+	hash   bool
+	p      *prompt.Prompter
 }
 
 // callback returns the check for addr and the host key algorithms to
@@ -31,7 +39,7 @@ type hostKeys struct {
 // trip a false "changed" warning.
 func (h *hostKeys) callback(addr string) (ssh.HostKeyCallback, []string, error) {
 	var existing []string
-	for _, f := range h.files {
+	for _, f := range slices.Concat(h.files, h.global) {
 		if _, err := os.Stat(f); err == nil {
 			existing = append(existing, f)
 		}
@@ -59,7 +67,7 @@ func (h *hostKeys) callback(addr string) (ssh.HostKeyCallback, []string, error) 
 		case err == nil:
 			return nil
 		case errors.As(err, &ke) && len(ke.Want) == 0:
-			return h.askUnknown(hostname, key)
+			return h.unknown(hostname, key)
 		case errors.As(err, &ke):
 			h.warnChanged(hostname, key, ke.Want[0])
 			return errHostKeyRejected
@@ -69,7 +77,17 @@ func (h *hostKeys) callback(addr string) (ssh.HostKeyCallback, []string, error) 
 	return cb, algos, nil
 }
 
-func (h *hostKeys) askUnknown(hostname string, key ssh.PublicKey) error {
+func (h *hostKeys) unknown(hostname string, key ssh.PublicKey) error {
+	switch h.strict {
+	case "yes":
+		h.p.Print(fmt.Sprintf("No %s host key is known for %s and you have requested strict checking.\nHost key verification failed.\n",
+			keyName(key), displayHost(hostname)))
+		return errHostKeyRejected
+	case "accept-new", "no":
+		h.add(hostname, key)
+		return nil
+	}
+
 	fp := ssh.FingerprintSHA256(key)
 	h.p.Print(fmt.Sprintf("The authenticity of host '%s' can't be established.\n%s key fingerprint is %s.\n",
 		displayHost(hostname), keyName(key), fp))
@@ -81,14 +99,7 @@ func (h *hostKeys) askUnknown(hostname string, key ssh.PublicKey) error {
 		}
 		switch strings.TrimSpace(ans) {
 		case "yes", fp:
-			if len(h.files) > 0 {
-				if err := appendKnownHost(h.files[0], hostname, key); err != nil {
-					h.p.Print(fmt.Sprintf("Failed to add the host to the list of known hosts (%s): %v\n", h.files[0], err))
-					return nil
-				}
-			}
-			h.p.Print(fmt.Sprintf("Warning: Permanently added '%s' (%s) to the list of known hosts.\n",
-				displayHost(hostname), keyName(key)))
+			h.add(hostname, key)
 			return nil
 		case "no":
 			h.p.Print("Host key verification failed.\n")
@@ -96,6 +107,19 @@ func (h *hostKeys) askUnknown(hostname string, key ssh.PublicKey) error {
 		}
 		q = "Please type 'yes', 'no' or the fingerprint: "
 	}
+}
+
+// add records an accepted key in the user's first known_hosts file.
+func (h *hostKeys) add(hostname string, key ssh.PublicKey) {
+	if len(h.files) == 0 {
+		return
+	}
+	if err := appendKnownHost(h.files[0], hostname, key, h.hash); err != nil {
+		h.p.Print(fmt.Sprintf("Failed to add the host to the list of known hosts (%s): %v\n", h.files[0], err))
+		return
+	}
+	h.p.Print(fmt.Sprintf("Warning: Permanently added '%s' (%s) to the list of known hosts.\n",
+		displayHost(hostname), keyName(key)))
 }
 
 func (h *hostKeys) warnChanged(hostname string, key ssh.PublicKey, known knownhosts.KnownKey) {
@@ -114,7 +138,7 @@ Host key verification failed.
 `, keyName(key), ssh.FingerprintSHA256(key), keyName(known.Key), known.Filename, known.Line, displayHost(hostname)))
 }
 
-func appendKnownHost(file, hostname string, key ssh.PublicKey) error {
+func appendKnownHost(file, hostname string, key ssh.PublicKey, hash bool) error {
 	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
 		return err
 	}
@@ -122,7 +146,11 @@ func appendKnownHost(file, hostname string, key ssh.PublicKey) error {
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(f, knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key))
+	host := knownhosts.Normalize(hostname)
+	if hash {
+		host = knownhosts.HashHostname(host)
+	}
+	_, err = fmt.Fprintln(f, knownhosts.Line([]string{host}, key))
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

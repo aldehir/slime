@@ -15,5 +15,10 @@ func DialAgent() (io.ReadWriteCloser, error) {
 	if sock == "" {
 		return nil, errors.New("SSH_AUTH_SOCK not set")
 	}
-	return net.Dial("unix", sock)
+	return DialAgentAt(sock)
+}
+
+// DialAgentAt connects to the agent on the socket at path.
+func DialAgentAt(path string) (io.ReadWriteCloser, error) {
+	return net.Dial("unix", path)
 }

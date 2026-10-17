@@ -10,8 +10,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -25,20 +27,48 @@ const defaultTerm = "xterm-256color"
 type Options struct {
 	// Dest has its user and port filled in.
 	Dest Destination
-	// KnownHosts are the known_hosts files, the first of which gets
-	// newly accepted keys.
-	KnownHosts []string
+	// Identities are key files to offer, in order; missing files are
+	// skipped. The agent signs for any it holds.
+	Identities []string
+	// IdentitiesOnly offers the agent's keys only when they are among
+	// Identities.
+	IdentitiesOnly bool
+	// Jumps are hosts to go through to reach Dest, first to last
+	// (ProxyJump).
+	Jumps []Hop
+
+	// KnownHosts are the user's known_hosts files, the first of which
+	// gets newly accepted keys. GlobalKnownHosts are only read.
+	KnownHosts       []string
+	GlobalKnownHosts []string
+	// StrictHostKeyChecking is "ask" (or ""), "yes", "accept-new", or
+	// "no". "no" adds new keys as accept-new does but still refuses
+	// changed ones.
+	StrictHostKeyChecking string
+	// HashKnownHosts writes accepted hosts hashed.
+	HashKnownHosts bool
+
 	// ConnectTimeout bounds the TCP connect. Zero is the system's.
 	ConnectTimeout time.Duration
-	// Identities are private key files to offer, after the agent's
-	// keys. Missing files are skipped.
-	Identities []string
+	// KeepaliveInterval, when set, asks the server for a reply that
+	// often, and gives up on the connection after KeepaliveCountMax go
+	// unanswered (ServerAliveInterval, ServerAliveCountMax).
+	KeepaliveInterval time.Duration
+	KeepaliveCountMax int
+
 	// DialAgent connects to an SSH agent. Nil means no agent.
 	DialAgent func() (io.ReadWriteCloser, error)
 	// OpenPipes turns the handle values in an Open into the channel's
 	// pipes: the user's input to read and the remote's output to
 	// write. Nil means they are Windows handles in this process.
 	OpenPipes func(in, out uint64) (io.ReadCloser, io.WriteCloser, error)
+}
+
+// Hop is a host to log in to on the way to the destination.
+type Hop struct {
+	Dest           Destination
+	Identities     []string
+	IdentitiesOnly bool
 }
 
 type state int
@@ -64,9 +94,17 @@ type Server struct {
 	pending []*channel
 	netConn net.Conn
 	client  *ssh.Client
+	// jumps carry client, first hop first.
+	jumps []*ssh.Client
 	// connDone is closed when client.Wait returns, with connErr.
 	connDone chan struct{}
 	connErr  error
+	// connLost is set with connErr when the connection ended without
+	// our closing it.
+	connLost bool
+	// closedByUs is set before we close client, so watch can tell our
+	// close from the remote's: through a jump host both end in EOF.
+	closedByUs atomic.Bool
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -337,36 +375,88 @@ func (s *Server) connect(ch *channel) {
 		go s.start(client, c)
 	}
 	go s.watch(client)
+	if s.opts.KeepaliveInterval > 0 {
+		go s.keepalive(client)
+	}
 }
 
+// dial connects and logs in to each jump host in turn, and through them
+// to the destination, prompting on p.
 func (s *Server) dial(p *prompt.Prompter) (*ssh.Client, error) {
-	d := s.opts.Dest
-	addr := d.Addr()
-	dialer := net.Dialer{Timeout: s.opts.ConnectTimeout}
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	if s.state == stateClosing {
-		s.mu.Unlock()
-		conn.Close()
-		return nil, errors.New("cancelled")
-	}
-	s.netConn = conn
-	s.mu.Unlock()
-
-	hk := &hostKeys{files: s.opts.KnownHosts, p: p}
-	check, algos, err := hk.callback(addr)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
+	hops := append(slices.Clone(s.opts.Jumps), Hop{
+		Dest:           s.opts.Dest,
+		Identities:     s.opts.Identities,
+		IdentitiesOnly: s.opts.IdentitiesOnly,
+	})
 	signers, closeAgent := agentSigners(s.opts.DialAgent)
 	defer closeAgent()
-	auth := newAuthenticator(p, d, signers, loadKeys(s.opts.Identities, signers))
+
+	var jumps []*ssh.Client
+	closeJumps := func() {
+		for i := len(jumps) - 1; i >= 0; i-- {
+			jumps[i].Close()
+		}
+	}
+	for i, hop := range hops {
+		addr := hop.Dest.Addr()
+		var conn net.Conn
+		var err error
+		if i == 0 {
+			dialer := net.Dialer{Timeout: s.opts.ConnectTimeout}
+			if conn, err = dialer.Dial("tcp", addr); err != nil {
+				return nil, err
+			}
+			// Closing the first hop's connection cancels everything.
+			s.mu.Lock()
+			if s.state == stateClosing {
+				s.mu.Unlock()
+				conn.Close()
+				return nil, errors.New("cancelled")
+			}
+			s.netConn = conn
+			s.mu.Unlock()
+		} else if conn, err = jumps[i-1].Dial("tcp", addr); err != nil {
+			closeJumps()
+			return nil, fmt.Errorf("jump host %s can't reach %s: %w", hops[i-1].Dest.Host, addr, err)
+		}
+
+		client, err := s.login(conn, hop, signers, p)
+		if err != nil {
+			conn.Close()
+			closeJumps()
+			if i < len(hops)-1 {
+				return nil, &jumpError{host: hop.Dest.Host, err: err}
+			}
+			return nil, err
+		}
+		if i == len(hops)-1 {
+			s.mu.Lock()
+			s.jumps = jumps
+			s.mu.Unlock()
+			return client, nil
+		}
+		jumps = append(jumps, client)
+	}
+	panic("unreachable")
+}
+
+// login checks hop's host key and logs in over conn.
+func (s *Server) login(conn net.Conn, hop Hop, agentSigners []ssh.Signer, p *prompt.Prompter) (*ssh.Client, error) {
+	addr := hop.Dest.Addr()
+	hk := &hostKeys{
+		files:  s.opts.KnownHosts,
+		global: s.opts.GlobalKnownHosts,
+		strict: s.opts.StrictHostKeyChecking,
+		hash:   s.opts.HashKnownHosts,
+		p:      p,
+	}
+	check, algos, err := hk.callback(addr)
+	if err != nil {
+		return nil, err
+	}
+	auth := newAuthenticator(p, hop.Dest, agentSigners, loadKeys(hop.Identities), hop.IdentitiesOnly)
 	config := &ssh.ClientConfig{
-		User:              d.User,
+		User:              hop.Dest.User,
 		AuthCallback:      auth.callback,
 		HostKeyCallback:   check,
 		HostKeyAlgorithms: algos,
@@ -376,10 +466,44 @@ func (s *Server) dial(p *prompt.Prompter) (*ssh.Client, error) {
 	}
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 	return ssh.NewClient(c, chans, reqs), nil
+}
+
+// keepalive asks the server for a reply every KeepaliveInterval, as
+// ssh's ServerAliveInterval does, and drops the connection when
+// KeepaliveCountMax go unanswered. Any reply counts, even a refusal.
+func (s *Server) keepalive(client *ssh.Client) {
+	limit := max(s.opts.KeepaliveCountMax, 1)
+	t := time.NewTicker(s.opts.KeepaliveInterval)
+	defer t.Stop()
+	var waiting atomic.Bool
+	var missed atomic.Int32
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.connDone:
+			return
+		case <-t.C:
+		}
+		if waiting.Load() {
+			if int(missed.Add(1)) >= limit {
+				reason := fmt.Sprintf("Timeout, server %s not responding", s.opts.Dest.Host)
+				s.finish(errors.New(reason), reason)
+				return
+			}
+			continue
+		}
+		waiting.Store(true)
+		go func() {
+			if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err == nil {
+				missed.Store(0)
+				waiting.Store(false)
+			}
+		}()
+	}
 }
 
 // start opens ch's session channel with a pty and a shell, then copies
@@ -496,11 +620,8 @@ func (s *Server) dropLocked(ch *channel) {
 	ch.in.Close()
 }
 
-// finishIfIdle ends the helper once the last channel is gone.
-//
-// A channel can end because the remote dropped the connection: the
-// connection closes its channels before client.Wait returns. Closing
-// the client ourselves and seeing what Wait says tells the two apart.
+// finishIfIdle ends the helper once the last channel is gone, reporting
+// a disconnect if the channel ended because the connection dropped.
 func (s *Server) finishIfIdle() {
 	s.mu.Lock()
 	idle := s.state == stateConnected && len(s.channels) == 0
@@ -509,9 +630,17 @@ func (s *Server) finishIfIdle() {
 	if !idle {
 		return
 	}
-	client.Close()
-	<-s.connDone
-	if s.connErr != nil && !errors.Is(s.connErr, net.ErrClosed) {
+	// A dropped connection closes its channels just before Wait returns
+	// and, through a jump host, ends in the same EOF as our own close.
+	// Give it a moment to show before taking the end for ours.
+	select {
+	case <-s.connDone:
+	case <-time.After(100 * time.Millisecond):
+		s.closedByUs.Store(true)
+		client.Close()
+		<-s.connDone
+	}
+	if s.connLost {
 		s.finish(s.connErr, connReason(s.connErr))
 		return
 	}
@@ -521,20 +650,34 @@ func (s *Server) finishIfIdle() {
 // watch reports the connection failing.
 func (s *Server) watch(client *ssh.Client) {
 	s.connErr = client.Wait()
+	s.connLost = !s.closedByUs.Load()
 	close(s.connDone)
 	s.mu.Lock()
 	closing := s.state == stateClosing || len(s.channels) == 0
 	s.mu.Unlock()
 	// Otherwise finishIfIdle or finish closed it and decides.
-	if closing || errors.Is(s.connErr, net.ErrClosed) {
+	if closing || !s.connLost {
 		return
 	}
 	s.finish(s.connErr, connReason(s.connErr))
 }
 
+// jumpError is failing to log in to a jump host.
+type jumpError struct {
+	host string
+	err  error
+}
+
+func (e *jumpError) Error() string { return "jump host " + e.host + ": " + e.err.Error() }
+func (e *jumpError) Unwrap() error { return e.err }
+
 // failReason says why connecting failed, without x/crypto's "ssh:
 // handshake failed:" wrapping where ours says it better.
 func failReason(err error) string {
+	var jump *jumpError
+	if errors.As(err, &jump) {
+		return "jump host " + jump.host + ": " + failReason(jump.err)
+	}
 	var denied *deniedError
 	switch {
 	case errors.As(err, &denied):
@@ -566,7 +709,7 @@ func (s *Server) finish(err error, reason string) {
 		}
 		s.channels = map[uint32]*channel{}
 		s.pending = nil
-		client, conn := s.client, s.netConn
+		client, jumps, conn := s.client, s.jumps, s.netConn
 		s.mu.Unlock()
 
 		if reason != "" {
@@ -577,8 +720,12 @@ func (s *Server) finish(err error, reason string) {
 			ch.out.Close()
 			ch.in.Close()
 		}
+		s.closedByUs.Store(true)
 		if client != nil {
 			client.Close()
+			for i := len(jumps) - 1; i >= 0; i-- {
+				jumps[i].Close()
+			}
 		} else if conn != nil {
 			conn.Close()
 		}

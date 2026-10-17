@@ -127,11 +127,13 @@ that shows on hover.
   connection aren't dimmed.
 - **The new session key hint** went with the "New session" button.
   Ctrl+Shift+T opens one in the active session's group.
-- **`~/.ssh/config`**: `Host` aliases, `User`, `Port`, `IdentityFile`,
-  `ProxyJump`, `ServerAliveInterval`. The helper takes only what's in
-  the URL, plus its own flags.
-- **Keepalives.** A dead connection with no traffic isn't noticed until
-  TCP gives up.
+- **More of `~/.ssh/config`.** The helper reads Host blocks and
+  Include, and acts on `HostName`, `User`, `Port`, `IdentityFile`,
+  `IdentitiesOnly`, `IdentityAgent`, the known hosts settings,
+  `ConnectTimeout`, `ServerAlive*`, and `ProxyJump`. `Match` blocks
+  never apply, `ProxyCommand` is refused rather than bypassed, and a
+  jump host's own `ProxyJump` isn't followed. Certificates
+  (`CertificateFile`) and `HostKeyAlias` are ignored.
 - **Pixel sizes in `pty-req` and `window-change`.** Only cells are sent;
   mode 2048 reports still carry pixels in-band.
 - **Ghostty's terminfo on the remote.** `TERM` is `xterm-256color`.

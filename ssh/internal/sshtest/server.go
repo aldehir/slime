@@ -42,6 +42,12 @@ type Options struct {
 	// MaxSessions. Zero is unlimited.
 	MaxSessions int
 	Banner      string
+	// Forwarding accepts direct-tcpip channels, making the server
+	// usable as a jump host.
+	Forwarding bool
+	// Unresponsive ignores global requests (keepalives) without
+	// replying, like a server that has hung.
+	Unresponsive bool
 }
 
 type Server struct {
@@ -229,8 +235,18 @@ func (s *Server) serveConn(c net.Conn) {
 	if err != nil {
 		return
 	}
-	go ssh.DiscardRequests(reqs)
+	go func() {
+		for req := range reqs {
+			if !s.opts.Unresponsive {
+				req.Reply(false, nil)
+			}
+		}
+	}()
 	for nc := range chans {
+		if nc.ChannelType() == "direct-tcpip" && s.opts.Forwarding {
+			go s.forward(nc)
+			continue
+		}
 		if nc.ChannelType() != "session" {
 			nc.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
@@ -253,6 +269,38 @@ func (s *Server) serveConn(c net.Conn) {
 			(&session{ch: ch}).serve(reqs)
 		}()
 	}
+}
+
+// forward connects a direct-tcpip channel to the address it asks for.
+func (s *Server) forward(nc ssh.NewChannel) {
+	var req struct {
+		Host     string
+		Port     uint32
+		OrigHost string
+		OrigPort uint32
+	}
+	if ssh.Unmarshal(nc.ExtraData(), &req) != nil {
+		nc.Reject(ssh.ConnectionFailed, "bad request")
+		return
+	}
+	conn, err := net.Dial("tcp", net.JoinHostPort(req.Host, strconv.Itoa(int(req.Port))))
+	if err != nil {
+		nc.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := nc.Accept()
+	if err != nil {
+		conn.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go func() {
+		io.Copy(ch, conn)
+		ch.CloseWrite()
+	}()
+	io.Copy(conn, ch)
+	conn.Close()
+	ch.Close()
 }
 
 func (s *Server) endSession() {

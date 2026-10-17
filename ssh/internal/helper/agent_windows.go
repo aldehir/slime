@@ -18,6 +18,12 @@ func DialAgent() (io.ReadWriteCloser, error) {
 	if sock := os.Getenv("SSH_AUTH_SOCK"); strings.HasPrefix(sock, `\\.\pipe\`) {
 		path = sock
 	}
+	return DialAgentAt(path)
+}
+
+// DialAgentAt connects to the agent on the named pipe at path
+// (IdentityAgent).
+func DialAgentAt(path string) (io.ReadWriteCloser, error) {
 	timeout := 2 * time.Second
 	return winio.DialPipe(path, &timeout)
 }
