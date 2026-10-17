@@ -40,6 +40,9 @@ type fakePty struct {
 	mu    sync.Mutex
 	input bytes.Buffer
 	size  [2]uint16
+	// Set by blockWrites: Write waits on block, saying so on writing.
+	block   chan struct{}
+	writing chan struct{}
 
 	exitOnce sync.Once
 	exited   chan struct{}
@@ -90,8 +93,30 @@ func (p *fakePty) Read(b []byte) (int, error) {
 
 func (p *fakePty) Write(b []byte) (int, error) {
 	p.mu.Lock()
+	block, writing := p.block, p.writing
+	p.mu.Unlock()
+	if block != nil {
+		select {
+		case writing <- struct{}{}:
+		default:
+		}
+		<-block
+	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.input.Write(b)
+}
+
+// blockWrites makes Write wait, as a full input pipe does, until the
+// returned func releases it; writing takes a token when one waits.
+func (p *fakePty) blockWrites() (release func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	block := make(chan struct{})
+	p.block = block
+	p.writing = make(chan struct{}, 1)
+	var once sync.Once
+	return func() { once.Do(func() { close(block) }) }
 }
 
 func (p *fakePty) Resize(cols, rows uint16, _, _ uint32) error {

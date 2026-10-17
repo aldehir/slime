@@ -29,6 +29,9 @@ type Pane struct {
 	status programStatus
 	done   bool
 	fr     framing
+	// What the terminal answered its program since the last take, for
+	// the child: written outside the lock (writeReplies).
+	replies []byte
 }
 
 func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term *vt.Terminal) *Pane {
@@ -48,7 +51,7 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 		// otherwise.
 		Reply: func(b []byte) {
 			if c := pn.client; c == nil || c.frames {
-				pn.pty.Write(b)
+				pn.replies = append(pn.replies, b...)
 			}
 		},
 		UnknownMode: pn.setMode,
@@ -79,10 +82,21 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 // notify sends a client that draws a Notice. Runs inside term.Write,
 // under p.mu. Notices count against the client's backlog, and one that
 // doesn't fit is dropped: a program retitling on every write can't grow
-// the queue.
+// the queue. A dropped title, pwd, or status is the whole state, and is
+// sent again once the client catches up (resendDueLocked); a bell or
+// clipboard write is lost.
 func (p *Pane) notify(n *Notice) {
-	if c := p.client; c != nil && c.frames {
-		c.send(p.id, n)
+	c := p.client
+	if c == nil || !c.frames || c.send(p.id, n) {
+		return
+	}
+	switch n.Kind {
+	case NoticeTitle:
+		p.fr.due |= dueTitle
+	case NoticePwd:
+		p.fr.due |= duePwd
+	case NoticeStatus:
+		p.fr.due |= dueStatus
 	}
 }
 
@@ -104,6 +118,22 @@ func (p *Pane) setMode(mode uint16, ansi, enabled bool) {
 	p.modes = append(p.modes, Mode{Mode: mode, ANSI: ansi, Enabled: enabled})
 }
 
+// takeRepliesLocked returns what the terminal answered since the last
+// take, for writeReplies once the lock is released: a full input pipe
+// blocks until the child reads, and the reader needs the lock to keep
+// draining output.
+func (p *Pane) takeRepliesLocked() []byte {
+	r := p.replies
+	p.replies = nil
+	return r
+}
+
+func (p *Pane) writeReplies(b []byte) {
+	if len(b) > 0 {
+		p.pty.Write(b)
+	}
+}
+
 // run copies pty output into the terminal and to the client until the
 // child is gone, then takes the pane out of its tab.
 func (p *Pane) run() {
@@ -121,7 +151,9 @@ func (p *Pane) run() {
 				p.srv.log.Info("client too slow; dropping it", "pane", p.id)
 				c.close()
 			}
+			replies := p.takeRepliesLocked()
 			p.mu.Unlock()
+			p.writeReplies(replies)
 		}
 		if err != nil {
 			break
@@ -151,7 +183,15 @@ func (p *Pane) run() {
 // exactly where the snapshot ends.
 func (p *Pane) attach(c *conn, size Size) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	err := p.attachLocked(c, size)
+	// A resize can answer a program's size query (mode 2048).
+	replies := p.takeRepliesLocked()
+	p.mu.Unlock()
+	p.writeReplies(replies)
+	return err
+}
+
+func (p *Pane) attachLocked(c *conn, size Size) error {
 	if p.done {
 		return nil
 	}
@@ -221,10 +261,12 @@ func (p *Pane) input(c *conn, data []byte) {
 // itself (a workspace no window shows).
 func (p *Pane) resize(c *conn, size Size) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.client == c && !p.done && size.Cols != 0 && size.Rows != 0 && size != p.size {
 		p.resizeLocked(size)
 	}
+	replies := p.takeRepliesLocked()
+	p.mu.Unlock()
+	p.writeReplies(replies)
 }
 
 func (p *Pane) resizeLocked(size Size) {

@@ -459,3 +459,144 @@ func TestNotices(t *testing.T) {
 		}
 	}
 }
+
+// TestFramesReplyOutsideLock checks that a query's reply is written to
+// the child outside the pane's lock: a child that stops reading its
+// input while asking must not stall the pane for everyone else.
+func TestFramesReplyOutsideLock(t *testing.T) {
+	h := newHarness(t)
+	d := newDrawer(t, h)
+	d.ack(d.draw(5 * time.Second))
+	p := h.pty(0)
+	release := p.blockWrites()
+	defer release()
+	p.emit("\x1b[c")
+	select {
+	case <-p.writing:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the DA1 reply was never written")
+	}
+	// The reply waits on the child. The pane must still answer a lock
+	// holder meanwhile.
+	pane := h.srv.pane(d.pane)
+	done := make(chan struct{})
+	go func() {
+		pane.info(0)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("the pane's lock is held while the reply waits on the child")
+	}
+}
+
+// evMotion is mouse motion with no button held.
+func evMotion(x, y float32) []byte {
+	b := []byte{5, 2, 0, 0, 0, 0}
+	b = binary.LittleEndian.AppendUint32(b, math.Float32bits(x))
+	b = binary.LittleEndian.AppendUint32(b, math.Float32bits(y))
+	return binary.LittleEndian.AppendUint32(b, 0)
+}
+
+// attachDrawer connects a second client that draws and attaches ws,
+// taking it from the client attached before.
+func attachDrawer(t *testing.T, h *harness, ws, pane uint32) *drawer {
+	t.Helper()
+	a, b := net.Pipe()
+	go h.srv.handle(a)
+	c, err := NewClientWith(b, Hello{Caps: CapFrames})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	tag := c.NextTag()
+	c.Send(0, &WorkspaceAttach{Tag: tag, WS: ws})
+	if _, err := c.Await(tag, false); err != nil {
+		t.Fatal(err)
+	}
+	return &drawer{t: t, c: c, conn: b, pane: pane}
+}
+
+// TestFramesReattachDropsDrag checks that a client lost in the middle of
+// a selection drag doesn't leave the next one selecting: its motion goes
+// to a program that asks for it.
+func TestFramesReattachDropsDrag(t *testing.T) {
+	h := newHarness(t)
+	d := newDrawer(t, h)
+	d.ack(d.draw(5 * time.Second))
+	p := h.pty(0)
+	p.emit("hello world")
+	d.ack(d.draw(5 * time.Second))
+	d.event(evGeometry(40, 10))
+	d.event(evLeft(0, 15, 25))
+	d.event(evLeft(2, 85, 25))
+	// The drag's frame says the events are in.
+	if f := d.draw(5 * time.Second); f == nil {
+		t.Fatal("no frame for the drag")
+	}
+
+	d2 := attachDrawer(t, h, h.list().Workspaces[0].ID, d.pane)
+	d2.ack(d2.draw(5 * time.Second))
+	d2.event(evGeometry(40, 10))
+	p.emit("\x1b[?1003h\x1b[?1006h")
+	d2.ack(d2.draw(5 * time.Second))
+	d2.event(evMotion(25, 45))
+	eventually(t, "the motion report", func() bool { return strings.Contains(p.inputString(), "\x1b[<35;3;3M") })
+}
+
+// noticeOf reads until a notice of kind for the pane, acking frames on
+// the way, or returns nil if none comes within wait.
+func (d *drawer) noticeOf(kind NoticeKind, wait time.Duration) *Notice {
+	d.t.Helper()
+	d.conn.SetReadDeadline(time.Now().Add(wait))
+	defer d.conn.SetReadDeadline(time.Time{})
+	for {
+		id, m, err := d.c.Recv()
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil
+		}
+		if err != nil {
+			d.t.Fatal(err)
+		}
+		switch m := m.(type) {
+		case *Draw:
+			d.c.Send(id, &Ack{Seq: m.Seq})
+		case *Notice:
+			if id == d.pane && m.Kind == kind {
+				return m
+			}
+		}
+	}
+}
+
+// TestNoticeDroppedResent checks that a status notice the client's
+// backlog dropped comes once the client catches up: it's the whole
+// state, so the sidebar would otherwise stay stale until the next
+// change.
+func TestNoticeDroppedResent(t *testing.T) {
+	h := newHarness(t)
+	d := newDrawer(t, h)
+	d.ack(d.draw(5 * time.Second))
+	p := h.pty(0)
+	c := h.srv.pane(d.pane).client
+
+	// The client is as far behind as it may be.
+	c.mu.Lock()
+	c.queued = MaxQueued
+	c.mu.Unlock()
+	p.emit("\x1b]7501;state=working\x07")
+	if n := d.noticeOf(NoticeStatus, 200*time.Millisecond); n != nil {
+		t.Fatalf("a status notice got through a full backlog: %+v", n)
+	}
+
+	// It caught up, and acks the next frame.
+	c.mu.Lock()
+	c.queued = 0
+	c.mu.Unlock()
+	p.emit("x")
+	n := d.noticeOf(NoticeStatus, 5*time.Second)
+	if n == nil || len(n.Status) != 1 || n.Status[0].State != uint8(vt.StatusWorking) {
+		t.Fatalf("status after catching up %+v, want working", n)
+	}
+}

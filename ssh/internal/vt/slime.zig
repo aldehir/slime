@@ -139,6 +139,19 @@ export fn slime_vt_view_free(v: ?*View, t: Terminal) void {
     alloc.destroy(self);
 }
 
+/// Forget the input state the last client left, for a new one: a
+/// selection drag in progress (the selection it made stays), the wheel's
+/// remainder, and the cell motion was last reported in.
+export fn slime_vt_view_reset(v: ?*View, t: Terminal) void {
+    const self = v orelse return;
+    const term = zigTerminal(t) orelse return;
+    self.gesture.reset(term);
+    self.selecting = false;
+    self.drag = .{};
+    self.mouse_cell = null;
+    self.wheel_remainder = .{ 0, 0 };
+}
+
 /// Give a terminal slime's defaults: mode 2027 clusters multi-codepoint
 /// graphemes (emoji sequences, combining marks) into one cell, as the
 /// Ghostty app does, and a null cursor blink blinks, including after a

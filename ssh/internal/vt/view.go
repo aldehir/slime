@@ -22,6 +22,7 @@ extern uint64_t slime_vt_frame_layout(void);
 extern bool slime_vt_frame_text(const uint8_t* ptr, size_t len, uint8_t** out_ptr, size_t* out_len);
 extern SlimeView* slime_vt_view_new(void);
 extern void slime_vt_view_free(SlimeView* v, GhosttyTerminal t);
+extern void slime_vt_view_reset(SlimeView* v, GhosttyTerminal t);
 extern uint8_t slime_vt_view_hold(SlimeView* v, GhosttyTerminal t);
 extern void slime_vt_end_sync(GhosttyTerminal t);
 extern bool slime_vt_view_frame(SlimeView* v, GhosttyTerminal t, bool full,
@@ -103,6 +104,11 @@ func (v *View) Close(t *Terminal) {
 		v.v = nil
 	}
 }
+
+// Reset forgets the input state the last client left: a selection drag
+// in progress, the wheel's remainder, the cell motion was last reported
+// in. For a new client; the frames' state stays.
+func (v *View) Reset(t *Terminal) { C.slime_vt_view_reset(v.v, t.term) }
 
 // Hold is why the next frame of a terminal should wait.
 type Hold uint8

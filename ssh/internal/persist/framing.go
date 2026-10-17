@@ -45,6 +45,7 @@ type framing struct {
 	acked    uint32   // the last frame acked; the ones after are in flight
 	changed  bool     // the terminal changed since the last frame
 	full     bool     // the next frame has everything: a new attach
+	due      dueNotices
 	lastSent time.Time
 	holdFrom time.Time // when the current hold began; zero if none
 	// Closes to stop the selection drag's autoscroll ticker; nil while
@@ -55,6 +56,16 @@ type framing struct {
 	stop  chan struct{} // closed when the pane ends
 	timer *time.Timer
 }
+
+// dueNotices are the whole-state notices the client's backlog dropped,
+// to send again once it catches up.
+type dueNotices uint8
+
+const (
+	dueTitle dueNotices = 1 << iota
+	duePwd
+	dueStatus
+)
 
 // startFraming runs the pane's framer until the pane ends.
 func (p *Pane) startFraming() {
@@ -111,6 +122,10 @@ func (p *Pane) attachFramesLocked(c *conn) error {
 			return err
 		}
 		p.fr.view = v
+	} else {
+		// The last client's drag, wheel remainder, and the like aren't
+		// this one's.
+		p.fr.view.Reset(p.term)
 	}
 	c.sendForce(p.id, &Attached{
 		Modes:   append([]Mode(nil), p.modes...),
@@ -129,6 +144,7 @@ func (p *Pane) attachFramesLocked(c *conn) error {
 	p.fr.acked = 0
 	p.fr.full = true
 	p.fr.changed = true
+	p.fr.due = 0
 	p.fr.holdFrom = time.Time{}
 	p.fr.lastSent = time.Time{}
 	p.wakeFramer()
@@ -145,8 +161,31 @@ func (p *Pane) ack(c *conn, seq uint32) {
 		return
 	}
 	p.fr.acked = seq
+	// Drawing a frame means the client is reading again.
+	p.resendDueLocked(c)
 	if p.fr.changed {
 		p.wakeFramer()
+	}
+}
+
+// resendDueLocked sends c the whole-state notices its backlog dropped,
+// stopping at the first that still doesn't fit.
+func (p *Pane) resendDueLocked(c *conn) {
+	for _, d := range []struct {
+		bit  dueNotices
+		make func() *Notice
+	}{
+		{dueTitle, func() *Notice { title, _ := p.term.Title(); return &Notice{Kind: NoticeTitle, Text: title} }},
+		{duePwd, func() *Notice { pwd, _ := p.term.Pwd(); return &Notice{Kind: NoticePwd, Text: pwd} }},
+		{dueStatus, func() *Notice { return &Notice{Kind: NoticeStatus, Status: p.status.records()} }},
+	} {
+		if p.fr.due&d.bit == 0 {
+			continue
+		}
+		if !c.send(p.id, d.make()) {
+			return
+		}
+		p.fr.due &^= d.bit
 	}
 }
 
