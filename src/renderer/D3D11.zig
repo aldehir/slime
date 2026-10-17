@@ -85,6 +85,9 @@ brush: *d2d1.ISolidColorBrush,
 icon: ?Painter.Icon = null,
 /// The chrome's icons. Null where Direct2D can't draw SVG.
 lucide: ?Painter.LucideIcons = null,
+/// A copy of part of the last frame, for the UI to draw scaled (a pane
+/// being dragged). Kept between frames at its last size.
+capture: ?Capture = null,
 
 /// GPU copies of one terminal's kitty images (see `image.Images`), by
 /// kitty image ID. Each terminal needs its own: image IDs are per
@@ -96,6 +99,18 @@ pub const ImageTextures = struct {
     pub fn deinit(self: *ImageTextures, alloc: std.mem.Allocator) void {
         for (self.map.values()) |t| t.deinit();
         self.map.deinit(alloc);
+    }
+};
+
+const Capture = struct {
+    texture: *d3d11.ITexture2D,
+    bitmap: *d2d1.IBitmap1,
+    width: u32,
+    height: u32,
+
+    fn deinit(self: Capture) void {
+        com.release(self.bitmap);
+        com.release(self.texture);
     }
 };
 
@@ -254,6 +269,7 @@ pub fn deinit(self: *D3D11) void {
     com.releaseOpt(&self.d2d_target);
     if (self.icon) |icon| icon.deinit();
     if (self.lucide) |*icons| Painter.deinitLucide(icons);
+    if (self.capture) |c| c.deinit();
     (D2d{ .factory = self.d2d_factory, .device = self.d2d_device, .context = self.d2d_context, .brush = self.brush }).deinit();
     com.release(self.image_placement);
     self.lcd_atlas.deinit();
@@ -371,7 +387,10 @@ pub fn resize(self: *D3D11, width: u32, height: u32) Error!void {
 }
 
 /// Draw the terminals, then `ui` over them, and present. `ui` has a
-/// `paint(*Painter)` method. Waits for the swap chain first unless
+/// `paint(*Painter)` method, and `capture() ?Painter.Rect` and
+/// `paintOver(*Painter, ?Painter.Image)`: when `capture` names a part of
+/// the frame, that part is copied once `paint` is done, and `paintOver`
+/// draws over the frame with the copy. Waits for the swap chain first unless
 /// `waitForFrame` or `frameAcquired` already did.
 pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error{ DeviceLost, HResult }!void {
     const rtv = self.rtv orelse return;
@@ -403,6 +422,13 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
         try self.drawGrid(pane);
     }
     try self.paintUi(ui);
+    if (ui.capture()) |region| {
+        const img = self.captureRegion(region) catch |err| img: {
+            log.warn("capturing the frame failed: {}", .{err});
+            break :img null;
+        };
+        try self.paintOver(ui, img);
+    }
 
     self.frame_acquired = false;
     self.frame_started = false;
@@ -452,6 +478,65 @@ fn drawGrid(self: *D3D11, f: Pane) Error!void {
         ctx.drawInstanced(4, @intCast(frame.instances.items.len), 0, 0);
     }
     try self.drawImages(images, f.textures, .above_text);
+}
+
+fn paintOver(self: *D3D11, ui: anytype, img: ?Painter.Image) Error!void {
+    const d2d = self.d2d_context;
+    d2d.beginDraw();
+    var painter: Painter = .{ .ctx = d2d, .factory = self.d2d_factory, .brush = self.brush, .icon = self.icon, .lucide = if (self.lucide) |*icons| icons else null };
+    ui.paintOver(&painter, img);
+    try com.check(d2d.endDraw(), "ID2D1DeviceContext::EndDraw");
+}
+
+/// Copy `region` of the frame drawn so far, as an image for Direct2D.
+/// Direct2D's EndDraw has flushed its drawing to the context, so the
+/// copy, queued after it, sees it.
+fn captureRegion(self: *D3D11, region: Painter.Rect) Error!?Painter.Image {
+    const x0: u32 = @intFromFloat(std.math.clamp(@round(region.x), 0, @as(f32, @floatFromInt(self.width))));
+    const y0: u32 = @intFromFloat(std.math.clamp(@round(region.y), 0, @as(f32, @floatFromInt(self.height))));
+    const x1: u32 = @intFromFloat(std.math.clamp(@round(region.right()), 0, @as(f32, @floatFromInt(self.width))));
+    const y1: u32 = @intFromFloat(std.math.clamp(@round(region.bottom()), 0, @as(f32, @floatFromInt(self.height))));
+    if (x1 <= x0 or y1 <= y0) return null;
+    const w = x1 - x0;
+    const h = y1 - y0;
+    if (self.capture) |c| if (c.width != w or c.height != h) {
+        c.deinit();
+        self.capture = null;
+    };
+    if (self.capture == null) self.capture = try self.createCapture(w, h);
+    const c = self.capture.?;
+
+    var back_buffer: ?*d3d11.ITexture2D = null;
+    try com.check(
+        self.swap_chain.getBuffer(0, &d3d11.ITexture2D.iid, @ptrCast(&back_buffer)),
+        "IDXGISwapChain::GetBuffer",
+    );
+    defer com.releaseOpt(&back_buffer);
+    self.context.copySubresourceRegion(c.texture.resource(), 0, 0, back_buffer.?.resource(), &.{ .left = x0, .top = y0, .right = x1, .bottom = y1 });
+    return .{ .bitmap = c.bitmap, .w = @floatFromInt(w), .h = @floatFromInt(h) };
+}
+
+fn createCapture(self: *D3D11, w: u32, h: u32) Error!Capture {
+    var texture: ?*d3d11.ITexture2D = null;
+    try com.check(self.device.createTexture2D(&.{
+        .Width = w,
+        .Height = h,
+        .Format = buffer_format,
+        .Usage = d3d11.USAGE_DEFAULT,
+        .BindFlags = d3d11.BIND_SHADER_RESOURCE,
+    }, &texture), "ID3D11Device::CreateTexture2D(capture)");
+    errdefer com.releaseOpt(&texture);
+    const surface = com.query(texture.?, dxgi.ISurface) orelse {
+        log.err("capture texture has no IDXGISurface", .{});
+        return error.HResult;
+    };
+    defer com.release(surface);
+    var bitmap: ?*d2d1.IBitmap1 = null;
+    try com.check(self.d2d_context.createBitmapFromDxgiSurface(surface, &.{
+        .pixelFormat = .{ .format = buffer_format, .alphaMode = d2d1.ALPHA_MODE_IGNORE },
+        .bitmapOptions = 0,
+    }, &bitmap), "ID2D1DeviceContext::CreateBitmapFromDxgiSurface(capture)");
+    return .{ .texture = texture.?, .bitmap = bitmap.?, .width = w, .height = h };
 }
 
 fn paintUi(self: *D3D11, ui: anytype) Error!void {

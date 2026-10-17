@@ -67,6 +67,15 @@ pub const BUFFER_DESC = extern struct {
     StructureByteStride: u32 = 0,
 };
 
+pub const BOX = extern struct {
+    left: u32,
+    top: u32,
+    front: u32 = 0,
+    right: u32,
+    bottom: u32,
+    back: u32 = 1,
+};
+
 pub const TEXTURE2D_DESC = extern struct {
     Width: u32,
     Height: u32,
@@ -279,6 +288,11 @@ pub const IDeviceContext = extern struct {
     }
 
     /// Upload `data` to all of subresource 0.
+    /// Copy `box` of `src` to (`x`, `y`) in `dst`, both subresource 0.
+    pub fn copySubresourceRegion(self: *IDeviceContext, dst: *IResource, x: u32, y: u32, src: *IResource, box: *const BOX) void {
+        com.call(self, 46, fn (*IResource, u32, u32, u32, u32, *IResource, u32, *const BOX) void, .{ dst, 0, x, y, 0, src, 0, box });
+    }
+
     pub fn updateSubresource(self: *IDeviceContext, res: *IResource, data: [*]const u8, row_pitch: u32) void {
         com.call(self, 48, fn (*IResource, u32, ?*const anyopaque, [*]const u8, u32, u32) void, .{
             res, 0, null, data, row_pitch, 0,

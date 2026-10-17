@@ -65,8 +65,10 @@ cells: Cells = .{},
 images: Images = .{},
 textures: Renderer.ImageTextures = .{},
 
-/// Where the session's pane is in the window, in client pixels, and the
-/// space around its grid in it. Set by the window's layout.
+/// Where the session's pane is in the window, in client pixels: all of
+/// it (`frame`, its title strip and terminal), its terminal (`rect`), and
+/// the space around the grid in that. Set by the window's layout.
+frame: Rect = .{},
 rect: Rect = .{},
 pad: Window.PaddingPx = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 },
 

@@ -175,6 +175,9 @@ bound_key: ?u32 = null,
 mouse_in_terminal: bool = false,
 /// A divider being dragged, which has the mouse until the button's up.
 drag: ?Drag = null,
+/// A pane pressed on its title strip, which drags it once the mouse moves
+/// far enough, until the button's up.
+pane_drag: ?PaneDrag = null,
 /// The tab a middle click went down on, to close it on release.
 middle_pressed: ?usize = null,
 /// TrackMouseEvent is armed for the mouse leaving the client area, and
@@ -198,6 +201,22 @@ const Drag = struct {
     /// divider.
     from: [2]u16,
     origin: i32,
+};
+
+const PaneDrag = struct {
+    tab: *Tab,
+    source: *Session,
+    /// Where the button went down.
+    start: win32.POINT,
+    /// The mouse, once it's moved past the system's drag distance.
+    at: ?win32.POINT = null,
+    drop: ?Drop = null,
+};
+
+/// Where a dragged pane would land, and its highlight.
+const Drop = struct {
+    place: Tab.Place,
+    rect: Chrome.Rect,
 };
 
 const Hold = enum {
@@ -732,19 +751,127 @@ fn endDrag(self: *Window) void {
     self.drag = null;
     _ = win32.ReleaseCapture();
     if (std.meta.eql(d.from, d.divider.shares())) return;
+    self.sendLayout(d.tab);
+}
+
+/// Send slimed tab `t`'s tree, changed here.
+fn sendLayout(self: *Window, t: *const Tab) void {
     const conn = self.slimed orelse return;
     var arena: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena.deinit();
-    const root = (d.tab.toLayout(arena.allocator()) catch return) orelse return;
-    conn.layout(d.tab.id, root) catch |err| log.err("sending the layout failed: {}", .{err});
+    const root = (t.toLayout(arena.allocator()) catch return) orelse return;
+    conn.layout(t.id, root) catch |err| log.err("sending the layout failed: {}", .{err});
 }
 
-/// Drop a drag whose tree is about to change, as it stands: slimed's
-/// tree, or the pane closing, decides the layout now.
+/// Drop a drag (of a divider or a pane) whose tree is about to change, as
+/// it stands: slimed's tree, or the pane closing, decides the layout now.
 fn cancelDrag(self: *Window) void {
-    if (self.drag == null) return;
+    if (self.drag == null and self.pane_drag == null) return;
     self.drag = null;
+    if (self.pane_drag != null) self.dirty = true;
+    self.pane_drag = null;
     _ = win32.ReleaseCapture();
+}
+
+/// The button went down on pane `s`'s title strip: focus it, and drag it
+/// if the mouse moves on with the button down.
+fn startPaneDrag(self: *Window, s: *Session, pos: win32.POINT) void {
+    self.focusPane(s);
+    self.hideTip();
+    self.pane_drag = .{ .tab = self.activeTab(), .source = s, .start = pos };
+    _ = win32.SetCapture(self.hwnd.?);
+}
+
+/// Follow the mouse with the dragged pane: once it's gone past the
+/// system's drag distance, find where the pane would land. Only a tab of
+/// several slimed panes rearranges; others just took focus.
+fn paneDragTo(self: *Window, d: *PaneDrag, pos: win32.POINT) void {
+    if (d.tab.id == 0 or d.tab.count() < 2 or self.slimed == null) return;
+    if (d.at == null) {
+        const dx = win32.GetSystemMetricsForDpi(win32.SM_CXDRAG, self.dpi);
+        const dy = win32.GetSystemMetricsForDpi(win32.SM_CYDRAG, self.dpi);
+        if (@abs(pos.x - d.start.x) <= dx and @abs(pos.y - d.start.y) <= dy) return;
+        // The panes each fill the tab while one is zoomed: show them all.
+        if (d.tab.zoom != null) {
+            d.tab.zoom = null;
+            self.layoutTab(d.tab);
+        }
+    }
+    d.at = pos;
+    d.drop = self.dropAt(d, pos);
+    self.dirty = true;
+}
+
+/// Let go of the dragged pane, moving it where it was dropped.
+fn endPaneDrag(self: *Window) void {
+    const d = self.pane_drag orelse return;
+    // First: releasing the capture comes back as WM_CAPTURECHANGED.
+    self.pane_drag = null;
+    _ = win32.ReleaseCapture();
+    self.dirty = true;
+    const drop = d.drop orelse return;
+    d.tab.move(self.alloc, d.source, drop.place) catch |err| return log.err("moving the pane failed: {}", .{err});
+    self.layoutTab(d.tab);
+    self.sendLayout(d.tab);
+}
+
+/// Where the dragged pane would land at `pos`: along a side of the tab
+/// near its edge, else in the pane under the mouse, beside it on the
+/// side the mouse is toward, or in its place from its middle.
+fn dropAt(self: *Window, d: *const PaneDrag, pos: win32.POINT) ?Drop {
+    const x: f32 = @floatFromInt(pos.x);
+    const y: f32 = @floatFromInt(pos.y);
+    const area = self.chrome.paneArea(&self.chrome_layout);
+    if (!area.contains(x, y)) return null;
+    const band = self.chrome.px(24);
+    const edge: ?Slimed.Direction = if (x < area.x + band)
+        .left
+    else if (x >= area.right() - band)
+        .right
+    else if (y < area.y + band)
+        .up
+    else if (y >= area.bottom() - band)
+        .down
+    else
+        null;
+    if (edge) |side| return .{
+        .place = .{ .edge = side },
+        .rect = half(area, side).inset(self.chrome.px(4), self.chrome.px(4)),
+    };
+
+    var it = d.tab.iterator();
+    const target = while (it.next()) |s| {
+        if (s.frame.contains(x, y)) break s;
+    } else return null;
+    if (target == d.source) return null;
+    const f = target.frame;
+    const inset = self.chrome.px(6);
+    // The middle 40% each way swaps; else the side the mouse is toward,
+    // as diagonals from the corners divide it.
+    const nx = (x - (f.x + f.w / 2)) / f.w;
+    const ny = (y - (f.y + f.h / 2)) / f.h;
+    if (@abs(nx) < 0.2 and @abs(ny) < 0.2) return .{
+        .place = .{ .swap = target },
+        .rect = f.inset(inset, inset),
+    };
+    const side: Slimed.Direction = if (@abs(nx) > @abs(ny))
+        (if (nx < 0) .left else .right)
+    else
+        (if (ny < 0) .up else .down);
+    return .{
+        .place = .{ .beside = .{ .target = target, .side = side } },
+        .rect = half(f, side).inset(inset, inset),
+    };
+}
+
+/// The half of `r` on `side`.
+fn half(r: Chrome.Rect, side: Slimed.Direction) Chrome.Rect {
+    return switch (side) {
+        .left => .{ .x = r.x, .y = r.y, .w = @round(r.w / 2), .h = r.h },
+        .right => .{ .x = r.x + @round(r.w / 2), .y = r.y, .w = r.w - @round(r.w / 2), .h = r.h },
+        .up => .{ .x = r.x, .y = r.y, .w = r.w, .h = @round(r.h / 2) },
+        .down => .{ .x = r.x, .y = r.y + @round(r.h / 2), .w = r.w, .h = r.h - @round(r.h / 2) },
+    };
 }
 
 /// The active tab's pane `view` listed at `i`.
@@ -1277,7 +1404,9 @@ fn view(self: *Window) Chrome.View {
         if (!tab.shows(s)) continue;
         self.shown.append(self.alloc, s) catch break;
         self.view_panes.append(self.alloc, .{
+            .frame = s.frame,
             .rect = s.rect,
+            .title = s.title(),
             .focused = s == tab.focus,
             .splittable = s.slimedPane() != null,
             .zoomable = several,
@@ -1289,11 +1418,17 @@ fn view(self: *Window) Chrome.View {
         };
     }
     for (tab.dividers.items) |d| self.view_dividers.append(self.alloc, d.rect) catch break;
+    const pane_drag: ?Chrome.View.PaneDrag = if (self.pane_drag) |d| if (d.at) |at| .{
+        .source = std.mem.indexOfScalar(*Session, self.shown.items, d.source),
+        .drop = if (d.drop) |drop| drop.rect else null,
+        .mouse = .{ .x = @floatFromInt(at.x), .y = @floatFromInt(at.y) },
+    } else null else null;
     return .{
         .groups = self.view_groups.items,
         .tabs = self.view_tabs.items,
         .panes = self.view_panes.items,
         .dividers = self.view_dividers.items,
+        .pane_drag = pane_drag,
         .connect = if (self.connect_field) |*f| f else null,
         .caret_visible = self.blink_visible,
         .dialog = if (self.activeSession().login) |l| &l.dialog else null,
@@ -1370,6 +1505,11 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         if (!held) self.endDrag();
         return;
     }
+    if (self.pane_drag) |*d| {
+        self.paneDragTo(d, pos);
+        if (!held) self.endPaneDrag();
+        return;
+    }
 
     if (self.mouse_in_terminal) {
         s.mouseInput(msg, wparam, toPane(s, pos));
@@ -1403,6 +1543,7 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     switch (msg) {
         win32.WM_LBUTTONDOWN => {
             if (hit == .divider) return self.startDrag(hit.divider, pos);
+            if (hit == .pane_title) if (self.shownPane(hit.pane_title)) |pane| return self.startPaneDrag(pane, pos);
             self.setPressed(hit);
             _ = win32.SetCapture(self.hwnd.?);
             // Rows switch on press, as tabs do.
@@ -1573,6 +1714,14 @@ const Ui = struct {
     pub fn paint(self: Ui, p: *Painter) void {
         self.window.chrome.paint(p, &self.window.chrome_layout, &self.view);
     }
+
+    pub fn capture(self: Ui) ?Chrome.Rect {
+        return Chrome.dragCapture(&self.view);
+    }
+
+    pub fn paintOver(self: Ui, p: *Painter, thumb: ?Painter.Image) void {
+        self.window.chrome.paintDrag(p, &self.window.chrome_layout, &self.view, thumb);
+    }
 };
 
 fn renderFallible(self: *Window, r: *Renderer) !void {
@@ -1654,16 +1803,22 @@ fn updateLayout(self: *Window, size: ClientSize) void {
 }
 
 /// Place tab `t`'s panes in the terminal area and fit their grids to
-/// them. Each pane is padded by `paddingPx`, and the grid is centered in
-/// what's left, so the part of a cell that doesn't fit is split between
-/// opposite edges rather than all at the right and bottom.
+/// them. Each pane's terminal is under its title strip, padded by
+/// `paddingPx` (but for the chrome's inset at the top, which the strip
+/// stands in for), and the grid is centered in what's left, so the part
+/// of a cell that doesn't fit is split between opposite edges rather
+/// than all at the right and bottom.
 fn layoutTab(self: *Window, t: *Tab) void {
     t.place(self.alloc, self.chrome.paneArea(&self.chrome_layout), self.chrome.paneGap()) catch |err| log.err("laying out panes failed: {}", .{err});
-    const pad = self.paddingPx();
+    var pad = self.paddingPx();
+    pad.top -|= @intFromFloat(self.chrome_layout.inset);
+    const strip = self.chrome.paneTitleHeight();
     const m = self.grid.metrics;
     var it = t.iterator();
     while (it.next()) |s| {
         if (!t.shows(s)) continue;
+        const top = @min(strip, s.frame.h);
+        s.rect = .{ .x = s.frame.x, .y = s.frame.y + top, .w = s.frame.w, .h = s.frame.h - top };
         const w = @as(u32, @intFromFloat(s.rect.w)) -| pad.left -| pad.right;
         const h = @as(u32, @intFromFloat(s.rect.h)) -| pad.top -| pad.bottom;
         const cols: u16 = @intCast(std.math.clamp(w / m.cell_width, 1, std.math.maxInt(u16)));
@@ -1925,6 +2080,11 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
         win32.WM_KEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP => {
             if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.hideTip();
+            // Escape drops a pane being dragged where it was.
+            if (msg == win32.WM_KEYDOWN and wparam == win32.VK_ESCAPE and self.pane_drag != null) {
+                self.cancelDrag();
+                return 0;
+            }
             if (self.connect_field != null or self.activeLogin() != null) {
                 if (msg == win32.WM_KEYDOWN and (self.connectKey(@truncate(wparam)) or self.loginKey(@truncate(wparam)))) return 0;
                 if (self.keyBinding(msg, wparam)) return 0;
@@ -2001,6 +2161,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         win32.WM_CAPTURECHANGED => {
             if (lparam != @as(isize, @bitCast(@intFromPtr(hwnd)))) {
                 if (self.drag != null) self.endDrag();
+                // A pane drag that lost the mouse lands nowhere.
+                self.cancelDrag();
                 if (self.mouse_in_terminal) {
                     self.mouse_in_terminal = false;
                     self.activeSession().cancelSelection();
@@ -2037,6 +2199,9 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 else => null,
             };
             if (divider) |d| cursor = if (d.axis() == .row) win32.IDC_SIZEWE else win32.IDC_SIZENS;
+            if (self.pane_drag) |d| if (d.at != null) {
+                cursor = win32.IDC_SIZEALL;
+            };
             const pane = if (self.mouse_in_terminal) self.activeSession() else switch (hit) {
                 .terminal => |i| self.shownPane(i),
                 else => null,

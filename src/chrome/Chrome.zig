@@ -74,7 +74,9 @@ pub const Hit = union(enum) {
     close_tab: usize,
     /// Pane `i` of `View.panes`, away from its buttons.
     terminal: usize,
-    /// Pane `i`'s buttons, which show while the mouse is over it.
+    /// Pane `i`'s title strip, away from its buttons, which drags it.
+    pane_title: usize,
+    /// Pane `i`'s buttons.
     split_right: usize,
     split_down: usize,
     zoom: usize,
@@ -102,6 +104,8 @@ pub const View = struct {
     panes: []const Pane = &.{},
     /// Those gaps.
     dividers: []const Rect = &.{},
+    /// A pane being dragged by its title strip.
+    pane_drag: ?PaneDrag = null,
     /// The host being typed after "Connect" was clicked, if it was.
     connect: ?*const TextField = null,
     /// The on phase of the caret's blink, while focused.
@@ -146,7 +150,10 @@ pub const View = struct {
     };
 
     pub const Pane = struct {
+        /// All of it, and its terminal, under the title strip.
+        frame: Rect,
         rect: Rect,
+        title: []const u16,
         /// It gets the keys. Others are dimmed while the tab has several.
         focused: bool,
         /// It can be split (it runs in slimed), and zoomed if not alone.
@@ -155,6 +162,15 @@ pub const View = struct {
         zoomed: bool,
         /// Its terminal's default background.
         bg: Color,
+    };
+
+    pub const PaneDrag = struct {
+        /// The pane in `panes`, while it's there.
+        source: ?usize,
+        /// Where it would land, highlighted.
+        drop: ?Rect = null,
+        /// The mouse, once it's moved enough to drag.
+        mouse: ?struct { x: f32, y: f32 } = null,
     };
 
     pub fn title(self: *const View) []const u16 {
@@ -268,6 +284,11 @@ pub fn paneGap(self: *const Chrome) f32 {
     return self.px(panes.gap);
 }
 
+/// The height of a pane's title strip, above its terminal.
+pub fn paneTitleHeight(self: *const Chrome) f32 {
+    return self.px(panes.title_height);
+}
+
 pub fn hitTest(self: *const Chrome, l: *const Layout, view: *const View, x: f32, y: f32) Hit {
     if (l.terminal.contains(x, y)) {
         if (view.dialog) |d| return modal.hitTest(self, l.terminal, d, x, y);
@@ -289,7 +310,10 @@ pub fn hitTest(self: *const Chrome, l: *const Layout, view: *const View, x: f32,
 /// drawn.
 pub fn setHover(self: *Chrome, hit: Hit) bool {
     // The caption draws nothing for hover. A pane shows its buttons.
-    const h: Hit = if (hit == .caption or hit == .divider) .none else hit;
+    const h: Hit = switch (hit) {
+        .caption, .divider, .pane_title => .none,
+        else => hit,
+    };
     if (self.hover.eql(h)) return false;
     self.hover = h;
     self.tip = .none;
@@ -352,6 +376,17 @@ pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const Vi
     self.paintToggle(p, l, view);
     self.paintCaptionButtons(p, l, view);
     self.paintTip(p, l, view);
+}
+
+/// The part of the frame `paintDrag` wants a copy of, if any.
+pub fn dragCapture(view: *const View) ?Rect {
+    return panes.dragCapture(view);
+}
+
+/// Over the frame `paint` drew: a pane being dragged, with `thumb`, the
+/// copy `dragCapture` asked for.
+pub fn paintDrag(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View, thumb: ?Painter.Image) void {
+    panes.paintDrag(self, p, l, view, thumb);
 }
 
 /// What a button's tooltip says, and the key that does the same, if
@@ -700,7 +735,7 @@ test "layout and hit testing" {
         .groups = &.{.{ .label = &.{}, .tabs = 2, .kind = .local }},
         .tabs = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = true } },
         .active = 0,
-        .panes = &.{.{ .rect = .{ .x = 240, .y = 36, .w = 760, .h = 564 }, .focused = true, .splittable = false, .zoomable = false, .zoomed = false, .bg = .{ 0, 0, 0, 1 } }},
+        .panes = &.{.{ .frame = .{ .x = 240, .y = 36, .w = 760, .h = 564 }, .rect = .{ .x = 240, .y = 66, .w = 760, .h = 534 }, .title = &.{}, .focused = true, .splittable = false, .zoomable = false, .zoomed = false, .bg = .{ 0, 0, 0, 1 } }},
         .focused = true,
         .maximized = false,
         .terminal_bg = .{ 0, 0, 0, 1 },
@@ -710,7 +745,8 @@ test "layout and hit testing" {
     try std.testing.expectEqual(Hit.caption, chrome.hitTest(&l, &view, 500, 5));
     try std.testing.expectEqual(Hit.toggle_mode, chrome.hitTest(&l, &view, l.toggle.x + 1, 5));
     try std.testing.expectEqual(Hit.caption, chrome.hitTest(&l, &view, l.icon.x + 1, l.icon.y + 1));
-    try std.testing.expectEqual(Hit{ .terminal = 0 }, chrome.hitTest(&l, &view, l.terminal.x + 1, l.terminal.y + 1));
+    try std.testing.expectEqual(Hit{ .terminal = 0 }, chrome.hitTest(&l, &view, l.terminal.x + 1, l.terminal.y + 100));
+    try std.testing.expectEqual(Hit{ .pane_title = 0 }, chrome.hitTest(&l, &view, l.terminal.x + 1, l.terminal.y + 1));
     try std.testing.expect(l.list.w > 0 and l.terminal.x == l.list.right());
 
     chrome.toggleMode();

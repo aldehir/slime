@@ -212,6 +212,24 @@ pub fn lucideIcon(self: *Painter, name: Lucide, r: Rect, width: f32, c: Color) v
     icon.draw(r);
 }
 
+/// Pixels the renderer captured, for drawing scaled.
+pub const Image = struct {
+    bitmap: *d2d1.IBitmap1,
+    w: f32,
+    h: f32,
+};
+
+/// Draw `img` scaled into `r` with high-quality filtering, inside rounded
+/// corners of `radius`, at `opacity`.
+pub fn image(self: *Painter, img: Image, r: Rect, radius: f32, opacity: f32) void {
+    var mask: ?*d2d1.IRoundedRectangleGeometry = null;
+    com.check(self.factory.createRoundedRectangleGeometry(&.{ .rect = r.d2d(), .radiusX = radius, .radiusY = radius }, &mask), "ID2D1Factory::CreateRoundedRectangleGeometry") catch return;
+    defer com.releaseOpt(&mask);
+    self.ctx.pushLayer(&.{ .contentBounds = r.d2d(), .geometricMask = mask, .opacity = opacity });
+    self.ctx.drawBitmap(img.bitmap, &r.d2d(), 1, d2d1.INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+    self.ctx.popLayer();
+}
+
 pub fn pushClip(self: *Painter, r: Rect) void {
     self.ctx.pushAxisAlignedClip(&r.d2d());
 }

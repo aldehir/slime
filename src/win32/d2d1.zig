@@ -22,6 +22,11 @@ pub const FIGURE_END_CLOSED: u32 = 1;
 pub const SWEEP_DIRECTION_COUNTER_CLOCKWISE: u32 = 0;
 pub const SWEEP_DIRECTION_CLOCKWISE: u32 = 1;
 pub const ARC_SIZE_SMALL: u32 = 0;
+pub const ANTIALIAS_MODE_PER_PRIMITIVE: u32 = 0;
+pub const INTERPOLATION_MODE_HIGH_QUALITY_CUBIC: u32 = 5;
+pub const LAYER_OPTIONS1_NONE: u32 = 0;
+
+pub const MATRIX_3X2_F = [6]f32;
 
 /// Premultiplied is not required: colors are straight RGBA.
 pub const COLOR_F = [4]f32;
@@ -69,6 +74,16 @@ pub const BITMAP_PROPERTIES1 = extern struct {
     colorContext: ?*anyopaque = null,
 };
 
+pub const LAYER_PARAMETERS1 = extern struct {
+    contentBounds: RECT_F,
+    geometricMask: ?*IRoundedRectangleGeometry = null,
+    maskAntialiasMode: u32 = ANTIALIAS_MODE_PER_PRIMITIVE,
+    maskTransform: MATRIX_3X2_F = .{ 1, 0, 0, 1, 0, 0 },
+    opacity: f32 = 1,
+    opacityBrush: ?*anyopaque = null,
+    layerOptions: u32 = LAYER_OPTIONS1_NONE,
+};
+
 pub const IFactory1 = extern struct {
     vtable: com.VTable,
 
@@ -78,6 +93,10 @@ pub const IFactory1 = extern struct {
         .data3 = 0x4b9a,
         .data4 = .{ 0xaa, 0x1d, 0x14, 0xba, 0x40, 0x1c, 0xfa, 0x1f },
     };
+
+    pub fn createRoundedRectangleGeometry(self: *IFactory1, rect: *const ROUNDED_RECT, out: *?*IRoundedRectangleGeometry) HRESULT {
+        return com.call(self, 6, fn (*const ROUNDED_RECT, *?*IRoundedRectangleGeometry) HRESULT, .{ rect, out });
+    }
 
     pub fn createPathGeometry(self: *IFactory1, out: *?*IPathGeometry) HRESULT {
         return com.call(self, 10, fn (*?*IPathGeometry) HRESULT, .{out});
@@ -160,6 +179,20 @@ pub const IDeviceContext = extern struct {
         com.call(self, 46, fn () void, .{});
     }
 
+    pub fn popLayer(self: *IDeviceContext) void {
+        com.call(self, 41, fn () void, .{});
+    }
+
+    /// ID2D1DeviceContext's DrawBitmap, which takes an interpolation mode.
+    pub fn drawBitmap(self: *IDeviceContext, bitmap: *IBitmap1, dst: *const RECT_F, opacity: f32, mode: u32) void {
+        com.call(self, 85, fn (*IBitmap1, *const RECT_F, f32, u32, ?*const RECT_F, ?*const anyopaque) void, .{ bitmap, dst, opacity, mode, null, null });
+    }
+
+    /// ID2D1DeviceContext's PushLayer, which needs no layer object.
+    pub fn pushLayer(self: *IDeviceContext, params: *const LAYER_PARAMETERS1) void {
+        com.call(self, 86, fn (*const LAYER_PARAMETERS1, ?*anyopaque) void, .{ params, null });
+    }
+
     pub fn beginDraw(self: *IDeviceContext) void {
         com.call(self, 48, fn () void, .{});
     }
@@ -234,6 +267,7 @@ pub const ISvgElement = extern struct {
 };
 
 pub const IBitmap1 = extern struct { vtable: com.VTable };
+pub const IRoundedRectangleGeometry = extern struct { vtable: com.VTable };
 
 pub const ISolidColorBrush = extern struct {
     vtable: com.VTable,

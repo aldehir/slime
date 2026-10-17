@@ -246,6 +246,8 @@ pub const SWP_FRAMECHANGED = 0x0020;
 pub const SM_CXFRAME = 32;
 pub const SM_CYFRAME = 33;
 pub const SM_CXPADDEDBORDER = 92;
+pub const SM_CXDRAG = 68;
+pub const SM_CYDRAG = 69;
 pub const TME_LEAVE = 0x00000002;
 pub const TME_NONCLIENT = 0x00000010;
 // Cursor resource IDs (MAKEINTRESOURCE values, which aren't u16-aligned).

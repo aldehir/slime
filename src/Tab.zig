@@ -227,12 +227,158 @@ fn removeNode(alloc: Allocator, node: *Node, s: *const Session) ?*Session {
     return null;
 }
 
-/// Give each pane its part of `area` (in `Session.rect`), with `gap`
+/// Where a dragged pane goes.
+pub const Place = union(enum) {
+    /// Where this pane is, which takes its place.
+    swap: *Session,
+    /// On `side` of `target`, taking half its space.
+    beside: struct { target: *Session, side: Slimed.Direction },
+    /// Along the tab's whole `side`, taking half the tab.
+    edge: Slimed.Direction,
+};
+
+/// Move pane `s` to `to`, and focus it. The tree changes whole or not at
+/// all: the move is made on a copy.
+pub fn move(self: *Tab, alloc: Allocator, s: *Session, to: Place) !void {
+    if (self.count() < 2 or !self.contains(s)) return;
+    switch (to) {
+        .swap => |t| if (t == s or !self.contains(t)) return,
+        .beside => |b| if (b.target == s or !self.contains(b.target)) return,
+        .edge => {},
+    }
+    var root = try cloneNode(alloc, self.root);
+    errdefer freeNode(alloc, root);
+    switch (to) {
+        .swap => |t| {
+            const from = leafOf(&root, s).?;
+            const into = leafOf(&root, t).?;
+            from.* = .{ .pane = t };
+            into.* = .{ .pane = s };
+        },
+        .beside => |b| {
+            try take(alloc, &root, s);
+            try insertBeside(alloc, &root, s, b.target, b.side);
+        },
+        .edge => |side| {
+            try take(alloc, &root, s);
+            try insertEdge(alloc, &root, s, side);
+        },
+    }
+    freeNode(alloc, self.root);
+    self.root = root;
+    self.zoom = null;
+    self.focus = s;
+}
+
+fn cloneNode(alloc: Allocator, node: Node) !Node {
+    switch (node) {
+        .pane => return node,
+        .split => |sp| {
+            const children = try alloc.alloc(Child, sp.children.len);
+            var made: usize = 0;
+            errdefer {
+                for (children[0..made]) |c| freeNode(alloc, c.node);
+                alloc.free(children);
+            }
+            for (children, sp.children) |*out, c| {
+                out.* = .{ .share = c.share, .node = try cloneNode(alloc, c.node) };
+                made += 1;
+            }
+            return .{ .split = .{ .axis = sp.axis, .children = children } };
+        },
+    }
+}
+
+/// The leaf holding `s`.
+fn leafOf(node: *Node, s: *const Session) ?*Node {
+    switch (node.*) {
+        .pane => |p| return if (p == s) node else null,
+        .split => |*sp| for (sp.children) |*c| {
+            if (leafOf(&c.node, s)) |n| return n;
+        },
+    }
+    return null;
+}
+
+/// Take `s` out of `root`, which holds another pane too.
+fn take(alloc: Allocator, root: *Node, s: *const Session) !void {
+    _ = removeNode(alloc, root, s);
+    // Removing keeps the pane, with no share, when it can't allocate.
+    if (containsNode(root.*, s)) return error.OutOfMemory;
+}
+
+/// The split directly holding the leaf of `s`, and its index there.
+fn parentOf(node: *Node, s: *const Session) ?struct { split: *Split, index: usize } {
+    const sp = switch (node.*) {
+        .pane => return null,
+        .split => |*sp| sp,
+    };
+    for (sp.children, 0..) |*c, i| switch (c.node) {
+        .pane => |p| if (p == s) return .{ .split = sp, .index = i },
+        .split => if (parentOf(&c.node, s)) |found| return found,
+    };
+    return null;
+}
+
+fn axisOf(side: Slimed.Direction) Axis {
+    return if (side == .right or side == .left) .row else .column;
+}
+
+fn after(side: Slimed.Direction) bool {
+    return side == .right or side == .down;
+}
+
+/// `children` with `child` put in at `at`, in a new slice; frees the old.
+fn insertChild(alloc: Allocator, sp: *Split, at: usize, child: Child) !void {
+    const more = try alloc.alloc(Child, sp.children.len + 1);
+    @memcpy(more[0..at], sp.children[0..at]);
+    more[at] = child;
+    @memcpy(more[at + 1 ..], sp.children[at..]);
+    alloc.free(sp.children);
+    sp.children = more;
+}
+
+/// Put `s` on `side` of `target`: into the split holding it if that runs
+/// the same way, sharing its space, else in a new split with it.
+fn insertBeside(alloc: Allocator, root: *Node, s: *Session, target: *Session, side: Slimed.Direction) !void {
+    const axis = axisOf(side);
+    if (parentOf(root, target)) |p| if (p.split.axis == axis) {
+        const t = &p.split.children[p.index];
+        const half = @max(1, t.share / 2);
+        t.share = @max(1, t.share - half);
+        return insertChild(alloc, p.split, if (after(side)) p.index + 1 else p.index, .{ .share = half, .node = .{ .pane = s } });
+    };
+    const leaf = leafOf(root, target).?;
+    const kids = try alloc.alloc(Child, 2);
+    kids[@intFromBool(!after(side))] = .{ .share = 5000, .node = .{ .pane = target } };
+    kids[@intFromBool(after(side))] = .{ .share = 5000, .node = .{ .pane = s } };
+    leaf.* = .{ .split = .{ .axis = axis, .children = kids } };
+}
+
+/// Put `s` along `side` of the whole tree, taking half of it.
+fn insertEdge(alloc: Allocator, root: *Node, s: *Session, side: Slimed.Direction) !void {
+    const axis = axisOf(side);
+    switch (root.*) {
+        .split => |*sp| if (sp.axis == axis) {
+            var total: u32 = 0;
+            for (sp.children) |c| total += c.share;
+            const share: u16 = @intCast(@min(total, std.math.maxInt(u16)));
+            return insertChild(alloc, sp, if (after(side)) sp.children.len else 0, .{ .share = share, .node = .{ .pane = s } });
+        },
+        .pane => {},
+    }
+    const kids = try alloc.alloc(Child, 2);
+    kids[@intFromBool(!after(side))] = .{ .share = 5000, .node = root.* };
+    kids[@intFromBool(after(side))] = .{ .share = 5000, .node = .{ .pane = s } };
+    root.* = .{ .split = .{ .axis = axis, .children = kids } };
+}
+
+/// Give each pane its part of `area` (in `Session.frame`), with `gap`
 /// pixel dividers between them; a zoomed pane gets all of it.
 pub fn place(self: *Tab, alloc: Allocator, area: Rect, gap: f32) !void {
     self.dividers.clearRetainingCapacity();
     if (self.zoom) |z| {
-        z.rect = area;
+        z.frame = area;
         return;
     }
     try self.placeNode(alloc, &self.root, area, gap);
@@ -241,7 +387,7 @@ pub fn place(self: *Tab, alloc: Allocator, area: Rect, gap: f32) !void {
 fn placeNode(self: *Tab, alloc: Allocator, node: *Node, r: Rect, gap: f32) !void {
     const sp = switch (node.*) {
         .pane => |s| {
-            s.rect = r;
+            s.frame = r;
             return;
         },
         .split => |*sp| sp,
@@ -385,9 +531,9 @@ test "placing and removing panes" {
     defer tab.destroy(alloc);
 
     try tab.place(alloc, .{ .x = 10, .y = 20, .w = 401, .h = 201 }, 1);
-    try std.testing.expectEqual(Rect{ .x = 10, .y = 20, .w = 300, .h = 201 }, a.rect);
-    try std.testing.expectEqual(Rect{ .x = 311, .y = 20, .w = 100, .h = 100 }, b.rect);
-    try std.testing.expectEqual(Rect{ .x = 311, .y = 121, .w = 100, .h = 100 }, c.rect);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 20, .w = 300, .h = 201 }, a.frame);
+    try std.testing.expectEqual(Rect{ .x = 311, .y = 20, .w = 100, .h = 100 }, b.frame);
+    try std.testing.expectEqual(Rect{ .x = 311, .y = 121, .w = 100, .h = 100 }, c.frame);
     try std.testing.expectEqual(@as(usize, 2), tab.dividers.items.len);
     try std.testing.expectEqual(@as(usize, 3), tab.count());
 
@@ -408,16 +554,56 @@ test "placing and removing panes" {
     try std.testing.expectEqual(&b, tab.focus);
     try std.testing.expect(!tab.contains(&c));
     try tab.place(alloc, .{ .w = 401, .h = 100 }, 1);
-    try std.testing.expectEqual(Rect{ .x = 301, .w = 100, .h = 100 }, b.rect);
+    try std.testing.expectEqual(Rect{ .x = 301, .w = 100, .h = 100 }, b.frame);
 
     tab.zoom = &a;
     try tab.place(alloc, .{ .w = 401, .h = 100 }, 1);
-    try std.testing.expectEqual(Rect{ .w = 401, .h = 100 }, a.rect);
+    try std.testing.expectEqual(Rect{ .w = 401, .h = 100 }, a.frame);
     try std.testing.expectEqual(@as(usize, 0), tab.dividers.items.len);
 
     try std.testing.expectEqual(&b, tab.remove(alloc, &a).?);
     try std.testing.expect(tab.zoom == null);
     try std.testing.expect(tab.remove(alloc, &b) == null);
+}
+
+test "moving panes" {
+    const alloc = std.testing.allocator;
+    var a: Session = undefined;
+    var b: Session = undefined;
+    var c: Session = undefined;
+    const row = try alloc.alloc(Child, 3);
+    row[0] = .{ .share = 3334, .node = .{ .pane = &a } };
+    row[1] = .{ .share = 3333, .node = .{ .pane = &b } };
+    row[2] = .{ .share = 3333, .node = .{ .pane = &c } };
+    const tab = try create(alloc, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    defer tab.destroy(alloc);
+
+    // c along the top: a column of c over the rest.
+    try tab.move(alloc, &c, .{ .edge = .up });
+    try std.testing.expectEqual(Axis.column, tab.root.split.axis);
+    try std.testing.expectEqual(&c, tab.root.split.children[0].node.pane);
+    try std.testing.expectEqual(@as(usize, 2), tab.root.split.children[1].node.split.children.len);
+    try std.testing.expectEqual(&c, tab.focus);
+
+    // a below b: b's leaf becomes a column, and the row collapses.
+    try tab.move(alloc, &a, .{ .beside = .{ .target = &b, .side = .down } });
+    try std.testing.expectEqual(Axis.column, tab.root.split.axis);
+    try std.testing.expectEqual(@as(usize, 3), tab.root.split.children.len);
+    try std.testing.expectEqual(&b, tab.root.split.children[1].node.pane);
+    try std.testing.expectEqual(&a, tab.root.split.children[2].node.pane);
+
+    // Swapping trades leaves and keeps the shape.
+    try tab.move(alloc, &a, .{ .swap = &c });
+    try std.testing.expectEqual(&a, tab.root.split.children[0].node.pane);
+    try std.testing.expectEqual(&c, tab.root.split.children[2].node.pane);
+
+    // Right of b, in the column: a new row of b and c.
+    try tab.move(alloc, &c, .{ .beside = .{ .target = &b, .side = .right } });
+    const pair = tab.root.split.children[1].node.split;
+    try std.testing.expectEqual(Axis.row, pair.axis);
+    try std.testing.expectEqual(&b, pair.children[0].node.pane);
+    try std.testing.expectEqual(&c, pair.children[1].node.pane);
+    try std.testing.expectEqual(@as(usize, 3), tab.count());
 }
 
 test fromLayout {
