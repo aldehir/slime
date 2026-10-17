@@ -229,7 +229,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     self.dpi = win32.GetDpiForWindow(hwnd);
     self.grid = try .init(alloc, io, config.@"font-family".items, config.@"font-size", self.dpi, config.@"font-antialias");
     errdefer self.grid.deinit();
-    self.chrome = try .init(self.dpi, theme);
+    self.chrome = try .init(self.dpi, config.@"chrome-scale", theme);
     errdefer self.chrome.deinit();
 
     const size = self.clientSize();

@@ -37,8 +37,10 @@ fn Impl(comptime mode: Mode) type {
 }
 
 mode: Mode = .sidebar,
-/// Pixels per DIP.
+/// Pixels per DIP: the monitor's scale times `zoom`.
 scale: f32,
+/// The configured `chrome-scale`, over the monitor's.
+zoom: f32 = 1,
 fonts: Fonts,
 theme: Theme,
 /// What the mouse is over, and what a button went down on.
@@ -148,9 +150,10 @@ pub const Layout = struct {
     inset: f32 = 0,
 };
 
-pub fn init(dpi: u32, theme: Theme) !Chrome {
-    const scale = scaleFor(dpi);
-    return .{ .scale = scale, .fonts = try .init(scale), .theme = theme };
+pub fn init(dpi: u32, zoom: f32, theme: Theme) !Chrome {
+    const z = std.math.clamp(zoom, min_zoom, max_zoom);
+    const scale = scaleFor(dpi, z);
+    return .{ .scale = scale, .zoom = z, .fonts = try .init(scale), .theme = theme };
 }
 
 pub fn deinit(self: *Chrome) void {
@@ -158,15 +161,19 @@ pub fn deinit(self: *Chrome) void {
 }
 
 pub fn setDpi(self: *Chrome, dpi: u32) !void {
-    const scale = scaleFor(dpi);
+    const scale = scaleFor(dpi, self.zoom);
     const fonts: Fonts = try .init(scale);
     self.fonts.deinit();
     self.fonts = fonts;
     self.scale = scale;
 }
 
-fn scaleFor(dpi: u32) f32 {
-    return @as(f32, @floatFromInt(dpi)) / 96.0;
+/// The range `chrome-scale` is clamped to.
+const min_zoom = 0.5;
+const max_zoom = 3;
+
+fn scaleFor(dpi: u32, zoom: f32) f32 {
+    return @as(f32, @floatFromInt(dpi)) / 96.0 * zoom;
 }
 
 /// `dip` device independent pixels as whole pixels.

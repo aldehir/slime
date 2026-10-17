@@ -27,6 +27,10 @@ const log = std.log.scoped(.config);
 /// the terminal's text and the chrome's. Not a Ghostty key; the values
 /// are Windows Terminal's.
 @"font-antialias": font.Antialias = .grayscale,
+/// How much larger than the monitor's scale to draw the chrome: the
+/// title bar, session list, and dialogs. From 0.5 to 3. Not a Ghostty
+/// key.
+@"chrome-scale": f32 = 1,
 
 /// Ghostty's default colors. Programs can override these with OSC 10/11.
 background: RGB = .{ .r = 0x28, .g = 0x2c, .b = 0x34 },
@@ -425,6 +429,7 @@ test "padding, word chars, theme, clipboard" {
         \\theme = light: Catppuccin Latte , dark:Catppuccin Mocha
         \\clipboard-write = deny
         \\font-antialias = cleartype
+        \\chrome-scale = 1.25
     );
     defer c.deinit();
     try std.testing.expectEqual(Padding{ .top_left = 2, .bottom_right = 4 }, c.@"window-padding-x");
@@ -435,6 +440,7 @@ test "padding, word chars, theme, clipboard" {
     try std.testing.expectEqual(.ask, c.@"clipboard-read");
     try std.testing.expectEqual(.deny, c.@"clipboard-write");
     try std.testing.expectEqual(.cleartype, c.@"font-antialias");
+    try std.testing.expectEqual(1.25, c.@"chrome-scale");
     try std.testing.expectError(error.InvalidValue, c.set("font-antialias", "subpixel"));
 
     try std.testing.expectError(error.InvalidTheme, Theme.parse(c._arena.allocator(), "light:A"));
