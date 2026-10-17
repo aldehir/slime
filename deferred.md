@@ -110,6 +110,13 @@ connects (a plug) or, once connected, opens another channel on the
 connection (`+`). A host with no sessions can be forgotten with the ×
 that shows on hover.
 
+Icon buttons name themselves in a tooltip once the mouse rests on them
+(the system hover time), with the key that does the same where there is
+one.
+
+- **Tooltips on the caption buttons.** Left to Windows, whose Snap
+  Layouts flyout takes hover over maximize.
+
 - **Reordering hosts.** They're listed in the order first connected to.
 - **The mouse in text fields** (`chrome/TextField.zig`): clicking to
   place the caret, dragging to select, double-click for a word. Only

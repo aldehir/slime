@@ -16,6 +16,10 @@ pub fn hitTest(_: *const Chrome, _: *const Chrome.Layout, _: *const Chrome.View,
     return null;
 }
 
+pub fn buttonRect(_: *const Chrome, _: *const Chrome.Layout, _: *const Chrome.View, _: Chrome.Hit) ?Chrome.Rect {
+    return null;
+}
+
 pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *const Chrome.View) void {
     c.paintTitle(p, l, view);
 }

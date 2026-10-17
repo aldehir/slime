@@ -68,6 +68,60 @@ pub fn find(bindings: []const Binding, vk: u32, mods: Mods) ?Binding {
     return null;
 }
 
+/// A key's name for a hint, e.g. "Ctrl+Shift+T".
+pub const Label = struct {
+    buf: [24]u16 = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const Label) []const u16 {
+        return self.buf[0..self.len];
+    }
+
+    fn append(self: *Label, text: []const u8) void {
+        for (text) |c| {
+            self.buf[self.len] = c;
+            self.len += 1;
+        }
+    }
+};
+
+/// The first of `bindings` that runs `action`, named. Empty if none does
+/// or its key has no name here.
+pub fn label(bindings: []const Binding, action: std.meta.Tag(Action)) Label {
+    var out: Label = .{};
+    const b = for (bindings) |b| {
+        if (b.action == action) break b;
+    } else return out;
+    var key_buf: [1]u8 = undefined;
+    const key: []const u8 = switch (b.trigger.vk) {
+        'A'...'Z', '0'...'9' => |vk| key: {
+            key_buf[0] = @intCast(vk);
+            break :key &key_buf;
+        },
+        win32.VK_TAB => "Tab",
+        win32.VK_INSERT => "Insert",
+        win32.VK_PRIOR => "PgUp",
+        win32.VK_NEXT => "PgDn",
+        win32.VK_OEM_PLUS => "+",
+        win32.VK_OEM_MINUS => "-",
+        else => return out,
+    };
+    const mods = b.trigger.mods;
+    if (mods.ctrl) out.append("Ctrl+");
+    if (mods.shift) out.append("Shift+");
+    if (mods.alt) out.append("Alt+");
+    if (mods.super) out.append("Win+");
+    out.append(key);
+    return out;
+}
+
+test label {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    try std.testing.expectEqualSlices(u16, L("Ctrl+Shift+T"), label(&defaults, .new_tab).slice());
+    try std.testing.expectEqualSlices(u16, L("Ctrl+Shift+C"), label(&defaults, .copy_to_clipboard).slice());
+    try std.testing.expectEqual(@as(usize, 0), label(&.{}, .new_tab).len);
+}
+
 test find {
     const plus = find(&defaults, win32.VK_OEM_PLUS, .{ .ctrl = true, .shift = true, .num_lock = true }).?;
     try std.testing.expectEqual(Action{ .increase_font_size = 1 }, plus.action);

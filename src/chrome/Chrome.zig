@@ -21,6 +21,7 @@ const modal = @import("modal.zig");
 
 pub const Rect = Painter.Rect;
 pub const Color = Painter.Color;
+const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
 pub const Mode = enum {
     /// Sessions listed in a sidebar, grouped by where they run.
@@ -46,6 +47,9 @@ theme: Theme,
 /// What the mouse is over, and what a button went down on.
 hover: Hit = .none,
 pressed: Hit = .none,
+/// The button whose tooltip shows: the one under the mouse, once it's
+/// rested there.
+tip: Hit = .none,
 
 pub const Hit = union(enum) {
     none,
@@ -101,6 +105,11 @@ pub const View = struct {
     /// Frame stats, when built with `-Dstats`. Lines end with LF.
     stats: []const u16 = &.{},
 
+    /// The keys for a new session in the active session's group and for
+    /// closing the active session, which their tooltips show.
+    new_session_key: []const u16 = &.{},
+    close_session_key: []const u16 = &.{},
+
     pub const Group = struct {
         label: []const u16,
         /// How many of `sessions` are in it.
@@ -124,6 +133,16 @@ pub const View = struct {
 
     pub fn title(self: *const View) []const u16 {
         return if (self.active < self.sessions.len) self.sessions[self.active].title else &.{};
+    }
+
+    /// The group the active session is in.
+    pub fn activeGroup(self: *const View) usize {
+        var end: usize = 0;
+        for (self.groups, 0..) |g, i| {
+            end += g.sessions;
+            if (self.active < end) return i;
+        }
+        return 0;
     }
 };
 
@@ -233,6 +252,29 @@ pub fn setHover(self: *Chrome, hit: Hit) bool {
     const h: Hit = if (hit == .terminal or hit == .caption) .none else hit;
     if (self.hover.eql(h)) return false;
     self.hover = h;
+    self.tip = .none;
+    return true;
+}
+
+/// Buttons that are only an icon, which tooltips name.
+pub fn hasTip(hit: Hit) bool {
+    return switch (hit) {
+        .toggle_mode, .new_session, .forget_host, .close_session => true,
+        else => false,
+    };
+}
+
+/// Show the tooltip of the button under the mouse, if it has one.
+/// Returns true if that changed what's drawn.
+pub fn showTip(self: *Chrome) bool {
+    if (!hasTip(self.hover) or self.pressed != .none or self.tip.eql(self.hover)) return false;
+    self.tip = self.hover;
+    return true;
+}
+
+pub fn hideTip(self: *Chrome) bool {
+    if (self.tip == .none) return false;
+    self.tip = .none;
     return true;
 }
 
@@ -249,6 +291,7 @@ pub fn toggleMode(self: *Chrome) void {
     };
     self.hover = .none;
     self.pressed = .none;
+    self.tip = .none;
 }
 
 pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
@@ -266,6 +309,76 @@ pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const Vi
     p.appIcon(l.icon);
     self.paintToggle(p, l, view);
     self.paintCaptionButtons(p, l, view);
+    self.paintTip(p, l, view);
+}
+
+/// What a button's tooltip says, and the key that does the same, if
+/// there is one.
+fn tipText(self: *const Chrome, view: *const View, hit: Hit) struct { []const u16, []const u16 } {
+    const none: []const u16 = &.{};
+    return switch (hit) {
+        .toggle_mode => .{ switch (self.mode) {
+            .sidebar => L("Hide sidebar"),
+            .tabs => L("Show sidebar"),
+        }, none },
+        .new_session => |g| if (g < view.groups.len and view.groups[g].kind == .disconnected)
+            .{ L("Connect"), none }
+        else
+            .{ L("New session"), if (g == view.activeGroup()) view.new_session_key else none },
+        .forget_host => .{ L("Forget host"), none },
+        .close_session => |i| .{ L("Close session"), if (i == view.active) view.close_session_key else none },
+        else => .{ none, none },
+    };
+}
+
+/// The button `hit` is, if it's on screen.
+fn buttonRect(self: *const Chrome, l: *const Layout, view: *const View, hit: Hit) ?Rect {
+    if (hit == .toggle_mode) return l.toggle;
+    return switch (self.mode) {
+        inline else => |m| Impl(m).buttonRect(self, l, view, hit),
+    };
+}
+
+/// The tooltip under its button, or over it if there's no room below,
+/// kept inside the window.
+fn paintTip(self: *const Chrome, p: *Painter, l: *const Layout, view: *const View) void {
+    if (self.tip == .none) return;
+    const anchor = self.buttonRect(l, view, self.tip) orelse return;
+    const label, const key = self.tipText(view, self.tip);
+    if (label.len == 0) return;
+    const font = self.fonts.tip;
+    const pad = self.px(9);
+    const gap = self.px(12);
+    const label_w = @ceil(self.fonts.measure(label, font));
+    const key_w = if (key.len > 0) @ceil(self.fonts.measure(key, font)) else 0;
+    const w = pad + label_w + (if (key.len > 0) gap + key_w else 0) + pad;
+    const h = self.px(26);
+    const margin = self.px(8);
+    const offset = self.px(6);
+    var r: Rect = .{
+        .x = @round(std.math.clamp(anchor.x + (anchor.w - w) / 2, margin, @max(margin, l.window.w - margin - w))),
+        .y = anchor.bottom() + offset,
+        .w = w,
+        .h = h,
+    };
+    if (r.bottom() > l.window.h - margin) r.y = anchor.y - offset - h;
+
+    const radius = self.px(6);
+    self.paintShadow(p, r, radius, 3, 1);
+    self.fillBordered(p, r, radius, self.theme.dialog, self.theme.dialog_outline);
+    p.text(label, font, .{ .x = r.x + pad, .y = r.y, .w = label_w, .h = h }, self.theme.text_strong);
+    if (key.len > 0) p.text(key, font, .{ .x = r.right() - pad - key_w, .y = r.y, .w = key_w, .h = h }, self.theme.text_muted);
+}
+
+/// A soft shadow around the rounded rect `r`: `rings` rings `step` DIPs
+/// apart, each faint, so they add up to a fade outward.
+pub fn paintShadow(self: *const Chrome, p: *Painter, r: Rect, radius: f32, rings: f32, step: f32) void {
+    var i = rings;
+    while (i > 0) : (i -= 1) {
+        const spread = self.px(i * step);
+        const ring: Rect = .{ .x = r.x - spread, .y = r.y - spread, .w = r.w + 2 * spread, .h = r.h + 2 * spread };
+        p.fillRounded(ring, radius + spread, .{ 0, 0, 0, 0.06 });
+    }
 }
 
 pub const ButtonState = enum { rest, hover, pressed };
@@ -411,6 +524,8 @@ pub const Fonts = struct {
     section: *dwrite.ITextFormat,
     /// Key hints, centered.
     hint: *dwrite.ITextFormat,
+    /// Tooltips.
+    tip: *dwrite.ITextFormat,
     /// Numbers that change in place, like the stats.
     mono: *dwrite.ITextFormat,
     /// A dialog's title.
@@ -423,7 +538,6 @@ pub const Fonts = struct {
     button: *dwrite.ITextFormat,
     button_strong: *dwrite.ITextFormat,
 
-    const L = std.unicode.utf8ToUtf16LeStringLiteral;
     const ui_families = [_][:0]const u16{ L("Segoe UI Variable Text"), L("Segoe UI") };
     const mono_families = [_][:0]const u16{ L("Cascadia Mono"), L("Consolas") };
 
@@ -447,6 +561,7 @@ pub const Fonts = struct {
             .{ "title", ui, dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_CENTER, one_line },
             .{ "section", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 11, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
             .{ "hint", ui, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_CENTER, one_line },
+            .{ "tip", ui, dwrite.FONT_WEIGHT.NORMAL, 12, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
             .{ "mono", mono, dwrite.FONT_WEIGHT.NORMAL, 10.5, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
             .{ "heading", ui, dwrite.FONT_WEIGHT.SEMI_BOLD, 15, dwrite.TEXT_ALIGNMENT_LEADING, one_line },
             .{ "prose", ui, dwrite.FONT_WEIGHT.NORMAL, 12.5, dwrite.TEXT_ALIGNMENT_LEADING, @as(?u32, dwrite.WORD_WRAPPING_WRAP) },
@@ -466,7 +581,7 @@ pub const Fonts = struct {
     }
 
     fn deinit(self: *Fonts) void {
-        inline for (.{ "body", "body_strong", "title", "section", "hint", "mono", "heading", "prose", "mono_prose", "button", "button_strong" }) |name| com.release(@field(self, name));
+        inline for (.{ "body", "body_strong", "title", "section", "hint", "tip", "mono", "heading", "prose", "mono_prose", "button", "button_strong" }) |name| com.release(@field(self, name));
         com.release(self.factory);
         self.* = undefined;
     }

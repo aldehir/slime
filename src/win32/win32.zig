@@ -303,6 +303,7 @@ pub const MK_XBUTTON2 = 0x0040;
 pub const XBUTTON1 = 0x0001;
 pub const WHEEL_DELTA = 120;
 pub const WHEEL_PAGESCROLL: u32 = 0xFFFFFFFF;
+pub const SPI_GETMOUSEHOVERTIME = 0x0066;
 pub const SPI_GETWHEELSCROLLLINES = 0x0068;
 
 // KEY_EVENT_RECORD.dwControlKeyState

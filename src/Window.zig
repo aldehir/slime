@@ -61,6 +61,14 @@ const blink_timer_id = 4;
 /// Steps a login dialog's spinner while it waits.
 const spinner_timer_id = 5;
 const spinner_ms = 100;
+/// Shows a tooltip once the mouse rests on a button.
+const tip_timer_id = 6;
+/// How long after a tooltip hides the next shows without waiting.
+const tip_warm_ms = 1000;
+
+/// The keys tooltips name.
+const new_session_key = binding.label(&binding.defaults, .new_tab);
+const close_session_key = binding.label(&binding.defaults, .close_surface);
 
 /// How long a frame waits for a cursor that output just hid to come
 /// back. See `updateHold`.
@@ -135,6 +143,9 @@ blink_visible: bool = true,
 /// The host being typed after "Connect" was clicked. Takes the keyboard
 /// while set.
 connect_field: ?Chrome.TextField = null,
+
+/// Until when the next tooltip shows at once. See `tip_warm_ms`.
+tip_warm_until: u64 = 0,
 
 /// The spinner's timer is running, and its step.
 spinning: bool = false,
@@ -610,6 +621,7 @@ fn setFocus(self: *Window, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
     self.dirty = true;
+    if (!focused) self.hideTip();
     if (focused) {
         self.resetBlink();
     } else {
@@ -881,6 +893,8 @@ fn view(self: *Window) Chrome.View {
         .maximized = win32.IsZoomed(self.hwnd.?) != 0,
         .terminal_bg = Painter.rgb(@as(u24, bg.r) << 16 | @as(u24, bg.g) << 8 | bg.b),
         .stats = self.stats_text[0..self.stats_len],
+        .new_session_key = new_session_key.slice(),
+        .close_session_key = close_session_key.slice(),
     };
 }
 
@@ -896,8 +910,28 @@ fn toTerminal(self: *const Window, pos: win32.POINT) win32.POINT {
     return .{ .x = pos.x - @as(i32, @intFromFloat(t.x)), .y = pos.y - @as(i32, @intFromFloat(t.y)) };
 }
 
+/// Track what the mouse is over, and time the tooltip of a button it
+/// moves onto.
 fn setHover(self: *Window, hit: Chrome.Hit) void {
-    if (self.chrome.setHover(hit)) self.dirty = true;
+    const had_tip = self.chrome.tip != .none;
+    if (!self.chrome.setHover(hit)) return;
+    self.dirty = true;
+    _ = win32.KillTimer(self.hwnd, tip_timer_id);
+    const now = win32.GetTickCount64();
+    if (had_tip) self.tip_warm_until = now + tip_warm_ms;
+    if (!Chrome.hasTip(self.chrome.hover)) return;
+    if (now < self.tip_warm_until) {
+        _ = self.chrome.showTip();
+        return;
+    }
+    var ms: u32 = 400;
+    _ = win32.SystemParametersInfoW(win32.SPI_GETMOUSEHOVERTIME, 0, &ms, 0);
+    _ = win32.SetTimer(self.hwnd, tip_timer_id, ms, null);
+}
+
+fn hideTip(self: *Window) void {
+    _ = win32.KillTimer(self.hwnd, tip_timer_id);
+    if (self.chrome.hideTip()) self.dirty = true;
 }
 
 fn setPressed(self: *Window, hit: Chrome.Hit) void {
@@ -931,6 +965,7 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
 
     const hit = self.hitAt(pos);
     self.setHover(hit);
+    if (press) self.hideTip();
     // Clicking anywhere else closes the host field.
     if (press and hit != .connect) self.cancelConnect();
     if (hit == .terminal) {
@@ -1355,6 +1390,10 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                     self.spinner_step +%= 1;
                     self.dirty = true;
                 },
+                tip_timer_id => {
+                    _ = win32.KillTimer(hwnd, tip_timer_id);
+                    if (self.chrome.showTip()) self.dirty = true;
+                },
                 sizemove_timer_id => {
                     if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.outputArrived();
                     if (self.dirty) self.render();
@@ -1409,6 +1448,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_KEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP => {
+            if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.hideTip();
             if (self.connect_field != null or self.activeLogin() != null) {
                 if (msg == win32.WM_KEYDOWN and (self.connectKey(@truncate(wparam)) or self.loginKey(@truncate(wparam)))) return 0;
                 if (self.keyBinding(msg, wparam)) return 0;

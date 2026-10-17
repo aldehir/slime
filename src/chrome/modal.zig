@@ -167,13 +167,7 @@ pub fn paint(c: *const Chrome, p: *Painter, area: Rect, d: *const Dialog, opts: 
     const l = layout(c, area, d);
     const r = l.box;
 
-    // A soft shadow all around: rings fading out.
-    var i: f32 = 4;
-    while (i > 0) : (i -= 1) {
-        const spread = c.px(i * 1.5);
-        const ring: Rect = .{ .x = r.x - spread, .y = r.y - spread, .w = r.w + 2 * spread, .h = r.h + 2 * spread };
-        p.fillRounded(ring, c.px(radius) + spread, .{ 0, 0, 0, 0.06 });
-    }
+    c.paintShadow(p, r, c.px(radius), 4, 1.5);
     const edge = if (d.danger) mixColor(t.dialog_outline, t.danger, 0.35) else t.dialog_outline;
     c.fillBordered(p, r, c.px(radius), t.dialog, edge);
 

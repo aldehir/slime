@@ -59,6 +59,24 @@ pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.Vi
     return .none;
 }
 
+/// Where a header's or row's button is, if it's in view.
+pub fn buttonRect(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.View, hit: Hit) ?Rect {
+    const rows = rowsArea(c, l);
+    var walk: Walk = .init(c, l, view);
+    while (walk.next()) |item| {
+        if (item.rect.bottom() > rows.bottom()) break;
+        switch (item.part) {
+            .header => |g| switch (hit) {
+                .new_session => |h| if (h == g) return rowButton(c, item.rect),
+                .forget_host => |h| if (h == g) return forgetButton(c, item.rect),
+                else => {},
+            },
+            .row => |i| if (hit == .close_session and hit.close_session == i) return rowButton(c, item.rect),
+        }
+    }
+    return null;
+}
+
 pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *const Chrome.View) void {
     p.fill(l.list, c.theme.ground);
     c.paintTitle(p, l, view);
