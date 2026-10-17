@@ -1,5 +1,6 @@
-//! Sessions in a sidebar under the title bar, grouped by where they run.
-//! Only local sessions exist so far, so there's one group.
+//! Sessions in a sidebar under the title bar, grouped by where they run:
+//! Local, then each SSH connection. A group's header has a button that
+//! opens another session there.
 
 const std = @import("std");
 const Chrome = @import("Chrome.zig");
@@ -13,16 +14,14 @@ const L = std.unicode.utf8ToUtf16LeStringLiteral;
 pub const titlebar_height = 36;
 const width = 240;
 const pad_x = 12;
-const pad_top = 8;
-const button_height = 32;
+const pad_top = 4;
 const section_gap = 10;
 const header_height = 28;
 const row_height = 30;
 const row_gap = 4;
-const close_size = 20;
+/// Rows' close buttons and headers' new session buttons, in one column.
+const button_size = 20;
 const corner = 10;
-
-const new_session_hint = L("Ctrl+Shift+T");
 
 pub fn layout(c: *const Chrome, l: *Chrome.Layout) void {
     const top = l.titlebar.bottom();
@@ -35,13 +34,15 @@ pub fn layout(c: *const Chrome, l: *Chrome.Layout) void {
 
 pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.View, x: f32, y: f32) ?Hit {
     if (!l.list.contains(x, y)) return null;
-    const p: Parts = .init(c, l);
-    if (p.new_session.contains(x, y)) return .new_session;
-    for (0..view.sessions.len) |i| {
-        const r = p.row(i);
-        if (r.y >= l.list.bottom()) break;
-        if (!r.contains(x, y)) continue;
-        return if (closeButton(c, r).contains(x, y)) .{ .close_session = i } else .{ .session = i };
+    var walk: Walk = .init(c, l, view);
+    while (walk.next()) |item| {
+        if (item.rect.y >= l.list.bottom()) break;
+        if (!item.rect.contains(x, y)) continue;
+        const on_button = rowButton(c, item.rect).contains(x, y);
+        return switch (item.part) {
+            .header => |g| if (on_button) .{ .new_session = g } else .none,
+            .row => |i| if (on_button) .{ .close_session = i } else .{ .session = i },
+        };
     }
     return .none;
 }
@@ -52,13 +53,13 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
     p.pushClip(l.list);
     defer p.popClip();
 
-    const parts: Parts = .init(c, l);
-    paintNewSession(c, p, parts.new_session);
-    p.text(L("LOCAL"), c.fonts.section, parts.header.inset(c.px(2), 0), c.theme.text_muted);
-    for (view.sessions, 0..) |session, i| {
-        const r = parts.row(i);
-        if (r.y >= l.list.bottom()) break;
-        paintRow(c, p, r, i, session, i == view.active);
+    var walk: Walk = .init(c, l, view);
+    while (walk.next()) |item| {
+        if (item.rect.y >= l.list.bottom()) break;
+        switch (item.part) {
+            .header => |g| paintHeader(c, p, item.rect, g, view.groups[g]),
+            .row => |i| paintRow(c, p, item.rect, i, view.sessions[i], i == view.active),
+        }
     }
     paintStats(c, p, l, view.stats);
 }
@@ -79,30 +80,33 @@ fn paintStats(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, stats: []c
     while (it.next()) |line| : (r.y += line_h) p.text(line, c.fonts.mono, r, c.theme.text_muted);
 }
 
-fn paintNewSession(c: *const Chrome, p: *Painter, r: Rect) void {
-    const bg = switch (c.buttonState(.new_session)) {
-        .rest => c.theme.surface,
-        .hover, .pressed => c.theme.surface_hover,
-    };
-    p.fillRounded(r, c.px(6), bg);
-    // Lucide's plus spans 14 of its 24 units: 12 DIPs wide in this box,
-    // whose odd size centers the lines on pixels.
-    const icon = c.px(21);
-    c.drawIcon(p, .plus, .{ .x = r.x + c.px(6), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, c.theme.text);
+fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.View.Group) void {
+    const button = rowButton(c, r);
+    const hit: Hit = .{ .new_session = g };
+    const hovered = c.hover.eql(hit);
+    if (hovered) p.fillRounded(button, c.px(4), switch (c.buttonState(hit)) {
+        .pressed => c.theme.button_pressed,
+        else => c.theme.button_hover,
+    });
+    // Lucide's plus spans 14 of its 24 units: 10 DIPs in this box, whose
+    // odd size centers the lines on pixels.
+    const icon = c.px(17);
+    c.drawIcon(p, .plus, button.center(icon, icon), if (hovered) c.theme.text_strong else c.theme.text_muted);
 
-    // The key hint, in an outlined chip at the right.
-    const hint_w = @ceil(c.fonts.measure(new_session_hint, c.fonts.hint)) + c.px(10);
-    const hint: Rect = .{
-        .x = r.right() - c.px(8) - hint_w,
-        .y = r.y + @round((r.h - c.px(18)) / 2),
-        .w = hint_w,
-        .h = c.px(18),
-    };
-    p.strokeRounded(hint, c.px(4), c.stroke(), c.theme.outline);
-    p.text(new_session_hint, c.fonts.hint, hint, c.theme.text_muted);
+    const label_x = r.x + c.px(2);
+    const label: Rect = .{ .x = label_x, .y = r.y, .w = @max(0, button.x - c.px(4) - label_x), .h = r.h };
+    var buf: [256]u16 = undefined;
+    p.text(upper(&buf, group.label), c.fonts.section, label, c.theme.text_muted);
+}
 
-    const label_x = r.x + c.px(30);
-    p.text(L("New session"), c.fonts.body, .{ .x = label_x, .y = r.y, .w = hint.x - c.px(8) - label_x, .h = r.h }, c.theme.text);
+/// `text` in capitals, as section headers are, cut to fit `buf`. Only
+/// ASCII letters change: labels are host names.
+fn upper(buf: []u16, text: []const u16) []const u16 {
+    const n = @min(buf.len, text.len);
+    for (buf[0..n], text[0..n]) |*out, unit| {
+        out.* = if (unit >= 'a' and unit <= 'z') unit - ('a' - 'A') else unit;
+    }
+    return buf[0..n];
 }
 
 fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.View.Session, active: bool) void {
@@ -119,7 +123,7 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.Vi
     const icon_color = if (active) c.theme.text else c.theme.text_muted;
     c.drawIcon(p, .terminal, .{ .x = r.x + c.px(10), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, icon_color);
 
-    const close = closeButton(c, r);
+    const close = rowButton(c, r);
     const text_x = r.x + c.px(34);
     const text_right = if (hovered or active or session.activity) close.x - c.px(4) else r.right() - c.px(8);
     const text_rect: Rect = .{ .x = text_x, .y = r.y, .w = @max(0, text_right - text_x), .h = r.h };
@@ -142,8 +146,9 @@ fn paintRow(c: *const Chrome, p: *Painter, r: Rect, i: usize, session: Chrome.Vi
     }
 }
 
-fn closeButton(c: *const Chrome, row: Rect) Rect {
-    const size = c.px(close_size);
+/// The button at the right of a row or header.
+fn rowButton(c: *const Chrome, row: Rect) Rect {
+    const size = c.px(button_size);
     return .{
         .x = row.right() - c.px(5) - size,
         .y = row.y + @round((row.h - size) / 2),
@@ -152,39 +157,70 @@ fn closeButton(c: *const Chrome, row: Rect) Rect {
     };
 }
 
-/// Where the list's parts go.
-const Parts = struct {
-    new_session: Rect,
-    header: Rect,
-    /// From one row's top to the next's.
-    row_step: f32,
+/// The list's parts from the top: each group's header, then its rows.
+const Walk = struct {
+    groups: []const Chrome.View.Group,
+    x: f32,
+    w: f32,
+    /// The top of the next part.
+    y: f32,
+    header_h: f32,
     row_h: f32,
+    row_gap: f32,
+    section_gap: f32,
+    group: usize = 0,
+    /// Parts given out of the current group, its header first.
+    in_group: usize = 0,
+    session: usize = 0,
 
-    fn init(c: *const Chrome, l: *const Chrome.Layout) Parts {
-        const x = l.list.x + c.px(pad_x);
-        const w = @max(0, l.list.w - 2 * c.px(pad_x));
-        const new_session: Rect = .{ .x = x, .y = l.list.y + c.px(pad_top), .w = w, .h = c.px(button_height) };
+    const Item = struct {
+        part: union(enum) { header: usize, row: usize },
+        rect: Rect,
+    };
+
+    fn init(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.View) Walk {
         return .{
-            .new_session = new_session,
-            .header = .{ .x = x, .y = new_session.bottom() + c.px(section_gap), .w = w, .h = c.px(header_height) },
-            .row_step = c.px(row_height) + c.px(row_gap),
+            .groups = view.groups,
+            .x = l.list.x + c.px(pad_x),
+            .w = @max(0, l.list.w - 2 * c.px(pad_x)),
+            .y = l.list.y + c.px(pad_top),
+            .header_h = c.px(header_height),
             .row_h = c.px(row_height),
+            .row_gap = c.px(row_gap),
+            .section_gap = c.px(section_gap),
         };
     }
 
-    fn row(self: Parts, i: usize) Rect {
-        return .{
-            .x = self.header.x,
-            .y = self.header.bottom() + @as(f32, @floatFromInt(i)) * self.row_step,
-            .w = self.header.w,
-            .h = self.row_h,
-        };
+    fn next(self: *Walk) ?Item {
+        while (self.group < self.groups.len) {
+            if (self.in_group == 0) {
+                self.in_group = 1;
+                return .{ .part = .{ .header = self.group }, .rect = self.take(self.header_h, 0) };
+            }
+            if (self.in_group <= self.groups[self.group].sessions) {
+                self.in_group += 1;
+                self.session += 1;
+                return .{ .part = .{ .row = self.session - 1 }, .rect = self.take(self.row_h, self.row_gap) };
+            }
+            self.group += 1;
+            self.in_group = 0;
+            self.y += self.section_gap;
+        }
+        return null;
+    }
+
+    /// The next `h` of the list, with `gap` after it.
+    fn take(self: *Walk, h: f32, gap: f32) Rect {
+        const r: Rect = .{ .x = self.x, .y = self.y, .w = self.w, .h = h };
+        self.y += h + gap;
+        return r;
     }
 };
 
-test "rows and their close buttons" {
+test "groups, rows, and their buttons" {
     const c: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: Chrome.View = .{
+        .groups = &.{ .{ .label = &.{}, .sessions = 0 }, .{ .label = &.{}, .sessions = 2 } },
         .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = false } },
         .active = 0,
         .focused = true,
@@ -192,12 +228,22 @@ test "rows and their close buttons" {
         .terminal_bg = .{ 0, 0, 0, 1 },
     };
     const l = c.layout(1000, 600);
-    const parts: Parts = .init(&c, &l);
-    const second = parts.row(1);
+    var walk: Walk = .init(&c, &l, &view);
+    const local = walk.next().?;
+    try std.testing.expectEqual(@as(usize, 0), local.part.header);
+    const remote = walk.next().?;
+    try std.testing.expectEqual(@as(usize, 1), remote.part.header);
+    try std.testing.expect(remote.rect.y > local.rect.bottom());
+    _ = walk.next().?;
+    const second = walk.next().?.rect;
+    try std.testing.expect(walk.next() == null);
+
     try std.testing.expectEqual(Hit{ .session = 1 }, c.hitTest(&l, &view, second.x + 2, second.y + 2));
-    const close = closeButton(&c, second);
+    const close = rowButton(&c, second);
     try std.testing.expectEqual(Hit{ .close_session = 1 }, c.hitTest(&l, &view, close.x + 1, close.y + 1));
-    try std.testing.expectEqual(Hit.new_session, c.hitTest(&l, &view, parts.new_session.x + 1, parts.new_session.y + 1));
+    const plus = rowButton(&c, remote.rect);
+    try std.testing.expectEqual(Hit{ .new_session = 1 }, c.hitTest(&l, &view, plus.x + 1, plus.y + 1));
+    try std.testing.expectEqual(Hit.none, c.hitTest(&l, &view, remote.rect.x + 2, remote.rect.y + 2));
     // Below the last row.
     try std.testing.expectEqual(Hit.none, c.hitTest(&l, &view, second.x + 2, second.bottom() + 5));
 }

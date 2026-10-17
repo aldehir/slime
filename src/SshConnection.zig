@@ -36,6 +36,8 @@ const MsgType = enum(u8) {
 };
 
 alloc: Allocator,
+/// What the helper was given, like `ssh://user@host`. Owned.
+destination: []const u16,
 process: win32.HANDLE,
 job: win32.HANDLE,
 /// Our ends of the helper's stdin and stdout.
@@ -136,8 +138,8 @@ pub const Ending = struct {
 
 /// Run the helper, which connects to `destination` (`ssh://...`, or
 /// whatever slime-ssh takes) once the first channel opens.
-pub fn spawn(alloc: Allocator, destination: []const u8) !*SshConnection {
-    if (std.mem.indexOfAny(u8, destination, "\" \t") != null) return error.BadDestination;
+pub fn spawn(alloc: Allocator, destination: []const u16) !*SshConnection {
+    if (std.mem.indexOfAny(u16, destination, std.unicode.utf8ToUtf16LeStringLiteral("\" \t")) != null) return error.BadDestination;
 
     var exe_buf: [max_path]u16 = undefined;
     const exe = try helperPath(&exe_buf);
@@ -146,8 +148,7 @@ pub fn spawn(alloc: Allocator, destination: []const u8) !*SshConnection {
     try cmd.append(alloc, '"');
     try cmd.appendSlice(alloc, exe);
     try cmd.appendSlice(alloc, std.unicode.utf8ToUtf16LeStringLiteral("\" "));
-    try cmd.ensureUnusedCapacity(alloc, destination.len + 1);
-    cmd.items.len += try std.unicode.utf8ToUtf16Le(cmd.unusedCapacitySlice(), destination);
+    try cmd.appendSlice(alloc, destination);
     try cmd.append(alloc, 0);
 
     // The helper's ends of its stdio are inherited; ours aren't.
@@ -240,8 +241,11 @@ pub fn spawn(alloc: Allocator, destination: []const u8) !*SshConnection {
 
     const self = try alloc.create(SshConnection);
     errdefer alloc.destroy(self);
+    const owned_destination = try alloc.dupe(u16, destination);
+    errdefer alloc.free(owned_destination);
     self.* = .{
         .alloc = alloc,
+        .destination = owned_destination,
         .process = pi.hProcess,
         .job = job,
         .control_in = stdin_write,
@@ -251,7 +255,7 @@ pub fn spawn(alloc: Allocator, destination: []const u8) !*SshConnection {
     hello.putU32(protocol_version);
     try self.send(.hello, 0, hello.bytes());
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
-    log.info("started slime-ssh for {s}", .{destination});
+    log.info("started slime-ssh for {f}", .{std.unicode.fmtUtf16Le(destination)});
     return self;
 }
 
@@ -263,6 +267,12 @@ fn helperPath(buf: *[max_path]u16) ![]const u16 {
     if (dir_end + helper_name.len > buf.len) return error.NameTooLong;
     @memcpy(buf[dir_end..][0..helper_name.len], helper_name);
     return buf[0 .. dir_end + helper_name.len];
+}
+
+/// The destination without its `ssh://`, for showing.
+pub fn label(self: *const SshConnection) []const u16 {
+    const scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
+    return if (std.mem.startsWith(u16, self.destination, scheme)) self.destination[scheme.len..] else self.destination;
 }
 
 /// The helper is running, so channels opened on it can work.
@@ -369,6 +379,7 @@ pub fn shutdownIfUnused(self: *SshConnection) void {
     _ = win32.CloseHandle(self.control_out);
     _ = win32.CloseHandle(self.process);
     self.channels.deinit(self.alloc);
+    self.alloc.free(self.destination);
     self.alloc.destroy(self);
 }
 

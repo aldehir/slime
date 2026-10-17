@@ -50,7 +50,8 @@ pub const Hit = union(enum) {
     maximize,
     close,
     toggle_mode,
-    new_session,
+    /// The button that opens a session in group `i`.
+    new_session: usize,
     session: usize,
     close_session: usize,
     terminal,
@@ -62,6 +63,9 @@ pub const Hit = union(enum) {
 
 /// The window's state, as the chrome shows it.
 pub const View = struct {
+    /// Where sessions run, in the order listed. Their sessions come one
+    /// group after another.
+    groups: []const Group,
     sessions: []const Session,
     active: usize,
     /// The window has keyboard focus.
@@ -72,6 +76,12 @@ pub const View = struct {
 
     /// Frame stats, when built with `-Dstats`. Lines end with LF.
     stats: []const u16 = &.{},
+
+    pub const Group = struct {
+        label: []const u16,
+        /// How many of `sessions` are in it.
+        sessions: usize,
+    };
 
     pub const Session = struct {
         title: []const u16,
@@ -400,6 +410,7 @@ pub const Fonts = struct {
 test "layout and hit testing" {
     var chrome: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: View = .{
+        .groups = &.{.{ .label = &.{}, .sessions = 2 }},
         .sessions = &.{ .{ .title = &.{}, .activity = false }, .{ .title = &.{}, .activity = true } },
         .active = 0,
         .focused = true,

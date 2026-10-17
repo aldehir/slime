@@ -67,8 +67,9 @@ alloc: Allocator,
 io: std.Io,
 /// Outlives the window.
 config: *const Config,
-/// What new sessions run, in CreateProcessW syntax. Outlives the window.
-command_line: []const u16,
+/// What local sessions run, in CreateProcessW syntax. Outlives the
+/// window.
+local_command: []const u16,
 hwnd: ?win32.HWND = null,
 /// The last stats report, which the chrome shows.
 stats_text: [max_stats_len]u16 = undefined,
@@ -86,12 +87,15 @@ chrome_layout: Chrome.Layout = undefined,
 renderer: ?Renderer = null,
 
 /// Never empty once created: closing the last session closes the window.
+/// Grouped as the sidebar shows them: local sessions first, then each
+/// connection's together.
 sessions: std.ArrayList(*Session) = .empty,
 /// The session shown and given input.
 active: usize = 0,
 next_session_id: u32 = 1,
-/// Scratch for `view`, with room for every session.
+/// Scratch for `view`, with room for every session and group.
 view_sessions: std.ArrayList(Chrome.View.Session) = .empty,
+view_groups: std.ArrayList(Chrome.View.Group) = .empty,
 
 /// Auto-reset event every session's reader thread sets after feeding
 /// output to its terminal. The message loop waits on it alongside
@@ -147,8 +151,9 @@ const Hold = enum {
 };
 
 /// Create the window with one session running `command_line`
-/// (CreateProcessW syntax).
-pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line: []const u16) !*Window {
+/// (CreateProcessW syntax, or an `ssh://` URL). Local sessions opened
+/// later run `local_command`.
+pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line: []const u16, local_command: []const u16) !*Window {
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
 
@@ -169,7 +174,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line:
         .alloc = alloc,
         .io = io,
         .config = config,
-        .command_line = command_line,
+        .local_command = local_command,
         .output_event = output_event,
         .hold_timer = hold_timer,
         .grid = undefined,
@@ -215,7 +220,12 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, command_line:
         self.renderer = null;
     }
 
-    try self.spawnSession();
+    const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
+    if (std.mem.startsWith(u16, command_line, ssh_scheme)) {
+        try self.spawnSession(.{ .destination = command_line });
+    } else {
+        try self.spawnSession(.{ .command = command_line });
+    }
     errdefer self.destroySessions();
     self.showTitle();
 
@@ -242,6 +252,7 @@ pub fn destroy(self: *Window) void {
         self.grid.deinit();
     }
     self.view_sessions.deinit(self.alloc);
+    self.view_groups.deinit(self.alloc);
     _ = win32.CloseHandle(self.output_event);
     _ = win32.CloseHandle(self.hold_timer);
     self.alloc.destroy(self);
@@ -263,49 +274,102 @@ fn sessionIndex(self: *const Window, id: u32) ?usize {
     return null;
 }
 
-/// Start a session and show it. One opened from an SSH session joins its
-/// connection, in the directory the shell last reported (OSC 7), without
-/// logging in again. Otherwise it runs the window's command, which may
-/// be an `ssh://` URL for a new connection.
-fn spawnSession(self: *Window) !void {
+/// Where a new session runs.
+const Target = union(enum) {
+    /// A command line on this machine, CreateProcessW syntax.
+    command: []const u16,
+    /// A shell on a connection, or on a new one to the same place if
+    /// it's gone.
+    connection: *SshConnection,
+    /// A shell on a new connection to an `ssh://` URL.
+    destination: []const u16,
+};
+
+/// Start a session on `target`, at the end of its group, and show it.
+/// One that joins a connection doesn't log in again, and starts in the
+/// directory the active session's shell last reported (OSC 7) if that's
+/// on the same connection.
+fn spawnSession(self: *Window, target: Target) !void {
     try self.sessions.ensureUnusedCapacity(self.alloc, 1);
     try self.view_sessions.ensureTotalCapacity(self.alloc, self.sessions.items.len + 1);
+    // At worst every session has a group of its own, besides Local.
+    try self.view_groups.ensureTotalCapacity(self.alloc, self.sessions.items.len + 2);
     const grid_size = self.gridSize();
     // Channel IDs are session IDs, and the helper takes 0 to mean the
     // connection.
     if (self.next_session_id == 0) self.next_session_id = 1;
 
-    var cwd_buf: [4096]u8 = undefined;
     var new_conn: ?*SshConnection = null;
-    const launch: Session.Launch = launch: {
-        if (self.sessions.items.len > 0) {
-            const active = self.activeSession();
-            if (active.sshConnection()) |conn| if (conn.isAlive()) break :launch .{ .ssh = .{
-                .conn = conn,
-                .title = active.default_title,
-                .cwd = active.pwd(&cwd_buf),
-            } };
-        }
-        const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
-        if (std.mem.startsWith(u16, self.command_line, ssh_scheme)) {
-            const dest = try std.unicode.utf16LeToUtf8Alloc(self.alloc, self.command_line);
-            defer self.alloc.free(dest);
-            new_conn = try SshConnection.spawn(self.alloc, dest);
-            break :launch .{ .ssh = .{ .conn = new_conn.?, .title = self.command_line[ssh_scheme.len..] } };
-        }
-        break :launch .{ .command = self.command_line };
+    const conn: ?*SshConnection = switch (target) {
+        .command => null,
+        .connection => |c| if (c.isAlive()) c else conn: {
+            new_conn = try SshConnection.spawn(self.alloc, c.destination);
+            break :conn new_conn;
+        },
+        .destination => |d| conn: {
+            new_conn = try SshConnection.spawn(self.alloc, d);
+            break :conn new_conn;
+        },
     };
+    var cwd_buf: [4096]u8 = undefined;
+    const launch: Session.Launch = if (conn) |c| .{ .ssh = .{
+        .conn = c,
+        .title = c.label(),
+        .cwd = if (self.sessions.items.len > 0 and self.activeSession().sshConnection() == c)
+            self.activeSession().pwd(&cwd_buf)
+        else
+            null,
+    } } else .{ .command = target.command };
     const s = Session.create(self, self.next_session_id, launch, grid_size.cols, grid_size.rows) catch |err| {
-        if (new_conn) |conn| conn.shutdownIfUnused();
+        if (new_conn) |c| c.shutdownIfUnused();
         return err;
     };
     self.next_session_id +%= 1;
-    self.sessions.appendAssumeCapacity(s);
-    if (self.sessions.items.len > 1) self.activate(self.sessions.items.len - 1);
+
+    const at = self.groupEnd(conn);
+    self.sessions.insertAssumeCapacity(at, s);
+    if (self.sessions.items.len == 1) return;
+    // The rows from `at` on moved down.
+    if (at <= self.active) self.active += 1;
+    _ = self.chrome.setHover(.none);
+    self.middle_pressed = null;
+    self.activate(at);
 }
 
+/// Where a session on `conn` (null for local) joins its group: after
+/// the group's last, else where a new group goes, local ones first.
+fn groupEnd(self: *const Window, conn: ?*SshConnection) usize {
+    var i = self.sessions.items.len;
+    while (i > 0) : (i -= 1) {
+        if (self.sessions.items[i - 1].sshConnection() == conn) return i;
+    }
+    return if (conn == null) 0 else self.sessions.items.len;
+}
+
+/// The connection behind the sidebar's group `g`, grouped as `view`
+/// does: null for Local, which is group 0.
+fn groupConnection(self: *const Window, g: usize) ?*SshConnection {
+    var group: usize = 0;
+    var conn: ?*SshConnection = null;
+    for (self.sessions.items) |s| {
+        const c = s.sshConnection();
+        if (c == conn) continue;
+        conn = c;
+        group += 1;
+        if (group == g) return c;
+    }
+    return null;
+}
+
+/// A session in the active session's group.
 fn newSession(self: *Window) void {
-    self.spawnSession() catch |err| log.err("new session failed: {}", .{err});
+    self.newSessionOn(self.activeSession().sshConnection());
+}
+
+/// A session on `conn`, or a local one.
+fn newSessionOn(self: *Window, conn: ?*SshConnection) void {
+    const target: Target = if (conn) |c| .{ .connection = c } else .{ .command = self.local_command };
+    self.spawnSession(target) catch |err| log.err("new session failed: {}", .{err});
 }
 
 /// Close session `i`, killing what runs in it. Closing the last one
@@ -545,13 +609,24 @@ fn blinkTick(self: *Window) void {
 
 /// The chrome's view of the window's state.
 fn view(self: *Window) Chrome.View {
-    // `spawnSession` keeps room for every session.
+    // `spawnSession` keeps room for every session and group.
     self.view_sessions.clearRetainingCapacity();
+    self.view_groups.clearRetainingCapacity();
+    // Local is always listed, for its button. Sessions are kept grouped.
+    self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .sessions = 0 });
+    var conn: ?*SshConnection = null;
     for (self.sessions.items) |s| {
+        const c = s.sshConnection();
+        if (c != conn) {
+            conn = c;
+            self.view_groups.appendAssumeCapacity(.{ .label = c.?.label(), .sessions = 0 });
+        }
+        self.view_groups.items[self.view_groups.items.len - 1].sessions += 1;
         self.view_sessions.appendAssumeCapacity(.{ .title = s.title(), .activity = s.activity });
     }
     const bg = self.activeSession().cells.default_bg;
     return .{
+        .groups = self.view_groups.items,
         .sessions = self.view_sessions.items,
         .active = self.active,
         .focused = self.focused,
@@ -654,7 +729,7 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             self.chrome.toggleMode();
             self.layout();
         },
-        .new_session => self.newSession(),
+        .new_session => |g| self.newSessionOn(self.groupConnection(g)),
         .close_session => |i| self.closeSession(i),
         else => {},
     }

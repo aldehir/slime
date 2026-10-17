@@ -23,8 +23,14 @@ pub fn main(init: std.process.Init) !void {
 
     const command_line = try shellCommand(init.gpa, config.command);
     defer init.gpa.free(command_line);
+    // What the sidebar's "Local" runs when the command is an ssh:// URL.
+    const local_command = if (isSshUrl(command_line))
+        try localShell(init.gpa, config.command)
+    else
+        try init.gpa.dupeZ(u16, command_line);
+    defer init.gpa.free(local_command);
 
-    const window = try Window.create(init.gpa, init.io, &config, command_line);
+    const window = try Window.create(init.gpa, init.io, &config, command_line, local_command);
     defer window.destroy();
 
     // Handle every pending message (input first) before drawing, so a
@@ -113,7 +119,26 @@ fn shellCommand(alloc: std.mem.Allocator, configured: ?[]const u8) ![:0]u16 {
             else => std.log.warn("command isn't valid UTF-8", .{}),
         }
     }
+    return comspec(alloc);
+}
 
+/// A shell on this machine: the configured `command` unless it's an
+/// ssh:// URL, else %COMSPEC%.
+fn localShell(alloc: std.mem.Allocator, configured: ?[]const u8) ![:0]u16 {
+    if (configured) |command| if (!std.mem.startsWith(u8, command, "ssh://")) {
+        if (std.unicode.utf8ToUtf16LeAllocZ(alloc, command)) |cmd| return cmd else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        }
+    };
+    return comspec(alloc);
+}
+
+fn isSshUrl(command_line: []const u16) bool {
+    return std.mem.startsWith(u16, command_line, std.unicode.utf8ToUtf16LeStringLiteral("ssh://"));
+}
+
+fn comspec(alloc: std.mem.Allocator) ![:0]u16 {
     var buf: [260]u16 = undefined;
     const n = win32.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("COMSPEC"), &buf, buf.len);
     if (n > 0 and n < buf.len) return alloc.dupeZ(u16, buf[0..n]);

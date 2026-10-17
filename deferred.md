@@ -104,11 +104,24 @@ Images placed at the cursor are drawn, in kitty's three z layers.
 through `slime-ssh.exe` (ssh/), one connection shared by every session
 opened from one of its sessions.
 
-- **A way to pick a host** other than the command: a connection list or
-  palette in the chrome, and a binding for a local session while an SSH
-  one is active.
-- **The sidebar groups SSH sessions under "Local".** They could group by
-  connection.
+The sidebar groups sessions by connection, under a header per host whose
+`+` opens another channel (or reconnects, if the connection is gone).
+
+- **A way to pick a host** other than the command: a "Connect" button
+  at the bottom of the sidebar that turns into a host field (with recent
+  hosts), adding a group. Needs a text box widget.
+- **Prompts in a dialog.** Fill in `TypePrompt` as a list of questions
+  (label, echo) plus kind, title and instruction, answered or cancelled,
+  covering passwords, passphrases, keyboard-interactive, and host keys.
+  Shown as a modal over the pending session's terminal area, not the
+  whole window. They're text in the session for now.
+- **Connection state in its header**: connecting, and disconnected with
+  a reconnect button. A dead connection's group looks like a live one,
+  and its `+` makes a new group to the same host.
+- **Group labels** that tell apart two connections to one host, by
+  user or port.
+- **The new session key hint** went with the "New session" button.
+  Ctrl+Shift+T opens one in the active session's group.
 - **`~/.ssh/config`**: `Host` aliases, `User`, `Port`, `IdentityFile`,
   `ProxyJump`, `ServerAliveInterval`. The helper takes only what's in
   the URL, plus its own flags.
@@ -117,8 +130,6 @@ opened from one of its sessions.
 - **Pixel sizes in `pty-req` and `window-change`.** Only cells are sent;
   mode 2048 reports still carry pixels in-band.
 - **Ghostty's terminfo on the remote.** `TERM` is `xterm-256color`.
-- **Structured prompts** (host keys, passwords, Duo) in the chrome. They
-  are text in the session for now; the protocol reserves a message.
 - **Agent forwarding, port forwarding, SFTP.**
 - **Helper logs in GUI builds** go nowhere: there is no stderr to pass.
 
