@@ -50,6 +50,8 @@ pub fn build(b: *std.Build) void {
     exe_mod.addAnonymousImport("slime-small.svg", .{ .root_source_file = b.path("assets/icon/slime-small.svg") });
     // The chrome's icons, embedded by the module next to them.
     exe_mod.addAnonymousImport("lucide", .{ .root_source_file = b.path("assets/icons/lucide/lucide.zig") });
+    // The frame codec slimed's library shares (src/Screen.zig).
+    exe_mod.addAnonymousImport("frame", .{ .root_source_file = b.path("ssh/internal/vt/frame.zig") });
 
     if (b.lazyDependency("ghostty", .{
         .target = target,
@@ -189,13 +191,15 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
     };
     // slimed links libghostty-vt with cgo (ssh/internal/vt), as a static
     // library for each target from a nested build of the submodule, which
-    // tracks its own sources. scripts/build-vt-lib.ps1 does the same.
+    // tracks its own sources. ssh/internal/vt/slime.zig is compiled in
+    // for slimed's own exports. scripts/build-vt-lib.ps1 does the same.
+    const extra = b.fmt("-Dvt-extra={s}", .{b.path("ssh/internal/vt/slime.zig").getPath(b)});
     const copy = b.addUpdateSourceFiles();
     for ([_]struct { zig: []const u8, go: []const u8, lib: []const u8 }{
         .{ .zig = "x86_64-windows-gnu", .go = "windows_amd64", .lib = "ghostty-vt-static.lib" },
         .{ .zig = "x86_64-linux-musl", .go = "linux_amd64", .lib = "libghostty-vt.a" },
     }) |t| {
-        const lib = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-Demit-lib-vt", b.fmt("-Dtarget={s}", .{t.zig}), "-Doptimize=ReleaseFast", "--prefix" });
+        const lib = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-Demit-lib-vt", b.fmt("-Dtarget={s}", .{t.zig}), "-Doptimize=ReleaseFast", extra, "--prefix" });
         const prefix = lib.addOutputDirectoryArg(b.fmt("vt-{s}", .{t.zig}));
         lib.setCwd(b.path("ghostty"));
         lib.has_side_effects = true;

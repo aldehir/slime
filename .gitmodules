@@ -1,4 +1,4 @@
 [submodule "ghostty"]
 	path = ghostty
 	url = https://github.com/aldehir/ghostty.git
-	branch = vt-unknown-modes
+	branch = slime

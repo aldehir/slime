@@ -175,6 +175,7 @@ test {
     _ = Window;
     _ = Config;
     _ = @import("Hosts.zig");
+    _ = @import("Screen.zig");
     _ = @import("Session.zig");
     _ = @import("Slimed.zig");
     _ = @import("Tab.zig");
