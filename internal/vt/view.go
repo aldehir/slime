@@ -26,7 +26,10 @@ extern SlimeScreen* slime_vt_screen_new(void);
 extern void slime_vt_screen_free(SlimeScreen* s);
 extern bool slime_vt_screen_apply(SlimeScreen* s, const uint8_t* ptr, size_t len);
 extern bool slime_vt_screen_text(const SlimeScreen* s, uint8_t** out_ptr, size_t* out_len);
-extern SlimeView* slime_vt_view_new(void);
+typedef struct SlimeSource SlimeSource;
+extern SlimeSource* slime_vt_source_new(void);
+extern void slime_vt_source_free(SlimeSource* s);
+extern SlimeView* slime_vt_view_new(SlimeSource* source);
 extern void slime_vt_view_free(SlimeView* v, GhosttyTerminal t);
 extern void slime_vt_view_reset(SlimeView* v, GhosttyTerminal t);
 extern uint8_t slime_vt_view_hold(SlimeView* v, GhosttyTerminal t);
@@ -133,6 +136,31 @@ func (s *Screen) Text() (string, error) {
 // scrolls: Session's old timer.
 const AutoscrollInterval = 15 * time.Millisecond
 
+// Source is what one terminal's Views share: the render state their
+// frames are cut from, which marks each row with when it last changed,
+// so every View sees every change (libghostty-vt's render state consumes
+// the terminal's dirty flags and could serve one View alone). One per
+// terminal; it isn't safe for concurrent use, and outlives its Views.
+type Source struct {
+	s *C.SlimeSource
+}
+
+func NewSource() (*Source, error) {
+	s := C.slime_vt_source_new()
+	if s == nil {
+		return nil, errors.New("vt: out of memory")
+	}
+	return &Source{s: s}, nil
+}
+
+// Close frees the Source. Its Views must be closed.
+func (s *Source) Close() {
+	if s.s != nil {
+		C.slime_vt_source_free(s.s)
+		s.s = nil
+	}
+}
+
 // View is one terminal as a client sees and drives it: frames of it to
 // draw (the viewport's rows that changed since the last frame, with the
 // cursor, colors, and selection) and the input state its events act on.
@@ -142,9 +170,9 @@ type View struct {
 	v *C.SlimeView
 }
 
-// NewView returns a View whose first frame is full.
-func NewView() (*View, error) {
-	v := C.slime_vt_view_new()
+// NewView returns a View of src's terminal whose first frame is full.
+func NewView(src *Source) (*View, error) {
+	v := C.slime_vt_view_new(src.s)
 	if v == nil {
 		return nil, errors.New("vt: out of memory")
 	}

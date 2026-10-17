@@ -78,6 +78,7 @@ const (
 	WorkspaceKill   = "workspace.kill"
 	WorkspaceRename = "workspace.rename"
 	WorkspaceResize = "workspace.resize"
+	WorkspaceFocus  = "workspace.focus"
 	WorkspaceInfo   = "workspace.info"
 	TabNew          = "tab.new"
 	TabClose        = "tab.close"
@@ -85,6 +86,7 @@ const (
 	TabLayout       = "tab.layout"
 	TabInfo         = "tab.info"
 	PaneSplit       = "pane.split"
+	PaneMove        = "pane.move"
 	PaneKill        = "pane.kill"
 	PaneWrite       = "pane.write"
 	PaneText        = "pane.text"
@@ -96,21 +98,24 @@ const (
 	HostList        = "host.list"
 )
 
-// Notifications. A workspace's viewer gets its workspace's without
+// Notifications. A workspace's viewers get their workspace's without
 // subscribing; everyone else subscribes to what it wants.
 const (
-	EvWorkspaceCreated   = "workspace.created"
-	EvWorkspaceDestroyed = "workspace.destroyed"
-	EvWorkspaceChanged   = "workspace.changed"
-	EvWorkspaceDetached  = "workspace.detached"
-	EvTabCreated         = "tab.created"
-	EvTabClosed          = "tab.closed"
-	EvTabRenamed         = "tab.renamed"
-	EvPaneCreated        = "pane.created"
-	EvPaneAttached       = "pane.attached"
-	EvPaneExited         = "pane.exited"
-	EvHostChanged        = "host.changed"
-	EvHostPrompt         = "host.prompt"
+	EvWorkspaceCreated      = "workspace.created"
+	EvWorkspaceDestroyed    = "workspace.destroyed"
+	EvWorkspaceChanged      = "workspace.changed"
+	EvWorkspaceDetached     = "workspace.detached"
+	EvWorkspaceViewerJoined = "workspace.viewer_joined"
+	EvWorkspaceViewerLeft   = "workspace.viewer_left"
+	EvTabCreated            = "tab.created"
+	EvTabClosed             = "tab.closed"
+	EvTabRenamed            = "tab.renamed"
+	EvTabSelected           = "tab.selected"
+	EvPaneCreated           = "pane.created"
+	EvPaneAttached          = "pane.attached"
+	EvPaneExited            = "pane.exited"
+	EvHostChanged           = "host.changed"
+	EvHostPrompt            = "host.prompt"
 )
 
 // Size is a terminal's grid and, if known, its cell size in pixels.
@@ -321,18 +326,168 @@ func (n *Node) unmarshal(b []byte, depth int) error {
 }
 
 // Workspace is a workspace's structure: what workspace.new and
-// workspace.attach return, and what workspace.changed carries.
+// workspace.attach return, and what workspace.changed carries. Focus
+// is the daemon's, shared by every viewer: ActiveTab is the tab shown,
+// and each tab has the pane that gets input and the one zoomed.
 type Workspace struct {
-	ID   uint32 `json:"id"`
-	Name string `json:"name"`
-	Tabs []Tab  `json:"tabs"`
+	ID        uint32 `json:"id"`
+	Name      string `json:"name"`
+	ActiveTab uint32 `json:"active_tab,omitempty"`
+	Tabs      []Tab  `json:"tabs"`
 }
 
-// Tab is one tab's layout.
+// Tab is one tab's layout and focus.
 type Tab struct {
 	ID   uint32 `json:"id"`
 	Name string `json:"name,omitempty"` // empty unless renamed
 	Tree *Node  `json:"tree"`
+	// Focus is the pane that gets input; Zoomed the pane filling the
+	// tab, or zero.
+	Focus  uint32 `json:"focus,omitempty"`
+	Zoomed uint32 `json:"zoomed,omitempty"`
+}
+
+// Layout is a tab to build: a tree whose leaves say what to run,
+// which tab.new and workspace.new take. On the wire a leaf is
+// {"pane": {"command": ..., "cwd": ..., "env": {...}}} and a split
+// {"split": {"axis": "row", "children": [{"share": 5000, "node": ...},
+// ...]}}, as Node is. Shares that are all zero divide a split equally.
+type Layout struct {
+	Pane     *PaneSpec
+	Axis     Axis
+	Children []LayoutChild
+}
+
+type LayoutChild struct {
+	Share uint16  `json:"share,omitempty"`
+	Node  *Layout `json:"node"`
+}
+
+// PaneSpec says what a new pane runs: Command (CreateProcessW syntax
+// on Windows; empty for the default shell) in Cwd, with Env added to
+// the daemon's environment.
+type PaneSpec struct {
+	Command string            `json:"command,omitempty"`
+	Cwd     string            `json:"cwd,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+}
+
+func (l *Layout) IsLeaf() bool { return l.Pane != nil }
+
+// Leaves lists the layout's panes in order: left to right, top to
+// bottom.
+func (l *Layout) Leaves() []*PaneSpec {
+	if l == nil {
+		return nil
+	}
+	if l.IsLeaf() {
+		return []*PaneSpec{l.Pane}
+	}
+	var out []*PaneSpec
+	for _, c := range l.Children {
+		out = append(out, c.Node.Leaves()...)
+	}
+	return out
+}
+
+// Validate checks a layout: splits have at least two children, and
+// shares either all zero or summing to Whole. It fills in equal shares
+// for the zeros.
+func (l *Layout) Validate() error {
+	if l == nil {
+		return errors.New("rpc: empty layout")
+	}
+	if l.IsLeaf() {
+		return nil
+	}
+	if l.Axis != Row && l.Axis != Column {
+		return fmt.Errorf("rpc: bad split axis %d", uint8(l.Axis))
+	}
+	if len(l.Children) < 2 {
+		return errors.New("rpc: a split with fewer than two children")
+	}
+	var sum int
+	for _, c := range l.Children {
+		if c.Node == nil {
+			return errors.New("rpc: an empty split child")
+		}
+		sum += int(c.Share)
+		if err := c.Node.Validate(); err != nil {
+			return err
+		}
+	}
+	switch {
+	case sum == 0:
+		n := len(l.Children)
+		left := Whole
+		for i := range l.Children {
+			share := Whole / n
+			if i == n-1 {
+				share = left
+			}
+			l.Children[i].Share = uint16(share)
+			left -= share
+		}
+	case sum != Whole:
+		return fmt.Errorf("rpc: split shares sum to %d, not %d", sum, Whole)
+	}
+	return nil
+}
+
+type layoutSplitJSON struct {
+	Axis     Axis          `json:"axis"`
+	Children []LayoutChild `json:"children"`
+}
+
+type layoutJSON struct {
+	Pane  *PaneSpec        `json:"pane,omitempty"`
+	Split *layoutSplitJSON `json:"split,omitempty"`
+}
+
+func (l *Layout) MarshalJSON() ([]byte, error) {
+	if l.IsLeaf() {
+		return json.Marshal(layoutJSON{Pane: l.Pane})
+	}
+	return json.Marshal(layoutJSON{Split: &layoutSplitJSON{Axis: l.Axis, Children: l.Children}})
+}
+
+func (l *Layout) UnmarshalJSON(b []byte) error {
+	return l.unmarshal(b, 0)
+}
+
+func (l *Layout) unmarshal(b []byte, depth int) error {
+	if depth > MaxDepth {
+		return ErrTooDeep
+	}
+	var raw struct {
+		Pane  *PaneSpec `json:"pane"`
+		Split *struct {
+			Axis     Axis `json:"axis"`
+			Children []struct {
+				Share uint16          `json:"share"`
+				Node  json.RawMessage `json:"node"`
+			} `json:"children"`
+		} `json:"split"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	switch {
+	case raw.Pane != nil && raw.Split == nil:
+		*l = Layout{Pane: raw.Pane}
+	case raw.Split != nil && raw.Pane == nil:
+		*l = Layout{Axis: raw.Split.Axis}
+		for _, c := range raw.Split.Children {
+			child := &Layout{}
+			if err := child.unmarshal(c.Node, depth+1); err != nil {
+				return err
+			}
+			l.Children = append(l.Children, LayoutChild{Share: c.Share, Node: child})
+		}
+	default:
+		return errors.New("rpc: a layout node is a pane or a split")
+	}
+	return nil
 }
 
 // WorkspaceListResult answers workspace.list.
@@ -344,13 +499,16 @@ type WorkspaceListResult struct {
 // WorkspaceDesc is a workspace as workspace.list and workspace.info
 // describe it.
 type WorkspaceDesc struct {
-	ID       uint32 `json:"id"`
-	Name     string `json:"name"`
-	Attached bool   `json:"attached"`
-	// DetachedAt is when it was last detached, in unix milliseconds;
+	ID   uint32 `json:"id"`
+	Name string `json:"name"`
+	// Attached: it has viewers, Viewers of them.
+	Attached bool `json:"attached"`
+	Viewers  int  `json:"viewers,omitempty"`
+	// DetachedAt is when its last viewer left, in unix milliseconds;
 	// zero while attached or if it never was.
-	DetachedAt int64 `json:"detached_at,omitempty"`
-	Tabs       []Tab `json:"tabs"`
+	DetachedAt int64  `json:"detached_at,omitempty"`
+	ActiveTab  uint32 `json:"active_tab,omitempty"`
+	Tabs       []Tab  `json:"tabs"`
 }
 
 // PaneDesc is a pane as workspace.list and pane.info describe it.
@@ -385,26 +543,45 @@ type TabInfoResult struct {
 	Tab
 }
 
-// Created answers tab.new and pane.split with what they made.
+// Created answers tab.new, pane.split, and pane.move with what they
+// made or moved: Pane is the tab's first pane for a tab.new of several.
 type Created struct {
 	Workspace uint32 `json:"workspace"`
 	Tab       uint32 `json:"tab"`
 	Pane      uint32 `json:"pane"`
 }
 
-// WorkspaceNewParams: the name; "default" if empty.
+// WorkspaceNewParams: the name ("default" if empty) and the tabs to
+// start it with, one layout each; a connection calling it becomes a
+// viewer. With no tabs, a connection that then hangs up loses the
+// empty workspace.
 type WorkspaceNewParams struct {
-	Name string `json:"name,omitempty"`
+	Name string    `json:"name,omitempty"`
+	Tabs []*Layout `json:"tabs,omitempty"`
 }
 
-// WorkspaceAttachParams takes workspace ID from whichever window has it.
-// Area is what the window gives a tab, which the daemon sizes its panes
-// to; zero leaves them as they are. The viewer gets pane.attached per
-// pane, then the Workspace result: panes come before the structure that
-// refers to them. Each pane's frames follow, starting with a full one.
+// WorkspaceAttachParams adds the caller to workspace ID's viewers,
+// beside any it has. Area is what the window gives a tab, which the
+// daemon sizes its panes to; zero leaves them as they are. The viewer
+// gets pane.attached per pane, then the Workspace result: panes come
+// before the structure that refers to them. Each pane's frames follow,
+// starting with a full one. Where viewers differ in size a pane takes
+// the smallest's, as tmux does.
 type WorkspaceAttachParams struct {
 	ID   uint32 `json:"id"`
 	Area Area   `json:"area,omitempty"`
+}
+
+// WorkspaceFocusParams moves the workspace's focus, for every viewer:
+// Tab becomes the active tab, Pane the focus of its tab (which is Tab
+// if that's zero), and Zoomed, if given, the pane zoomed in that tab
+// (zero for none). The other viewers get workspace.changed; the caller
+// doesn't, having made the change.
+type WorkspaceFocusParams struct {
+	ID     uint32  `json:"id"`
+	Tab    uint32  `json:"tab,omitempty"`
+	Pane   uint32  `json:"pane,omitempty"`
+	Zoomed *uint32 `json:"zoomed,omitempty"`
 }
 
 // WorkspaceParams names a workspace: detach, kill, info.
@@ -417,7 +594,7 @@ type WorkspaceRenameParams struct {
 	Name string `json:"name"`
 }
 
-// WorkspaceResizeParams tells the daemon the window's tab area, for
+// WorkspaceResizeParams tells the daemon the caller's tab area, for
 // estimating pane sizes in its tabs. The window still resizes each pane
 // itself.
 type WorkspaceResizeParams struct {
@@ -425,15 +602,19 @@ type WorkspaceResizeParams struct {
 	Area Area   `json:"area"`
 }
 
-// TabNewParams adds a tab with one pane running Command (CreateProcessW
-// syntax on Windows; empty for the default shell) in Cwd, sized Size
-// if given. The workspace's viewer gets pane.attached and
-// workspace.changed, then the caller gets Created.
+// TabNewParams adds a tab: Layout's panes, or one running Command
+// (CreateProcessW syntax on Windows; empty for the default shell) in
+// Cwd with Env, sized Size if given. Name names the tab. The
+// workspace's viewers get pane.attached and workspace.changed, then
+// the caller gets Created; a viewer's own call focuses the new tab.
 type TabNewParams struct {
-	Workspace uint32 `json:"workspace"`
-	Command   string `json:"command,omitempty"`
-	Cwd       string `json:"cwd,omitempty"`
-	Size      Size   `json:"size,omitempty"`
+	Workspace uint32            `json:"workspace"`
+	Name      string            `json:"name,omitempty"`
+	Layout    *Layout           `json:"layout,omitempty"`
+	Command   string            `json:"command,omitempty"`
+	Cwd       string            `json:"cwd,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Size      Size              `json:"size,omitempty"`
 }
 
 // TabParams names a tab: close, info.
@@ -455,13 +636,24 @@ type TabLayoutParams struct {
 
 // PaneSplitParams starts a pane beside Pane, on side Direction, taking
 // Share basis points of its space (half if zero). Replies as tab.new
-// does.
+// does; a viewer's own call focuses the new pane.
 type PaneSplitParams struct {
-	Pane      uint32    `json:"pane"`
-	Direction Direction `json:"direction"`
-	Share     uint16    `json:"share,omitempty"`
-	Command   string    `json:"command,omitempty"`
-	Cwd       string    `json:"cwd,omitempty"`
+	Pane      uint32            `json:"pane"`
+	Direction Direction         `json:"direction"`
+	Share     uint16            `json:"share,omitempty"`
+	Command   string            `json:"command,omitempty"`
+	Cwd       string            `json:"cwd,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+}
+
+// PaneMoveParams moves Pane to tab Tab of its workspace, along its
+// whole Side (right if zero), taking half of it; with Tab zero, into a
+// new tab after its own. A tab left empty closes. Replies with Created
+// naming the tab it's in now; a viewer's own call focuses the pane.
+type PaneMoveParams struct {
+	Pane uint32    `json:"pane"`
+	Tab  uint32    `json:"tab,omitempty"`
+	Side Direction `json:"side,omitempty"`
 }
 
 // PaneParams names a pane: kill, info.
@@ -508,13 +700,21 @@ type WorkspaceDestroyedParams struct {
 }
 
 // WorkspaceDetachedParams ends a viewer's hold on a workspace it didn't
-// let go of: taken by another window, or killed.
+// let go of: killed.
 type WorkspaceDetachedParams struct {
 	ID     uint32 `json:"id"`
 	Reason string `json:"reason"`
 }
 
-// TabEventParams: tab.created, tab.closed, and tab.renamed.
+// WorkspaceViewerParams: workspace.viewer_joined and
+// workspace.viewer_left, with how many viewers the workspace has now.
+type WorkspaceViewerParams struct {
+	ID      uint32 `json:"id"`
+	Viewers int    `json:"viewers"`
+}
+
+// TabEventParams: tab.created, tab.closed, tab.renamed, and
+// tab.selected (the workspace's active tab changed).
 type TabEventParams struct {
 	Workspace uint32 `json:"workspace"`
 	ID        uint32 `json:"id"`

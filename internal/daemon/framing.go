@@ -9,15 +9,16 @@ import (
 	"github.com/aldehir/slime/internal/vt"
 )
 
-// Framing: how a pane's frames reach its client.
+// Framing: how a pane's frames reach its viewers.
 //
 // Output only marks the pane changed and wakes its framer goroutine,
-// which cuts a frame of what changed since the last one when three
-// things allow: the client's frame interval has passed since the last
-// frame, fewer than maxInFlight frames await an Ack, and nothing holds
-// frames back (vt.Hold). Changes pile up in the terminal's render state
-// meanwhile, so a client that falls behind gets fewer, larger frames and
-// nothing queues without bound.
+// which cuts each viewer a frame of what changed since its last one
+// when three things allow: the viewer's frame interval has passed since
+// its last frame, fewer than maxInFlight of its frames await an Ack, and
+// nothing holds frames back (vt.Hold). Changes pile up in each viewer's
+// View meanwhile, so a viewer that falls behind gets fewer, larger
+// frames and nothing queues without bound, and a slow viewer doesn't
+// slow the others.
 
 const (
 	// defaultFrameInterval is the least time between frames when the
@@ -40,24 +41,37 @@ const (
 
 // framing is a pane's frame state. Guarded by the pane's lock.
 type framing struct {
-	view     *vt.View // made at the first attach
-	seq      uint32   // the last frame's
-	acked    uint32   // the last frame acked; the ones after are in flight
-	changed  bool     // the terminal changed since the last frame
-	full     bool     // the next frame has everything: a new attach
+	// The render state the viewers' frames are cut from; made with the
+	// first viewer.
+	source  *vt.Source
+	viewers map[*conn]*paneViewer
+	// Closes to stop the selection drag's autoscroll ticker; nil while
+	// none runs. The drag is dragging's.
+	autoscroll chan struct{}
+	dragging   *paneViewer
+
+	wake chan struct{} // buffered: the framer has something to look at
+	stop chan struct{} // closed when the pane ends
+}
+
+// paneViewer is one viewer's hold on a pane: the View its frames and
+// events go through, their pacing, and the size it asked for.
+type paneViewer struct {
+	c        *conn
+	view     *vt.View
+	seq      uint32 // the last frame's
+	acked    uint32 // the last frame acked; the ones after are in flight
+	changed  bool   // the terminal changed since its last frame
+	full     bool   // the next frame has everything: a new attach
 	due      dueNotices
 	lastSent time.Time
 	holdFrom time.Time // when the current hold began; zero if none
-	// Closes to stop the selection drag's autoscroll ticker; nil while
-	// none runs.
-	autoscroll chan struct{}
-
-	wake  chan struct{} // buffered: the framer has something to look at
-	stop  chan struct{} // closed when the pane ends
-	timer *time.Timer
+	timer    *time.Timer
+	// The size it asked for (Resize, or an attach's); zero if none.
+	size Size
 }
 
-// dueNotices are the whole-state notices the client's backlog dropped,
+// dueNotices are the whole-state notices a viewer's backlog dropped,
 // to send again once it catches up.
 type dueNotices uint8
 
@@ -69,6 +83,7 @@ const (
 
 // startFraming runs the pane's framer until the pane ends.
 func (p *Pane) startFraming() {
+	p.fr.viewers = map[*conn]*paneViewer{}
 	p.fr.wake = make(chan struct{}, 1)
 	p.fr.stop = make(chan struct{})
 	go func() {
@@ -79,22 +94,24 @@ func (p *Pane) startFraming() {
 				return
 			}
 			p.mu.Lock()
-			p.frameLocked()
+			for _, v := range p.fr.viewers {
+				p.frameLocked(v)
+			}
 			p.mu.Unlock()
 		}
 	}()
 }
 
-// stopFramingLocked ends the framer and frees its view. Under the lock,
-// once the pane is done.
+// stopFramingLocked ends the framer and frees the viewers' views. Under
+// the lock, once the pane is done.
 func (p *Pane) stopFramingLocked() {
 	close(p.fr.stop)
-	if p.fr.timer != nil {
-		p.fr.timer.Stop()
+	for c, v := range p.fr.viewers {
+		p.detachFramesLocked(c, v)
 	}
-	if p.fr.view != nil {
-		p.fr.view.Close(p.term)
-		p.fr.view = nil
+	if p.fr.source != nil {
+		p.fr.source.Close()
+		p.fr.source = nil
 	}
 }
 
@@ -106,27 +123,42 @@ func (p *Pane) wakeFramer() {
 	}
 }
 
-// changedLocked notes that the terminal changed, for the client's next
-// frame.
+// changedLocked notes that the terminal changed, for every viewer's
+// next frame.
 func (p *Pane) changedLocked() {
-	if p.client != nil {
-		p.fr.changed = true
+	for _, v := range p.fr.viewers {
+		v.changed = true
+	}
+	if len(p.fr.viewers) > 0 {
 		p.wakeFramer()
 	}
 }
 
-// attachFramesLocked starts c's frames of the pane with a full one.
-func (p *Pane) attachFramesLocked(c *conn) error {
-	if p.fr.view == nil {
-		v, err := vt.NewView()
-		if err != nil {
-			return err
+// attachFramesLocked starts c's frames of the pane with a full one,
+// adding it to the viewers if it isn't one.
+func (p *Pane) attachFramesLocked(c *conn) (*paneViewer, error) {
+	v := p.fr.viewers[c]
+	if v == nil {
+		if p.fr.source == nil {
+			src, err := vt.NewSource()
+			if err != nil {
+				return nil, err
+			}
+			p.fr.source = src
 		}
-		p.fr.view = v
+		view, err := vt.NewView(p.fr.source)
+		if err != nil {
+			return nil, err
+		}
+		v = &paneViewer{c: c, view: view}
+		p.fr.viewers[c] = v
 	} else {
-		// The last client's drag, wheel remainder, and the like aren't
-		// this one's.
-		p.fr.view.Reset(p.term)
+		// Attaching again starts over: its drag, wheel remainder, and the
+		// like aren't kept.
+		v.view.Reset(p.term)
+		if p.fr.dragging == v {
+			p.autoscrollLocked(v, false)
+		}
 	}
 	c.sendForce(0, notify(rpc.EvPaneAttached, rpc.PaneAttachedParams{ID: p.id, Command: p.command, Status: p.status.records()}))
 	// What the client would otherwise only learn when they change.
@@ -136,38 +168,50 @@ func (p *Pane) attachFramesLocked(c *conn) error {
 	if pwd, _ := p.term.Pwd(); pwd != "" {
 		c.sendForce(p.id, &Notice{Kind: NoticePwd, Text: pwd})
 	}
-	p.autoscrollLocked(false)
-	p.fr.seq = 0
-	p.fr.acked = 0
-	p.fr.full = true
-	p.fr.changed = true
-	p.fr.due = 0
-	p.fr.holdFrom = time.Time{}
-	p.fr.lastSent = time.Time{}
+	v.seq = 0
+	v.acked = 0
+	v.full = true
+	v.changed = true
+	v.due = 0
+	v.holdFrom = time.Time{}
+	v.lastSent = time.Time{}
 	p.wakeFramer()
-	return nil
+	return v, nil
 }
 
-// ack frees room for more frames, if c is the pane's client: an Ack
-// covers its frame and every one before it, so a client may ack only the
-// last frame it drew.
+// detachFramesLocked ends c's frames and frees its view.
+func (p *Pane) detachFramesLocked(c *conn, v *paneViewer) {
+	if p.fr.dragging == v {
+		p.autoscrollLocked(v, false)
+	}
+	if v.timer != nil {
+		v.timer.Stop()
+	}
+	v.view.Close(p.term)
+	delete(p.fr.viewers, c)
+}
+
+// ack frees room for more frames to c, if it's a viewer: an Ack covers
+// its frame and every one before it, so a client may ack only the last
+// frame it drew.
 func (p *Pane) ack(c *conn, seq uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.client != c || seq <= p.fr.acked || seq > p.fr.seq {
+	v := p.fr.viewers[c]
+	if v == nil || seq <= v.acked || seq > v.seq {
 		return
 	}
-	p.fr.acked = seq
+	v.acked = seq
 	// Drawing a frame means the client is reading again.
-	p.resendDueLocked(c)
-	if p.fr.changed {
+	p.resendDueLocked(v)
+	if v.changed {
 		p.wakeFramer()
 	}
 }
 
-// resendDueLocked sends c the whole-state notices its backlog dropped,
+// resendDueLocked sends v the whole-state notices its backlog dropped,
 // stopping at the first that still doesn't fit.
-func (p *Pane) resendDueLocked(c *conn) {
+func (p *Pane) resendDueLocked(v *paneViewer) {
 	for _, d := range []struct {
 		bit  dueNotices
 		make func() *Notice
@@ -176,61 +220,60 @@ func (p *Pane) resendDueLocked(c *conn) {
 		{duePwd, func() *Notice { pwd, _ := p.term.Pwd(); return &Notice{Kind: NoticePwd, Text: pwd} }},
 		{dueStatus, func() *Notice { return &Notice{Kind: NoticeStatus, Status: p.status.records()} }},
 	} {
-		if p.fr.due&d.bit == 0 {
+		if v.due&d.bit == 0 {
 			continue
 		}
-		if !c.send(p.id, d.make()) {
+		if !v.c.send(p.id, d.make()) {
 			return
 		}
-		p.fr.due &^= d.bit
+		v.due &^= d.bit
 	}
 }
 
-// frameLocked sends the client a frame if one is due and allowed, or
+// frameLocked sends viewer v a frame if one is due and allowed, or
 // arranges to look again when one will be.
-func (p *Pane) frameLocked() {
-	c := p.client
-	if c == nil || p.done || !p.fr.changed || p.fr.seq-p.fr.acked >= maxInFlight {
+func (p *Pane) frameLocked(v *paneViewer) {
+	if p.done || !v.changed || v.seq-v.acked >= maxInFlight {
 		// An Ack, a change, or an attach wakes the framer again.
 		return
 	}
 	now := time.Now()
-	if wait := c.interval - now.Sub(p.fr.lastSent); wait > 0 {
-		p.wakeIn(wait)
+	if wait := v.c.interval - now.Sub(v.lastSent); wait > 0 {
+		p.wakeIn(v, wait)
 		return
 	}
-	switch p.fr.view.Hold(p.term) {
+	switch v.view.Hold(p.term) {
 	case vt.HoldSync:
-		if p.holdingLocked(now, syncHold) {
+		if p.holdingLocked(v, now, syncHold) {
 			return
 		}
 		p.term.EndSync()
 	case vt.HoldCursor:
-		if p.holdingLocked(now, cursorHold) {
+		if p.holdingLocked(v, now, cursorHold) {
 			return
 		}
 	}
-	data, err := p.fr.view.Frame(p.term, p.fr.full)
+	data, err := v.view.Frame(p.term, v.full)
 	if err != nil {
 		p.srv.log.Error("encoding a frame", "pane", p.id, "err", err)
 		return
 	}
-	p.sendImagesLocked(c)
-	p.fr.seq++
+	p.sendImagesLocked(v)
+	v.seq++
 	// Frames are bounded by maxInFlight rather than the queue's cap.
-	c.sendForce(p.id, &Draw{Seq: p.fr.seq, Data: data})
-	p.fr.changed = false
-	p.fr.full = false
-	p.fr.lastSent = now
-	p.fr.holdFrom = time.Time{}
+	v.c.sendForce(p.id, &Draw{Seq: v.seq, Data: data})
+	v.changed = false
+	v.full = false
+	v.lastSent = now
+	v.holdFrom = time.Time{}
 }
 
-// sendImagesLocked sends c the kitty images the frame just cut places
+// sendImagesLocked sends v the kitty images the frame just cut places
 // that it lacks, each deflated and in ImageChunk pieces, ahead of the
 // frame. Images aren't counted against the backlog, as frames aren't.
-func (p *Pane) sendImagesLocked(c *conn) {
+func (p *Pane) sendImagesLocked(v *paneViewer) {
 	for i := 0; ; i++ {
-		img, more := p.fr.view.Image(p.term, i)
+		img, more := v.view.Image(p.term, i)
 		if !more {
 			return
 		}
@@ -248,7 +291,7 @@ func (p *Pane) sendImagesLocked(c *conn) {
 		total := uint32(len(data))
 		for off := uint32(0); off < total; {
 			n := min(total-off, ImageChunk)
-			c.sendForce(p.id, &Image{
+			v.c.sendForce(p.id, &Image{
 				ID:         img.ID,
 				Generation: img.Generation,
 				Width:      img.Width,
@@ -263,23 +306,24 @@ func (p *Pane) sendImagesLocked(c *conn) {
 }
 
 // holdingLocked reports whether a hold that began now or earlier still
-// has time left of max, and if so wakes the framer when it runs out.
-func (p *Pane) holdingLocked(now time.Time, max time.Duration) bool {
-	if p.fr.holdFrom.IsZero() {
-		p.fr.holdFrom = now
+// has time left of max, and if so wakes the framer for v when it runs
+// out.
+func (p *Pane) holdingLocked(v *paneViewer, now time.Time, max time.Duration) bool {
+	if v.holdFrom.IsZero() {
+		v.holdFrom = now
 	}
-	if left := max - now.Sub(p.fr.holdFrom); left > 0 {
-		p.wakeIn(left)
+	if left := max - now.Sub(v.holdFrom); left > 0 {
+		p.wakeIn(v, left)
 		return true
 	}
 	return false
 }
 
-// wakeIn wakes the framer after d.
-func (p *Pane) wakeIn(d time.Duration) {
-	if p.fr.timer == nil {
-		p.fr.timer = time.AfterFunc(d, p.wakeFramer)
+// wakeIn wakes the framer after d, for v.
+func (p *Pane) wakeIn(v *paneViewer, d time.Duration) {
+	if v.timer == nil {
+		v.timer = time.AfterFunc(d, p.wakeFramer)
 	} else {
-		p.fr.timer.Reset(d)
+		v.timer.Reset(d)
 	}
 }

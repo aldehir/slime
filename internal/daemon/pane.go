@@ -11,9 +11,9 @@ import (
 	"github.com/aldehir/slime/internal/vt"
 )
 
-// Pane is a pty and the terminal its output is fed to. Its client is the
-// owner of its workspace, set by the server as workspaces are attached
-// and detached.
+// Pane is a pty and the terminal its output is fed to. Its viewers are
+// its workspace's, set by the server as workspaces are attached and
+// detached; each gets its own frames of the one terminal.
 type Pane struct {
 	id      uint32
 	srv     *Server
@@ -24,9 +24,10 @@ type Pane struct {
 	// The tab it's in. Guarded by the server's lock.
 	tab *tab
 
-	mu     sync.Mutex
-	term   *vt.Terminal
-	client *conn
+	mu   sync.Mutex
+	term *vt.Terminal
+	// The size the pty and terminal have: the smallest its viewers asked
+	// for, or the daemon's own while none has.
 	size   Size
 	modes  []mode
 	status programStatus
@@ -49,7 +50,7 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 	}
 	term.SetEvents(vt.Events{
 		// The daemon's terminal answers queries (ConPTY asks DA1 at
-		// startup): the client has none of its own to.
+		// startup): the clients have none of their own to.
 		Reply:       func(b []byte) { pn.replies = append(pn.replies, b...) },
 		UnknownMode: pn.setMode,
 		ProgramStatus: func(s vt.Status) {
@@ -60,7 +61,7 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 			pn.status.promptStarted()
 			pn.statusChanged()
 		},
-		// The client has no terminal to learn these from.
+		// The clients have no terminal to learn these from.
 		TitleChanged: func() {
 			title, _ := pn.term.Title()
 			pn.notify(&Notice{Kind: NoticeTitle, Text: title})
@@ -76,28 +77,29 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 	return pn
 }
 
-// notify sends the client a Notice. Runs inside term.Write, under p.mu.
-// Notices count against the client's backlog, and one that doesn't fit
-// is dropped: a program retitling on every write can't grow the queue.
-// A dropped title, pwd, or status is the whole state, and is sent again
-// once the client catches up (resendDueLocked); a bell or clipboard
-// write is lost.
+// notify sends every viewer a Notice. Runs inside term.Write, under
+// p.mu. Notices count against a viewer's backlog, and one that doesn't
+// fit is dropped: a program retitling on every write can't grow the
+// queue. A dropped title, pwd, or status is the whole state, and is
+// sent again once the viewer catches up (resendDueLocked); a bell or
+// clipboard write is lost.
 func (p *Pane) notify(n *Notice) {
-	c := p.client
-	if c == nil || c.send(p.id, n) {
-		return
-	}
-	switch n.Kind {
-	case NoticeTitle:
-		p.fr.due |= dueTitle
-	case NoticePwd:
-		p.fr.due |= duePwd
-	case NoticeStatus:
-		p.fr.due |= dueStatus
+	for c, v := range p.fr.viewers {
+		if c.send(p.id, n) {
+			continue
+		}
+		switch n.Kind {
+		case NoticeTitle:
+			v.due |= dueTitle
+		case NoticePwd:
+			v.due |= duePwd
+		case NoticeStatus:
+			v.due |= dueStatus
+		}
 	}
 }
 
-// statusChanged sends the client every status record. Runs inside
+// statusChanged sends the viewers every status record. Runs inside
 // term.Write, under p.mu.
 func (p *Pane) statusChanged() {
 	p.notify(&Notice{Kind: NoticeStatus, Status: p.status.records()})
@@ -139,7 +141,7 @@ func (p *Pane) writeReplies(b []byte) {
 	}
 }
 
-// run copies pty output into the terminal, framing it for the client,
+// run copies pty output into the terminal, framing it for the viewers,
 // until the child is gone, then takes the pane out of its tab.
 func (p *Pane) run() {
 	buf := make([]byte, 32<<10)
@@ -165,16 +167,17 @@ func (p *Pane) run() {
 
 	p.mu.Lock()
 	p.done = true
-	// The viewer hears in order with the pane's frames; the subscribers
+	// The viewers hear in order with the pane's frames; the subscribers
 	// from paneExited.
-	viewer := p.client
-	if viewer != nil {
-		viewer.sendForce(0, notify(rpc.EvPaneExited, rpc.PaneExitedParams{ID: p.id, Status: status}))
-		p.client = nil
+	var told []*conn
+	exited := notify(rpc.EvPaneExited, rpc.PaneExitedParams{ID: p.id, Status: status})
+	for c := range p.fr.viewers {
+		c.sendForce(0, exited)
+		told = append(told, c)
 	}
 	p.stopFramingLocked()
 	p.mu.Unlock()
-	p.srv.paneExited(p, status, viewer)
+	p.srv.paneExited(p, status, told)
 	p.pty.Close()
 	p.term.Close()
 }
@@ -192,8 +195,8 @@ func (p *Pane) write(b []byte) error {
 	return err
 }
 
-// attach gives the pane to c, resized to size if that's set, and starts
-// its frames.
+// attach adds c to the pane's viewers, asking for size if that's set,
+// and starts its frames.
 func (p *Pane) attach(c *conn, size Size) error {
 	p.mu.Lock()
 	err := p.attachLocked(c, size)
@@ -208,13 +211,14 @@ func (p *Pane) attachLocked(c *conn, size Size) error {
 	if p.done {
 		return nil
 	}
-	if size.Cols != 0 && size.Rows != 0 && size != p.size {
-		p.resizeLocked(size)
-	}
-	if err := p.attachFramesLocked(c); err != nil {
+	v, err := p.attachFramesLocked(c)
+	if err != nil {
 		return err
 	}
-	p.client = c
+	if size.Cols != 0 && size.Rows != 0 {
+		v.size = size
+		p.fitLocked()
+	}
 	return nil
 }
 
@@ -252,26 +256,69 @@ func (p *Pane) text(asVT bool) (string, error) {
 	return s, nil
 }
 
-// detach releases c's attachment, if it has one.
+// detach releases c's attachment, if it has one. The pane may grow to
+// the viewers left.
 func (p *Pane) detach(c *conn) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.client == c {
-		p.client = nil
-		p.autoscrollLocked(false)
-	}
-}
-
-// resize sizes the pane for c, its client; with c nil, for the daemon
-// itself (a workspace no window shows).
-func (p *Pane) resize(c *conn, size Size) {
-	p.mu.Lock()
-	if p.client == c && !p.done && size.Cols != 0 && size.Rows != 0 && size != p.size {
-		p.resizeLocked(size)
+	v := p.fr.viewers[c]
+	if v != nil {
+		p.detachFramesLocked(c, v)
+		if len(p.fr.viewers) > 0 {
+			p.fitLocked()
+		}
 	}
 	replies := p.takeRepliesLocked()
 	p.mu.Unlock()
 	p.writeReplies(replies)
+}
+
+// resize sizes the pane for c, one of its viewers: it gets the
+// smallest size its viewers ask for. With c nil, for the daemon itself
+// (a workspace no window shows).
+func (p *Pane) resize(c *conn, size Size) {
+	p.mu.Lock()
+	if !p.done && size.Cols != 0 && size.Rows != 0 {
+		if c == nil {
+			if len(p.fr.viewers) == 0 && size != p.size {
+				p.resizeLocked(size)
+			}
+		} else if v := p.fr.viewers[c]; v != nil {
+			v.size = size
+			p.fitLocked()
+		}
+	}
+	replies := p.takeRepliesLocked()
+	p.mu.Unlock()
+	p.writeReplies(replies)
+}
+
+// fitLocked sizes the pane to the smallest its viewers asked for: the
+// fewest columns and the fewest rows, as tmux does, with the cell size
+// of the viewer with the least room. Viewers that haven't asked don't
+// count.
+func (p *Pane) fitLocked() {
+	var want Size
+	var least uint64
+	for _, v := range p.fr.viewers {
+		if v.size.Cols == 0 || v.size.Rows == 0 {
+			continue
+		}
+		room := uint64(v.size.Cols) * uint64(v.size.Rows)
+		if want.Cols == 0 || room < least {
+			least = room
+			want.CellW, want.CellH = v.size.CellW, v.size.CellH
+		}
+		if want.Cols == 0 || v.size.Cols < want.Cols {
+			want.Cols = v.size.Cols
+		}
+		if want.Rows == 0 || v.size.Rows < want.Rows {
+			want.Rows = v.size.Rows
+		}
+	}
+	if want.Cols != 0 && want != p.size {
+		p.srv.log.Debug("pane fit", "pane", p.id, "size", want, "viewers", len(p.fr.viewers))
+		p.resizeLocked(want)
+	}
 }
 
 func (p *Pane) resizeLocked(size Size) {
@@ -285,7 +332,7 @@ func (p *Pane) resizeLocked(size Size) {
 	p.changedLocked()
 }
 
-// cell is the pane's cell size in pixels, as its window last sized it:
+// cell is the pane's cell size in pixels, as its viewers last sized it:
 // panes can differ, each with its own font. Zero if never said.
 func (p *Pane) cell() Size {
 	p.mu.Lock()

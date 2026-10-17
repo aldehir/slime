@@ -1,9 +1,11 @@
 //! A window's connection to slime (cmd/slime), the daemon that
 //! owns local ptys so they outlive the window. The daemon keeps panes in
-//! tabs and tabs in workspaces; a window attaches one workspace and
-//! mirrors it. The protocol is internal/daemon's (wire.go): a binary
-//! frame path, and a JSON-RPC control plane (internal/rpc) in Call,
-//! Reply, and Notify envelopes, which `std.json` reads and writes here.
+//! tabs and tabs in workspaces; a window attaches one workspace, beside
+//! any other windows on it, and mirrors it: the layout, and the focus
+//! the daemon keeps for all of them (`focus`). The protocol is
+//! internal/daemon's (wire.go): a binary frame path, and a JSON-RPC
+//! control plane (internal/rpc) in Call, Reply, and Notify envelopes,
+//! which `std.json` reads and writes here.
 //!
 //! slime runs each pane's terminal; we draw what it sends: frames of
 //! the pane's screen, and notices of what else it did (a new title, a
@@ -78,6 +80,9 @@ reader: ?std.Thread = null,
 write_lock: win32.SRWLOCK = .{},
 /// The attached workspace.
 workspace: u32 = 0,
+/// The tab the daemon shows as active, as its structure last said or we
+/// last told it (Window's syncFocus). UI thread.
+active_tab: u32 = 0,
 /// Ids for calls, from the UI thread and, while a host's attaches, its
 /// reader.
 next_id: std.atomic.Value(u32) = .init(0),
@@ -102,7 +107,7 @@ frame_interval: u32 = 0,
 /// local daemon, and once attached for a host's.
 posting: std.atomic.Value(bool) = .init(false),
 
-/// Guards `panes`, `arrivals`, `structure`, `requested`, `created`,
+/// Guards `panes`, `arrivals`, `structure`, `focus_calls`,
 /// `host_events`, and `lost`, and is held while calling a sink, so a
 /// session can't go while one runs.
 lock: win32.SRWLOCK = .{},
@@ -112,11 +117,9 @@ arrivals: std.ArrayList(Arrival) = .empty,
 /// (`takeHosts`).
 host_events: std.ArrayList(HostEvent) = .empty,
 structure: ?*Structure = null,
-/// Ids of our own tab.new and pane.split calls, whose replies name the
-/// panes the window shows.
-requested: std.ArrayList(u32) = .empty,
-/// Panes those replies named, since the UI thread last looked.
-created: std.ArrayList(u32) = .empty,
+/// Ids of our `focus` calls not yet replied to. A structure that comes
+/// meanwhile may predate them, so its focus isn't taken.
+focus_calls: std.ArrayList(u32) = .empty,
 /// Ids of our `hostList` calls, whose replies become `hosts` events.
 host_lists: std.ArrayList(u32) = .empty,
 /// The connection ended; every live pane was told why.
@@ -467,17 +470,37 @@ pub const Child = struct {
 /// rpc.Whole: what a split's shares sum to.
 const whole_share = 10000;
 
-/// The workspace's tabs, from its last structure, in its order.
+/// The workspace's tabs, from its last structure, in its order, with
+/// the focus the daemon keeps for every window on it.
 pub const Structure = struct {
     arena: std.heap.ArenaAllocator,
     tabs: []const TabLayout,
+    /// The tab shown; 0 for none.
+    active_tab: u32,
+    /// Whether the focus here is current: false while a `focus` call of
+    /// ours is unanswered, which the structure may predate.
+    focus_known: bool,
 
-    pub const TabLayout = struct { id: u32, root: Node };
+    pub const TabLayout = struct {
+        id: u32,
+        root: Node,
+        /// The pane that gets input, and the one zoomed (0 for none).
+        focus: u32,
+        zoomed: u32,
+    };
 
     fn destroy(self: *Structure, alloc: Allocator) void {
         self.arena.deinit();
         alloc.destroy(self);
     }
+};
+
+/// A tab's focus as the daemon keeps it: the pane with input and the one
+/// zoomed (0 for none).
+pub const Focus = struct {
+    tab: u32,
+    pane: u32,
+    zoomed: u32,
 };
 
 /// What came since the UI thread last looked (`take`).
@@ -487,16 +510,11 @@ pub const Taken = struct {
     /// The tabs as they are now, if they changed. Every pane in them is
     /// live or among `arrivals`.
     structure: ?*Structure,
-    /// Panes we asked for (a new tab or split) whose replies came, for
-    /// the window to show and focus; others (a script's) are added
-    /// without taking focus. Each came in this or an earlier `take`.
-    created: []u32,
 
     pub fn deinit(self: *Taken, alloc: Allocator) void {
         for (self.arrivals) |*a| a.deinit(alloc);
         alloc.free(self.arrivals);
         if (self.structure) |st| st.destroy(alloc);
-        alloc.free(self.created);
     }
 };
 
@@ -512,8 +530,8 @@ const Json = struct {
         @"error": ?RpcError = null,
     };
     const RpcError = struct { code: i64 = 0, message: []const u8 = "" };
-    const Workspace = struct { id: u32, name: []const u8 = "", tabs: []const Tab = &.{} };
-    const Tab = struct { id: u32, name: []const u8 = "", tree: Node };
+    const Workspace = struct { id: u32, name: []const u8 = "", active_tab: u32 = 0, tabs: []const Tab = &.{} };
+    const Tab = struct { id: u32, name: []const u8 = "", tree: Node, focus: u32 = 0, zoomed: u32 = 0 };
     const Created = struct { workspace: u32 = 0, tab: u32 = 0, pane: u32 = 0 };
     const PaneAttached = struct { id: u32, command: []const u8 = "", status: []const Status = &.{} };
     const Status = struct { id: []const u8 = "", state: u8 = 0, progress: i8 = -1 };
@@ -579,11 +597,11 @@ const Pending = struct {
     }
 };
 
-/// Connect, starting the daemon if it isn't running, and attach the most
-/// recently detached workspace, or a new one with a tab running
-/// `command`. Panes' frames come at most every `frame_interval` µs. The
-/// workspace's panes wait in `arrivals`; `start` the reader after
-/// adopting them. UI thread.
+/// Connect, starting the daemon if it isn't running, and attach the
+/// workspace SLIME_WORKSPACE names, else the most recently detached, or
+/// a new one with a tab running `command`. Panes' frames come at most
+/// every `frame_interval` µs. The workspace's panes wait in `arrivals`;
+/// `start` the reader after adopting them. UI thread.
 pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16) !*Daemon {
     var pipe: Pipe = try .open(true);
     errdefer pipe.close();
@@ -628,8 +646,9 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host
     return self;
 }
 
-/// Say hello, subscribe to the hosts' changes, then attach the most
-/// recently detached workspace, or a new one with a tab running
+/// Say hello, subscribe to the hosts' changes, then attach the
+/// workspace asked for (SLIME_WORKSPACE, for the local daemon), else
+/// the most recently detached, or a new one with a tab running
 /// `command`, reading the replies in line. Before the reader routes
 /// frames.
 fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16) !void {
@@ -637,15 +656,19 @@ fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []cons
 
     // A host's state changes reach every window; a bridged daemon has
     // none to tell of.
+    var ws: u32 = 0;
     if (self.remote == null) {
         var sub = try self.awaitReply(buf, try self.call("subscribe", .{ .events = .{"host.*"} }), struct {});
         sub.deinit();
+        ws = requestedWorkspace();
     }
 
     // Most recently detached, from the list.
-    var list = try self.awaitReply(buf, try self.call("workspace.list", no_params), Json.WorkspaceList);
-    const ws = mostRecentDetached(list.value);
-    list.deinit();
+    if (ws == 0) {
+        var list = try self.awaitReply(buf, try self.call("workspace.list", no_params), Json.WorkspaceList);
+        ws = mostRecentDetached(list.value);
+        list.deinit();
+    }
 
     if (ws != 0) {
         var reply = try self.awaitReply(buf, try self.call("workspace.attach", .{ .id = ws, .area = area }), std.json.Value);
@@ -766,8 +789,7 @@ fn freeState(self: *Daemon) void {
     self.panes.deinit(self.alloc);
     for (self.arrivals.items) |*a| a.deinit(self.alloc);
     self.arrivals.deinit(self.alloc);
-    self.requested.deinit(self.alloc);
-    self.created.deinit(self.alloc);
+    self.focus_calls.deinit(self.alloc);
     self.host_lists.deinit(self.alloc);
     if (self.structure) |st| st.destroy(self.alloc);
     for (self.host_events.items) |*e| e.deinit(self.alloc);
@@ -823,10 +845,10 @@ pub fn hostList(self: *Daemon) void {
     self.host_lists.append(self.alloc, id) catch {};
 }
 
-/// Take the panes waiting for sessions, the latest tabs, and the panes
-/// our requests made, together so the tabs name no pane the caller
-/// hasn't seen. The caller owns them (`Taken.deinit`) and must `adopt`
-/// or `release` each arrival. UI thread.
+/// Take the panes waiting for sessions and the latest tabs, together so
+/// the tabs name no pane the caller hasn't seen. The caller owns them
+/// (`Taken.deinit`) and must `adopt` or `release` each arrival. UI
+/// thread.
 pub fn take(self: *Daemon) Taken {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
@@ -835,7 +857,6 @@ pub fn take(self: *Daemon) Taken {
     return .{
         .arrivals = self.arrivals.toOwnedSlice(self.alloc) catch &.{},
         .structure = structure,
-        .created = self.created.toOwnedSlice(self.alloc) catch &.{},
     };
 }
 
@@ -906,7 +927,8 @@ pub fn kill(self: *Daemon, pane: u32) void {
 }
 
 /// Ask for a new tab running `command`. Its pane arrives through
-/// `arrivals`, and the reply names it in `Taken.created`. UI thread.
+/// `arrivals`, focused in the structure that comes with it: a viewer's
+/// own new pane takes the focus. UI thread.
 pub fn tabNew(self: *Daemon, command: []const u16, size: Size) !void {
     _ = try self.tabNewCall(command, size);
 }
@@ -914,16 +936,16 @@ pub fn tabNew(self: *Daemon, command: []const u16, size: Size) !void {
 fn tabNewCall(self: *Daemon, command: []const u16, size: Size) !u32 {
     const cmd = try commandUtf8(self.alloc, command);
     defer self.alloc.free(cmd);
-    return self.callRequested("tab.new", .{ .workspace = self.workspace, .command = cmd, .size = size });
+    return self.call("tab.new", .{ .workspace = self.workspace, .command = cmd, .size = size });
 }
 
 /// Ask for a pane running `command` on side `dir` of `pane`, taking half
-/// its space. It arrives through `arrivals`, named in `Taken.created`.
-/// UI thread.
+/// its space. It arrives through `arrivals`, focused as `tabNew`'s. UI
+/// thread.
 pub fn split(self: *Daemon, pane: u32, dir: Direction, command: []const u16) !void {
     const cmd = try commandUtf8(self.alloc, command);
     defer self.alloc.free(cmd);
-    _ = try self.callRequested("pane.split", .{ .pane = pane, .direction = dir, .share = 5000, .command = cmd });
+    _ = try self.call("pane.split", .{ .pane = pane, .direction = dir, .share = 5000, .command = cmd });
 }
 
 /// Replace tab `tab`'s tree with `root`, which must hold the same panes:
@@ -934,17 +956,20 @@ pub fn layout(self: *Daemon, tab: u32, root: Node) !void {
     _ = try self.call("tab.layout", .{ .id = tab, .tree = root });
 }
 
-/// A call whose reply names a pane the window shows when it comes.
-fn callRequested(self: *Daemon, method: []const u8, params: anytype) !u32 {
+/// Tell the daemon the focus moved here: `f.tab` is shown, with `f.pane`
+/// focused and `f.zoomed` zoomed (0 for none). Every other window on the
+/// workspace follows; this one doesn't hear its own change, and takes no
+/// focus from a structure until the reply says this one is in. UI
+/// thread.
+pub fn focus(self: *Daemon, f: Focus) !void {
     win32.AcquireSRWLockExclusive(&self.lock);
-    try self.requested.ensureUnusedCapacity(self.alloc, 1);
+    try self.focus_calls.ensureUnusedCapacity(self.alloc, 1);
     win32.ReleaseSRWLockExclusive(&self.lock);
-    const id = try self.call(method, params);
+    const id = try self.call("workspace.focus", .{ .id = self.workspace, .tab = f.tab, .pane = f.pane, .zoomed = f.zoomed });
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     // The reply can't have come yet: it's read under this lock.
-    self.requested.appendAssumeCapacity(id);
-    return id;
+    self.focus_calls.appendAssumeCapacity(id);
 }
 
 /// Send a Call of `method` with `params` (any value std.json writes as
@@ -1156,18 +1181,14 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
     }
 }
 
-/// A reply came: if it answers one of our requests for a pane, note the
-/// pane for the window; if it answers `hostList`, keep the hosts.
+/// A reply came: if it answers a `focus` call, structures from now on
+/// carry its focus; if it answers `hostList`, keep the hosts.
 fn replied(self: *Daemon, env: Json.Envelope) void {
     const id = env.id orelse return;
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
-    if (std.mem.indexOfScalar(u32, self.requested.items, id)) |i| {
-        _ = self.requested.swapRemove(i);
-        if (env.result == .object) if (env.result.object.get("pane")) |pane| if (pane == .integer) {
-            self.created.append(self.alloc, std.math.cast(u32, pane.integer) orelse return) catch return;
-            if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
-        };
+    if (std.mem.indexOfScalar(u32, self.focus_calls.items, id)) |i| {
+        _ = self.focus_calls.orderedRemove(i);
         return;
     }
     if (std.mem.indexOfScalar(u32, self.host_lists.items, id)) |i| {
@@ -1205,17 +1226,19 @@ fn hostEventLocked(self: *Daemon, e: HostEvent) !void {
 /// layout order, and its tabs replace `structure`.
 fn applyWorkspace(self: *Daemon, value: std.json.Value) !void {
     const st = try self.alloc.create(Structure);
-    st.* = .{ .arena = .init(self.alloc), .tabs = &.{} };
+    st.* = .{ .arena = .init(self.alloc), .tabs = &.{}, .active_tab = 0, .focus_known = true };
     errdefer st.destroy(self.alloc);
     const a = st.arena.allocator();
     const ws = try std.json.parseFromValueLeaky(Json.Workspace, a, value, json_opts);
     const tabs = try a.alloc(Structure.TabLayout, ws.tabs.len);
-    for (tabs, ws.tabs) |*out, t| out.* = .{ .id = t.id, .root = t.tree };
+    for (tabs, ws.tabs) |*out, t| out.* = .{ .id = t.id, .root = t.tree, .focus = t.focus, .zoomed = t.zoomed };
     st.tabs = tabs;
+    st.active_tab = ws.active_tab;
 
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     self.workspace = ws.id;
+    st.focus_known = self.focus_calls.items.len == 0;
     for (tabs) |t| try self.arriveLocked(t.id, t.root);
     if (self.structure) |old| old.destroy(self.alloc);
     self.structure = st;
@@ -1422,6 +1445,17 @@ fn instance(buf: *[64]u16) ?[]const u16 {
     const len = win32.GetEnvironmentVariableW(L("SLIME_INSTANCE"), buf, buf.len);
     if (len == 0 or len >= buf.len) return null;
     return buf[0..len];
+}
+
+/// SLIME_WORKSPACE, if it's set to a workspace id: the one to attach,
+/// shown or not, so a second window can join a first's. 0 otherwise.
+fn requestedWorkspace() u32 {
+    var buf: [16]u16 = undefined;
+    const len = win32.GetEnvironmentVariableW(L("SLIME_WORKSPACE"), &buf, buf.len);
+    if (len == 0 or len >= buf.len) return 0;
+    var digits: [16]u8 = undefined;
+    for (buf[0..len], digits[0..len]) |u, *d| d.* = if (u < 0x80) @intCast(u) else return 0;
+    return std.fmt.parseUnsigned(u32, digits[0..len], 10) catch 0;
 }
 
 fn currentUser(buf: *align(@alignOf(win32.TOKEN_USER)) [256]u8) !*win32.SID {
@@ -1771,20 +1805,32 @@ test "a call is a JSON-RPC request as the daemon reads it" {
     try std.testing.expectEqualStrings(
         \\{"jsonrpc":"2.0","id":2,"method":"workspace.attach","params":{"id":9,"area":{"width":720,"height":432,"cell_width":9,"cell_height":18}}}
     , attach);
+    // zoomed 0 goes as 0, which unzooms: the Go side tells it from
+    // omitted.
+    const f = try encodeCall(alloc, 4, "workspace.focus", .{ .id = 9, .tab = 2, .pane = 4, .zoomed = 0 });
+    defer alloc.free(f);
+    try std.testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":4,"method":"workspace.focus","params":{"id":9,"tab":2,"pane":4,"zoomed":0}}
+    , f);
 }
 
 test "a workspace parses as the daemon sends it" {
-    // internal/rpc Workspace{ID: 9, Name: "main", Tabs: [{ID: 2, Name:
-    // "build", Tree: row(60% 3, 40% col(50% 4, 50% 5))}, {ID: 6, Tree: 7}]}.
+    // internal/rpc Workspace{ID: 9, Name: "main", ActiveTab: 2, Tabs:
+    // [{ID: 2, Name: "build", Tree: row(60% 3, 40% col(50% 4, 50% 5)),
+    // Focus: 4, Zoomed: 4}, {ID: 6, Tree: 7, Focus: 7}]}.
     const json =
-        \\{"id":9,"name":"main","tabs":[{"id":2,"name":"build","tree":{"split":{"axis":"row","children":[{"share":6000,"node":{"pane":3}},{"share":4000,"node":{"split":{"axis":"column","children":[{"share":5000,"node":{"pane":4}},{"share":5000,"node":{"pane":5}}]}}}]}}},{"id":6,"tree":{"pane":7}}]}
+        \\{"id":9,"name":"main","active_tab":2,"tabs":[{"id":2,"name":"build","tree":{"split":{"axis":"row","children":[{"share":6000,"node":{"pane":3}},{"share":4000,"node":{"split":{"axis":"column","children":[{"share":5000,"node":{"pane":4}},{"share":5000,"node":{"pane":5}}]}}}]}},"focus":4,"zoomed":4},{"id":6,"tree":{"pane":7},"focus":7}]}
     ;
     var parsed = try std.json.parseFromSlice(Json.Workspace, std.testing.allocator, json, json_opts);
     defer parsed.deinit();
     const ws = parsed.value;
     try std.testing.expectEqual(@as(u32, 9), ws.id);
+    try std.testing.expectEqual(@as(u32, 2), ws.active_tab);
     try std.testing.expectEqual(@as(usize, 2), ws.tabs.len);
     try std.testing.expectEqual(@as(u32, 2), ws.tabs[0].id);
+    try std.testing.expectEqual(@as(u32, 4), ws.tabs[0].focus);
+    try std.testing.expectEqual(@as(u32, 4), ws.tabs[0].zoomed);
+    try std.testing.expectEqual(@as(u32, 0), ws.tabs[1].zoomed);
     const row = ws.tabs[0].tree.split;
     try std.testing.expectEqual(Axis.row, row.axis);
     try std.testing.expectEqual(@as(u32, 3), row.children[0].node.pane);

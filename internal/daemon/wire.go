@@ -146,8 +146,8 @@ type Call struct{ Request rpc.Request }
 // Reply answers a Call (rpc.Response).
 type Reply struct{ Response rpc.Response }
 
-// Notify is an event (rpc.Notification), from the daemon to a viewer of
-// the workspace it's about and to the connections subscribed to it.
+// Notify is an event (rpc.Notification), from the daemon to the viewers
+// of the workspace it's about and to the connections subscribed to it.
 type Notify struct{ Notification rpc.Notification }
 
 // Bridge, as a connection's first frame instead of Hello, splices the
@@ -160,21 +160,23 @@ type Notify struct{ Notification rpc.Notification }
 // HelloReply.
 type Bridge struct{ Term string }
 
-// Resize sizes the pane in the frame's id; only its viewer's counts.
+// Resize is what a viewer wants the pane in the frame's id sized to;
+// the pane takes the smallest its viewers ask for.
 type Resize struct{ Size Size }
 
 // Ack says the client drew the pane's Draw Seq and those before it,
 // which frees room for more (see Pane's framing).
 type Ack struct{ Seq uint32 }
 
-// Event is input for the pane in the frame's id, from its viewer: a
-// key, mouse, wheel, paste, focus change, or copy, encoded as
-// internal/vt/event.zig lays out.
+// Event is input for the pane in the frame's id, from one of its
+// viewers: a key, mouse, wheel, paste, focus change, or copy, encoded
+// as internal/vt/event.zig lays out.
 type Event struct{ Data []byte }
 
 // Draw is a frame of the pane in the frame's id: what to draw, encoded
 // as internal/vt/frame.zig lays out. Seq counts the pane's frames to
-// this client from 1; Ack them.
+// this client from 1; Ack them. Each viewer gets its own frames of the
+// one terminal, paced to it.
 type Draw struct {
 	Seq  uint32
 	Data []byte

@@ -3,10 +3,11 @@
 //
 // Panes (a pty and its terminal) are arranged in tabs, each a layout
 // tree, and tabs are grouped in workspaces. A window attaches a whole
-// workspace and draws the frames of each pane's screen the daemon sends
-// (framing.go), sending input back as events (events.go). The daemon
-// owns the structure; a window mirrors it, asking for changes (rpc.go)
-// and applying the workspace.changed events that come back.
+// workspace, beside any other windows showing it, and draws the frames
+// of each pane's screen the daemon sends (framing.go), sending input
+// back as events (events.go). The daemon owns the structure and the
+// focus; a window mirrors them, asking for changes (rpc.go) and
+// applying the workspace.changed events that come back.
 package daemon
 
 import (
@@ -28,9 +29,9 @@ import (
 
 // Server holds the workspaces and serves clients.
 //
-// Its lock guards the structure: workspaces, tabs, their trees, which
-// panes exist, and who owns what. It's taken before a pane's lock,
-// never inside one.
+// Its lock guards the structure: workspaces, tabs, their trees and
+// focus, which panes exist, and who views what. It's taken before a
+// pane's lock, never inside one.
 type Server struct {
 	vt    *vt.Runtime
 	spawn func(pty.Options) (pty.Pty, error)
@@ -163,8 +164,8 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 	defer func() {
 		c.close()
 		s.mu.Lock()
-		for _, ws := range c.owned {
-			s.releaseLocked(ws, "")
+		for _, ws := range c.viewing {
+			s.releaseLocked(ws, c, "")
 		}
 		delete(s.conns, c)
 		s.hostClientGoneLocked(c)
@@ -262,24 +263,25 @@ func (s *Server) newIDLocked() uint32 {
 	return s.nextID
 }
 
-// startPane starts a child and its terminal, outside the server's lock:
-// spawning takes a while. The caller registers it, or kills it if
-// what it was for is gone by then.
-func (s *Server) startPane(command, cwd string, size Size) (pty.Pty, *vt.Terminal, error) {
+// startPane starts a child and its terminal for pane id, outside the
+// server's lock: spawning takes a while. The caller registers it
+// (addPaneLocked), or closes it if what it was for is gone by then.
+func (s *Server) startPane(id uint32, spec *rpc.PaneSpec, size Size) (*started, error) {
 	if size.Cols == 0 || size.Rows == 0 {
 		size.Cols, size.Rows = defaultSize.Cols, defaultSize.Rows
 	}
 	term, err := s.vt.New(size.Cols, size.Rows)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := term.Resize(size.Cols, size.Rows, size.CellW, size.CellH); err != nil {
 		term.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	p, err := s.spawn(pty.Options{
-		Command: command,
-		Dir:     cwd,
+		Command: spec.Command,
+		Dir:     spec.Cwd,
+		Env:     paneEnv(id, spec),
 		Cols:    size.Cols,
 		Rows:    size.Rows,
 		Width:   uint32(size.Cols) * size.CellW,
@@ -287,9 +289,9 @@ func (s *Server) startPane(command, cwd string, size Size) (pty.Pty, *vt.Termina
 	})
 	if err != nil {
 		term.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return p, term, nil
+	return &started{id: id, spec: spec, size: size, pty: p, term: term}, nil
 }
 
 func (s *Server) list() *rpc.WorkspaceListResult {

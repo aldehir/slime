@@ -442,9 +442,9 @@ fn frameInterval(self: *const Window) u32 {
 }
 
 /// Take up what `conn` sent: make sessions of the panes that arrived,
-/// and lay out tabs as its workspace has them. A pane we asked for (a new
-/// tab or split) is shown and focused; others (a script's) are added
-/// without taking focus.
+/// and lay out tabs as its workspace has them, focused as slime says: a
+/// pane we asked for (a new tab or split) is shown and focused; a
+/// script's is added without taking focus.
 fn daemonChanged(self: *Window, conn: *Daemon) void {
     var taken = conn.take();
     defer taken.deinit(self.alloc);
@@ -466,36 +466,27 @@ fn daemonChanged(self: *Window, conn: *Daemon) void {
     // Panes no tab holds (which slime doesn't send) aren't shown.
     var left = arrived.valueIterator();
     while (left.next()) |s| s.*.destroy();
-    // The last pane we asked for, if it's shown by now: its arrival came
-    // with or before its reply.
-    var requested: ?*Session = null;
-    for (taken.created) |pane| {
-        if (self.daemonSession(conn, pane)) |s| requested = s;
-    }
 
     if (self.tabs.items.len == 0) {
         // Every pane is gone: so is the window.
         _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
         return;
     }
-    if (requested) |s| for (self.tabs.items, 0..) |t, i| {
-        if (!t.contains(s)) continue;
-        self.activate(i);
-        self.focusPane(s);
-        break;
-    };
     self.dirty = true;
 }
 
-/// Lay out `conn`'s tabs as `st` has them: replace the trees of tabs we
-/// have, add tabs we don't (at the end of their group), and drop tabs and
-/// panes it no longer has. Sessions placed from `arrived` are taken out
-/// of it.
+/// Lay out `conn`'s tabs as `st` has them, in its order: replace the
+/// trees of tabs we have, add tabs we don't, and drop tabs and panes it
+/// no longer has. Its focus is slime's, shared with every window on the
+/// workspace: each tab's focused and zoomed pane, and the tab shown,
+/// which is followed when one of `conn`'s tabs is the one shown here.
+/// Sessions placed from `arrived` are taken out of it.
 fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
     const alloc = self.alloc;
     self.cancelDrag();
     const was_active: ?*Tab = if (self.tabs.items.len > 0) self.activeTab() else null;
     const was_focus: ?*Session = if (was_active) |t| t.focus else null;
+    const shown_conn: ?*Daemon = if (was_active) |t| t.conn else null;
 
     const Lookup = struct {
         window: *Window,
@@ -530,31 +521,44 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
         while (it.next()) |s| if (!used.contains(s)) try dropped.append(alloc, s);
     }
 
-    // Tabs slime has panes of ours in, by id.
-    var kept: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    defer kept.deinit(alloc);
+    // This daemon's tabs as slime orders them: ours with their new trees,
+    // and new ones. Each takes slime's focus, unless a focus call of ours
+    // is still out, which it may predate.
+    var ordered: std.ArrayList(*Tab) = .empty;
+    defer ordered.deinit(alloc);
+    try ordered.ensureTotalCapacity(alloc, st.tabs.len);
     for (st.tabs, roots) |lt, *root| {
         const node = root.* orelse continue;
-        try kept.put(alloc, lt.id, {});
-        for (self.tabs.items) |t| {
+        const t = for (self.tabs.items) |t| {
             if (t.conn != conn or t.id != lt.id) continue;
             t.setRoot(alloc, node);
-            break;
-        } else {
-            const t = try Tab.create(alloc, conn, lt.id, node, Tab.first(node));
-            self.tabs.insertAssumeCapacity(self.groupEnd(self.groupOf(t)), t);
-        }
+            break t;
+        } else try Tab.create(alloc, conn, lt.id, node, Tab.first(node));
         root.* = null;
+        ordered.appendAssumeCapacity(t);
+        if (st.focus_known) {
+            if (t.findPane(lt.focus)) |s| t.focus = s;
+            t.zoom = if (lt.zoomed != 0) t.findPane(lt.zoomed) else null;
+            t.sent_focus = focusOf(t);
+        }
     }
+    // They go where this daemon's tabs were, else at the end of their
+    // group; the tabs slime no longer has go.
+    var at: ?usize = null;
     var i: usize = 0;
     while (i < self.tabs.items.len) {
         const t = self.tabs.items[i];
-        if (t.conn != conn or kept.contains(t.id)) {
+        if (t.conn != conn) {
             i += 1;
             continue;
         }
+        if (at == null) at = i;
         _ = self.tabs.orderedRemove(i);
-        t.destroy(alloc);
+        if (std.mem.indexOfScalar(*Tab, ordered.items, t) == null) t.destroy(alloc);
+    }
+    if (ordered.items.len > 0) {
+        const from = at orelse self.groupEnd(self.groupOf(ordered.items[0]));
+        for (ordered.items, 0..) |t, k| self.tabs.insertAssumeCapacity(from + k, t);
     }
 
     if (was_focus) |f| if (std.mem.indexOfScalar(*Session, dropped.items, f) != null) {
@@ -571,13 +575,48 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
     self.middle_pressed = null;
     for (self.tabs.items) |t| self.layoutTab(t);
     if (self.tabs.items.len == 0) return;
-    if (was_active) |t| if (self.tabIndex(t)) |at| {
-        self.active = at;
-        if (t.focus != was_focus) self.activated();
-        return;
-    };
-    self.active = @min(self.active, self.tabs.items.len - 1);
+
+    // Where the active tab was, if it's still here; else the one in its
+    // place. slime's active tab is followed while this daemon's tabs are
+    // what's shown: a tab of another daemon (a host's) stays.
+    const still: ?usize = if (was_active) |t| self.tabIndex(t) else null;
+    var active = still orelse @min(self.active, self.tabs.items.len - 1);
+    if (st.focus_known) {
+        conn.active_tab = st.active_tab;
+        if (still == null or shown_conn == conn) for (self.tabs.items, 0..) |t, k| {
+            if (t.conn == conn and t.id == st.active_tab) active = k;
+        };
+    }
+    self.active = active;
+    const now_focus = self.activeTab().focus;
+    if (now_focus == was_focus) return;
+    // The pane that lost the focus hears, if it's still here.
+    if (was_focus) |f| if (self.focused and still != null and was_active.?.contains(f)) f.reportFocus(false);
     self.activated();
+}
+
+/// A tab's focus as `workspace.focus` takes it.
+fn focusOf(t: *const Tab) Daemon.Focus {
+    return .{
+        .tab = t.id,
+        .pane = t.focus.daemonPane() orelse 0,
+        .zoomed = if (t.zoom) |z| z.daemonPane() orelse 0 else 0,
+    };
+}
+
+/// Tell the active tab's daemon where the focus is, if that's news to
+/// it: the tab shown, its focused pane, and its zoom. Every other window
+/// on the workspace follows. After anything that moves them.
+fn syncFocus(self: *Window) void {
+    if (self.tabs.items.len == 0) return;
+    const t = self.activeTab();
+    const conn = t.conn orelse return;
+    const f = focusOf(t);
+    if (f.pane == 0) return;
+    if (conn.active_tab == t.id and t.sent_focus != null and std.meta.eql(t.sent_focus.?, f)) return;
+    conn.active_tab = t.id;
+    t.sent_focus = f;
+    conn.focus(f) catch |err| log.warn("telling slime the focus failed: {}", .{err});
 }
 
 /// The grid a daemon pane gets: the terminal area, as for any session.
@@ -986,6 +1025,7 @@ fn splitPane(self: *Window, s: *Session, dir: Daemon.Direction) void {
     if (t.zoom != null) {
         t.zoom = null;
         self.layoutTab(t);
+        self.syncFocus();
     }
     conn.split(pane, dir, self.daemonCommand(conn)) catch |err| log.err("split failed: {}", .{err});
     self.dirty = true;
@@ -998,6 +1038,7 @@ fn toggleZoom(self: *Window, s: *Session) void {
     self.focusPane(s);
     _ = self.chrome.setHover(.none);
     self.layoutTab(t);
+    self.syncFocus();
     self.dirty = true;
 }
 
@@ -1007,6 +1048,7 @@ fn unzoom(self: *Window, t: *Tab) void {
     t.zoom = null;
     _ = self.chrome.setHover(.none);
     self.layoutTab(t);
+    if (t == self.activeTab()) self.syncFocus();
     self.dirty = true;
 }
 
@@ -1136,6 +1178,7 @@ fn paneDragTo(self: *Window, d: *PaneDrag, pos: win32.POINT) void {
         if (d.tab.zoom != null) {
             d.tab.zoom = null;
             self.layoutTab(d.tab);
+            self.syncFocus();
         }
     }
     d.at = pos;
@@ -1154,6 +1197,7 @@ fn endPaneDrag(self: *Window) void {
     d.tab.move(self.alloc, d.source, drop.place) catch |err| return log.err("moving the pane failed: {}", .{err});
     self.layoutTab(d.tab);
     self.sendLayout(d.tab);
+    self.syncFocus();
 }
 
 /// Where the dragged pane would land at `pos`: along a side of the tab
@@ -1340,6 +1384,7 @@ fn activated(self: *Window) void {
     self.resetBlink();
     self.updateSpinner();
     self.showTitle();
+    self.syncFocus();
     self.dirty = true;
 }
 

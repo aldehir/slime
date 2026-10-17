@@ -194,29 +194,46 @@ func lsCommand() *cobra.Command {
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			for _, ws := range l.Workspaces {
-				state := "attached"
-				if !ws.Attached {
-					state = "detached"
-					if ws.DetachedAt != 0 {
-						state += " " + time.UnixMilli(ws.DetachedAt).Format("Jan 2 15:04")
-					}
-				}
-				fmt.Fprintf(w, "workspace %d\t%s\t%s\n", ws.ID, ws.Name, state)
+				fmt.Fprintf(w, "workspace %d\t%s\t%s\n", ws.ID, ws.Name, workspaceState(ws))
 				for _, t := range ws.Tabs {
-					fmt.Fprintf(w, "  tab %d\t%s\t%s\n", t.ID, t.Name, layoutString(t.Tree))
+					fmt.Fprintf(w, "  tab %d%s\t%s\t%s\n", t.ID, mark(t.ID == ws.ActiveTab), t.Name, layoutString(t.Tree))
 					for _, id := range t.Tree.Panes() {
 						p := panes[id]
 						title := p.Title
 						if title == "" {
 							title = p.Command
 						}
-						fmt.Fprintf(w, "    pane %d\t%dx%d\tpid %d\t%s\n", id, p.Cols, p.Rows, p.PID, title)
+						fmt.Fprintf(w, "    pane %d%s\t%dx%d\tpid %d\t%s\n", id, mark(id == t.Focus), p.Cols, p.Rows, p.PID, title)
 					}
 				}
 			}
 			return w.Flush()
 		},
 	}
+}
+
+// workspaceState says whether a workspace is shown, by how many, or
+// since when it isn't.
+func workspaceState(ws rpc.WorkspaceDesc) string {
+	if ws.Attached {
+		if ws.Viewers > 1 {
+			return fmt.Sprintf("attached (%d viewers)", ws.Viewers)
+		}
+		return "attached"
+	}
+	state := "detached"
+	if ws.DetachedAt != 0 {
+		state += " " + time.UnixMilli(ws.DetachedAt).Format("Jan 2 15:04")
+	}
+	return state
+}
+
+// mark flags the active tab and the focused pane in a listing.
+func mark(on bool) string {
+	if on {
+		return "*"
+	}
+	return ""
 }
 
 // layoutString shows a tree compactly: row(60% 3, 40% col(50% 4, 50% 5)).
@@ -247,29 +264,42 @@ func wsCommand() *cobra.Command {
 	ws := &cobra.Command{Use: "ws", Short: "Create, rename, kill, and describe workspaces"}
 	ws.AddCommand(&cobra.Command{
 		Use:   "new [name]",
-		Short: "Create a workspace, detached, and print its id",
+		Short: "Create a workspace, detached, with a tab running the shell, and print its id",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := connect(true)
-			if err != nil {
-				return err
-			}
-			defer c.Close()
 			var w rpc.Workspace
-			if err := c.Call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Name: strings.Join(args, "")}, &w); err != nil {
-				return err
-			}
 			// Hanging up detaches it, but an empty workspace would go:
 			// give it a shell.
-			created, err := tabNew(c, w.ID, []string{""}, rpc.Right)
-			if err != nil {
+			p := rpc.WorkspaceNewParams{Name: strings.Join(args, ""), Tabs: []*rpc.Layout{{Pane: &rpc.PaneSpec{}}}}
+			if err := call(rpc.WorkspaceNew, p, &w); err != nil {
 				return err
 			}
 			if jsonOut {
-				return printJSON(created)
+				return printJSON(w)
 			}
 			fmt.Println(w.ID)
 			return nil
+		},
+	}, &cobra.Command{
+		Use:   "focus <workspace> <tab> [pane]",
+		Short: "Show a tab in every window on the workspace, and focus a pane of it",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ws, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			tab, err := parseID(args[1])
+			if err != nil {
+				return err
+			}
+			p := rpc.WorkspaceFocusParams{ID: ws, Tab: tab}
+			if len(args) == 3 {
+				if p.Pane, err = parseID(args[2]); err != nil {
+					return err
+				}
+			}
+			return call(rpc.WorkspaceFocus, p, nil)
 		},
 	}, &cobra.Command{
 		Use:   "rename <workspace> <name>",
@@ -309,13 +339,9 @@ func wsCommand() *cobra.Command {
 			if jsonOut {
 				return printJSON(d)
 			}
-			state := "attached"
-			if !d.Attached {
-				state = "detached"
-			}
-			fmt.Printf("workspace %d\t%s\t%s\n", d.ID, d.Name, state)
+			fmt.Printf("workspace %d\t%s\t%s\n", d.ID, d.Name, workspaceState(d))
 			for _, t := range d.Tabs {
-				fmt.Printf("  tab %d\t%s\t%s\n", t.ID, t.Name, layoutString(t.Tree))
+				fmt.Printf("  tab %d%s\t%s\t%s\n", t.ID, mark(t.ID == d.ActiveTab), t.Name, layoutString(t.Tree))
 			}
 			return nil
 		},
@@ -326,6 +352,7 @@ func wsCommand() *cobra.Command {
 func tabCommand() *cobra.Command {
 	var (
 		wsID  uint32
+		name  string
 		split string
 	)
 	newTab := &cobra.Command{
@@ -335,11 +362,12 @@ func tabCommand() *cobra.Command {
 			"else a new one. Each command (CreateProcessW syntax; empty for the shell)\n" +
 			"gets a pane, sharing the tab equally along --split.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dir := rpc.Right
+			var axis rpc.Axis
 			switch split {
 			case "right", "h":
+				axis = rpc.Row
 			case "down", "v":
-				dir = rpc.Down
+				axis = rpc.Column
 			default:
 				return fmt.Errorf("--split is right or down, not %q", split)
 			}
@@ -367,8 +395,8 @@ func tabCommand() *cobra.Command {
 					ws = w.ID
 				}
 			}
-			created, err := tabNew(c, ws, args, dir)
-			if err != nil {
+			var created rpc.Created
+			if err := c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: ws, Name: name, Layout: layoutOf(args, axis)}, &created); err != nil {
 				return err
 			}
 			if jsonOut {
@@ -379,6 +407,7 @@ func tabCommand() *cobra.Command {
 		},
 	}
 	newTab.Flags().Uint32VarP(&wsID, "workspace", "w", 0, "workspace to start it in")
+	newTab.Flags().StringVarP(&name, "name", "n", "", "name the tab")
 	newTab.Flags().StringVar(&split, "split", "right", "how several commands share the tab: right (side by side) or down (stacked)")
 
 	tab := &cobra.Command{Use: "tab", Short: "Start, rename, close, and describe tabs"}
@@ -464,6 +493,71 @@ func paneCommand() *cobra.Command {
 		},
 	}
 	split.Flags().Float64VarP(&percent, "percent", "p", 50, "how much of the pane's space the new one takes")
+	move := &cobra.Command{
+		Use:   "move <pane> <tab|new> [right|down|left|up]",
+		Short: "Move a pane along a side of another tab, or into a new tab of its own",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pane, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			p := rpc.PaneMoveParams{Pane: pane}
+			if args[1] != "new" {
+				if p.Tab, err = parseID(args[1]); err != nil {
+					return err
+				}
+			}
+			if len(args) == 3 {
+				if err := p.Side.UnmarshalText([]byte(args[2])); err != nil {
+					return err
+				}
+			}
+			var moved rpc.Created
+			if err := call(rpc.PaneMove, p, &moved); err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(moved)
+			}
+			fmt.Println(moved.Tab)
+			return nil
+		},
+	}
+	var zoom, unzoom bool
+	focus := &cobra.Command{
+		Use:   "focus <pane>",
+		Short: "Give a pane the input in every window on its workspace, showing its tab",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pane, err := parseID(args[0])
+			if err != nil {
+				return err
+			}
+			if zoom && unzoom {
+				return fmt.Errorf("--zoom and --unzoom are one or the other")
+			}
+			c, err := connect(false)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			var d rpc.PaneDesc
+			if err := c.Call(rpc.PaneInfo, rpc.PaneParams{ID: pane}, &d); err != nil {
+				return err
+			}
+			p := rpc.WorkspaceFocusParams{ID: d.Workspace, Pane: pane}
+			if zoom {
+				p.Zoomed = &pane
+			}
+			if unzoom {
+				p.Zoomed = new(uint32)
+			}
+			return c.Call(rpc.WorkspaceFocus, p, nil)
+		},
+	}
+	focus.Flags().BoolVar(&zoom, "zoom", false, "zoom it to fill its tab too")
+	focus.Flags().BoolVar(&unzoom, "unzoom", false, "show every pane of its tab again")
 	text := &cobra.Command{
 		Use:   "text <pane>",
 		Short: "Print a pane's screen and scrollback, without taking it",
@@ -490,8 +584,8 @@ func paneCommand() *cobra.Command {
 	}
 	text.Flags().BoolVar(&asVT, "vt", false, "print the VT that redraws it rather than plain text")
 
-	pane := &cobra.Command{Use: "pane", Short: "Split, kill, write to, and read panes"}
-	pane.AddCommand(split, text, &cobra.Command{
+	pane := &cobra.Command{Use: "pane", Short: "Split, move, focus, kill, write to, and read panes"}
+	pane.AddCommand(split, move, focus, text, &cobra.Command{
 		Use:   "kill <pane>...",
 		Short: "End panes",
 		Args:  cobra.MinimumNArgs(1),
@@ -600,24 +694,17 @@ func call(method string, params, result any) error {
 	return c.Call(method, params, result)
 }
 
-// tabNew starts a tab with a pane per command, sharing it equally along
-// dir: each split takes its share of what the last pane has left.
-func tabNew(c *daemon.Client, ws uint32, commands []string, dir rpc.Direction) (*rpc.Created, error) {
-	var first rpc.Created
-	if err := c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: ws, Command: commands[0]}, &first); err != nil {
-		return nil, err
+// layoutOf is a tab of one pane per command, sharing it equally along
+// axis.
+func layoutOf(commands []string, axis rpc.Axis) *rpc.Layout {
+	if len(commands) == 1 {
+		return &rpc.Layout{Pane: &rpc.PaneSpec{Command: commands[0]}}
 	}
-	last := first.Pane
-	n := len(commands)
-	for k := 1; k < n; k++ {
-		share := uint16(rpc.Whole * (n - k) / (n - k + 1))
-		var created rpc.Created
-		if err := c.Call(rpc.PaneSplit, rpc.PaneSplitParams{Pane: last, Direction: dir, Share: share, Command: commands[k]}, &created); err != nil {
-			return nil, err
-		}
-		last = created.Pane
+	l := &rpc.Layout{Axis: axis}
+	for _, command := range commands {
+		l.Children = append(l.Children, rpc.LayoutChild{Node: &rpc.Layout{Pane: &rpc.PaneSpec{Command: command}}})
 	}
-	return &first, nil
+	return l
 }
 
 func parseID(s string) (uint32, error) {

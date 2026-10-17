@@ -2,6 +2,11 @@
 // Windows, and the system's pty on Unix.
 package pty
 
+import (
+	"sort"
+	"strings"
+)
+
 // Pty is a child process attached to a pseudoterminal.
 type Pty interface {
 	// Read reads the child's output. It returns io.EOF once the child
@@ -26,6 +31,41 @@ type Pty interface {
 	Close() error
 }
 
+// mergeEnv is environ (KEY=value entries) with extra's variables set,
+// replacing any of the same name. Names compare case-insensitively
+// when fold is set, as Windows does.
+func mergeEnv(environ []string, extra map[string]string, fold bool) []string {
+	same := func(a, b string) bool {
+		if fold {
+			return strings.EqualFold(a, b)
+		}
+		return a == b
+	}
+	out := make([]string, 0, len(environ)+len(extra))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		replaced := false
+		for k := range extra {
+			if same(k, name) {
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, kv)
+		}
+	}
+	names := make([]string, 0, len(extra))
+	for k := range extra {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		out = append(out, k+"="+extra[k])
+	}
+	return out
+}
+
 // Options say what to start.
 type Options struct {
 	// Command is the command line: CreateProcessW's syntax on Windows,
@@ -36,6 +76,10 @@ type Options struct {
 	// Dir is the working directory; empty inherits ours on Windows, and
 	// is the home directory on Unix.
 	Dir string
+
+	// Env is added to our environment for the child, replacing variables
+	// of the same name.
+	Env map[string]string
 
 	Cols, Rows uint16
 	// Width and Height are the grid's pixels, zero if unknown.

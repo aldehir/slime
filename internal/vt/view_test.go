@@ -13,9 +13,25 @@ import (
 	"testing"
 )
 
+func newSource(t testing.TB) *Source {
+	t.Helper()
+	s, err := NewSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	return s
+}
+
 func newView(t testing.TB, term *Terminal) *View {
 	t.Helper()
-	v, err := NewView()
+	return newViewOf(t, newSource(t), term)
+}
+
+// newViewOf makes a view on src, closed before src is.
+func newViewOf(t testing.TB, src *Source, term *Terminal) *View {
+	t.Helper()
+	v, err := NewView(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +95,51 @@ func TestFrames(t *testing.T) {
 	}
 	if FrameLayout() == 0 {
 		t.Error("no frame layout id")
+	}
+}
+
+// TestTwoViews: views on one source each see every change, whichever
+// frames first, and each gets a full frame after a resize.
+func TestTwoViews(t *testing.T) {
+	term := newTerm(t, 30, 5)
+	src := newSource(t)
+	a := newViewOf(t, src, term)
+	b := newViewOf(t, src, term)
+	write(t, term, "one")
+	frame(t, a, term, false)
+	// a consumed the change; b, framing later, still gets it.
+	first := frame(t, b, term, false)
+	if first[0]&frameFull == 0 {
+		t.Errorf("b's first frame flags %#x, want full", first[0])
+	}
+	// The row the cursor left is dirty too.
+	write(t, term, "\r\ntwo")
+	fa := frame(t, a, term, false)
+	fb := frame(t, b, term, false)
+	for name, f := range map[string][]byte{"a": fa, "b": fb} {
+		if text, err := FrameText(f); err != nil || text != "one\ntwo\n" {
+			t.Errorf("%s's partial frame carries %q (%v)", name, text, err)
+		}
+	}
+	// Two changes before b frames: every row either touched comes.
+	write(t, term, "\r\nthree")
+	frame(t, a, term, false)
+	write(t, term, "\r\nfour")
+	frame(t, a, term, false)
+	if text, err := FrameText(frame(t, b, term, false)); err != nil || text != "two\nthree\nfour\n" {
+		t.Errorf("b's frame after two changes carries %q (%v)", text, err)
+	}
+	if idle := frame(t, b, term, false); binary.LittleEndian.Uint16(idle[len(idle)-2:]) != 0 {
+		t.Error("b's idle frame has rows")
+	}
+	// A resize changes everything: full for both.
+	if err := term.Resize(20, 4, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]*View{"a": a, "b": b} {
+		if f := frame(t, v, term, false); f[0]&frameFull == 0 {
+			t.Errorf("%s's frame after a resize flags %#x, want full", name, f[0])
+		}
 	}
 }
 

@@ -25,6 +25,10 @@ focus: *Session,
 /// The pane filling the tab while it's zoomed. The others keep their
 /// sizes, out of sight.
 zoom: ?*Session = null,
+/// The focus and zoom as slime last had them, from its structure or our
+/// last `workspace.focus`, so a change here is sent once (Window's
+/// syncFocus). Null until slime has said.
+sent_focus: ?Daemon.Focus = null,
 /// Its panes aren't listed under it in the sidebar.
 folded: bool = false,
 /// Between panes, from the last `place`.

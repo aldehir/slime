@@ -142,7 +142,7 @@ func Start(opts Options) (Pty, error) {
 		return nil, fmt.Errorf("pty: CreatePseudoConsole: 0x%08x", uint32(hr))
 	}
 
-	if err := c.spawn(command, opts.Dir); err != nil {
+	if err := c.spawn(command, opts.Dir, opts.Env); err != nil {
 		c.closePseudoconsole()
 		c.free()
 		return nil, err
@@ -151,7 +151,7 @@ func Start(opts Options) (Pty, error) {
 	return c, nil
 }
 
-func (c *conpty) spawn(command, dir string) error {
+func (c *conpty) spawn(command, dir string, env map[string]string) error {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return fmt.Errorf("pty: CreateJobObject: %w", err)
@@ -195,10 +195,25 @@ func (c *conpty) spawn(command, dir string) error {
 			return err
 		}
 	}
+	// Ours, unless there's something to add: a block of NUL-terminated
+	// KEY=value strings, ended by another NUL.
+	var block *uint16
+	if len(env) > 0 {
+		var units []uint16
+		for _, kv := range mergeEnv(os.Environ(), env, true) {
+			u, err := windows.UTF16FromString(kv)
+			if err != nil {
+				return fmt.Errorf("pty: environment %q: %w", kv, err)
+			}
+			units = append(units, u...)
+		}
+		units = append(units, 0)
+		block = &units[0]
+	}
 	var pi windows.ProcessInformation
 	err = windows.CreateProcess(nil, cmd, nil, nil, false,
 		windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_UNICODE_ENVIRONMENT|windows.CREATE_SUSPENDED,
-		nil, cwd, &si.StartupInfo, &pi)
+		block, cwd, &si.StartupInfo, &pi)
 	if err != nil {
 		return fmt.Errorf("pty: CreateProcess %q: %w", command, err)
 	}

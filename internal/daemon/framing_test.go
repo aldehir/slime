@@ -365,9 +365,9 @@ func TestEvents(t *testing.T) {
 	other.Send(d.pane, &Event{Data: evText("nope")})
 	other.Send(d.pane, &Event{Data: evCopy(4)})
 	d.event(evText("!"))
-	eventually(t, "the owner's input", func() bool { return strings.HasSuffix(p.inputString(), "!") })
+	eventually(t, "the viewer's input", func() bool { return strings.HasSuffix(p.inputString(), "!") })
 	if strings.Contains(p.inputString(), "nope") {
-		t.Error("a non-owner's event reached the child")
+		t.Error("a non-viewer's event reached the child")
 	}
 }
 
@@ -487,8 +487,8 @@ func evMotion(x, y float32) []byte {
 	return binary.LittleEndian.AppendUint32(b, 0)
 }
 
-// attachDrawer connects a second client and attaches ws, taking it from
-// the client attached before.
+// attachDrawer connects a second client and attaches ws, beside any
+// client attached before.
 func attachDrawer(t *testing.T, h *harness, ws, pane uint32) *drawer {
 	t.Helper()
 	a, b := net.Pipe()
@@ -521,8 +521,11 @@ func TestFramesReattachDropsDrag(t *testing.T) {
 	if f := d.draw(5 * time.Second); f == nil {
 		t.Fatal("no frame for the drag")
 	}
+	ws := h.list().Workspaces[0].ID
+	d.c.Close()
+	eventually(t, "detach", func() bool { return !h.attached(ws) })
 
-	d2 := attachDrawer(t, h, h.list().Workspaces[0].ID, d.pane)
+	d2 := attachDrawer(t, h, ws, d.pane)
 	d2.ack(d2.draw(5 * time.Second))
 	d2.event(evGeometry(40, 10))
 	p.emit("\x1b[?1003h\x1b[?1006h")
@@ -565,7 +568,12 @@ func TestNoticeDroppedResent(t *testing.T) {
 	d := newDrawer(t, h)
 	d.ack(d.draw(5 * time.Second))
 	p := h.pty(0)
-	c := h.srv.pane(d.pane).client
+	pane := h.srv.pane(d.pane)
+	pane.mu.Lock()
+	var c *conn
+	for c = range pane.fr.viewers {
+	}
+	pane.mu.Unlock()
 
 	// The client is as far behind as it may be.
 	c.mu.Lock()

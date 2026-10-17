@@ -26,10 +26,10 @@ type conn struct {
 	closed   bool // nothing more is sent
 	draining bool // close once the queue is empty
 
-	// Workspaces this client is attached to, and the events it
-	// subscribed to beyond theirs. Guarded by the server's lock.
-	owned map[uint32]*workspace
-	subs  []string
+	// Workspaces this client views, and the events it subscribed to
+	// beyond theirs. Guarded by the server's lock.
+	viewing map[uint32]*workspace
+	subs    []string
 
 	// Set by the handshake: the least time between a pane's frames.
 	interval time.Duration
@@ -41,7 +41,7 @@ type queued struct {
 }
 
 func newConn(rw io.ReadWriteCloser, log *slog.Logger) *conn {
-	c := &conn{rw: rw, log: log, owned: map[uint32]*workspace{}}
+	c := &conn{rw: rw, log: log, viewing: map[uint32]*workspace{}}
 	c.cond = sync.NewCond(&c.mu)
 	go c.writeLoop()
 	return c

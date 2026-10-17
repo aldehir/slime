@@ -181,7 +181,10 @@ workspaces. The window draws what it sends: frames of each pane's screen
 done in the daemon; keys, the mouse, and the wheel go back as events
 (event.zig). A window attaches the workspace detached last, or a new
 one, and mirrors it: closing the window detaches the workspace, closing
-a pane ends it. Each sidebar row is a tab, drawn as its tree of panes,
+a pane ends it. Any number of windows can attach one workspace; each
+gets its own frames, a pane takes the smallest window's size, input
+comes from any of them, and the active tab, focused pane, and zoom are
+the daemon's, shared by all. Each sidebar row is a tab, drawn as its tree of panes,
 each under a title strip whose buttons split it or zoom it. Dragging the
 gap between panes resizes them; dragging a pane by its strip moves it
 beside another, along a side of the tab, or into another's place.
@@ -213,8 +216,8 @@ reconnects, reattaches, and replaces them.
   it holds, with matches marked in frames as the selection is.
 
 - **A pane can't be dragged to another tab**, or out into a tab of its
-  own: slime's Layout only rearranges a tab's own panes, so that needs
-  a message that moves a pane between tabs.
+  own, in the window: `pane.move` (`slime pane move`) does it in slime,
+  but the drag has no drop target for it.
 - **Pane keys unzoom.** Moving focus or resizing from the keyboard while
   a pane is zoomed shows every pane again; there's no Ghostty
   `split-preserve-zoom`, which keeps the newly focused pane zoomed.
@@ -225,21 +228,20 @@ reconnects, reattaches, and replaces them.
 - **Every pane shares the window's font size.** Panes keep their own
   cell size in slime's layout, but the window draws them all from one
   font grid, and Ctrl+= resizes every pane.
-- **Zoom is the window's**, not the workspace's: it's lost on reattach,
-  and the zoomed pane's pty takes the whole tab's size meanwhile.
-- **A tab a script adds** goes at the end of the Local rows, not where
-  slime lists it.
+- **A zoomed pane's pty takes the whole tab's size** while it's zoomed,
+  so the others reflow when it's unzoomed.
 - **Workspaces have no UI**: no list to attach or detach one, create or
-  rename one, or see which window has one. A window takes the most
-  recently detached at startup and can't change it.
-- **A workspace another window took** ("attached elsewhere") leaves its
-  panes saying so; they can only be closed.
+  rename one, or see which windows have it. A window takes the most
+  recently detached at startup (or `SLIME_WORKSPACE`) and can't change
+  it, and nothing shows that another window is on the same workspace.
 - **Daemon copies pile up.** slime-gui runs slime from a copy in
   `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
   doesn't block the next install, and never deletes old ones.
 
 - **New panes take slime's environment**, from whichever slime-gui started
-  it, not the window's.
+  it, not the window's (`SLIME_PANE` and `SLIME_INSTANCE` added, and
+  whatever `env` a `tab.new` or `pane.split` carries; the window sends
+  none).
 - **Only Linux hosts on x86-64.** Others get a tab saying slime can't
   run there: slime would need libghostty-vt built for them with Zig,
   and `remote/` carries none.
@@ -264,10 +266,13 @@ reconnects, reattaches, and replaces them.
   daemon has the destination and could retry and reopen the bridges.
 - **Idle hosts stay connected** for as long as the daemon runs, even
   with no window showing them.
-- **Several windows on one workspace.** Attaching takes a workspace from
-  whoever has it. The daemon's terminal answers the program's queries
-  already, so sharing needs frames paced per viewer and a rule for whose
-  size each pty takes (the smallest, as tmux does).
+- **Windows sharing a workspace share its colors.** Each window's
+  `settings` event sets the terminal's default colors and palette, so
+  with two windows on different themes the last to send wins for both.
+  Per-window colors would be a remap when the frame is cut.
+- **Windows sharing a workspace share its tab.** Both show the active
+  tab; per-window views (tmux's grouped sessions) are the model if
+  that's wanted.
 
 ## Configuration
 

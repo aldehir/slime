@@ -86,9 +86,71 @@ fn screenText(s: *const Frames.Screen, changed_only: bool, out_ptr: *?[*]u8, out
     return true;
 }
 
+/// What a terminal's views share: the render state frames are cut from,
+/// brought up to date once per frame by whichever view cuts it, and a
+/// generation per viewport row saying when the row last changed. A view
+/// remembers the generation its last frame covered and sends the rows
+/// changed since, so any number of views can each see every change,
+/// though libghostty-vt's render state consumes the terminal's dirty
+/// flags as it updates and could serve only one.
+const Source = struct {
+    state: vt.RenderState = .empty,
+    /// Per viewport row: the generation it last changed in.
+    gens: std.ArrayList(u64) = .empty,
+    /// Counts updates. A view's `generation` is the one its last frame
+    /// covered; rows with a later generation changed since.
+    generation: u64 = 0,
+    /// The generation of the last update that changed everything (a
+    /// resize, a screen switch): a view behind it sends a full frame.
+    full_generation: u64 = 0,
+
+    /// Bring the state up to date with the terminal, marking the rows
+    /// that changed with a new generation.
+    fn update(self: *Source, term: *vt.Terminal) !void {
+        try self.state.update(alloc, term);
+        self.generation += 1;
+        const rows = @min(self.state.row_data.len, self.state.rows);
+        var full = self.state.dirty == .full;
+        if (self.gens.items.len != rows) {
+            try self.gens.resize(alloc, rows);
+            full = true;
+        }
+        if (full) {
+            self.full_generation = self.generation;
+            @memset(self.gens.items, self.generation);
+        } else {
+            for (self.state.row_data.items(.dirty)[0..rows], self.gens.items) |dirty, *g| {
+                if (dirty) g.* = self.generation;
+            }
+        }
+        self.state.clean();
+    }
+};
+
+export fn slime_vt_source_new() ?*Source {
+    const s = alloc.create(Source) catch return null;
+    s.* = .{};
+    return s;
+}
+
+/// Free a source. Its views must be gone.
+export fn slime_vt_source_free(s: ?*Source) void {
+    const self = s orelse return;
+    self.state.deinit(alloc);
+    self.gens.deinit(alloc);
+    alloc.destroy(self);
+}
+
 const View = struct {
     // Frames.
-    state: vt.RenderState = .empty,
+    /// The terminal's render state, shared with its other views.
+    source: *Source,
+    /// The source generation the last frame covered; 0 before any.
+    generation: u64 = 0,
+    /// Whether the last frame showed the cursor, for `hold`.
+    cursor_shown: bool = true,
+    /// Scratch: which rows the frame being cut carries.
+    changed: std.ArrayList(bool) = .empty,
     frame: std.Io.Writer.Allocating,
     palette: ?vt.color.Palette = null,
     /// The kitty images the client has, and the last frame's placements.
@@ -144,9 +206,11 @@ const Result = extern struct {
     autoscroll: bool = false,
 };
 
-export fn slime_vt_view_new() ?*View {
+/// A view on the terminal whose source is `source`, which outlives it.
+export fn slime_vt_view_new(source: ?*Source) ?*View {
+    const src = source orelse return null;
     const v = alloc.create(View) catch return null;
-    v.* = .{ .frame = .init(alloc), .out = .init(alloc), .copied = .init(alloc) };
+    v.* = .{ .source = src, .frame = .init(alloc), .out = .init(alloc), .copied = .init(alloc) };
     v.word_boundary.appendSlice(alloc, &default_word_boundary) catch {};
     return v;
 }
@@ -162,7 +226,7 @@ export fn slime_vt_view_free(v: ?*View, t: Terminal) void {
     self.out.deinit();
     self.copied.deinit();
     self.word_boundary.deinit(alloc);
-    self.state.deinit(alloc);
+    self.changed.deinit(alloc);
     self.images.deinit(alloc);
     if (self.image_rgba) |rgba| alloc.free(rgba);
     alloc.destroy(self);
@@ -210,7 +274,7 @@ export fn slime_vt_view_hold(v: ?*View, t: Terminal) u8 {
     const self = v orelse return 0;
     const term = zigTerminal(t) orelse return 0;
     if (term.modes.get(.synchronized_output)) return 1;
-    if (!term.modes.get(.cursor_visible) and self.state.cursor.visible) return 2;
+    if (!term.modes.get(.cursor_visible) and self.cursor_shown) return 2;
     return 0;
 }
 
@@ -235,20 +299,28 @@ export fn slime_vt_view_frame(
 ) bool {
     const self = v orelse return false;
     const term = zigTerminal(t) orelse return false;
-    self.state.update(alloc, term) catch return false;
+    const src = self.source;
+    src.update(term) catch return false;
+    // Everything, if the client asks or everything changed since its
+    // last frame; else the rows changed since.
+    const whole = full or self.generation < src.full_generation;
+    self.changed.resize(alloc, src.gens.items.len) catch return false;
+    for (src.gens.items, self.changed.items) |g, *c| c.* = g > self.generation;
     if (full) self.images.reset();
     self.images.gather(alloc, term) catch return false;
-    const palette = self.state.colors.palette;
+    const palette = src.state.colors.palette;
     const palette_changed = if (self.palette) |p| !std.mem.eql(vt.color.RGB, &p, &palette) else true;
     self.frame.clearRetainingCapacity();
-    Frames.encode(&self.frame.writer, &self.state, .{
-        .full = full,
+    Frames.encode(&self.frame.writer, &src.state, .{
+        .full = whole,
+        .changed = self.changed.items,
         .palette = palette_changed,
         .motion = term.flags.mouse_event == .any,
         .mouse_shape = std.math.cast(u8, @intFromEnum(term.mouse_shape)) orelse 0,
         .images = &self.images,
     }) catch return false;
-    self.state.clean();
+    self.generation = src.generation;
+    self.cursor_shown = src.state.cursor.visible;
     self.palette = palette;
     const bytes = self.frame.written();
     out_ptr.* = bytes.ptr;

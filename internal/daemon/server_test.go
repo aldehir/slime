@@ -156,6 +156,7 @@ type harness struct {
 	srv  *Server
 	mu   sync.Mutex
 	ptys []*fakePty
+	opts []pty.Options
 }
 
 func newHarness(t *testing.T) *harness {
@@ -164,6 +165,7 @@ func newHarness(t *testing.T) *harness {
 		p := newFakePty(o)
 		h.mu.Lock()
 		h.ptys = append(h.ptys, p)
+		h.opts = append(h.opts, o)
 		h.mu.Unlock()
 		return p, nil
 	}})
@@ -438,7 +440,14 @@ func (h *harness) attached(ws uint32) bool {
 	h.srv.mu.Lock()
 	defer h.srv.mu.Unlock()
 	w := h.srv.workspaces[ws]
-	return w != nil && w.owner != nil
+	return w != nil && w.attached()
+}
+
+// spawned is the options the i'th child was started with.
+func (h *harness) spawned(i int) pty.Options {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.opts[i]
 }
 
 func eventually(t *testing.T, what string, f func() bool) {
@@ -680,24 +689,311 @@ func TestRepliesWhileDetached(t *testing.T) {
 	eventually(t, "DA1 reply while detached", func() bool { return p.inputString() == "\x1b[?62;22c\x1b[?62;22c" })
 }
 
-func TestSteal(t *testing.T) {
+// TestTwoViewers: a second window attaches beside the first. Both draw
+// the pane, both type into it, and each hears of the other.
+func TestTwoViewers(t *testing.T) {
 	h := newHarness(t)
 	w1 := h.window()
 	pane := w1.newWorkspace()
+	p := h.pty(0)
+	p.emit("before")
+	w1.until(pane, "before")
+
 	w2 := h.window()
 	w2.attach(w1.ws.ID, Area{})
-	p := h.pty(0)
-
-	d := nextEvent[rpc.WorkspaceDetachedParams](w1, rpc.EvWorkspaceDetached)
-	if d.ID != w1.ws.ID || d.Reason != "attached elsewhere" {
-		t.Fatalf("first window got %+v", d)
+	j := nextEvent[rpc.WorkspaceViewerParams](w1, rpc.EvWorkspaceViewerJoined)
+	if j.ID != w1.ws.ID || j.Viewers != 2 {
+		t.Fatalf("first window got %+v", j)
 	}
+	if l := h.list(); !l.Workspaces[0].Attached || l.Workspaces[0].Viewers != 2 {
+		t.Errorf("list %+v", l.Workspaces[0])
+	}
+	// The second starts from a full frame of what's there.
+	w2.until(pane, "before")
+
 	w1.c.Send(pane, &Event{Data: evText("from-1")})
+	eventually(t, "the first's input", func() bool { return p.inputString() == "from-1" })
 	w2.c.Send(pane, &Event{Data: evText("from-2")})
-	eventually(t, "input", func() bool { return p.inputString() != "" })
-	time.Sleep(20 * time.Millisecond)
-	if s := p.inputString(); s != "from-2" {
-		t.Errorf("input %q, want only the owner's", s)
+	eventually(t, "the second's input", func() bool { return p.inputString() == "from-1from-2" })
+
+	// Output reaches both.
+	p.emit("\r\nboth")
+	w1.until(pane, "both")
+	w2.until(pane, "both")
+	if a, b := w1.text(pane), w2.text(pane); a != b {
+		t.Errorf("screens differ: %q and %q", a, b)
+	}
+
+	// One leaves; the other keeps the workspace.
+	w2.detach()
+	l := nextEvent[rpc.WorkspaceViewerParams](w1, rpc.EvWorkspaceViewerLeft)
+	if l.Viewers != 1 {
+		t.Errorf("viewers after one left: %d", l.Viewers)
+	}
+	p.emit("\r\nstill")
+	w1.until(pane, "still")
+	if !h.attached(w1.ws.ID) {
+		t.Error("detached with a viewer left")
+	}
+}
+
+// TestSmallestViewer: a pane takes the smallest size its viewers ask
+// for, and grows back when that viewer leaves.
+func TestSmallestViewer(t *testing.T) {
+	h := newHarness(t)
+	w1 := h.window()
+	pane := w1.newWorkspace()
+	w1.c.Send(pane, &Resize{Size: Size{Cols: 100, Rows: 50, CellW: 10, CellH: 20}})
+	eventually(t, "the first's size", func() bool { return h.pty(0).getSize() == [2]uint16{100, 50} })
+
+	w2 := h.window()
+	w2.attach(w1.ws.ID, Area{Width: 600, Height: 800, CellW: 10, CellH: 20})
+	// Narrower than the first, shorter than the second.
+	if got := h.pty(0).getSize(); got != [2]uint16{60, 40} {
+		t.Errorf("with two viewers %v, want 60x40", got)
+	}
+	w2.c.Send(pane, &Resize{Size: Size{Cols: 120, Rows: 30, CellW: 10, CellH: 20}})
+	eventually(t, "the smallest of each", func() bool { return h.pty(0).getSize() == [2]uint16{100, 30} })
+
+	w2.c.Close()
+	eventually(t, "growing back", func() bool { return h.pty(0).getSize() == [2]uint16{100, 50} })
+}
+
+// TestFocus: the active tab, the focused pane, and the zoom are the
+// daemon's, moved by workspace.focus for every viewer but the one that
+// asked, and following what viewers make and what goes.
+func TestFocus(t *testing.T) {
+	h := newHarness(t)
+	w1 := h.window()
+	first := w1.newWorkspace()
+	tab1 := w1.ws.Tabs[0].ID
+	if w1.ws.ActiveTab != tab1 || w1.ws.Tabs[0].Focus != first {
+		t.Fatalf("after the first tab: %+v", w1.ws)
+	}
+	// A viewer's split focuses the new pane.
+	a, created := w1.split(first, Right, 5000, "")
+	w1.absorb(a)
+	second := created.Pane
+	if w1.ws.Tabs[0].Focus != second {
+		t.Errorf("focus after a split: %d, want %d", w1.ws.Tabs[0].Focus, second)
+	}
+	// A script's doesn't.
+	script := h.connect()
+	var scripted rpc.Created
+	if err := script.Call(rpc.TabNew, rpc.TabNewParams{Workspace: w1.ws.ID}, &scripted); err != nil {
+		t.Fatal(err)
+	}
+	nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
+	if w1.ws.ActiveTab != tab1 || len(w1.ws.Tabs) != 2 {
+		t.Errorf("after a script's tab: active %d, tabs %d", w1.ws.ActiveTab, len(w1.ws.Tabs))
+	}
+
+	w2 := h.window()
+	w2.attach(w1.ws.ID, Area{})
+	nextEvent[rpc.WorkspaceViewerParams](w1, rpc.EvWorkspaceViewerJoined)
+	if w2.ws.ActiveTab != tab1 || w2.ws.Tabs[0].Focus != second {
+		t.Errorf("the second viewer sees active %d focus %d", w2.ws.ActiveTab, w2.ws.Tabs[0].Focus)
+	}
+
+	// The second focuses the first pane and zooms it: the first viewer
+	// hears, the second doesn't hear its own change.
+	zoom := first
+	if _, err := w2.call(rpc.WorkspaceFocus, rpc.WorkspaceFocusParams{ID: w2.ws.ID, Pane: first, Zoomed: &zoom}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(w2.c.backlog) != 0 {
+		t.Errorf("the caller got %d messages back", len(w2.c.backlog))
+	}
+	ws := nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
+	if ws.Tabs[0].Focus != first || ws.Tabs[0].Zoomed != first {
+		t.Errorf("after focusing: %+v", ws.Tabs[0])
+	}
+	// Selecting the other tab.
+	if _, err := w2.call(rpc.WorkspaceFocus, rpc.WorkspaceFocusParams{ID: w2.ws.ID, Tab: scripted.Tab}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ws = nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
+	if ws.ActiveTab != scripted.Tab {
+		t.Errorf("active tab %d, want %d", ws.ActiveTab, scripted.Tab)
+	}
+	// Closing the active tab moves to the one before it. The zoomed pane
+	// exiting unzooms, and the focus moves to its neighbour.
+	if _, err := w2.call(rpc.TabClose, rpc.TabParams{ID: scripted.Tab}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ws = nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
+	if ws.ActiveTab != tab1 {
+		t.Errorf("active tab after a close %d, want %d", ws.ActiveTab, tab1)
+	}
+	h.pty(0).exit(0)
+	nextEvent[rpc.PaneExitedParams](w1, rpc.EvPaneExited)
+	ws = nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
+	if ws.Tabs[0].Focus != second || ws.Tabs[0].Zoomed != 0 {
+		t.Errorf("after the zoomed pane exited: %+v", ws.Tabs[0])
+	}
+
+	// Bad asks.
+	for _, p := range []rpc.WorkspaceFocusParams{
+		{ID: w2.ws.ID},
+		{ID: w2.ws.ID, Tab: 999},
+		{ID: w2.ws.ID, Pane: 999},
+	} {
+		var rerr *rpc.Error
+		if err := w2.c.Call(rpc.WorkspaceFocus, p, nil); !errors.As(err, &rerr) {
+			t.Errorf("%+v: %v", p, err)
+		}
+	}
+}
+
+// TestTabNewLayout: tab.new builds a whole layout in one call, each pane
+// sized to its share; workspace.new does the same for several tabs.
+func TestTabNewLayout(t *testing.T) {
+	h := newHarness(t)
+	w := h.window()
+	w.newWorkspace()
+	w.c.Call(rpc.WorkspaceResize, rpc.WorkspaceResizeParams{ID: w.ws.ID, Area: Area{Width: 1000, Height: 800, CellW: 10, CellH: 20}}, nil)
+	layout := &rpc.Layout{Axis: Row, Children: []rpc.LayoutChild{
+		{Share: 7000, Node: &rpc.Layout{Pane: &rpc.PaneSpec{Command: "nvim"}}},
+		{Share: 3000, Node: &rpc.Layout{Axis: Column, Children: []rpc.LayoutChild{
+			{Node: &rpc.Layout{Pane: &rpc.PaneSpec{Command: "tail"}}},
+			{Node: &rpc.Layout{Pane: &rpc.PaneSpec{}}},
+		}}},
+	}}
+	var created rpc.Created
+	a, err := w.call(rpc.TabNew, rpc.TabNewParams{Workspace: w.ws.ID, Name: "dev", Layout: layout}, &created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.absorb(a)
+	if len(a.Panes) != 3 {
+		t.Fatalf("%d panes attached", len(a.Panes))
+	}
+	tab := w.ws.Tabs[1]
+	if tab.ID != created.Tab || tab.Name != "dev" || tab.Focus != created.Pane || w.ws.ActiveTab != tab.ID {
+		t.Errorf("tab %+v, created %+v, active %d", tab, created, w.ws.ActiveTab)
+	}
+	panes := tab.Tree.Panes()
+	if len(panes) != 3 || panes[0] != created.Pane || tab.Tree.Children[0].Share != 7000 || tab.Tree.Children[1].Node.Children[0].Share != 5000 {
+		t.Errorf("tree %s", show(tab.Tree))
+	}
+	if got := h.spawned(1).Command; got != "nvim" {
+		t.Errorf("first pane runs %q", got)
+	}
+	if got := h.pty(1).getSize(); got != [2]uint16{70, 40} {
+		t.Errorf("nvim's size %v, want 70x40", got)
+	}
+	if got := h.pty(2).getSize(); got != [2]uint16{30, 20} {
+		t.Errorf("tail's size %v, want 30x20", got)
+	}
+
+	// Several tabs from nothing, detached.
+	script := h.connect()
+	var ws rpc.Workspace
+	tabs := []*rpc.Layout{{Pane: &rpc.PaneSpec{Command: "a"}}, {Pane: &rpc.PaneSpec{Command: "b"}}}
+	if err := script.Call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Name: "scripted", Tabs: tabs}, &ws); err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.Tabs) != 2 || ws.ActiveTab != ws.Tabs[0].ID {
+		t.Errorf("scripted workspace %+v", ws)
+	}
+	script.Close()
+	time.Sleep(10 * time.Millisecond)
+	if l := h.list(); len(l.Workspaces) != 2 {
+		t.Errorf("workspaces after the script hung up: %d", len(l.Workspaces))
+	}
+
+	// A bad layout.
+	bad := &rpc.Layout{Axis: Row, Children: []rpc.LayoutChild{{Share: 1, Node: &rpc.Layout{Pane: &rpc.PaneSpec{}}}}}
+	var rerr *rpc.Error
+	if err := w.c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: w.ws.ID, Layout: bad}, nil); !errors.As(err, &rerr) || rerr.Code != rpc.CodeInvalidParams {
+		t.Errorf("one-child split: %v", err)
+	}
+}
+
+// TestPaneMove moves a pane into a new tab, then beside another tab's
+// panes; the tab it leaves empty closes.
+func TestPaneMove(t *testing.T) {
+	h := newHarness(t)
+	w := h.window()
+	first := w.newWorkspace()
+	a, created := w.split(first, Right, 5000, "")
+	w.absorb(a)
+	second := created.Pane
+	tab1 := w.ws.Tabs[0].ID
+
+	var moved rpc.Created
+	a, err := w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: second}, &moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.absorb(a)
+	if len(w.ws.Tabs) != 2 || moved.Tab != w.ws.Tabs[1].ID || moved.Pane != second {
+		t.Fatalf("after moving out: %+v, tabs %+v", moved, w.ws.Tabs)
+	}
+	if tree := w.ws.Tabs[0].Tree; !tree.IsLeaf() || tree.Pane != first {
+		t.Errorf("the tab it left: %s", show(tree))
+	}
+	if w.ws.ActiveTab != moved.Tab || w.ws.Tabs[1].Focus != second {
+		t.Errorf("focus didn't follow: active %d, focus %d", w.ws.ActiveTab, w.ws.Tabs[1].Focus)
+	}
+
+	// Back, below the first: its own tab goes.
+	a, err = w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: second, Tab: tab1, Side: Down}, &moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.absorb(a)
+	if len(w.ws.Tabs) != 1 || moved.Tab != tab1 {
+		t.Fatalf("after moving back: %+v, tabs %+v", moved, w.ws.Tabs)
+	}
+	tree := w.ws.Tabs[0].Tree
+	if tree.Axis != Column || fmt.Sprint(tree.Panes()) != fmt.Sprint([]uint32{first, second}) {
+		t.Errorf("tree %s", show(tree))
+	}
+	// Along the same axis, it joins the split.
+	a, created = w.split(second, Down, 5000, "")
+	w.absorb(a)
+	third := created.Pane
+	a, err = w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: first, Tab: tab1, Side: Up}, &moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.absorb(a)
+	tree = w.ws.Tabs[0].Tree
+	if len(tree.Children) != 3 || fmt.Sprint(tree.Panes()) != fmt.Sprint([]uint32{first, second, third}) {
+		t.Errorf("tree %s", show(tree))
+	}
+	var sum int
+	for _, c := range tree.Children {
+		sum += int(c.Share)
+	}
+	if sum != Whole {
+		t.Errorf("shares sum to %d", sum)
+	}
+	if err := w.c.Call(rpc.PaneMove, rpc.PaneMoveParams{Pane: first, Tab: 999}, nil); err == nil {
+		t.Error("moved to a tab that isn't")
+	}
+}
+
+// TestPaneEnv: a pane's environment names it, and carries what the
+// caller asked for.
+func TestPaneEnv(t *testing.T) {
+	t.Setenv("SLIME_INSTANCE", "envtest")
+	h := newHarness(t)
+	w := h.window()
+	first := w.newWorkspace()
+	_, created := w.split(first, Right, 5000, "")
+	env := h.spawned(1).Env
+	if env["SLIME_PANE"] != fmt.Sprint(created.Pane) || env["SLIME_INSTANCE"] != "envtest" {
+		t.Errorf("env %v", env)
+	}
+	var made rpc.Created
+	if err := w.c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: w.ws.ID, Env: map[string]string{"FOO": "bar"}}, &made); err != nil {
+		t.Fatal(err)
+	}
+	env = h.spawned(2).Env
+	if env["FOO"] != "bar" || env["SLIME_PANE"] != fmt.Sprint(made.Pane) {
+		t.Errorf("env %v", env)
 	}
 }
 
@@ -736,9 +1032,9 @@ func TestResize(t *testing.T) {
 	}
 }
 
-// TestSplitByOwner: the owner gets the new pane and the new layout
+// TestSplitByViewer: a viewer gets the new pane and the new layout
 // before the reply, and the pane works.
-func TestSplitByOwner(t *testing.T) {
+func TestSplitByViewer(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	first := w.newWorkspace()
@@ -760,7 +1056,7 @@ func TestSplitByOwner(t *testing.T) {
 }
 
 // TestSplitByScript: another client splits a pane in an attached
-// workspace; the owner is told, gets the pane, and sees the layout.
+// workspace; the viewer is told, gets the pane, and sees the layout.
 func TestSplitByScript(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
@@ -820,7 +1116,7 @@ func TestSplitDetached(t *testing.T) {
 	})
 }
 
-// TestDetachRetiles: an owner that never sizes its panes (a script
+// TestDetachRetiles: a viewer that never sizes its panes (a script
 // building a tab) leaves them to the daemon when it hangs up.
 func TestDetachRetiles(t *testing.T) {
 	h := newHarness(t)

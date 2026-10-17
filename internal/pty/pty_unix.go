@@ -69,7 +69,7 @@ func Start(opts Options) (Pty, error) {
 	if cmd.Dir == "" {
 		cmd.Dir, _ = os.UserHomeDir()
 	}
-	cmd.Env = childEnv()
+	cmd.Env = mergeEnv(childEnv(), opts.Env, false)
 
 	size := &pty.Winsize{Cols: opts.Cols, Rows: opts.Rows, X: clamp16(opts.Width), Y: clamp16(opts.Height)}
 	master, err := pty.StartWithAttrs(cmd, size, &syscall.SysProcAttr{Setsid: true, Setctty: true})

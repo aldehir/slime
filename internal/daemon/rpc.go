@@ -64,6 +64,7 @@ var methods = map[string]handler{
 	rpc.WorkspaceKill:   method((*Server).workspaceKill),
 	rpc.WorkspaceRename: method((*Server).workspaceRename),
 	rpc.WorkspaceResize: method((*Server).workspaceResize),
+	rpc.WorkspaceFocus:  method((*Server).workspaceFocus),
 	rpc.WorkspaceInfo:   method((*Server).workspaceInfo),
 	rpc.TabNew:          method((*Server).tabNew),
 	rpc.TabClose:        method((*Server).tabClose),
@@ -71,6 +72,7 @@ var methods = map[string]handler{
 	rpc.TabLayout:       method((*Server).tabLayout),
 	rpc.TabInfo:         method((*Server).tabInfo),
 	rpc.PaneSplit:       method((*Server).paneSplit),
+	rpc.PaneMove:        method((*Server).paneMove),
 	rpc.PaneKill:        method((*Server).paneKill),
 	rpc.PaneWrite:       method((*Server).paneWrite),
 	rpc.PaneText:        method((*Server).paneText),
@@ -173,20 +175,28 @@ func notify(name string, params any) *Notify {
 	return n
 }
 
-// emitLocked sends event name to the viewer of ws, if any, and to
-// every connection subscribed to it, except skip (which already has
-// it). Under the server's lock.
-func (s *Server) emitLocked(name string, params any, ws *workspace, skip *conn) {
+// emitLocked sends event name to the viewers of ws, if any, and to
+// every connection subscribed to it, each once, except skip (which
+// made the change, or already has it). Under the server's lock.
+func (s *Server) emitLocked(name string, params any, ws *workspace, skip ...*conn) {
 	n := notify(name, params)
-	var viewer *conn
-	if ws != nil {
-		viewer = ws.owner
+	skipped := func(c *conn) bool {
+		for _, x := range skip {
+			if x == c {
+				return true
+			}
+		}
+		return false
 	}
-	if viewer != nil && viewer != skip {
-		viewer.sendForce(0, n)
+	if ws != nil {
+		for c := range ws.viewers {
+			if !skipped(c) {
+				c.sendForce(0, n)
+			}
+		}
 	}
 	for c := range s.conns {
-		if c == viewer || c == skip || !c.subscribedLocked(name) {
+		if skipped(c) || (ws != nil && ws.viewers[c] != nil) || !c.subscribedLocked(name) {
 			continue
 		}
 		c.sendForce(0, n)

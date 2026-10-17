@@ -68,6 +68,35 @@ func splitNode(root *Node, target, pane uint32, dir Direction, share uint16) (*N
 	return root, nil
 }
 
+// joinEdge puts pane along side dir of the whole tree, taking an equal
+// share of a root split that runs the same way, else half of a new
+// split over the root. It returns the new root.
+func joinEdge(root *Node, pane uint32, dir Direction) *Node {
+	axis := dir.Axis()
+	before := dir == Left || dir == Up
+	added := leaf(pane)
+	if !root.IsLeaf() && root.Axis == axis {
+		n := len(root.Children) + 1
+		share := Whole / n
+		// The others shrink to make room, keeping their proportions.
+		for i := range root.Children {
+			root.Children[i].Share = uint16(uint32(root.Children[i].Share) * uint32(Whole-share) / Whole)
+		}
+		if before {
+			root.Children = append([]Child{{Share: uint16(share), Node: added}}, root.Children...)
+		} else {
+			root.Children = append(root.Children, Child{Share: uint16(share), Node: added})
+		}
+		rebalance(root)
+		return root
+	}
+	kids := []Child{{Share: Whole / 2, Node: root}, {Share: Whole / 2, Node: added}}
+	if before {
+		kids[0], kids[1] = kids[1], kids[0]
+	}
+	return &Node{Axis: axis, Children: kids}
+}
+
 // removeNode takes pane out of the tree and returns the new root: nil if it
 // was the last. Its siblings grow in proportion to fill its space, and a
 // split left with one child is replaced by that child.

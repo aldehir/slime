@@ -297,11 +297,14 @@ pub fn Codec(comptime vt: type) type {
         };
 
         /// Encode a frame from `state`: every row if `full` or the state
-        /// says so, else its dirty rows. The caller cleans the state
-        /// after (`RenderState.clean`), and decides whether the palette
-        /// goes.
+        /// says so, else the rows `changed` marks, or its dirty rows with
+        /// no `changed`. The caller cleans the state after
+        /// (`RenderState.clean`), and decides whether the palette goes.
         pub fn encode(w: *std.Io.Writer, state: *const RenderState, opts: struct {
             full: bool = false,
+            /// Per row: whether the frame carries it. Null for the
+            /// state's own dirty flags.
+            changed: ?[]const bool = null,
             palette: bool = false,
             /// Terminal state the render state doesn't carry.
             motion: bool = false,
@@ -343,11 +346,18 @@ pub fn Codec(comptime vt: type) type {
             const rows = state.row_data.slice();
             const n_rows = @min(rows.len, state.rows);
             const dirty = rows.items(.dirty);
+            const carries = struct {
+                fn f(full_: bool, changed: ?[]const bool, dirty_: []const bool, y: usize) bool {
+                    if (full_) return true;
+                    if (changed) |c| return y < c.len and c[y];
+                    return dirty_[y];
+                }
+            }.f;
             var count: u16 = 0;
-            for (0..n_rows) |y| count += @intFromBool(full or dirty[y]);
+            for (0..n_rows) |y| count += @intFromBool(carries(full, opts.changed, dirty, y));
             try w.writeInt(u16, count, .little);
             for (rows.items(.cells)[0..n_rows], rows.items(.selection)[0..n_rows], 0..) |row_cells, sel, y| {
-                if (!full and !dirty[y]) continue;
+                if (!carries(full, opts.changed, dirty, y)) continue;
                 try w.writeInt(u16, @intCast(y), .little);
                 try w.writeByte(@intFromBool(sel != null));
                 const s = sel orelse .{ 0, 0 };
