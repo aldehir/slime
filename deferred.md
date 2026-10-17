@@ -145,33 +145,39 @@ one.
 - **Agent forwarding, port forwarding, SFTP.**
 - **Helper logs in GUI builds** go nowhere: there is no stderr to pass.
 
-## Persistent sessions
+## Persistent workspaces
 
 `persist-sessions = true` runs local sessions in slimed (ssh/cmd/slimed),
-a daemon that holds their ConPTYs and terminal state. Closing the window
-detaches them, and the next window reattaches every detached one from a
-snapshot. Closing a session ends it. Off by default.
+a daemon that holds every pane's ConPTY and terminal state, arranged in
+tabs (each a layout tree) and workspaces. A window attaches the workspace
+detached last, or a new one, and mirrors it: closing the window detaches
+the workspace, closing a session ends its pane. `slimed tab new`, `split`,
+and the rest change a workspace from scripts, attached or not. Off by
+default.
 
-- **Detaching one session** without closing the window, and listing
-  detached sessions in the sidebar to attach one, rather than taking all
-  of them at startup.
-- **A session another client took** ("attached elsewhere") can only be
-  closed; there's no reattach.
+- **Splits aren't drawn.** Each pane is its own sidebar row, sized to the
+  whole terminal area, whatever its tab's layout says. Drawing a tab's
+  tree, focus between panes, and split bindings come next.
+- **A pane a script adds** goes at the end of the Local rows, not beside
+  its tab's.
+- **Workspaces have no UI**: no list to attach or detach one, create or
+  rename one, or see which window has one. A window takes the most
+  recently detached at startup and can't change it.
+- **A workspace another window took** ("attached elsewhere") leaves its
+  panes saying so; they can only be closed.
 - **Daemon copies pile up.** slime runs slimed from a copy in
   `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
   doesn't block the next install, and never deletes old ones.
-- **A full reset (RIS) in a session** drops grapheme clustering on the
+- **A full reset (RIS) in a pane** drops grapheme clustering on the
   daemon's copy of its terminal: libghostty-vt's C API can't set default
   modes, so slimed sets mode 2027's current value only. The next attach
-  then shows that session without clustering.
-- **New sessions take slimed's environment**, from whichever slime
-  started it, not the window's.
-- **Several windows** each take whatever's detached when they open, and
-  a session belongs to one window at a time.
-- **Several clients on one session.** Attaching takes a session from
+  then shows that pane without clustering.
+- **New panes take slimed's environment**, from whichever slime started
+  it, not the window's.
+- **Several windows on one workspace.** Attaching takes a workspace from
   whoever has it. Sharing needs a rule for whose replies to device
   queries reach the program (clients would send them as their own frame
-  type, not input) and whose size the pty takes; a read-only attach
+  type, not input) and whose size each pty takes; a read-only attach
   would sidestep both.
 
 ## Configuration

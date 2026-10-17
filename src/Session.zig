@@ -72,9 +72,9 @@ exit_wait: ?win32.HANDLE = null,
 /// closes it. UI thread only.
 ended: bool = false,
 
-/// The slimed session was lost to us while its child ran (taken by
-/// another client, or slimed went away). Written by the reader thread
-/// before it posts WM_APP_CHILD_EXITED.
+/// The slimed pane was lost to us while its child ran (its workspace was
+/// taken by another window, or slimed went away). Written by the
+/// connection's reader before it posts WM_APP_CHILD_EXITED.
 slimed_loss: ?SlimedLoss = null,
 
 /// Logging in to the SSH host, while there's something to show: a
@@ -120,14 +120,15 @@ const Transport = union(enum) {
     conpty: Pty,
     /// A remote shell on an SSH connection.
     ssh: *SshConnection.Channel,
-    /// A local child in a pseudoconsole slimed holds, which outlives us.
-    slimed: *Slimed,
+    /// A pane slimed holds, which outlives us. Its output comes from the
+    /// connection's reader through our sink.
+    slimed: struct { conn: *Slimed, pane: u32 },
 
     fn write(self: *Transport, data: []const u8) void {
         switch (self.*) {
             .conpty => |*pty| pty.write(data),
             .ssh => |ch| ch.write(data),
-            .slimed => |s| s.write(data),
+            .slimed => |s| s.conn.write(s.pane, data),
         }
     }
 };
@@ -143,11 +144,11 @@ pub const Launch = union(enum) {
         title: []const u16,
         cwd: ?[]const u8 = null,
     },
-    /// A session slimed keeps: a new one, or one left detached. `command`
-    /// is what it runs, for the default title.
+    /// A pane of the workspace slimed keeps for this window, from its
+    /// snapshot. The arrival stays the caller's.
     slimed: struct {
-        target: Slimed.Target,
-        command: []const u16,
+        conn: *Slimed,
+        arrival: *const Slimed.Arrival,
     },
 };
 
@@ -178,7 +179,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     const default_title = try alloc.dupe(u16, switch (launch) {
         .command => |command_line| programName(command_line),
         .ssh => |ssh| ssh.title,
-        .slimed => |s| programName(s.command),
+        .slimed => |s| programName(s.arrival.command),
     });
     errdefer alloc.free(default_title);
     self.* = .{
@@ -190,33 +191,18 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
         .stream = undefined,
     };
 
-    // A slimed session's terminal comes from the daemon's snapshot of it.
-    var slimed: ?*Slimed = null;
-    // A session we just made would otherwise wait, detached, for the next
-    // window.
-    errdefer if (slimed) |s| {
-        if (launch.slimed.target == .new) s.kill();
-        s.deinit();
-    };
+    // A slimed pane's terminal comes from the daemon's snapshot of it.
     var restored: ?ghostty_vt.snapshot.Decoded = null;
     defer if (restored) |*d| d.deinit(alloc);
     if (launch == .slimed) {
-        const cell = window.cellSizePx();
-        const s, const attachment = try Slimed.open(alloc, launch.slimed.target, .{
-            .cols = cols,
-            .rows = rows,
-            .cell_width = cell.width,
-            .cell_height = cell.height,
-        });
-        slimed = s;
-        defer alloc.free(attachment.snapshot);
-        var reader: std.Io.Reader = .fixed(attachment.snapshot);
+        const arrival = launch.slimed.arrival;
+        var reader: std.Io.Reader = .fixed(arrival.snapshot);
         restored = try ghostty_vt.snapshot.decode(alloc, window.io, &reader, .{
             // slimed's own limit (ssh/internal/vt ContinuationLimit).
             .max_continuation_bytes = 64 * 1024,
             .compress_history = true,
         });
-        self.win32_input = attachment.win32_input;
+        self.win32_input = arrival.win32_input;
     }
 
     self.terminal = if (restored) |*d| d.toOwned() else try .init(window.io, alloc, .{
@@ -283,16 +269,21 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
             const term = if (config.@"ssh-terminfo") "xterm-ghostty" else "xterm-256color";
             self.transport = .{ .ssh = try ssh.conn.open(id, term, cols, rows, cols * cell.width, rows * cell.height, ssh.cwd) };
         },
-        .slimed => {
-            self.transport = .{ .slimed = slimed.? };
-            slimed = null;
+        .slimed => |s| {
+            // No reader of our own: the connection's feeds the sink, first
+            // with what came while the pane waited for us.
+            self.transport = .{ .slimed = .{ .conn = s.conn, .pane = s.arrival.pane } };
+            s.conn.adopt(s.arrival.pane, .{ .ctx = self, .output = slimedOutput, .ended = slimedEnded });
+            // The daemon sized it from its layout; we show it whole.
+            const cell = window.cellSizePx();
+            s.conn.resize(s.arrival.pane, .{ .cols = cols, .rows = rows, .cell_width = cell.width, .cell_height = cell.height });
+            return self;
         },
     }
     errdefer self.stopTransport();
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
 
-    // An SSH channel or slimed's pty has no process here; the reader
-    // reports the end.
+    // An SSH channel has no process here; its reader reports the end.
     const pty = switch (self.transport.?) {
         .conpty => |*pty| pty,
         .ssh, .slimed => return self,
@@ -338,13 +329,12 @@ fn stopTransport(self: *Session) void {
     switch (transport.*) {
         .conpty => |*pty| pty.close(),
         .ssh => |ch| ch.close(),
-        // Wake the reader until it's gone: a cancel that lands before
-        // it blocks in ReadFile again is lost.
-        .slimed => |s| if (self.reader) |t| {
-            while (win32.WaitForSingleObject(t.getHandle(), 0) != win32.WAIT_OBJECT_0) {
-                s.cancel();
-                _ = win32.WaitForSingleObject(t.getHandle(), 20);
-            }
+        // Only our view of it: the pane runs on in slimed. Once released,
+        // the connection's reader no longer calls our sink.
+        .slimed => |s| {
+            s.conn.release(s.pane);
+            self.transport = null;
+            return;
         },
     }
     if (self.reader) |t| t.join();
@@ -352,25 +342,44 @@ fn stopTransport(self: *Session) void {
     switch (transport.*) {
         .conpty => |*pty| pty.deinit(),
         .ssh => |ch| ch.deinit(),
-        // Hanging up detaches; slimed keeps the session.
-        .slimed => |s| s.deinit(),
+        .slimed => unreachable,
     }
     self.transport = null;
 }
 
-/// End a slimed session for good, not just our attachment, before the
-/// session is destroyed: the user closed it. Destroying alone detaches,
-/// as closing the window does. A session already lost to us is left
-/// alone.
+/// End a slimed pane for good, not just our view of it, before the
+/// session is destroyed: the user closed it. Destroying alone leaves it
+/// to slimed, as closing the window does. A pane already lost to us is
+/// left alone.
 pub fn kill(self: *Session) void {
     if (self.slimed_loss != null) return;
     switch (self.transport orelse return) {
-        .slimed => |s| s.kill(),
+        .slimed => |s| s.conn.kill(s.pane),
         else => {},
     }
 }
 
-/// Why the slimed session was lost to us, once WM_APP_CHILD_EXITED says
+/// Sink for a slimed pane's output. On the connection's reader thread,
+/// under its lock.
+fn slimedOutput(ctx: *anyopaque, data: []const u8) void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    self.output(data);
+}
+
+/// Sink for a slimed pane's end. On the connection's reader thread (or
+/// the UI thread, adopting a pane already lost), under its lock.
+fn slimedEnded(ctx: *anyopaque, why: ?[]const u8) void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    if (why) |text| {
+        var loss: SlimedLoss = .{};
+        loss.set("{s}", .{text});
+        // Read on the UI thread only after the post, which orders it.
+        self.slimed_loss = loss;
+    }
+    _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
+}
+
+/// Why the slimed pane was lost to us, once WM_APP_CHILD_EXITED says
 /// it ended, if its child didn't exit.
 pub fn slimedLoss(self: *const Session) ?*const SlimedLoss {
     return if (self.slimed_loss) |*l| l else null;
@@ -469,7 +478,7 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
         .ssh => |ch| if (changed or px_changed) ch.resize(cols, rows, @as(u32, cols) * cell.width, @as(u32, rows) * cell.height),
         // The daemon's terminal answers pixel size reports while we're
         // detached, so it hears about new fonts too.
-        .slimed => |s| if (changed or px_changed) s.resize(.{
+        .slimed => |s| if (changed or px_changed) s.conn.resize(s.pane, .{
             .cols = cols,
             .rows = rows,
             .cell_width = cell.width,
@@ -486,7 +495,7 @@ fn readLoop(self: *Session) void {
         const n = switch (self.transport.?) {
             .conpty => |*pty| pty.read(&buf),
             .ssh => |ch| ch.read(&buf),
-            .slimed => |s| return self.readSlimed(s),
+            .slimed => unreachable,
         } catch break;
         if (n == 0) break;
         self.output(buf[0..n]);
@@ -501,37 +510,6 @@ fn output(self: *Session, data: []const u8) void {
     if (build_options.stats) _ = self.window.stats.bytes.fetchAdd(data.len, .monotonic);
     self.unseen.store(true, .release);
     _ = win32.SetEvent(self.window.output_event);
-}
-
-/// Reader thread for a slimed session: output until the child exits,
-/// the session is taken from us, or the connection ends (slimed went
-/// away, or `stopTransport` cancelled it).
-fn readSlimed(self: *Session, s: *Slimed) void {
-    var loss: SlimedLoss = .{};
-    if (self.alloc.alloc(u8, 1 << 20)) |buf| {
-        defer self.alloc.free(buf);
-        while (true) {
-            const event = s.next(buf) catch {
-                loss.set("lost slimed", .{});
-                break;
-            };
-            switch (event) {
-                .output => |data| self.output(data),
-                .exit => |status| {
-                    log.info("slimed session {d} exited with status {d}", .{ s.id, status });
-                    _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
-                    return;
-                },
-                .detached => |reason| {
-                    loss.set("detached: {s}", .{reason});
-                    break;
-                },
-            }
-        }
-    } else |_| loss.set("out of memory", .{});
-    // Read on the UI thread only after the post, which orders it.
-    self.slimed_loss = loss;
-    _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
 }
 
 /// Send input (keys, pastes, query replies) to the child.
