@@ -362,6 +362,16 @@ pub fn paintEditText(self: *const Chrome, p: *Painter, inner: Rect, field: *cons
     }
 }
 
+/// The rounded rect `r` filled with `fill`, inside a border of `border`.
+/// Both are fills, the inner one a stroke's width in on a radius that
+/// much smaller, so the edges meet with no seam at the corners, as a
+/// stroke over a fill leaves.
+pub fn fillBordered(self: *const Chrome, p: *Painter, r: Rect, radius: f32, fill: Color, border: Color) void {
+    const w = self.stroke();
+    p.fillRounded(r, radius, border);
+    p.fillRounded(r.inset(w, w), @max(0, radius - w), fill);
+}
+
 /// The width of icon strokes.
 pub fn stroke(self: *const Chrome) f32 {
     return @max(1, @round(self.scale));

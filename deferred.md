@@ -117,9 +117,8 @@ that shows on hover.
 - **IME composition in text fields.** Committed text arrives as
   WM_CHAR, but the candidate window isn't placed at the caret.
 - **The Connect field's key** to open it from the keyboard.
-- **Login dialog keyboard reach.** Tab moves between fields but not to
-  the buttons, which only Enter (the primary one), Escape, and the mouse
-  press. A keyboard-interactive round past eight questions is cut short.
+- **Long keyboard-interactive rounds.** One past eight questions is cut
+  short.
 - **Notices during login** (`Warning: Permanently added ...`, banners)
   still print in the session's terminal, behind the dialog.
 - **Logging in, in the header.** A host shows `+` from the moment its

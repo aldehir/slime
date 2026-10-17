@@ -25,6 +25,13 @@ pub const State = enum {
 
 pub const Action = enum { accept, skip, cancel, close };
 
+pub const Focus = union(enum) {
+    none,
+    field: usize,
+    /// An index into `buttons`.
+    button: usize,
+};
+
 pub const Button = struct {
     label: []const u16,
     action: Action,
@@ -58,8 +65,9 @@ field_count: usize = 0,
 /// For `asking`; `waiting` and `failed` have their own.
 asking_buttons: [max_buttons]Button = undefined,
 asking_button_count: usize = 0,
-/// The field with the keyboard.
-focus: usize = 0,
+/// What has the keyboard: Tab moves it through the fields and the
+/// buttons.
+focus: Focus = .none,
 state: State = .asking,
 status: []const u16 = &.{},
 
@@ -123,6 +131,24 @@ pub fn defaultAction(self: *const Dialog) ?Action {
     return null;
 }
 
+/// Enter's button: the focused one, else the primary one.
+pub fn enterAction(self: *const Dialog) ?Action {
+    if (self.focusedButton()) |b| return b.action;
+    return self.defaultAction();
+}
+
+/// The focused button, if it can be pressed.
+pub fn focusedButton(self: *const Dialog) ?Button {
+    const i = switch (self.focus) {
+        .button => |i| i,
+        else => return null,
+    };
+    var buf: [max_buttons]Button = undefined;
+    const bs = self.buttons(&buf);
+    if (i >= bs.len or bs[i].disabled) return null;
+    return bs[i];
+}
+
 /// Escape's button.
 pub fn escapeAction(self: *const Dialog) Action {
     return if (self.state == .failed) .close else .cancel;
@@ -130,15 +156,38 @@ pub fn escapeAction(self: *const Dialog) Action {
 
 /// The field with the keyboard, while the dialog asks.
 pub fn focused(self: *Dialog) ?*TextField {
-    if (self.state != .asking or self.focus >= self.field_count) return null;
-    return &self.fields[self.focus].edit;
+    if (self.state != .asking) return null;
+    return switch (self.focus) {
+        .field => |i| if (i < self.field_count) &self.fields[i].edit else null,
+        else => null,
+    };
 }
 
-/// Move the keyboard to the next field, or back.
+/// Move the keyboard to the next field or button, or back: the fields
+/// while asking, then the buttons that can be pressed, around again.
 pub fn cycleFocus(self: *Dialog, forward: bool) void {
-    const n = self.field_count;
+    var order: [max_fields + max_buttons]Focus = undefined;
+    var n: usize = 0;
+    if (self.state == .asking) {
+        for (0..self.field_count) |i| {
+            order[n] = .{ .field = i };
+            n += 1;
+        }
+    }
+    var buf: [max_buttons]Button = undefined;
+    for (self.buttons(&buf), 0..) |b, i| {
+        if (b.disabled) continue;
+        order[n] = .{ .button = i };
+        n += 1;
+    }
     if (n == 0) return;
-    self.focus = if (forward) (self.focus + 1) % n else (self.focus + n - 1) % n;
+    const at = for (order[0..n], 0..) |f, i| {
+        if (std.meta.eql(f, self.focus)) break i;
+    } else null;
+    const next = if (at) |i|
+        (if (forward) (i + 1) % n else (i + n - 1) % n)
+    else if (forward) 0 else n - 1;
+    self.focus = order[next];
 }
 
 test "fields split a multi-line label" {
@@ -160,7 +209,26 @@ test "buttons follow the state" {
     try std.testing.expectEqual(@as(usize, 2), d.buttons(&buf).len);
     try std.testing.expectEqual(Dialog.Action.accept, d.defaultAction().?);
 
+    // Tab goes through the field, then the buttons, and around.
+    d.addField(L("pw: "), false);
+    d.focus = .{ .field = 0 };
+    d.cycleFocus(true);
+    try std.testing.expectEqual(Focus{ .button = 0 }, d.focus);
+    try std.testing.expectEqual(Action.cancel, d.enterAction().?);
+    d.cycleFocus(true);
+    d.cycleFocus(true);
+    try std.testing.expectEqual(Focus{ .field = 0 }, d.focus);
+    d.cycleFocus(false);
+    try std.testing.expectEqual(Focus{ .button = 1 }, d.focus);
+
     d.state = .waiting;
+    // Only Cancel can be pressed, and no field.
+    d.focus = .none;
+    d.cycleFocus(true);
+    try std.testing.expectEqual(Focus{ .button = 0 }, d.focus);
+    d.cycleFocus(true);
+    try std.testing.expectEqual(Focus{ .button = 0 }, d.focus);
+    try std.testing.expectEqual(@as(?*TextField, null), d.focused());
     const waiting = d.buttons(&buf);
     try std.testing.expect(waiting[1].disabled);
     try std.testing.expectEqual(@as(?Action, null), d.defaultAction());

@@ -324,6 +324,7 @@ pub const VK_CONTROL = 0x11;
 pub const VK_MENU = 0x12;
 pub const VK_CAPITAL = 0x14;
 pub const VK_ESCAPE = 0x1B;
+pub const VK_SPACE = 0x20;
 pub const VK_TAB = 0x09;
 pub const VK_PRIOR = 0x21;
 pub const VK_NEXT = 0x22;

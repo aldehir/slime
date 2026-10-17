@@ -174,9 +174,8 @@ pub fn paint(c: *const Chrome, p: *Painter, area: Rect, d: *const Dialog, opts: 
         const ring: Rect = .{ .x = r.x - spread, .y = r.y - spread, .w = r.w + 2 * spread, .h = r.h + 2 * spread };
         p.fillRounded(ring, c.px(radius) + spread, .{ 0, 0, 0, 0.06 });
     }
-    p.fillRounded(r, c.px(radius), t.dialog);
-    const outline = if (d.danger) mixColor(t.dialog_outline, t.danger, 0.35) else t.dialog_outline;
-    p.strokeRounded(r.inset(c.stroke() / 2, c.stroke() / 2), c.px(radius), c.stroke(), outline);
+    const edge = if (d.danger) mixColor(t.dialog_outline, t.danger, 0.35) else t.dialog_outline;
+    c.fillBordered(p, r, c.px(radius), t.dialog, edge);
 
     const accent = if (d.danger) t.danger else t.accent;
     c.drawIcon(p, switch (d.icon) {
@@ -197,10 +196,10 @@ pub fn paint(c: *const Chrome, p: *Painter, area: Rect, d: *const Dialog, opts: 
     for (d.constFields(), l.fields[0..d.field_count], 0..) |*field, fr, n| {
         if (field.above.len > 0) p.text(field.above, f.prose, fr.above, if (dim) t.text_muted else t.text);
         p.text(field.label, f.body, fr.label, if (dim) t.text_muted else t.text);
-        const focused = !dim and n == d.focus;
+        const focused = !dim and std.meta.eql(d.focus, Dialog.Focus{ .field = n });
         const box = fr.box;
-        p.fillRounded(box, c.px(6), if (dim) opts.terminal_bg else t.ground);
-        p.strokeRounded(box.inset(c.stroke() / 2, c.stroke() / 2), c.px(6), c.stroke(), if (focused) t.accent else t.dialog_outline);
+        if (focused) paintGlow(c, p, box, c.px(6), t.accent);
+        c.fillBordered(p, box, c.px(6), if (dim) opts.terminal_bg else t.ground, if (focused) t.accent else t.outline);
         c.paintEditText(p, box.inset(c.px(10), 0), &field.edit, .{
             .caret = focused and opts.focused and opts.caret_visible,
             .mask = !field.echo,
@@ -226,11 +225,24 @@ pub fn paint(c: *const Chrome, p: *Painter, area: Rect, d: *const Dialog, opts: 
     }
 
     for (l.buttons[0..l.button_count], l.buttonSlice(), 0..) |br, b, n| {
-        paintButton(c, p, br, b, c.buttonState(.{ .dialog_button = n }));
+        const focused = std.meta.eql(d.focus, Dialog.Focus{ .button = n });
+        if (focused) paintGlow(c, p, br, c.px(6), if (b.style == .danger) t.danger else t.accent);
+        paintButton(c, p, br, b, c.buttonState(.{ .dialog_button = n }), focused);
     }
 }
 
-fn paintButton(c: *const Chrome, p: *Painter, r: Rect, b: Dialog.Button, state: Chrome.ButtonState) void {
+/// A glow around `r`, for what has the keyboard, drawn before it: faint
+/// fills a pixel apart, which add up to a fade outward.
+fn paintGlow(c: *const Chrome, p: *Painter, r: Rect, rad: f32, color: Chrome.Color) void {
+    const w = c.stroke();
+    var k: f32 = 4;
+    while (k > 0) : (k -= 1) {
+        p.fillRounded(r.inset(-k * w, -k * w), rad + k * w, withAlpha(color, 0.09));
+    }
+}
+
+/// `focused` gives a button with no edge of its own a crisp one.
+fn paintButton(c: *const Chrome, p: *Painter, r: Rect, b: Dialog.Button, state: Chrome.ButtonState, focused: bool) void {
     const t = &c.theme;
     const rad = c.px(6);
     const lit = state != .rest and !b.disabled;
@@ -241,12 +253,13 @@ fn paintButton(c: *const Chrome, p: *Painter, r: Rect, b: Dialog.Button, state: 
             p.text(b.label, c.fonts.button_strong, r, if (b.disabled) withAlpha(t.on_accent, 0.6) else t.on_accent);
         },
         .normal => {
-            p.fillRounded(r, rad, if (lit) t.surface_hover else t.surface);
+            const bg = if (lit) t.surface_hover else t.surface;
+            if (focused) c.fillBordered(p, r, rad, bg, t.accent) else p.fillRounded(r, rad, bg);
             p.text(b.label, c.fonts.button, r, t.text);
         },
         .danger => {
-            if (lit) p.fillRounded(r, rad, withAlpha(t.danger, 0.12));
-            p.strokeRounded(r.inset(c.stroke() / 2, c.stroke() / 2), rad, c.stroke(), withAlpha(t.danger, 0.55));
+            const bg = if (lit) mixColor(t.dialog, t.danger, 0.12) else t.dialog;
+            c.fillBordered(p, r, rad, bg, if (focused) t.danger else mixColor(t.dialog, t.danger, 0.55));
             p.text(b.label, c.fonts.button, r, t.danger);
         },
     }

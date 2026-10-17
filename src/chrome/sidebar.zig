@@ -135,8 +135,7 @@ fn paintConnect(c: *const Chrome, p: *Painter, r: Rect) void {
 /// caret in view, with the selection behind it.
 fn paintField(c: *const Chrome, p: *Painter, r: Rect, field: *const Chrome.TextField, caret: bool) void {
     const radius = c.px(6);
-    p.fillRounded(r, radius, c.theme.surface);
-    p.strokeRounded(r.inset(c.stroke() / 2, c.stroke() / 2), radius, c.stroke(), c.theme.accent);
+    c.fillBordered(p, r, radius, c.theme.surface, c.theme.accent);
 
     const inner = r.inset(c.px(10), 0);
     if (field.len == 0) p.text(L("user@host:port"), c.fonts.body, inner, c.theme.text_inactive);

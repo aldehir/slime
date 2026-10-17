@@ -757,7 +757,8 @@ fn loginKey(self: *Window, vk: u32) bool {
     const login = self.activeLogin() orelse return false;
     const d = &login.dialog;
     switch (vk) {
-        win32.VK_RETURN => if (d.defaultAction()) |action| self.loginAction(action),
+        win32.VK_RETURN => if (d.enterAction()) |action| self.loginAction(action),
+        win32.VK_SPACE => if (d.focusedButton()) |b| self.loginAction(b.action) else return false,
         win32.VK_ESCAPE => self.loginAction(d.escapeAction()),
         // Ctrl+Tab still switches sessions.
         win32.VK_TAB => if (win32.GetKeyState(win32.VK_CONTROL) < 0)
@@ -766,7 +767,7 @@ fn loginKey(self: *Window, vk: u32) bool {
             d.cycleFocus(win32.GetKeyState(win32.VK_SHIFT) >= 0),
         else => {
             const field = d.focused() orelse return false;
-            if (!self.editKey(field, vk, d.fields[d.focus].echo)) return false;
+            if (!self.editKey(field, vk, d.fields[d.focus.field].echo)) return false;
         },
     }
     self.keyHandled();
@@ -989,7 +990,7 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
         },
         .dialog_field => |i| {
             const d = &(self.activeSession().login orelse return).dialog;
-            d.focus = i;
+            d.focus = .{ .field = i };
             self.resetBlink();
             self.dirty = true;
         },

@@ -82,6 +82,7 @@ pub fn ask(self: *Login, prompt: *SshConnection.Prompt) void {
         },
     }
     for (prompt.questions) |q| d.addField(q.label, q.echo);
+    if (d.field_count > 0) d.focus = .{ .field = 0 };
     self.dialog = d;
     self.status_from_server = false;
     if (old) |o| o.destroy();
@@ -96,6 +97,7 @@ pub fn info(self: *Login, text: []const u16) void {
 /// The user answered: wait for what comes back.
 pub fn answered(self: *Login) void {
     self.dialog.state = .waiting;
+    self.dialog.focus = .none;
     self.setStatus(&.{ L("Waiting for "), self.host, L("\u{2026}") });
     self.status_from_server = false;
 }
@@ -103,6 +105,7 @@ pub fn answered(self: *Login) void {
 /// Logging in failed for `why`, unless the server said why last.
 pub fn fail(self: *Login, why: []const u8) void {
     self.dialog.state = .failed;
+    self.dialog.focus = .none;
     if (self.status_from_server) return;
     var buf: [256]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&buf, why[0..@min(why.len, buf.len)]) catch 0;
