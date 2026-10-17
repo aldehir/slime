@@ -379,3 +379,18 @@ func TestProgramStatus(t *testing.T) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 }
+
+// TestClipboardWrite checks OSC 52 writes reach the handler, the last of
+// a Write winning, and that an empty one clears.
+func TestClipboardWrite(t *testing.T) {
+	term := newTerm(t, 20, 4)
+	var got []string
+	term.SetEvents(Events{ClipboardWrite: func(text []byte) { got = append(got, string(text)) }})
+	// "aGk=" is "hi"; "eW8=" is "yo".
+	write(t, term, "\x1b]52;c;aGk=\x07\x1b]52;c;eW8=\x07")
+	write(t, term, "\x1b]52;c;\x07")
+	write(t, term, "\x1b]52;p;aGk=\x07")
+	if fmt.Sprint(got) != fmt.Sprint([]string{"yo", ""}) {
+		t.Errorf("clipboard writes %q, want [yo, empty]", got)
+	}
+}

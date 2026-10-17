@@ -50,8 +50,9 @@ pub fn build(b: *std.Build) void {
     exe_mod.addAnonymousImport("slime-small.svg", .{ .root_source_file = b.path("assets/icon/slime-small.svg") });
     // The chrome's icons, embedded by the module next to them.
     exe_mod.addAnonymousImport("lucide", .{ .root_source_file = b.path("assets/icons/lucide/lucide.zig") });
-    // The frame codec slimed's library shares (src/Screen.zig).
+    // The frame and event codecs slimed's library shares (src/Screen.zig).
     exe_mod.addAnonymousImport("frame", .{ .root_source_file = b.path("ssh/internal/vt/frame.zig") });
+    exe_mod.addAnonymousImport("event", .{ .root_source_file = b.path("ssh/internal/vt/event.zig") });
 
     if (b.lazyDependency("ghostty", .{
         .target = target,

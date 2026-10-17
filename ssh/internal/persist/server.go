@@ -199,10 +199,16 @@ func (s *Server) handshake(c *conn, r *Reader) bool {
 		Version:         Version,
 		SnapshotVersion: s.snapshotVersion,
 		PID:             uint32(os.Getpid()),
+		FrameLayout:     vt.FrameLayout(),
 	})
 	if hello.Version != Version {
 		c.sendForce(0, &Error{Message: fmt.Sprintf("slimed speaks version %d, not %d", Version, hello.Version)})
 		return false
+	}
+	c.frames = hello.Caps&CapFrames != 0
+	c.interval = defaultFrameInterval
+	if hello.FrameInterval != 0 {
+		c.interval = time.Duration(hello.FrameInterval) * time.Microsecond
 	}
 	return true
 }
@@ -245,6 +251,14 @@ func (s *Server) dispatch(c *conn, id uint32, m Message) {
 	case *Input:
 		if p := s.pane(id); p != nil {
 			p.input(c, m.Data)
+		}
+	case *Ack:
+		if p := s.pane(id); p != nil {
+			p.ack(c, m.Seq)
+		}
+	case *Event:
+		if p := s.pane(id); p != nil {
+			p.event(c, m.Data)
 		}
 	case *Resize:
 		if p := s.pane(id); p != nil {

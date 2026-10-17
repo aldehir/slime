@@ -16,10 +16,17 @@ type Client struct {
 	Hello HelloReply
 }
 
-// NewClient says hello over rw.
+// NewClient says hello over rw, as a client that runs its own terminals.
 func NewClient(rw io.ReadWriteCloser) (*Client, error) {
+	return NewClientWith(rw, Hello{})
+}
+
+// NewClientWith says hello over rw with hello's capabilities; its
+// Version is filled in.
+func NewClientWith(rw io.ReadWriteCloser, hello Hello) (*Client, error) {
 	c := &Client{rw: rw, r: NewReader(rw)}
-	if err := c.Send(0, &Hello{Version: Version}); err != nil {
+	hello.Version = Version
+	if err := c.Send(0, &hello); err != nil {
 		return nil, err
 	}
 	_, m, err := c.Recv()
@@ -92,6 +99,8 @@ type PaneState struct {
 	Attached Attached
 	Snapshot []byte
 	Output   [][]byte
+	// Frames, for a client that draws them.
+	Draws []*Draw
 }
 
 // Attachment collects what attaching (or a request that adds a pane to
@@ -121,6 +130,10 @@ func (c *Client) Await(tag uint32, wantCreated bool) (*Attachment, error) {
 		case *Output:
 			if p := a.Panes[id]; p != nil {
 				p.Output = append(p.Output, append([]byte(nil), m.Data...))
+			}
+		case *Draw:
+			if p := a.Panes[id]; p != nil {
+				p.Draws = append(p.Draws, &Draw{Seq: m.Seq, Data: append([]byte(nil), m.Data...)})
 			}
 		case *Workspace:
 			if m.Tag == tag {

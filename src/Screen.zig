@@ -8,6 +8,10 @@ const frame = @import("frame");
 pub const Codec = frame.Codec(ghostty_vt);
 pub const Screen = Codec.Screen;
 
+/// Input to send slimed: the codec it decodes with (event.zig).
+pub const event = @import("event");
+pub const Events = event.Codec(ghostty_vt);
+
 const testing = std.testing;
 const RenderState = ghostty_vt.RenderState;
 
@@ -179,4 +183,78 @@ test "a frame for another size is rejected" {
     other.buf.clearRetainingCapacity();
     try Codec.encode(&other.buf.writer, &other.state, .{});
     try testing.expectError(error.BadFrame, h.screen.apply(h.alloc, other.buf.written()));
+}
+
+test "events round trip" {
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    var scratch: Events.Scratch = .{};
+    const records = [_]event.Win32Key{
+        .{ .vk = 65, .scancode = 30, .char = 'a', .down = true, .control_state = 8, .repeat = 2 },
+        .{ .vk = 65, .scancode = 30, .char = 'b', .down = false },
+    };
+    const cases = [_]Events.Event{
+        .{ .key = .{
+            .event = .{
+                .action = .repeat,
+                .key = .key_a,
+                .mods = .{ .ctrl = true, .shift = true },
+                .consumed_mods = .{ .shift = true },
+                .composing = true,
+                .utf8 = "A",
+                .unshifted_codepoint = 'a',
+            },
+            .win32 = &records,
+        } },
+        .{ .text = "h\u{e9}llo" },
+        .{ .paste = "line\nnext" },
+        .{ .focus = true },
+        .{ .mouse = .{ .action = .motion, .button = .right, .mods = .{ .alt = true }, .held = true, .x = 12.5, .y = -3, .time = 0xfffffff0 } },
+        .{ .mouse = .{ .action = .release, .button = null, .mods = .{}, .held = false, .x = 0, .y = 0, .time = 1 } },
+        .{ .wheel = .{ .horizontal = true, .rotation = -240, .lines_per_notch = event.lines_page, .mods = .{ .super = true }, .x = 1, .y = 2 } },
+        .{ .copy = 0xabcdef },
+        .{ .geometry = .{ .cell_width = 9, .cell_height = 19, .padding = .{ .left = 1, .top = 2, .right = 3, .bottom = 4 }, .width = 800, .height = 600 } },
+        .{ .settings = .{ .double_click_ms = 400, .word_boundary = &.{ ' ', '\u{2502}', '$' } } },
+        .cancel,
+    };
+    for (cases) |ev| {
+        buf.clearRetainingCapacity();
+        try Events.encode(&buf.writer, ev);
+        const got = try Events.decode(buf.written(), &scratch);
+        try testing.expectEqual(std.meta.activeTag(ev), std.meta.activeTag(got));
+        switch (ev) {
+            .key => |k| {
+                const g = got.key;
+                try testing.expectEqual(k.event.action, g.event.action);
+                try testing.expectEqual(k.event.key, g.event.key);
+                try testing.expectEqual(k.event.mods, g.event.mods);
+                try testing.expectEqual(k.event.consumed_mods, g.event.consumed_mods);
+                try testing.expectEqual(k.event.composing, g.event.composing);
+                try testing.expectEqualStrings(k.event.utf8, g.event.utf8);
+                try testing.expectEqual(k.event.unshifted_codepoint, g.event.unshifted_codepoint);
+                try testing.expectEqualSlices(event.Win32Key, k.win32, g.win32);
+            },
+            .text => |s| try testing.expectEqualStrings(s, got.text),
+            .paste => |s| try testing.expectEqualStrings(s, got.paste),
+            .settings => |s| {
+                try testing.expectEqual(s.double_click_ms, got.settings.double_click_ms);
+                try testing.expectEqualSlices(u21, s.word_boundary, got.settings.word_boundary);
+            },
+            else => try testing.expectEqualDeep(ev, got),
+        }
+    }
+    try testing.expectError(error.BadEvent, Events.decode(&.{0}, &scratch));
+    try testing.expectError(error.EndOfStream, Events.decode(&.{@intFromEnum(event.Kind.copy)}, &scratch));
+}
+
+test "frames carry the mouse shape and whether to send motion" {
+    var h: Harness = undefined;
+    try h.init(10, 3);
+    defer h.deinit();
+    try h.state.update(h.alloc, &h.t);
+    h.buf.clearRetainingCapacity();
+    try Codec.encode(&h.buf.writer, &h.state, .{ .motion = true, .mouse_shape = 3 });
+    try h.screen.apply(h.alloc, h.buf.written());
+    try testing.expect(h.screen.motion);
+    try testing.expectEqual(3, h.screen.mouse_shape);
 }

@@ -13,6 +13,7 @@
 //!
 //!     u8   flags (Flags)
 //!     u16  cols, rows
+//!     u8   mouse shape (OSC 22, ghostty's MouseShape)
 //!     rgb  background, foreground
 //!     u8   has cursor color, rgb cursor color
 //!     rgb  palette[256]                     if flags.palette
@@ -40,7 +41,10 @@ pub const Flags = packed struct(u8) {
     /// Every row is in the frame, and the screen takes its size.
     full: bool = false,
     palette: bool = false,
-    _pad: u6 = 0,
+    /// The program wants mouse motion without a button held (any-event
+    /// tracking, mode 1003); the client sends it only then.
+    motion: bool = false,
+    _pad: u5 = 0,
 };
 
 const CursorBits = packed struct(u8) {
@@ -87,12 +91,16 @@ pub fn Codec(comptime vt: type) type {
         pub fn encode(w: *std.Io.Writer, state: *const RenderState, opts: struct {
             full: bool = false,
             palette: bool = false,
+            /// Terminal state the render state doesn't carry.
+            motion: bool = false,
+            mouse_shape: u8 = 0,
         }) std.Io.Writer.Error!void {
             const full = opts.full or state.dirty == .full;
-            const flags: Flags = .{ .full = full, .palette = opts.palette or full };
+            const flags: Flags = .{ .full = full, .palette = opts.palette or full, .motion = opts.motion };
             try w.writeByte(@bitCast(flags));
             try w.writeInt(u16, state.cols, .little);
             try w.writeInt(u16, state.rows, .little);
+            try w.writeByte(opts.mouse_shape);
 
             const colors = &state.colors;
             try writeRgb(w, colors.background);
@@ -206,6 +214,11 @@ pub fn Codec(comptime vt: type) type {
             colors: RenderState.Colors = RenderState.empty.colors,
             cursor: Cursor = RenderState.empty.cursor,
             row_data: std.ArrayList(Row) = .empty,
+            /// The pointer the program asked for (OSC 22), as ghostty's
+            /// MouseShape numbers them.
+            mouse_shape: u8 = 0,
+            /// Send mouse motion without a button held (Flags.motion).
+            motion: bool = false,
 
             /// Scratch for decoding a row: its style table.
             style_table: std.AutoHashMapUnmanaged(StyleId, Style) = .empty,
@@ -253,6 +266,8 @@ pub fn Codec(comptime vt: type) type {
                     return error.BadFrame;
                 }
                 for (self.row_data.items) |*row| row.dirty = false;
+                self.mouse_shape = try r.takeByte();
+                self.motion = flags.motion;
 
                 self.colors.background = try readRgb(&r);
                 self.colors.foreground = try readRgb(&r);
@@ -290,7 +305,25 @@ pub fn Codec(comptime vt: type) type {
                 }
             }
 
-            fn resize(self: *Screen, alloc: Allocator, cols: u16, rows: u16) Allocator.Error!void {
+            /// Write the text of the rows the last frame changed, a line
+            /// each, trailing blanks trimmed: for tests and debugging.
+            pub fn changedText(self: *const Screen, w: *std.Io.Writer) std.Io.Writer.Error!void {
+                for (self.row_data.items) |row| {
+                    if (!row.dirty) continue;
+                    var line: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+                    defer line.deinit();
+                    for (row.raws.items, row.graphemes.items) |raw, extra| {
+                        if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
+                        const cp: u21 = if (raw.hasText()) raw.codepoint() else ' ';
+                        try line.writer.print("{u}", .{cp});
+                        if (raw.hasGrapheme()) for (extra) |e| try line.writer.print("{u}", .{e});
+                    }
+                    try w.writeAll(std.mem.trimEnd(u8, line.written(), " "));
+                    try w.writeByte('\n');
+                }
+            }
+
+            pub fn resize(self: *Screen, alloc: Allocator, cols: u16, rows: u16) Allocator.Error!void {
                 for (self.row_data.items[@min(rows, self.row_data.items.len)..]) |*row| row.deinit(alloc);
                 const old = self.row_data.items.len;
                 try self.row_data.resize(alloc, rows);

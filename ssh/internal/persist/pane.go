@@ -28,6 +28,7 @@ type Pane struct {
 	modes  []Mode // the unknown modes seen, in their current state
 	status programStatus
 	done   bool
+	fr     framing
 }
 
 func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term *vt.Terminal) *Pane {
@@ -42,18 +43,53 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 	}
 	term.SetEvents(vt.Events{
 		// Answer queries while detached so the program doesn't wait on a
-		// reply (ConPTY asks DA1 at startup); an attached client's own
-		// terminal answers otherwise.
+		// reply (ConPTY asks DA1 at startup), and always for a client that
+		// draws frames; a client running its own terminal answers
+		// otherwise.
 		Reply: func(b []byte) {
-			if pn.client == nil {
+			if c := pn.client; c == nil || c.frames {
 				pn.pty.Write(b)
 			}
 		},
-		UnknownMode:   pn.setMode,
-		ProgramStatus: pn.status.report,
-		PromptStart:   pn.status.promptStarted,
+		UnknownMode: pn.setMode,
+		ProgramStatus: func(s vt.Status) {
+			pn.status.report(s)
+			pn.statusChanged()
+		},
+		PromptStart: func() {
+			pn.status.promptStarted()
+			pn.statusChanged()
+		},
+		// A client that draws has no terminal to learn these from.
+		TitleChanged: func() {
+			title, _ := pn.term.Title()
+			pn.notify(&Notice{Kind: NoticeTitle, Text: title})
+		},
+		PwdChanged: func() {
+			pwd, _ := pn.term.Pwd()
+			pn.notify(&Notice{Kind: NoticePwd, Text: pwd})
+		},
+		Bell:           func() { pn.notify(&Notice{Kind: NoticeBell}) },
+		ClipboardWrite: func(text []byte) { pn.notify(&Notice{Kind: NoticeClipboard, Text: string(text)}) },
 	})
+	pn.startFraming()
 	return pn
+}
+
+// notify sends a client that draws a Notice. Runs inside term.Write,
+// under p.mu. Notices count against the client's backlog, and one that
+// doesn't fit is dropped: a program retitling on every write can't grow
+// the queue.
+func (p *Pane) notify(n *Notice) {
+	if c := p.client; c != nil && c.frames {
+		c.send(p.id, n)
+	}
+}
+
+// statusChanged sends a client that draws every status record. Runs
+// inside term.Write, under p.mu.
+func (p *Pane) statusChanged() {
+	p.notify(&Notice{Kind: NoticeStatus, Status: p.status.records()})
 }
 
 // setMode records an unknown mode's state. Runs inside term.Write,
@@ -77,7 +113,9 @@ func (p *Pane) run() {
 		if n > 0 {
 			p.mu.Lock()
 			p.term.Write(buf[:n])
-			if c := p.client; c != nil && !c.send(p.id, &Output{Data: buf[:n]}) {
+			if c := p.client; c != nil && c.frames {
+				p.changedLocked()
+			} else if c != nil && !c.send(p.id, &Output{Data: buf[:n]}) {
 				// Too far behind: drop the connection, which detaches its
 				// workspaces. Reattaching is a snapshot away.
 				p.srv.log.Info("client too slow; dropping it", "pane", p.id)
@@ -101,6 +139,7 @@ func (p *Pane) run() {
 		c.sendForce(p.id, &Exit{Status: status})
 		p.client = nil
 	}
+	p.stopFramingLocked()
 	p.mu.Unlock()
 	p.srv.paneExited(p)
 	p.pty.Close()
@@ -119,7 +158,11 @@ func (p *Pane) attach(c *conn, size Size) error {
 	if size.Cols != 0 && size.Rows != 0 && size != p.size {
 		p.resizeLocked(size)
 	}
-	if err := p.snapshotTo(c, 0); err != nil {
+	if c.frames {
+		if err := p.attachFramesLocked(c); err != nil {
+			return err
+		}
+	} else if err := p.snapshotTo(c, 0); err != nil {
 		return err
 	}
 	p.client = c
@@ -159,6 +202,7 @@ func (p *Pane) detach(c *conn) {
 	defer p.mu.Unlock()
 	if p.client == c {
 		p.client = nil
+		p.autoscrollLocked(false)
 	}
 }
 
@@ -191,6 +235,7 @@ func (p *Pane) resizeLocked(size Size) {
 		p.srv.log.Error("resizing terminal", "pane", p.id, "err", err)
 	}
 	p.size = size
+	p.changedLocked()
 }
 
 // cell is the pane's cell size in pixels, as its window last sized it:

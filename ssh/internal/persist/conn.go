@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // MaxQueued is how far behind, in bytes, a client may fall before it
@@ -27,6 +28,11 @@ type conn struct {
 	// Workspaces this client is attached to. Guarded by the server's
 	// lock.
 	owned map[uint32]*workspace
+
+	// Set by the handshake: the client draws frames (CapFrames), at most
+	// one a pane per interval.
+	frames   bool
+	interval time.Duration
 }
 
 type queued struct {

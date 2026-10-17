@@ -39,6 +39,11 @@ type Events struct {
 	// reset reports StatusClear with no id.
 	ProgramStatus func(s Status)
 	PromptStart   func()
+
+	// ClipboardWrite carries a program's write to the clipboard (OSC 52,
+	// 5522): its text, or empty to clear it. Only the last write of a
+	// Write is delivered. The slice is only valid during the call.
+	ClipboardWrite func(text []byte)
 }
 
 // StatusState is a program status report's state, numbered as
@@ -80,6 +85,9 @@ type pending struct {
 	// Program status reports and new prompts, in order; a nil status is
 	// a prompt.
 	status []*Status
+	// The last clipboard write, if hasClipboard.
+	clipboard    []byte
+	hasClipboard bool
 }
 
 // Primary and secondary device attributes, as slime answers them:
@@ -178,6 +186,19 @@ func goProgramStatus(_ C.GhosttyTerminal, ud unsafe.Pointer, rep *C.GhosttyTermi
 	}
 }
 
+//export goClipboardWrite
+func goClipboardWrite(_ C.GhosttyTerminal, ud unsafe.Pointer, data *C.uint8_t, n C.size_t) {
+	t := termOf(ud)
+	if t == nil {
+		return
+	}
+	t.pend.clipboard = t.pend.clipboard[:0]
+	if n > 0 {
+		t.pend.clipboard = append(t.pend.clipboard, unsafe.Slice((*byte)(data), int(n))...)
+	}
+	t.pend.hasClipboard = true
+}
+
 //export goLog
 func goLog(_ unsafe.Pointer, level C.GhosttySysLogLevel, scope *C.uint8_t, scopeLen C.size_t, msg *C.uint8_t, msgLen C.size_t) {
 	logger.Lock()
@@ -207,7 +228,7 @@ func goLog(_ unsafe.Pointer, level C.GhosttySysLogLevel, scope *C.uint8_t, scope
 // deliver hands what the last Write's callbacks recorded to the handlers.
 func (t *Terminal) deliver() {
 	p := t.pend
-	t.pend = pending{reply: p.reply[:0], modes: p.modes[:0], status: p.status[:0]}
+	t.pend = pending{reply: p.reply[:0], modes: p.modes[:0], status: p.status[:0], clipboard: p.clipboard[:0]}
 	for _, s := range p.status {
 		if s == nil {
 			if t.events.PromptStart != nil {
@@ -235,5 +256,8 @@ func (t *Terminal) deliver() {
 	}
 	if p.pwd && t.events.PwdChanged != nil {
 		t.events.PwdChanged()
+	}
+	if p.hasClipboard && t.events.ClipboardWrite != nil {
+		t.events.ClipboardWrite(p.clipboard)
 	}
 }

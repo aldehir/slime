@@ -23,9 +23,11 @@ import (
 const Version = 1
 
 // MaxFrame bounds a frame so a corrupt stream can't make us allocate
-// gigabytes. Snapshots go out in SnapshotChunk pieces.
+// gigabytes. Snapshots go out in SnapshotChunk pieces. A full Frame of
+// a big screen whose every cell has its own style and grapheme can come
+// near a few MiB, and goes whole.
 const (
-	MaxFrame      = 1 << 20
+	MaxFrame      = 8 << 20
 	SnapshotChunk = 256 << 10
 )
 
@@ -55,6 +57,8 @@ const (
 	TypeInput           Type = 15
 	TypeResize          Type = 16
 	TypePeek            Type = 17
+	TypeAck             Type = 18
+	TypeEvent           Type = 19
 )
 
 // Daemon to client.
@@ -69,6 +73,9 @@ const (
 	TypeDetached   Type = 72
 	TypeError      Type = 73
 	TypeCreated    Type = 74
+	TypeDraw       Type = 75
+	TypeCopied     Type = 76
+	TypeNotice     Type = 77
 )
 
 var (
@@ -99,7 +106,25 @@ type Size struct {
 	CellW, CellH uint32
 }
 
-type Hello struct{ Version uint32 }
+// Hello opens a connection. Caps and FrameInterval are optional on the
+// wire; a client that sends neither runs its own terminals.
+type Hello struct {
+	Version uint32
+	Caps    uint32
+	// FrameInterval is the least time between a pane's frames, in
+	// microseconds: the client's refresh period. Zero for the default.
+	FrameInterval uint32
+}
+
+// Capabilities a client asks for in Hello.
+const (
+	// CapFrames: the client draws frames (Draw) instead of running a
+	// terminal.
+	// Attaching sends Attached with no snapshot, then frames; panes take
+	// Event messages, not Input; and the daemon's terminal answers the
+	// program's queries.
+	CapFrames uint32 = 1 << 0
+)
 
 // List asks for every workspace; the reply is Workspaces.
 type List struct{}
@@ -196,12 +221,62 @@ type Resize struct{ Size Size }
 // Attached (with Tag) and the snapshot, and nothing live follows.
 type Peek struct{ Tag uint32 }
 
+// Ack says the client drew the pane's Draw Seq, which frees room for
+// another (see Pane's framing).
+type Ack struct{ Seq uint32 }
+
+// Event is input for the pane in the frame's id, from a CapFrames
+// client: a key, mouse, wheel, paste, focus change, or copy, encoded as
+// ssh/internal/vt/event.zig lays out.
+type Event struct{ Data []byte }
+
+// Draw is a frame of the pane in the frame's id: what to draw, encoded
+// as ssh/internal/vt/frame.zig lays out. Seq counts the pane's frames to
+// this client from 1; Ack them.
+type Draw struct {
+	Seq  uint32
+	Data []byte
+}
+
+// Copied answers a copy Event for the pane in the frame's id: Tag is the
+// event's, and Text the selection's (empty with none).
+type Copied struct {
+	Tag  uint32
+	Text string
+}
+
+// Notice tells a client that draws (CapFrames) what the pane in the
+// frame's id did besides change its screen: what a client running its
+// own terminal would learn from the output.
+type Notice struct {
+	Kind NoticeKind
+	// Text is the new title or pwd (as sent: OSC 7's is a file:// URI),
+	// or the clipboard's new text (empty to clear it).
+	Text string
+	// Status is every program status record, oldest update first, for
+	// NoticeStatus.
+	Status []StatusRecord
+}
+
+type NoticeKind uint8
+
+const (
+	NoticeTitle NoticeKind = iota + 1
+	NoticePwd
+	NoticeBell
+	NoticeClipboard
+	NoticeStatus
+)
+
 type HelloReply struct {
 	Version uint32
 	// SnapshotVersion is the snapshot format the daemon writes. A client
 	// that can't decode it shouldn't attach.
 	SnapshotVersion uint16
 	PID             uint32
+	// FrameLayout is the daemon's vt.FrameLayout. A CapFrames client
+	// whose own differs can't draw its frames.
+	FrameLayout uint64
 }
 
 type Workspaces struct {
@@ -320,6 +395,8 @@ func (*PaneKill) Type() Type        { return TypePaneKill }
 func (*Input) Type() Type           { return TypeInput }
 func (*Resize) Type() Type          { return TypeResize }
 func (*Peek) Type() Type            { return TypePeek }
+func (*Ack) Type() Type             { return TypeAck }
+func (*Event) Type() Type           { return TypeEvent }
 func (*HelloReply) Type() Type      { return TypeHelloReply }
 func (*Workspaces) Type() Type      { return TypeWorkspaces }
 func (*Workspace) Type() Type       { return TypeWorkspace }
@@ -330,9 +407,23 @@ func (*Exit) Type() Type            { return TypeExit }
 func (*Detached) Type() Type        { return TypeDetached }
 func (*Error) Type() Type           { return TypeError }
 func (*Created) Type() Type         { return TypeCreated }
+func (*Draw) Type() Type            { return TypeDraw }
+func (*Copied) Type() Type          { return TypeCopied }
+func (*Notice) Type() Type          { return TypeNotice }
 
-func (m *Hello) encode(e *encoder) { e.u32(m.Version) }
-func (m *Hello) decode(d *decoder) { m.Version = d.u32() }
+func (m *Hello) encode(e *encoder) {
+	e.u32(m.Version)
+	e.u32(m.Caps)
+	e.u32(m.FrameInterval)
+}
+
+func (m *Hello) decode(d *decoder) {
+	m.Version = d.u32()
+	if d.more() {
+		m.Caps = d.u32()
+		m.FrameInterval = d.u32()
+	}
+}
 
 func (*List) encode(*encoder) {}
 func (*List) decode(*decoder) {}
@@ -454,16 +545,58 @@ func (m *Resize) decode(d *decoder) { m.Size = d.size() }
 func (m *Peek) encode(e *encoder) { e.u32(m.Tag) }
 func (m *Peek) decode(d *decoder) { m.Tag = d.u32() }
 
+func (m *Ack) encode(e *encoder) { e.u32(m.Seq) }
+func (m *Ack) decode(d *decoder) { m.Seq = d.u32() }
+
+func (m *Event) encode(e *encoder) { e.raw(m.Data) }
+func (m *Event) decode(d *decoder) { m.Data = d.rest() }
+
+func (m *Draw) encode(e *encoder) {
+	e.u32(m.Seq)
+	e.raw(m.Data)
+}
+
+func (m *Draw) decode(d *decoder) {
+	m.Seq = d.u32()
+	m.Data = d.rest()
+}
+
+func (m *Copied) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Text)
+}
+
+func (m *Copied) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Text = d.str()
+}
+
+func (m *Notice) encode(e *encoder) {
+	e.u8(uint8(m.Kind))
+	e.str(m.Text)
+	e.statusRecords(m.Status)
+}
+
+func (m *Notice) decode(d *decoder) {
+	m.Kind = NoticeKind(d.u8())
+	m.Text = d.str()
+	m.Status = d.statusRecords()
+}
+
 func (m *HelloReply) encode(e *encoder) {
 	e.u32(m.Version)
 	e.u16(m.SnapshotVersion)
 	e.u32(m.PID)
+	e.u64(m.FrameLayout)
 }
 
 func (m *HelloReply) decode(d *decoder) {
 	m.Version = d.u32()
 	m.SnapshotVersion = d.u16()
 	m.PID = d.u32()
+	if d.more() {
+		m.FrameLayout = d.u64()
+	}
 }
 
 func (m *Workspaces) encode(e *encoder) {
@@ -540,12 +673,7 @@ func (m *Attached) encode(e *encoder) {
 		e.bool(md.Enabled)
 	}
 	e.str(m.Command)
-	e.u32(uint32(len(m.Status)))
-	for _, r := range m.Status {
-		e.str(r.ID)
-		e.u8(r.State)
-		e.u8(uint8(r.Progress))
-	}
+	e.statusRecords(m.Status)
 }
 
 func (m *Attached) decode(d *decoder) {
@@ -557,11 +685,7 @@ func (m *Attached) decode(d *decoder) {
 		m.Modes[i] = Mode{Mode: d.u16(), ANSI: d.bool(), Enabled: d.bool()}
 	}
 	m.Command = d.str()
-	n = d.count(6)
-	m.Status = make([]StatusRecord, n)
-	for i := range m.Status {
-		m.Status[i] = StatusRecord{ID: d.str(), State: d.u8(), Progress: int8(d.u8())}
-	}
+	m.Status = d.statusRecords()
 }
 
 func (m *Snapshot) encode(e *encoder) { e.raw(m.Data) }
@@ -658,6 +782,10 @@ func newMessage(t Type) Message {
 		return new(Resize)
 	case TypePeek:
 		return new(Peek)
+	case TypeAck:
+		return new(Ack)
+	case TypeEvent:
+		return new(Event)
 	case TypeHelloReply:
 		return new(HelloReply)
 	case TypeWorkspaces:
@@ -678,6 +806,12 @@ func newMessage(t Type) Message {
 		return new(Error)
 	case TypeCreated:
 		return new(Created)
+	case TypeDraw:
+		return new(Draw)
+	case TypeCopied:
+		return new(Copied)
+	case TypeNotice:
+		return new(Notice)
 	}
 	return nil
 }
@@ -750,6 +884,15 @@ func (e *encoder) str(s string) {
 	e.buf = append(e.buf, s...)
 }
 
+func (e *encoder) statusRecords(rs []StatusRecord) {
+	e.u32(uint32(len(rs)))
+	for _, r := range rs {
+		e.str(r.ID)
+		e.u8(r.State)
+		e.u8(uint8(r.Progress))
+	}
+}
+
 func (e *encoder) size(s Size) {
 	e.u16(s.Cols)
 	e.u16(s.Rows)
@@ -815,6 +958,9 @@ func (d *decoder) take(n int) []byte {
 	return b
 }
 
+// more says whether anything is left: fields added later are optional.
+func (d *decoder) more() bool { return d.err == nil && len(d.buf) > 0 }
+
 func (d *decoder) rest() []byte {
 	b := d.buf
 	d.buf = nil
@@ -875,6 +1021,15 @@ func (d *decoder) str() string {
 		return ""
 	}
 	return string(d.take(int(n)))
+}
+
+func (d *decoder) statusRecords() []StatusRecord {
+	n := d.count(6)
+	rs := make([]StatusRecord, n)
+	for i := range rs {
+		rs[i] = StatusRecord{ID: d.str(), State: d.u8(), Progress: int8(d.u8())}
+	}
+	return rs
 }
 
 func (d *decoder) size() Size {
