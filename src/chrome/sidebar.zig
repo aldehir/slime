@@ -333,7 +333,11 @@ fn paintPane(c: *const Chrome, p: *Painter, r: Rect, i: usize, j: usize, view: *
     const tab = view.tabs[i];
     const pane = tab.panes[j];
     const hit: Hit = .{ .tab_pane = .{ .tab = i, .pane = j } };
-    if (c.hover.eql(hit)) p.fillRounded(r, c.px(6), c.theme.row_hover);
+    // The highlight starts past the guide, which runs on unbroken.
+    if (c.hover.eql(hit)) {
+        const inset = c.px(fold_width);
+        p.fillRounded(.{ .x = r.x + inset, .y = r.y, .w = r.w - inset, .h = r.h }, c.px(6), c.theme.row_hover);
+    }
     const guide_x = Chrome.crisp(r.x + c.px(fold_width / 2) + c.px(1), c.stroke());
     const last = j + 1 == tab.panes.len;
     p.line(guide_x, r.y, guide_x, if (last) r.y + r.h / 2 else r.bottom(), c.stroke(), c.theme.outline);
