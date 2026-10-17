@@ -18,7 +18,7 @@ import (
 	"github.com/aldehir/slime/ssh/internal/vt"
 )
 
-// drawer is a client that draws frames (CapFrames).
+// drawer is a client with one pane, reading its frames one at a time.
 type drawer struct {
 	t    *testing.T
 	c    *Client
@@ -28,12 +28,12 @@ type drawer struct {
 	images []*Image
 }
 
-// newDrawer connects a client that draws, makes a workspace with one
-// pane, and returns it having read the attach.
+// newDrawer connects a client, makes a workspace with one pane, and
+// returns it having read the attach.
 func newDrawer(t *testing.T, h *harness) *drawer {
 	a, b := net.Pipe()
 	go h.srv.handle(a)
-	c, err := NewClientWith(b, Hello{Caps: CapFrames, FrameInterval: 1000})
+	c, err := NewClientWith(b, Hello{FrameInterval: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,12 +52,8 @@ func newDrawer(t *testing.T, h *harness) *drawer {
 		t.Fatal(err)
 	}
 	d.pane = att.Created.Pane
-	p := att.Panes[d.pane]
-	if p == nil {
+	if att.Panes[d.pane] == nil {
 		t.Fatal("no Attached for the new pane")
-	}
-	if len(p.Attached.Modes) != 0 || p.Attached.SnapshotLen != 0 {
-		t.Errorf("attached with a snapshot (%d bytes)", p.Attached.SnapshotLen)
 	}
 	return d
 }
@@ -83,9 +79,6 @@ func (d *drawer) draw(wait time.Duration) *Draw {
 			piece := *im
 			piece.Data = append([]byte(nil), im.Data...)
 			d.images = append(d.images, &piece)
-		}
-		if _, ok := m.(*Output); ok {
-			d.t.Fatal("a client that draws got raw output")
 		}
 	}
 }
@@ -278,7 +271,7 @@ func TestFramesReattach(t *testing.T) {
 
 	a, b := net.Pipe()
 	go h.srv.handle(a)
-	c, err := NewClientWith(b, Hello{Caps: CapFrames})
+	c, err := NewClient(b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,13 +492,13 @@ func evMotion(x, y float32) []byte {
 	return binary.LittleEndian.AppendUint32(b, 0)
 }
 
-// attachDrawer connects a second client that draws and attaches ws,
-// taking it from the client attached before.
+// attachDrawer connects a second client and attaches ws, taking it from
+// the client attached before.
 func attachDrawer(t *testing.T, h *harness, ws, pane uint32) *drawer {
 	t.Helper()
 	a, b := net.Pipe()
 	go h.srv.handle(a)
-	c, err := NewClientWith(b, Hello{Caps: CapFrames})
+	c, err := NewClient(b)
 	if err != nil {
 		t.Fatal(err)
 	}

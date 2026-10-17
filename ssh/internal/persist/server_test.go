@@ -190,17 +190,17 @@ func (h *harness) connect() *Client {
 }
 
 // window is a client playing slime: it owns workspaces and mirrors their
-// panes' terminals.
+// panes' screens from the frames it's sent, acking each.
 type window struct {
-	t     *testing.T
-	h     *harness
-	c     *Client
-	ws    *Workspace
-	terms map[uint32]*vt.Terminal
+	t       *testing.T
+	h       *harness
+	c       *Client
+	ws      *Workspace
+	screens map[uint32]*vt.Screen
 }
 
 func (h *harness) window() *window {
-	return &window{t: h.t, h: h, c: h.connect(), terms: map[uint32]*vt.Terminal{}}
+	return &window{t: h.t, h: h, c: h.connect(), screens: map[uint32]*vt.Screen{}}
 }
 
 // absorb takes in what an attach or a new pane delivered.
@@ -208,16 +208,27 @@ func (w *window) absorb(a *Attachment) {
 	w.t.Helper()
 	w.ws = a.Workspace
 	for id, p := range a.Panes {
-		term, err := runtime(w.t).Decode(p.Snapshot)
+		s, err := vt.NewScreen()
 		if err != nil {
 			w.t.Fatal(err)
 		}
-		w.t.Cleanup(func() { term.Close() })
-		for _, b := range p.Output {
-			term.Write(b)
+		w.t.Cleanup(s.Close)
+		w.screens[id] = s
+		for _, d := range p.Draws {
+			w.draw(id, d)
 		}
-		w.terms[id] = term
 	}
+}
+
+// draw applies a pane's frame to its screen and acks it.
+func (w *window) draw(id uint32, d *Draw) {
+	w.t.Helper()
+	if s := w.screens[id]; s != nil {
+		if err := s.Apply(d.Data); err != nil {
+			w.t.Fatal(err)
+		}
+	}
+	w.c.Send(id, &Ack{Seq: d.Seq})
 }
 
 // newWorkspace creates a workspace with one tab, and returns its pane.
@@ -256,8 +267,8 @@ func (w *window) attach(ws uint32, area Area) {
 	w.absorb(a)
 }
 
-// until applies output to the window's terminals until pane's text
-// contains want, and returns the other messages it read on the way.
+// until applies frames to the window's screens until pane's shows want,
+// and returns the other messages it read on the way.
 func (w *window) until(pane uint32, want string) []Message {
 	w.t.Helper()
 	var others []Message
@@ -273,15 +284,15 @@ func (w *window) until(pane uint32, want string) []Message {
 		if err != nil {
 			w.t.Fatalf("waiting for %q: %v", want, err)
 		}
-		if out, ok := m.(*Output); ok && w.terms[id] != nil {
-			w.terms[id].Write(out.Data)
+		if d, ok := m.(*Draw); ok {
+			w.draw(id, d)
 		} else {
 			others = append(others, m)
 		}
 	}
 }
 
-// next reads until a message of type T, applying output on the way.
+// next reads until a message of type T, applying frames on the way.
 func next[T Message](w *window) (uint32, T) {
 	w.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -290,8 +301,8 @@ func next[T Message](w *window) (uint32, T) {
 		if err != nil {
 			w.t.Fatal(err)
 		}
-		if out, ok := m.(*Output); ok && w.terms[id] != nil {
-			w.terms[id].Write(out.Data)
+		if d, ok := m.(*Draw); ok {
+			w.draw(id, d)
 			continue
 		}
 		if ws, ok := m.(*Workspace); ok {
@@ -306,11 +317,13 @@ func next[T Message](w *window) (uint32, T) {
 	return 0, zero
 }
 
+// text is the pane's screen as the window has drawn it: the viewport,
+// not the scrollback.
 func (w *window) text(pane uint32) string {
-	if w.terms[pane] == nil {
+	if w.screens[pane] == nil {
 		return ""
 	}
-	s, _ := w.terms[pane].Text()
+	s, _ := w.screens[pane].Text()
 	return s
 }
 
@@ -357,7 +370,7 @@ func TestWireRoundTrip(t *testing.T) {
 	}}
 	tabs := []TabInfo{{ID: 2, Name: "build", Tree: tree}, {ID: 6, Tree: &Node{Pane: 7}}}
 	msgs := []Message{
-		&Hello{Version: 3},
+		&Hello{Version: 3, FrameInterval: 16667},
 		&List{},
 		&WorkspaceNew{Tag: 1, Name: "main"},
 		&WorkspaceAttach{Tag: 2, WS: 9, Area: Area{720, 432, 9, 18}},
@@ -371,18 +384,16 @@ func TestWireRoundTrip(t *testing.T) {
 		&Split{Tag: 4, Pane: 3, Dir: Down, Share: 3000, Command: "pwsh", Cwd: "D:\\"},
 		&Layout{Tab: 2, Tree: tree},
 		&PaneKill{},
-		&Input{Data: []byte("ls\r")},
 		&Resize{Size: Size{1, 2, 3, 4}},
-		&Peek{Tag: 5},
-		&HelloReply{Version: 1, SnapshotVersion: 2, PID: 99},
+		&Peek{Tag: 5, VT: true},
+		&HelloReply{Version: 1, PID: 99, FrameLayout: 1 << 63},
 		&Workspaces{
 			Workspaces: []WorkspaceInfo{{ID: 9, Name: "main", Attached: true, DetachedAt: 1700000000000, Tabs: tabs}, {ID: 10}},
 			Panes:      []PaneInfo{{ID: 3, Tab: 2, Command: "c", Title: "t", Pwd: "p", Cols: 80, Rows: 24, Created: 1700000000000, PID: 5}},
 		},
 		&Workspace{Tag: 6, ID: 9, Name: "main", Tabs: tabs},
-		&Attached{Tag: 7, SnapshotLen: 1234, Modes: []Mode{{9001, false, true}, {4, true, false}}, Command: "pwsh -NoLogo", Status: []StatusRecord{{"", 1, 40}, {"deploy/eu", 3, -1}}},
-		&Snapshot{Data: []byte("GHOSTSNP")},
-		&Output{Data: []byte("\x1b[31mred")},
+		&Attached{Command: "pwsh -NoLogo", Status: []StatusRecord{{"", 1, 40}, {"deploy/eu", 3, -1}}},
+		&PaneText{Tag: 5, Data: []byte("\x1b[31mred")},
 		&Exit{Status: 0xc000013a},
 		&Detached{WS: 9, Reason: "too slow"},
 		&Error{Tag: 8, Message: "no such pane"},
@@ -439,10 +450,6 @@ func normalize(m Message) Message {
 		}
 		if len(m.Panes) == 0 {
 			m.Panes = nil
-		}
-	case *Attached:
-		if len(m.Modes) == 0 {
-			m.Modes = nil
 		}
 	case *HostAnswer:
 		if len(m.Answers) == 0 {
@@ -504,8 +511,9 @@ func TestVersionMismatch(t *testing.T) {
 	}
 }
 
-// TestDetachReattach: output while detached lands in the snapshot, and
-// output after attaching continues it.
+// TestDetachReattach: output while detached lands in the daemon's
+// terminal, which attaching again shows whole, and output after that
+// continues it.
 func TestDetachReattach(t *testing.T) {
 	h := newHarness(t)
 	w1 := h.window()
@@ -528,8 +536,9 @@ func TestDetachReattach(t *testing.T) {
 	}
 	w2 := h.window()
 	w2.attach(ws, Area{})
+	w2.until(pane, "two")
 	if s := w2.text(pane); s != "one\ntwo" {
-		t.Errorf("snapshot text %q", s)
+		t.Errorf("text after reattaching %q", s)
 	}
 	p.emit("three")
 	w2.until(pane, "three")
@@ -561,7 +570,8 @@ func TestMostRecentDetached(t *testing.T) {
 }
 
 // TestAttachSeam attaches while output streams, then checks the client's
-// terminal matches the daemon's: nothing lost or doubled at the seam.
+// screen matches the daemon's: the partial frames after the full one
+// carry every change since it, nothing lost or doubled at the seam.
 func TestAttachSeam(t *testing.T) {
 	h := newHarness(t)
 	w1 := h.window()
@@ -586,41 +596,33 @@ func TestAttachSeam(t *testing.T) {
 	w2.attach(ws, Area{})
 	<-done
 	w2.until(pane, "END")
-	// Each terminal drops old scrollback a page at a time, and the
-	// client's pages were laid out by the decoder, so the oldest lines
-	// can differ. Everything both still hold must match.
+	// The client has the viewport; the daemon's text has the scrollback
+	// before it.
 	got, want := w2.text(pane), h.serverText(pane)
-	short, long := got, want
-	if len(short) > len(long) {
-		short, long = long, short
-	}
-	if !strings.HasSuffix(long, short) {
+	if !strings.HasSuffix(want, got) {
 		t.Fatalf("client and daemon differ:\nclient ends %q\ndaemon ends %q",
 			got[max(0, len(got)-200):], want[max(0, len(want)-200):])
 	}
-	if n := strings.Count(short, "\n"); n < 1000 {
-		t.Errorf("only %d lines in common", n)
+	if n := strings.Count(got, "\n"); n != 9 {
+		t.Errorf("client shows %d lines, want the 10-row viewport", n+1)
 	}
 }
 
+// TestRepliesWhileDetached: the daemon's terminal answers the program's
+// queries attached or not, the client having no terminal of its own.
 func TestRepliesWhileDetached(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
-	pane := w.newWorkspace()
+	w.newWorkspace()
 	p := h.pty(0)
 
-	// Attached: the window answers, so the daemon doesn't.
 	p.emit("\x1b[c")
-	p.emit("mark1")
-	w.until(pane, "mark1")
-	if s := p.inputString(); s != "" {
-		t.Errorf("daemon answered while attached: %q", s)
-	}
+	eventually(t, "DA1 reply while attached", func() bool { return p.inputString() == "\x1b[?62;22c" })
 
 	w.c.Send(0, &WorkspaceDetach{WS: w.ws.ID})
 	eventually(t, "detach", func() bool { return !h.attached(w.ws.ID) })
 	p.emit("\x1b[c")
-	eventually(t, "DA1 reply", func() bool { return p.inputString() == "\x1b[?62;22c" })
+	eventually(t, "DA1 reply while detached", func() bool { return p.inputString() == "\x1b[?62;22c\x1b[?62;22c" })
 }
 
 func TestSteal(t *testing.T) {
@@ -635,8 +637,8 @@ func TestSteal(t *testing.T) {
 	if d.WS != w1.ws.ID || d.Reason != "attached elsewhere" {
 		t.Fatalf("first window got %+v", d)
 	}
-	w1.c.Send(pane, &Input{Data: []byte("from-1")})
-	w2.c.Send(pane, &Input{Data: []byte("from-2")})
+	w1.c.Send(pane, &Event{Data: evText("from-1")})
+	w2.c.Send(pane, &Event{Data: evText("from-2")})
 	eventually(t, "input", func() bool { return p.inputString() != "" })
 	time.Sleep(20 * time.Millisecond)
 	if s := p.inputString(); s != "from-2" {
@@ -649,20 +651,18 @@ func TestAttachSizesPanes(t *testing.T) {
 	w1 := h.window()
 	pane := w1.newWorkspace()
 	w1.c.Send(0, &Split{Tag: w1.c.NextTag(), Pane: pane, Dir: Right, Share: 2500})
-	_, created := next[*Created](w1)
+	next[*Created](w1)
 	w1.c.Close()
 	eventually(t, "detach", func() bool { return !h.attached(w1.ws.ID) })
 
 	w2 := h.window()
 	w2.attach(w1.ws.ID, Area{Width: 900, Height: 540, CellW: 9, CellH: 18})
-	if cols, rows, _ := w2.terms[pane].Size(); cols != 75 || rows != 30 {
-		t.Errorf("left pane %dx%d, want 75x30", cols, rows)
-	}
-	if cols, rows, _ := w2.terms[created.Pane].Size(); cols != 25 || rows != 30 {
-		t.Errorf("right pane %dx%d, want 25x30", cols, rows)
+	// Sized before the attach replies.
+	if got := h.pty(0).getSize(); got != [2]uint16{75, 30} {
+		t.Errorf("left pty %v, want 75x30", got)
 	}
 	if got := h.pty(1).getSize(); got != [2]uint16{25, 30} {
-		t.Errorf("right pty %v", got)
+		t.Errorf("right pty %v, want 25x30", got)
 	}
 }
 
@@ -682,8 +682,8 @@ func TestResize(t *testing.T) {
 	}
 }
 
-// TestSplitByOwner: the owner gets the new pane's snapshot and the new
-// layout, and the pane works.
+// TestSplitByOwner: the owner gets the new pane and the new layout, and
+// the pane works.
 func TestSplitByOwner(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
@@ -697,7 +697,7 @@ func TestSplitByOwner(t *testing.T) {
 	w.absorb(a)
 	second := a.Created.Pane
 	if a.Panes[second] == nil {
-		t.Fatal("no snapshot for the new pane")
+		t.Fatal("no Attached for the new pane")
 	}
 	tree := w.ws.Tabs[0].Tree
 	if tree.Axis != Column || fmt.Sprint(tree.Panes()) != fmt.Sprint([]uint32{first, second}) || tree.Children[1].Share != 3000 {
@@ -708,7 +708,7 @@ func TestSplitByOwner(t *testing.T) {
 }
 
 // TestSplitByScript: another client splits a pane in an attached
-// workspace; the owner is told, gets the snapshot, and sees the layout.
+// workspace; the owner is told, gets the pane, and sees the layout.
 func TestSplitByScript(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
@@ -720,18 +720,18 @@ func TestSplitByScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var snapshot bool
+	var attached bool
 	for {
 		id, m, err := w.c.Recv()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, ok := m.(*Attached); ok && id == created.Pane {
-			snapshot = true
+			attached = true
 		}
 		if ws, ok := m.(*Workspace); ok {
-			if !snapshot {
-				t.Error("structure before the snapshot it refers to")
+			if !attached {
+				t.Error("structure before the pane it refers to")
 			}
 			if got := fmt.Sprint(ws.Tabs[0].Tree.Panes()); got != fmt.Sprint([]uint32{created.Pane, first}) {
 				t.Errorf("panes %s", got)
@@ -925,58 +925,38 @@ func TestPeekDoesntTake(t *testing.T) {
 	pane := w.newWorkspace()
 	h.pty(0).emit("peekaboo")
 	w.until(pane, "peekaboo")
-	p, err := h.connect().Peek(pane)
+	text, err := h.connect().Peek(pane, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	term, err := runtime(t).Decode(p.Snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer term.Close()
-	if s, _ := term.Text(); s != "peekaboo" {
-		t.Errorf("peeked %q", s)
+	if string(text) != "peekaboo" {
+		t.Errorf("peeked %q", text)
 	}
 	if !h.attached(w.ws.ID) {
 		t.Error("peeking took the workspace")
 	}
 	h.pty(0).emit(" still mine")
 	w.until(pane, "still mine")
+	if vt, err := h.connect().Peek(pane, true); err != nil || !strings.Contains(string(vt), "peekaboo still mine") {
+		t.Errorf("peeked as VT %q, %v", vt, err)
+	}
 }
 
-func TestModesInAttach(t *testing.T) {
+// TestModesTracked: the daemon keeps the modes libghostty-vt leaves to
+// it, which decide how it encodes keys.
+func TestModesTracked(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
 	pane := w.newWorkspace()
 	h.pty(0).emit("\x1b[?9001h\x1b[?1004hmark")
 	w.until(pane, "mark")
-	tag := uint32(77)
-	w2 := h.connect()
-	w2.Send(0, &WorkspaceAttach{Tag: tag, WS: w.ws.ID})
-	a, err := w2.Await(tag, false)
-	if err != nil {
-		t.Fatal(err)
+	p := h.srv.pane(pane)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	want := []mode{{num: 9001, enabled: true}}
+	if !p.win32InputLocked() || !reflect.DeepEqual(p.modes, want) {
+		t.Errorf("modes %+v, want %+v", p.modes, want)
 	}
-	want := []Mode{{Mode: 9001, Enabled: true}}
-	if !reflect.DeepEqual(a.Panes[pane].Attached.Modes, want) {
-		t.Errorf("modes %+v, want %+v", a.Panes[pane].Attached.Modes, want)
-	}
-}
-
-// TestSlowClient never reads, so its queue fills: the daemon hangs up on
-// it, which detaches its workspace.
-func TestSlowClient(t *testing.T) {
-	h := newHarness(t)
-	w := h.window()
-	w.newWorkspace()
-	p := h.pty(0)
-	chunk := strings.Repeat("x", 32<<10)
-	go func() {
-		for range MaxQueued/len(chunk) + 64 {
-			p.emit(chunk)
-		}
-	}()
-	eventually(t, "drop", func() bool { return !h.attached(w.ws.ID) })
 }
 
 func TestDisconnectDetaches(t *testing.T) {

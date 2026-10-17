@@ -566,11 +566,12 @@ pub fn Codec(comptime vt: type) type {
                 }
             }
 
-            /// Write the text of the rows the last frame changed, a line
-            /// each, trailing blanks trimmed: for tests and debugging.
-            pub fn changedText(self: *const Screen, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            /// Write the text of the rows, a line each, trailing blanks
+            /// trimmed: for tests and debugging. With `changed_only`,
+            /// just the rows the last frame changed.
+            pub fn text(self: *const Screen, w: *std.Io.Writer, changed_only: bool) std.Io.Writer.Error!void {
                 for (self.row_data.items) |row| {
-                    if (!row.dirty) continue;
+                    if (changed_only and !row.dirty) continue;
                     var line: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
                     defer line.deinit();
                     for (row.raws.items, row.graphemes.items) |raw, extra| {

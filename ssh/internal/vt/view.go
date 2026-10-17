@@ -20,6 +20,12 @@ typedef struct {
 
 extern uint64_t slime_vt_frame_layout(void);
 extern bool slime_vt_frame_text(const uint8_t* ptr, size_t len, uint8_t** out_ptr, size_t* out_len);
+
+typedef struct SlimeScreen SlimeScreen;
+extern SlimeScreen* slime_vt_screen_new(void);
+extern void slime_vt_screen_free(SlimeScreen* s);
+extern bool slime_vt_screen_apply(SlimeScreen* s, const uint8_t* ptr, size_t len);
+extern bool slime_vt_screen_text(const SlimeScreen* s, uint8_t** out_ptr, size_t* out_len);
 extern SlimeView* slime_vt_view_new(void);
 extern void slime_vt_view_free(SlimeView* v, GhosttyTerminal t);
 extern void slime_vt_view_reset(SlimeView* v, GhosttyTerminal t);
@@ -47,6 +53,7 @@ import "C"
 
 import (
 	"errors"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -67,11 +74,59 @@ func FrameText(frame []byte) (string, error) {
 	if !C.slime_vt_frame_text((*C.uint8_t)(unsafe.Pointer(&frame[0])), C.size_t(len(frame)), &ptr, &n) {
 		return "", errors.New("vt: bad frame")
 	}
+	return takeText(ptr, n), nil
+}
+
+// takeText copies out a text buffer slime.zig allocated with malloc and
+// frees it; nil is empty.
+func takeText(ptr *C.uint8_t, n C.size_t) string {
 	if ptr == nil {
-		return "", nil
+		return ""
 	}
 	defer C.free(unsafe.Pointer(ptr))
-	return C.GoStringN((*C.char)(unsafe.Pointer(ptr)), C.int(n)), nil
+	return C.GoStringN((*C.char)(unsafe.Pointer(ptr)), C.int(n))
+}
+
+// Screen is a pane as a client mirrors it from its frames, the viewport
+// only: for tests and debugging. It isn't safe for concurrent use.
+type Screen struct{ s *C.SlimeScreen }
+
+func NewScreen() (*Screen, error) {
+	s := C.slime_vt_screen_new()
+	if s == nil {
+		return nil, errors.New("vt: out of memory")
+	}
+	return &Screen{s: s}, nil
+}
+
+func (s *Screen) Close() {
+	if s.s != nil {
+		C.slime_vt_screen_free(s.s)
+		s.s = nil
+	}
+}
+
+// Apply draws a frame on the screen. A partial frame must fit the size
+// the last full one set; after an error the screen wants a full frame.
+func (s *Screen) Apply(frame []byte) error {
+	if len(frame) == 0 {
+		return errors.New("vt: empty frame")
+	}
+	if !C.slime_vt_screen_apply(s.s, (*C.uint8_t)(unsafe.Pointer(&frame[0])), C.size_t(len(frame))) {
+		return errors.New("vt: bad frame")
+	}
+	return nil
+}
+
+// Text is the screen's rows, a line each, trailing blanks and blank rows
+// trimmed.
+func (s *Screen) Text() (string, error) {
+	var ptr *C.uint8_t
+	var n C.size_t
+	if !C.slime_vt_screen_text(s.s, &ptr, &n) {
+		return "", errors.New("vt: formatting the screen")
+	}
+	return strings.TrimRight(takeText(ptr, n), "\n"), nil
 }
 
 // AutoscrollInterval is how often a selection drag past an edge

@@ -7,8 +7,9 @@ import (
 	"time"
 )
 
-// MaxQueued is how far behind, in bytes, a client may fall before it
-// loses its attachments. Snapshots don't count.
+// MaxQueued is how far behind, in bytes, a client may be before notices
+// to it are dropped (Pane.notify). Frames and images don't count: they
+// pace themselves (framing.go).
 const MaxQueued = 16 << 20
 
 // conn is one client connection. Frames go out through a queue drained
@@ -29,9 +30,7 @@ type conn struct {
 	// lock.
 	owned map[uint32]*workspace
 
-	// Set by the handshake: the client draws frames (CapFrames), at most
-	// one a pane per interval.
-	frames   bool
+	// Set by the handshake: the least time between a pane's frames.
 	interval time.Duration
 }
 
@@ -51,8 +50,8 @@ func newConn(rw io.ReadWriteCloser, log *slog.Logger) *conn {
 // MaxQueued behind or gone.
 func (c *conn) send(id uint32, m Message) bool { return c.enqueue(id, m, false) }
 
-// sendForce queues m whatever the backlog: snapshots, and the messages
-// that end an attachment.
+// sendForce queues m whatever the backlog: frames, images, and the
+// messages that start or end an attachment.
 func (c *conn) sendForce(id uint32, m Message) { c.enqueue(id, m, true) }
 
 func (c *conn) enqueue(id uint32, m Message, force bool) bool {

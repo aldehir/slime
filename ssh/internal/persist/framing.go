@@ -8,8 +8,7 @@ import (
 	"github.com/aldehir/slime/ssh/internal/vt"
 )
 
-// Framing: how a pane's frames reach a client that draws them
-// (CapFrames).
+// Framing: how a pane's frames reach its client.
 //
 // Output only marks the pane changed and wakes its framer goroutine,
 // which cuts a frame of what changed since the last one when three
@@ -40,7 +39,7 @@ const (
 
 // framing is a pane's frame state. Guarded by the pane's lock.
 type framing struct {
-	view     *vt.View // made at the first attach by a client that draws
+	view     *vt.View // made at the first attach
 	seq      uint32   // the last frame's
 	acked    uint32   // the last frame acked; the ones after are in flight
 	changed  bool     // the terminal changed since the last frame
@@ -106,9 +105,10 @@ func (p *Pane) wakeFramer() {
 	}
 }
 
-// changedLocked notes that the terminal changed, for a client that draws.
+// changedLocked notes that the terminal changed, for the client's next
+// frame.
 func (p *Pane) changedLocked() {
-	if c := p.client; c != nil && c.frames {
+	if p.client != nil {
 		p.fr.changed = true
 		p.wakeFramer()
 	}
@@ -127,11 +127,7 @@ func (p *Pane) attachFramesLocked(c *conn) error {
 		// this one's.
 		p.fr.view.Reset(p.term)
 	}
-	c.sendForce(p.id, &Attached{
-		Modes:   append([]Mode(nil), p.modes...),
-		Command: p.command,
-		Status:  p.status.records(),
-	})
+	c.sendForce(p.id, &Attached{Command: p.command, Status: p.status.records()})
 	// What the client would otherwise only learn when they change.
 	if title, _ := p.term.Title(); title != "" {
 		c.sendForce(p.id, &Notice{Kind: NoticeTitle, Text: title})
@@ -193,7 +189,7 @@ func (p *Pane) resendDueLocked(c *conn) {
 // arranges to look again when one will be.
 func (p *Pane) frameLocked() {
 	c := p.client
-	if c == nil || !c.frames || p.done || !p.fr.changed || p.fr.seq-p.fr.acked >= maxInFlight {
+	if c == nil || p.done || !p.fr.changed || p.fr.seq-p.fr.acked >= maxInFlight {
 		// An Ack, a change, or an attach wakes the framer again.
 		return
 	}

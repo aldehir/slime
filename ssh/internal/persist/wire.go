@@ -15,20 +15,19 @@ import (
 // can append fields.
 //
 // Requests that create something or can fail carry a tag, which the
-// reply (Created, Workspace, Attached) or Error echoes.
+// reply (Created, Workspace, PaneText) or Error echoes.
 
 // Version is exchanged in Hello and HelloReply; peers with different
 // versions don't talk.
 const Version = 1
 
 // MaxFrame bounds a frame so a corrupt stream can't make us allocate
-// gigabytes. Snapshots go out in SnapshotChunk pieces and images in
-// ImageChunk pieces. A full Frame of a big screen whose every cell has
-// its own style and grapheme can come near a few MiB, and goes whole.
+// gigabytes. Images go out in ImageChunk pieces. A full Draw of a big
+// screen whose every cell has its own style and grapheme can come near
+// a few MiB, and goes whole.
 const (
-	MaxFrame      = 8 << 20
-	SnapshotChunk = 256 << 10
-	ImageChunk    = 1 << 20
+	MaxFrame   = 8 << 20
+	ImageChunk = 1 << 20
 )
 
 // maxDepth bounds a layout tree's nesting on the wire.
@@ -54,7 +53,6 @@ const (
 	TypeSplit           Type = 12
 	TypeLayout          Type = 13
 	TypePaneKill        Type = 14
-	TypeInput           Type = 15
 	TypeResize          Type = 16
 	TypePeek            Type = 17
 	TypeAck             Type = 18
@@ -72,8 +70,6 @@ const (
 	TypeWorkspaces Type = 66
 	TypeWorkspace  Type = 67
 	TypeAttached   Type = 68
-	TypeSnapshot   Type = 69
-	TypeOutput     Type = 70
 	TypeExit       Type = 71
 	TypeDetached   Type = 72
 	TypeError      Type = 73
@@ -85,6 +81,7 @@ const (
 	TypeHosts      Type = 79
 	TypeHostState  Type = 80
 	TypePrompt     Type = 81
+	TypePaneText   Type = 82
 )
 
 var (
@@ -115,25 +112,15 @@ type Size struct {
 	CellW, CellH uint32
 }
 
-// Hello opens a connection. Caps and FrameInterval are optional on the
-// wire; a client that sends neither runs its own terminals.
+// Hello opens a connection. The client draws what the daemon sends
+// (Draw) and sends input back as Event messages; the daemon's terminal
+// answers the program's queries.
 type Hello struct {
 	Version uint32
-	Caps    uint32
 	// FrameInterval is the least time between a pane's frames, in
 	// microseconds: the client's refresh period. Zero for the default.
 	FrameInterval uint32
 }
-
-// Capabilities a client asks for in Hello.
-const (
-	// CapFrames: the client draws frames (Draw) instead of running a
-	// terminal.
-	// Attaching sends Attached with no snapshot, then frames; panes take
-	// Event messages, not Input; and the daemon's terminal answers the
-	// program's queries.
-	CapFrames uint32 = 1 << 0
-)
 
 // List asks for every workspace; the reply is Workspaces.
 type List struct{}
@@ -146,10 +133,10 @@ type WorkspaceNew struct {
 }
 
 // WorkspaceAttach takes a workspace from whichever window has it. Area
-// is what the window gives a tab, which the daemon sizes its panes to
-// before snapshotting them. The reply is, per pane, Attached and its
-// snapshot, then Workspace: snapshots come before the structure that
-// refers to them.
+// is what the window gives a tab, which the daemon sizes its panes to.
+// The reply is Attached per pane, then Workspace: panes come before the
+// structure that refers to them. Each pane's frames follow, starting
+// with a full one.
 type WorkspaceAttach struct {
 	Tag  uint32
 	WS   uint32
@@ -182,8 +169,8 @@ type WorkspaceResize struct {
 
 // TabNew adds a tab with one pane running Command (CreateProcessW
 // syntax on Windows; empty for the default shell). The owner of the
-// workspace gets the new pane's Attached and snapshot, then Workspace;
-// the sender gets Created.
+// workspace gets the new pane's Attached, then Workspace; the sender
+// gets Created.
 type TabNew struct {
 	Tag     uint32
 	WS      uint32
@@ -220,15 +207,16 @@ type Layout struct {
 // PaneKill ends the pane in the frame's id.
 type PaneKill struct{}
 
-// Input goes to the pane in the frame's id; only its owner's counts.
-type Input struct{ Data []byte }
-
 // Resize sizes the pane in the frame's id; only its owner's counts.
 type Resize struct{ Size Size }
 
-// Peek asks for a pane's snapshot without taking it: the reply is
-// Attached (with Tag) and the snapshot, and nothing live follows.
-type Peek struct{ Tag uint32 }
+// Peek asks for the text of a pane's screen and scrollback without
+// taking it: the reply is PaneText with Tag. With VT, the text is the
+// VT sequences that redraw the screen instead of plain text.
+type Peek struct {
+	Tag uint32
+	VT  bool
+}
 
 // Ack says the client drew the pane's Draw Seq and those before it,
 // which frees room for more (see Pane's framing).
@@ -406,9 +394,8 @@ type Copied struct {
 	Text string
 }
 
-// Notice tells a client that draws (CapFrames) what the pane in the
-// frame's id did besides change its screen: what a client running its
-// own terminal would learn from the output.
+// Notice tells the client what the pane in the frame's id did besides
+// change its screen: what a terminal of its own would have told it.
 type Notice struct {
 	Kind NoticeKind
 	// Text is the new title or pwd (as sent: OSC 7's is a file:// URI),
@@ -431,12 +418,9 @@ const (
 
 type HelloReply struct {
 	Version uint32
-	// SnapshotVersion is the snapshot format the daemon writes. A client
-	// that can't decode it shouldn't attach.
-	SnapshotVersion uint16
-	PID             uint32
-	// FrameLayout is the daemon's vt.FrameLayout. A CapFrames client
-	// whose own differs can't draw its frames.
+	PID     uint32
+	// FrameLayout is the daemon's vt.FrameLayout. A client whose own
+	// differs can't draw its frames.
 	FrameLayout uint64
 }
 
@@ -482,18 +466,13 @@ type Workspace struct {
 	Tabs []TabInfo
 }
 
-// Attached starts a pane's attachment (or answers a Peek, with its tag).
-// SnapshotLen bytes of Snapshot frames follow, then live Output. Modes
-// are the modes libghostty-vt doesn't keep in a snapshot, in their
-// current state (win32-input-mode).
+// Attached starts a pane's attachment: its frames follow, the first a
+// full one, with a Notice for its title and pwd if it has them.
 type Attached struct {
-	Tag         uint32
-	SnapshotLen uint32
-	Modes       []Mode
 	// Command is what the pane runs, for a client that didn't start it.
 	Command string
-	// Status is what the pane's programs report doing (OSC 7501), which
-	// a snapshot doesn't carry, oldest update first.
+	// Status is what the pane's programs report doing (OSC 7501), oldest
+	// update first.
 	Status []StatusRecord
 }
 
@@ -506,15 +485,11 @@ type StatusRecord struct {
 	Progress int8
 }
 
-type Mode struct {
-	Mode    uint16
-	ANSI    bool
-	Enabled bool
+// PaneText answers a Peek of the pane in the frame's id.
+type PaneText struct {
+	Tag  uint32
+	Data []byte
 }
-
-type Snapshot struct{ Data []byte }
-
-type Output struct{ Data []byte }
 
 // Exit says the pane's child exited. The owner gets Workspace after,
 // with the pane gone from its tab.
@@ -553,7 +528,6 @@ func (*TabRename) Type() Type       { return TypeTabRename }
 func (*Split) Type() Type           { return TypeSplit }
 func (*Layout) Type() Type          { return TypeLayout }
 func (*PaneKill) Type() Type        { return TypePaneKill }
-func (*Input) Type() Type           { return TypeInput }
 func (*Resize) Type() Type          { return TypeResize }
 func (*Peek) Type() Type            { return TypePeek }
 func (*Ack) Type() Type             { return TypeAck }
@@ -562,8 +536,7 @@ func (*HelloReply) Type() Type      { return TypeHelloReply }
 func (*Workspaces) Type() Type      { return TypeWorkspaces }
 func (*Workspace) Type() Type       { return TypeWorkspace }
 func (*Attached) Type() Type        { return TypeAttached }
-func (*Snapshot) Type() Type        { return TypeSnapshot }
-func (*Output) Type() Type          { return TypeOutput }
+func (*PaneText) Type() Type        { return TypePaneText }
 func (*Exit) Type() Type            { return TypeExit }
 func (*Detached) Type() Type        { return TypeDetached }
 func (*Error) Type() Type           { return TypeError }
@@ -583,16 +556,12 @@ func (*Prompt) Type() Type          { return TypePrompt }
 
 func (m *Hello) encode(e *encoder) {
 	e.u32(m.Version)
-	e.u32(m.Caps)
 	e.u32(m.FrameInterval)
 }
 
 func (m *Hello) decode(d *decoder) {
 	m.Version = d.u32()
-	if d.more() {
-		m.Caps = d.u32()
-		m.FrameInterval = d.u32()
-	}
+	m.FrameInterval = d.u32()
 }
 
 func (*List) encode(*encoder) {}
@@ -706,14 +675,18 @@ func (m *Layout) decode(d *decoder) {
 func (*PaneKill) encode(*encoder) {}
 func (*PaneKill) decode(*decoder) {}
 
-func (m *Input) encode(e *encoder) { e.raw(m.Data) }
-func (m *Input) decode(d *decoder) { m.Data = d.rest() }
-
 func (m *Resize) encode(e *encoder) { e.size(m.Size) }
 func (m *Resize) decode(d *decoder) { m.Size = d.size() }
 
-func (m *Peek) encode(e *encoder) { e.u32(m.Tag) }
-func (m *Peek) decode(d *decoder) { m.Tag = d.u32() }
+func (m *Peek) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.bool(m.VT)
+}
+
+func (m *Peek) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.VT = d.bool()
+}
 
 func (m *Ack) encode(e *encoder) { e.u32(m.Seq) }
 func (m *Ack) decode(d *decoder) { m.Seq = d.u32() }
@@ -775,18 +748,14 @@ func (m *Notice) decode(d *decoder) {
 
 func (m *HelloReply) encode(e *encoder) {
 	e.u32(m.Version)
-	e.u16(m.SnapshotVersion)
 	e.u32(m.PID)
 	e.u64(m.FrameLayout)
 }
 
 func (m *HelloReply) decode(d *decoder) {
 	m.Version = d.u32()
-	m.SnapshotVersion = d.u16()
 	m.PID = d.u32()
-	if d.more() {
-		m.FrameLayout = d.u64()
-	}
+	m.FrameLayout = d.u64()
 }
 
 func (m *Workspaces) encode(e *encoder) {
@@ -854,35 +823,24 @@ func (m *Workspace) decode(d *decoder) {
 }
 
 func (m *Attached) encode(e *encoder) {
-	e.u32(m.Tag)
-	e.u32(m.SnapshotLen)
-	e.u32(uint32(len(m.Modes)))
-	for _, md := range m.Modes {
-		e.u16(md.Mode)
-		e.bool(md.ANSI)
-		e.bool(md.Enabled)
-	}
 	e.str(m.Command)
 	e.statusRecords(m.Status)
 }
 
 func (m *Attached) decode(d *decoder) {
-	m.Tag = d.u32()
-	m.SnapshotLen = d.u32()
-	n := d.count(4)
-	m.Modes = make([]Mode, n)
-	for i := range m.Modes {
-		m.Modes[i] = Mode{Mode: d.u16(), ANSI: d.bool(), Enabled: d.bool()}
-	}
 	m.Command = d.str()
 	m.Status = d.statusRecords()
 }
 
-func (m *Snapshot) encode(e *encoder) { e.raw(m.Data) }
-func (m *Snapshot) decode(d *decoder) { m.Data = d.rest() }
+func (m *PaneText) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.raw(m.Data)
+}
 
-func (m *Output) encode(e *encoder) { e.raw(m.Data) }
-func (m *Output) decode(d *decoder) { m.Data = d.rest() }
+func (m *PaneText) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Data = d.rest()
+}
 
 func (m *Exit) encode(e *encoder) { e.u32(m.Status) }
 func (m *Exit) decode(d *decoder) { m.Status = d.u32() }
@@ -1064,8 +1022,6 @@ func newMessage(t Type) Message {
 		return new(Layout)
 	case TypePaneKill:
 		return new(PaneKill)
-	case TypeInput:
-		return new(Input)
 	case TypeResize:
 		return new(Resize)
 	case TypePeek:
@@ -1082,10 +1038,8 @@ func newMessage(t Type) Message {
 		return new(Workspace)
 	case TypeAttached:
 		return new(Attached)
-	case TypeSnapshot:
-		return new(Snapshot)
-	case TypeOutput:
-		return new(Output)
+	case TypePaneText:
+		return new(PaneText)
 	case TypeExit:
 		return new(Exit)
 	case TypeDetached:

@@ -113,7 +113,7 @@ func TestSlimedOnLinux(t *testing.T) {
 	}
 	pane := a.Created.Pane
 	want := "marker:xterm-256color:" + home
-	waitOutput(t, c, pane, want, a.Panes[pane])
+	waitText(t, c, pane, want, a.Panes[pane])
 	// Hanging up the SSH connection detaches the workspace.
 	c.Close()
 
@@ -136,62 +136,61 @@ func TestSlimedOnLinux(t *testing.T) {
 	if w := persist.MostRecentDetached(list); w == nil || w.ID != created.WS {
 		t.Fatalf("workspace %d not detached: %+v", created.WS, list)
 	}
-	p, err := c2.Peek(pane)
+	text, err := c2.Peek(pane, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text := snapshotText(t, p.Snapshot); !strings.Contains(text, want) {
-		t.Errorf("restored text %q", text)
+	if !strings.Contains(string(text), want) {
+		t.Errorf("kept text %q", text)
 	}
 }
 
-// waitOutput reads until pane's output, after what attaching gave,
-// holds want.
-func waitOutput(t *testing.T, c *persist.Client, pane uint32, want string, p *persist.PaneState) {
+// waitText draws pane's frames, after what attaching gave, until its
+// screen holds want.
+func waitText(t *testing.T, c *persist.Client, pane uint32, want string, p *persist.PaneState) {
 	t.Helper()
-	var got strings.Builder
-	for _, b := range p.Output {
-		got.Write(b)
-	}
-	done := make(chan struct{})
+	got := make(chan string, 1)
 	go func() {
-		defer close(done)
-		for !strings.Contains(got.String(), want) {
-			id, m, err := c.Recv()
-			if err != nil {
+		s, err := vt.NewScreen()
+		if err != nil {
+			got <- err.Error()
+			return
+		}
+		defer s.Close()
+		var text string
+		draw := func(d *persist.Draw) bool {
+			if err := s.Apply(d.Data); err != nil {
+				text = err.Error()
+				return true
+			}
+			c.Send(pane, &persist.Ack{Seq: d.Seq})
+			text, _ = s.Text()
+			return strings.Contains(text, want)
+		}
+		for _, d := range p.Draws {
+			if draw(d) {
+				got <- text
 				return
 			}
-			if o, ok := m.(*persist.Output); ok && id == pane {
-				got.Write(o.Data)
+		}
+		for {
+			id, m, err := c.Recv()
+			if err != nil {
+				got <- text
+				return
+			}
+			if d, ok := m.(*persist.Draw); ok && id == pane && draw(d) {
+				got <- text
+				return
 			}
 		}
 	}()
 	select {
-	case <-done:
+	case text := <-got:
+		if !strings.Contains(text, want) {
+			t.Fatalf("no %q in %q", want, text)
+		}
 	case <-time.After(timeout):
-		t.Fatalf("no %q in %q", want, got.String())
+		t.Fatalf("no %q within %v", want, timeout)
 	}
-	if !strings.Contains(got.String(), want) {
-		t.Fatalf("no %q in %q", want, got.String())
-	}
-}
-
-func snapshotText(t *testing.T, snap []byte) string {
-	t.Helper()
-	ctx := context.Background()
-	rt, err := vt.NewRuntime(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rt.Close(ctx)
-	term, err := rt.Decode(snap)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer term.Close()
-	s, err := term.Text()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s
 }

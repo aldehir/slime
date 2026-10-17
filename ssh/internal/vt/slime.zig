@@ -42,8 +42,37 @@ export fn slime_vt_frame_text(ptr: [*]const u8, len: usize, out_ptr: *?[*]u8, ou
     defer screen.deinit(alloc);
     screen.resize(alloc, std.mem.readInt(u16, bytes[1..3], .little), std.mem.readInt(u16, bytes[3..5], .little)) catch return false;
     screen.apply(alloc, bytes) catch return false;
+    return screenText(&screen, true, out_ptr, out_len);
+}
+
+/// A screen a client mirrors from a pane's frames, as slime's Session
+/// does: for tests and debugging in Go.
+export fn slime_vt_screen_new() ?*Frames.Screen {
+    const s = alloc.create(Frames.Screen) catch return null;
+    s.* = .{};
+    return s;
+}
+
+export fn slime_vt_screen_free(s: *Frames.Screen) void {
+    s.deinit(alloc);
+    alloc.destroy(s);
+}
+
+/// Apply a frame. Returns false for a bad one, or a partial one that
+/// doesn't fit the screen.
+export fn slime_vt_screen_apply(s: *Frames.Screen, ptr: [*]const u8, len: usize) bool {
+    s.apply(alloc, ptr[0..len]) catch return false;
+    return true;
+}
+
+/// The screen's text, a line a row, as slime_vt_frame_text gives it.
+export fn slime_vt_screen_text(s: *const Frames.Screen, out_ptr: *?[*]u8, out_len: *usize) bool {
+    return screenText(s, false, out_ptr, out_len);
+}
+
+fn screenText(s: *const Frames.Screen, changed_only: bool, out_ptr: *?[*]u8, out_len: *usize) bool {
     var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
-    screen.changedText(&out.writer) catch return false;
+    s.text(&out.writer, changed_only) catch return false;
     // An empty slice's pointer isn't an allocation free() can take.
     out_ptr.* = null;
     out_len.* = 0;

@@ -62,7 +62,7 @@ func TestConPTY(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { c.Close() })
-		return &window{t: t, h: h, c: c, terms: map[uint32]*vt.Terminal{}}
+		return &window{t: t, h: h, c: c, screens: map[uint32]*vt.Screen{}}
 	}
 
 	os.Setenv("SLIMED_HELPER_SHELL", "1")
@@ -89,7 +89,7 @@ func TestConPTY(t *testing.T) {
 	w1.absorb(a)
 	pane := a.Created.Pane
 	w1.until(pane, "ready>")
-	w1.c.Send(pane, &Input{Data: []byte("first\r")})
+	w1.c.Send(pane, &Event{Data: evText("first\r")})
 	w1.until(pane, "got first")
 	w1.c.Close()
 	eventually(t, "detach", func() bool { return !h.attached(w1.ws.ID) })
@@ -105,23 +105,21 @@ func TestConPTY(t *testing.T) {
 		t.Fatal(err)
 	}
 	w2.absorb(a)
-	if s := w2.text(pane); !strings.Contains(s, "got first") {
-		t.Errorf("restored text %q", s)
-	}
-	win32 := false
-	for _, m := range a.Panes[pane].Attached.Modes {
-		if m.Mode == 9001 && !m.ANSI {
-			win32 = m.Enabled
-		}
-	}
-	t.Logf("modes in attach: %+v", a.Panes[pane].Attached.Modes)
+	w2.until(pane, "got first")
+	// ConPTY turns on win32-input-mode, which the daemon must track to
+	// encode keys for it.
+	p := srv.pane(pane)
+	p.mu.Lock()
+	win32 := p.win32InputLocked()
+	t.Logf("modes seen: %+v", p.modes)
+	p.mu.Unlock()
 	if !win32 {
-		t.Error("win32-input-mode not reported")
+		t.Error("win32-input-mode not tracked")
 	}
 
-	w2.c.Send(pane, &Input{Data: []byte("second\r")})
+	w2.c.Send(pane, &Event{Data: evText("second\r")})
 	w2.until(pane, "got second")
-	w2.c.Send(pane, &Input{Data: []byte("exit\r")})
+	w2.c.Send(pane, &Event{Data: evText("exit\r")})
 	if _, e := next[*Exit](w2); e.Status != 3 {
 		t.Errorf("exit status %d, want 3", e.Status)
 	}

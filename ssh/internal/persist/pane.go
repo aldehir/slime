@@ -1,6 +1,8 @@
 package persist
 
 import (
+	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,7 +27,7 @@ type Pane struct {
 	term   *vt.Terminal
 	client *conn
 	size   Size
-	modes  []Mode // the unknown modes seen, in their current state
+	modes  []mode
 	status programStatus
 	done   bool
 	fr     framing
@@ -45,15 +47,9 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 		size:    size,
 	}
 	term.SetEvents(vt.Events{
-		// Answer queries while detached so the program doesn't wait on a
-		// reply (ConPTY asks DA1 at startup), and always for a client that
-		// draws frames; a client running its own terminal answers
-		// otherwise.
-		Reply: func(b []byte) {
-			if c := pn.client; c == nil || c.frames {
-				pn.replies = append(pn.replies, b...)
-			}
-		},
+		// The daemon's terminal answers queries (ConPTY asks DA1 at
+		// startup): the client has none of its own to.
+		Reply:       func(b []byte) { pn.replies = append(pn.replies, b...) },
 		UnknownMode: pn.setMode,
 		ProgramStatus: func(s vt.Status) {
 			pn.status.report(s)
@@ -63,7 +59,7 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 			pn.status.promptStarted()
 			pn.statusChanged()
 		},
-		// A client that draws has no terminal to learn these from.
+		// The client has no terminal to learn these from.
 		TitleChanged: func() {
 			title, _ := pn.term.Title()
 			pn.notify(&Notice{Kind: NoticeTitle, Text: title})
@@ -79,15 +75,15 @@ func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term 
 	return pn
 }
 
-// notify sends a client that draws a Notice. Runs inside term.Write,
-// under p.mu. Notices count against the client's backlog, and one that
-// doesn't fit is dropped: a program retitling on every write can't grow
-// the queue. A dropped title, pwd, or status is the whole state, and is
-// sent again once the client catches up (resendDueLocked); a bell or
-// clipboard write is lost.
+// notify sends the client a Notice. Runs inside term.Write, under p.mu.
+// Notices count against the client's backlog, and one that doesn't fit
+// is dropped: a program retitling on every write can't grow the queue.
+// A dropped title, pwd, or status is the whole state, and is sent again
+// once the client catches up (resendDueLocked); a bell or clipboard
+// write is lost.
 func (p *Pane) notify(n *Notice) {
 	c := p.client
-	if c == nil || !c.frames || c.send(p.id, n) {
+	if c == nil || c.send(p.id, n) {
 		return
 	}
 	switch n.Kind {
@@ -100,22 +96,30 @@ func (p *Pane) notify(n *Notice) {
 	}
 }
 
-// statusChanged sends a client that draws every status record. Runs
-// inside term.Write, under p.mu.
+// statusChanged sends the client every status record. Runs inside
+// term.Write, under p.mu.
 func (p *Pane) statusChanged() {
 	p.notify(&Notice{Kind: NoticeStatus, Status: p.status.records()})
 }
 
+// mode is the state of a mode libghostty-vt leaves to us
+// (win32-input-mode), as the program last set it.
+type mode struct {
+	num     uint16
+	ansi    bool
+	enabled bool
+}
+
 // setMode records an unknown mode's state. Runs inside term.Write,
 // under p.mu.
-func (p *Pane) setMode(mode uint16, ansi, enabled bool) {
+func (p *Pane) setMode(num uint16, ansi, enabled bool) {
 	for i := range p.modes {
-		if p.modes[i].Mode == mode && p.modes[i].ANSI == ansi {
-			p.modes[i].Enabled = enabled
+		if p.modes[i].num == num && p.modes[i].ansi == ansi {
+			p.modes[i].enabled = enabled
 			return
 		}
 	}
-	p.modes = append(p.modes, Mode{Mode: mode, ANSI: ansi, Enabled: enabled})
+	p.modes = append(p.modes, mode{num: num, ansi: ansi, enabled: enabled})
 }
 
 // takeRepliesLocked returns what the terminal answered since the last
@@ -134,8 +138,8 @@ func (p *Pane) writeReplies(b []byte) {
 	}
 }
 
-// run copies pty output into the terminal and to the client until the
-// child is gone, then takes the pane out of its tab.
+// run copies pty output into the terminal, framing it for the client,
+// until the child is gone, then takes the pane out of its tab.
 func (p *Pane) run() {
 	buf := make([]byte, 32<<10)
 	for {
@@ -143,14 +147,7 @@ func (p *Pane) run() {
 		if n > 0 {
 			p.mu.Lock()
 			p.term.Write(buf[:n])
-			if c := p.client; c != nil && c.frames {
-				p.changedLocked()
-			} else if c != nil && !c.send(p.id, &Output{Data: buf[:n]}) {
-				// Too far behind: drop the connection, which detaches its
-				// workspaces. Reattaching is a snapshot away.
-				p.srv.log.Info("client too slow; dropping it", "pane", p.id)
-				c.close()
-			}
+			p.changedLocked()
 			replies := p.takeRepliesLocked()
 			p.mu.Unlock()
 			p.writeReplies(replies)
@@ -178,9 +175,8 @@ func (p *Pane) run() {
 	p.term.Close()
 }
 
-// attach gives the pane to c, resized to size if that's set, and queues
-// the snapshot. Under the lock, so the live output that follows starts
-// exactly where the snapshot ends.
+// attach gives the pane to c, resized to size if that's set, and starts
+// its frames.
 func (p *Pane) attach(c *conn, size Size) error {
 	p.mu.Lock()
 	err := p.attachLocked(c, size)
@@ -198,41 +194,46 @@ func (p *Pane) attachLocked(c *conn, size Size) error {
 	if size.Cols != 0 && size.Rows != 0 && size != p.size {
 		p.resizeLocked(size)
 	}
-	if c.frames {
-		if err := p.attachFramesLocked(c); err != nil {
-			return err
-		}
-	} else if err := p.snapshotTo(c, 0); err != nil {
+	if err := p.attachFramesLocked(c); err != nil {
 		return err
 	}
 	p.client = c
 	return nil
 }
 
-// peek sends c the pane's snapshot without attaching it.
-func (p *Pane) peek(c *conn, tag uint32) error {
+// peek sends c the text of the pane's screen and scrollback without
+// attaching it: plain, or the VT that redraws it. Plain text past what
+// a message holds loses its oldest lines.
+func (p *Pane) peek(c *conn, tag uint32, asVT bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.snapshotTo(c, tag)
-}
-
-func (p *Pane) snapshotTo(c *conn, tag uint32) error {
-	snap, err := p.term.Snapshot()
-	if err != nil {
-		return err
+	if p.done {
+		return errors.New("pane ended")
 	}
-	c.sendForce(p.id, &Attached{
-		Tag:         tag,
-		SnapshotLen: uint32(len(snap)),
-		Modes:       append([]Mode(nil), p.modes...),
-		Command:     p.command,
-		Status:      p.status.records(),
-	})
-	for len(snap) > 0 {
-		n := min(len(snap), SnapshotChunk)
-		c.sendForce(p.id, &Snapshot{Data: snap[:n]})
-		snap = snap[n:]
+	var data []byte
+	if asVT {
+		b, err := p.term.VT()
+		if err != nil {
+			return err
+		}
+		if len(b) > MaxFrame-64 {
+			return errors.New("too much to send")
+		}
+		data = b
+	} else {
+		s, err := p.term.Text()
+		if err != nil {
+			return err
+		}
+		if max := MaxFrame - 64; len(s) > max {
+			s = s[len(s)-max:]
+			if i := strings.IndexByte(s, '\n'); i >= 0 {
+				s = s[i+1:]
+			}
+		}
+		data = []byte(s)
 	}
+	c.sendForce(p.id, &PaneText{Tag: tag, Data: data})
 	return nil
 }
 
@@ -243,17 +244,6 @@ func (p *Pane) detach(c *conn) {
 	if p.client == c {
 		p.client = nil
 		p.autoscrollLocked(false)
-	}
-}
-
-func (p *Pane) input(c *conn, data []byte) {
-	p.mu.Lock()
-	attached := p.client == c && !p.done
-	p.mu.Unlock()
-	// Outside the lock: a full input pipe blocks until the child reads,
-	// and the reader needs the lock to keep draining output.
-	if attached {
-		p.pty.Write(data)
 	}
 }
 

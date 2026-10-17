@@ -1,8 +1,8 @@
 // slimed keeps terminals alive while no window shows them: it owns
 // each pane's pty and terminal state, arranged in tabs and workspaces,
-// and a window attaches a workspace with a snapshot of each pane
-// followed by live output. slime is the client; the other commands here
-// script workspaces and try them out from a console.
+// and a window attaches a workspace to draw the frames of its panes.
+// slime is the client; the other commands here script workspaces and
+// look at them from a console.
 package main
 
 import (
@@ -44,7 +44,7 @@ func newCommand() *cobra.Command {
 		SilenceUsage:  true,
 	}
 	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
-		splitCommand(), attachCommand(), peekCommand(), killCommand())
+		splitCommand(), peekCommand(), killCommand())
 	root.AddCommand(hostCommands()...)
 	return root
 }
@@ -400,56 +400,6 @@ func splitCommand() *cobra.Command {
 	return cmd
 }
 
-func attachCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "attach <pane>",
-		Short: "Show a pane in this console, taking its workspace (Ctrl+] detaches)",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := parseID(args[0])
-			if err != nil {
-				return err
-			}
-			c, err := connect(false)
-			if err != nil {
-				return err
-			}
-			defer c.Close()
-			l, err := c.List()
-			if err != nil {
-				return err
-			}
-			ws := workspaceOf(l, pane)
-			if ws == 0 {
-				return fmt.Errorf("no pane %d", pane)
-			}
-			var size persist.Size
-			if cols, rows, err := consoleSize(); err == nil {
-				size.Cols, size.Rows = cols, rows
-			}
-			tag := c.NextTag()
-			// A console has no pixel size: its grid, in one-pixel cells.
-			area := persist.Area{Width: uint32(size.Cols), Height: uint32(size.Rows), CellW: 1, CellH: 1}
-			if err := c.Send(0, &persist.WorkspaceAttach{Tag: tag, WS: ws, Area: area}); err != nil {
-				return err
-			}
-			a, err := c.Await(tag, false)
-			if err != nil {
-				return err
-			}
-			p := a.Panes[pane]
-			if p == nil {
-				return fmt.Errorf("no snapshot for pane %d", pane)
-			}
-			// The pane may share its tab; here it has the whole console.
-			if size.Cols != 0 {
-				c.Send(pane, &persist.Resize{Size: size})
-			}
-			return attach(c, ws, pane, p)
-		},
-	}
-}
-
 func peekCommand() *cobra.Command {
 	var asVT bool
 	cmd := &cobra.Command{
@@ -466,34 +416,15 @@ func peekCommand() *cobra.Command {
 				return err
 			}
 			defer c.Close()
-			p, err := c.Peek(pane)
+			text, err := c.Peek(pane, asVT)
 			if err != nil {
 				return err
 			}
-			ctx := context.Background()
-			rt, err := vt.NewRuntime(ctx, nil)
-			if err != nil {
-				return err
-			}
-			defer rt.Close(ctx)
-			t, err := rt.Decode(p.Snapshot)
-			if err != nil {
-				return err
-			}
-			defer t.Close()
 			if asVT {
-				b, err := t.VT()
-				if err != nil {
-					return err
-				}
-				_, err = os.Stdout.Write(b)
+				_, err = os.Stdout.Write(text)
 				return err
 			}
-			s, err := t.Text()
-			if err != nil {
-				return err
-			}
-			fmt.Println(s)
+			fmt.Println(string(text))
 			return nil
 		},
 	}

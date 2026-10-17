@@ -265,10 +265,9 @@ reconnects, reattaches, and replaces them.
 - **Idle hosts stay connected** for as long as the daemon runs, even
   with no window showing them.
 - **Several windows on one workspace.** Attaching takes a workspace from
-  whoever has it. Sharing needs a rule for whose replies to device
-  queries reach the program (clients would send them as their own frame
-  type, not input) and whose size each pty takes; a read-only attach
-  would sidestep both.
+  whoever has it. The daemon's terminal answers the program's queries
+  already, so sharing needs frames paced per viewer and a rule for whose
+  size each pty takes (the smallest, as tmux does).
 
 ## Configuration
 

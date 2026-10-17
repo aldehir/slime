@@ -38,8 +38,6 @@ const L = std.unicode.utf8ToUtf16LeStringLiteral;
 const protocol_version = 1;
 /// ssh/internal/persist's MaxFrame: a full frame goes whole.
 const max_frame = 8 << 20;
-/// Hello's CapFrames: we draw frames rather than run terminals.
-const cap_frames = 1 << 0;
 /// Long enough for long-path-aware installs.
 const max_path = 32 * 1024;
 const daemon_name = L("slimed.exe");
@@ -59,7 +57,6 @@ const MsgType = enum(u8) {
     split = 12,
     layout = 13,
     pane_kill = 14,
-    input = 15,
     resize = 16,
     peek = 17,
     ack = 18,
@@ -73,8 +70,6 @@ const MsgType = enum(u8) {
     workspaces = 66,
     workspace = 67,
     attached = 68,
-    snapshot = 69,
-    output = 70,
     exit = 71,
     detached = 72,
     @"error" = 73,
@@ -86,6 +81,7 @@ const MsgType = enum(u8) {
     hosts = 79,
     host_state = 80,
     prompt = 81,
+    pane_text = 82,
     _,
 };
 
@@ -1005,10 +1001,6 @@ fn handle(self: *Slimed, f: Frame) !u32 {
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     switch (f.type) {
         .attached => {
-            _ = try r.readU32(); // tag
-            if (try r.readU32() != 0) return error.UnwantedSnapshot;
-            const modes = try r.readU32();
-            _ = try r.take(@as(usize, modes) * 4);
             const command = toUtf16(self.alloc, r.readStr() catch "") catch return error.OutOfMemory;
             errdefer self.alloc.free(command);
             const status = try readStatus(self.alloc, &r);
@@ -1321,10 +1313,9 @@ fn toUtf16(a: Allocator, s: []const u8) ![]const u16 {
 /// daemon's frames are laid out as ours. A bridge the local daemon
 /// refuses answers with an Error instead, kept in `failure`.
 fn handshake(self: *Slimed, buf: []u8) !void {
-    var hello: [12]u8 = undefined;
+    var hello: [8]u8 = undefined;
     std.mem.writeInt(u32, hello[0..4], protocol_version, .little);
-    std.mem.writeInt(u32, hello[4..8], cap_frames, .little);
-    std.mem.writeInt(u32, hello[8..12], self.frame_interval, .little);
+    std.mem.writeInt(u32, hello[4..8], self.frame_interval, .little);
     try self.send(.hello, 0, &hello);
     const f = try self.pipe.readFrame(buf);
     if (f.type == .@"error") {
@@ -1336,7 +1327,6 @@ fn handshake(self: *Slimed, buf: []u8) !void {
     if (f.type != .hello_reply) return error.BadReply;
     var r: Reader = .{ .buf = f.payload };
     const version = try r.readU32();
-    _ = try r.readU16(); // snapshot version
     _ = try r.readU32(); // pid
     // A daemon too old to say draws no frames.
     const frame_layout = r.readU64() catch 0;

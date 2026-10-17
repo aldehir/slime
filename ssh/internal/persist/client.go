@@ -16,13 +16,13 @@ type Client struct {
 	Hello HelloReply
 }
 
-// NewClient says hello over rw, as a client that runs its own terminals.
+// NewClient says hello over rw.
 func NewClient(rw io.ReadWriteCloser) (*Client, error) {
 	return NewClientWith(rw, Hello{})
 }
 
-// NewClientWith says hello over rw with hello's capabilities; its
-// Version is filled in.
+// NewClientWith says hello over rw with hello's settings; its Version
+// is filled in.
 func NewClientWith(rw io.ReadWriteCloser, hello Hello) (*Client, error) {
 	c := &Client{rw: rw, r: NewReader(rw)}
 	hello.Version = Version
@@ -74,7 +74,7 @@ func (c *Client) NextTag() uint32 {
 }
 
 // List asks for the workspaces. The helpers below read replies in line,
-// so they're for a client that isn't also reading live output.
+// so they're for a client that isn't also drawing a workspace.
 func (c *Client) List() (*Workspaces, error) {
 	if err := c.Send(0, &List{}); err != nil {
 		return nil, err
@@ -93,15 +93,12 @@ func (c *Client) List() (*Workspaces, error) {
 	}
 }
 
-// PaneState is a pane as attaching delivered it: its snapshot, and the
-// output that followed before the reply was complete.
+// PaneState is a pane as attaching delivered it, with the frames and
+// notices that followed before the reply was complete.
 type PaneState struct {
 	Attached Attached
-	Snapshot []byte
-	Output   [][]byte
-	// Frames and notices, for a client that draws them.
-	Draws   []*Draw
-	Notices []*Notice
+	Draws    []*Draw
+	Notices  []*Notice
 }
 
 // Attachment collects what attaching (or a request that adds a pane to
@@ -113,7 +110,7 @@ type Attachment struct {
 }
 
 // Await reads until the Workspace and Created (if want is set) replies
-// tagged tag have come, collecting pane snapshots and output on the way.
+// tagged tag have come, collecting what came for the panes on the way.
 func (c *Client) Await(tag uint32, wantCreated bool) (*Attachment, error) {
 	a := &Attachment{Panes: map[uint32]*PaneState{}}
 	for a.Workspace == nil || (wantCreated && a.Created == nil) {
@@ -124,14 +121,6 @@ func (c *Client) Await(tag uint32, wantCreated bool) (*Attachment, error) {
 		switch m := m.(type) {
 		case *Attached:
 			a.Panes[id] = &PaneState{Attached: *m}
-		case *Snapshot:
-			if p := a.Panes[id]; p != nil {
-				p.Snapshot = append(p.Snapshot, m.Data...)
-			}
-		case *Output:
-			if p := a.Panes[id]; p != nil {
-				p.Output = append(p.Output, append([]byte(nil), m.Data...))
-			}
 		case *Draw:
 			if p := a.Panes[id]; p != nil {
 				p.Draws = append(p.Draws, &Draw{Seq: m.Seq, Data: append([]byte(nil), m.Data...)})
@@ -178,34 +167,27 @@ func (c *Client) AwaitCreated(tag uint32) (*Created, error) {
 	}
 }
 
-// Peek returns a pane's snapshot without taking it.
-func (c *Client) Peek(pane uint32) (*PaneState, error) {
+// Peek returns the text of a pane's screen and scrollback without
+// taking it: plain, or with asVT the VT that redraws it.
+func (c *Client) Peek(pane uint32, asVT bool) ([]byte, error) {
 	tag := c.NextTag()
-	if err := c.Send(pane, &Peek{Tag: tag}); err != nil {
+	if err := c.Send(pane, &Peek{Tag: tag, VT: asVT}); err != nil {
 		return nil, err
 	}
-	var p *PaneState
 	for {
 		id, m, err := c.Recv()
 		if err != nil {
 			return nil, err
 		}
 		switch m := m.(type) {
-		case *Attached:
+		case *PaneText:
 			if m.Tag == tag && id == pane {
-				p = &PaneState{Attached: *m}
-			}
-		case *Snapshot:
-			if p != nil && id == pane {
-				p.Snapshot = append(p.Snapshot, m.Data...)
+				return m.Data, nil
 			}
 		case *Error:
 			if m.Tag == tag {
 				return nil, fmt.Errorf("slimed: %s", m.Message)
 			}
-		}
-		if p != nil && len(p.Snapshot) == int(p.Attached.SnapshotLen) {
-			return p, nil
 		}
 	}
 }

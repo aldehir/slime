@@ -6,14 +6,14 @@ import (
 	"github.com/aldehir/slime/ssh/internal/vt"
 )
 
-// Events: input from a client that draws (CapFrames), which the pane's
-// View turns into input for the child, selection, scrolling, and copies
-// against the daemon's terminal. See ssh/internal/vt/event.zig.
+// Events: input from the client, which the pane's View turns into input
+// for the child, selection, scrolling, and copies against the daemon's
+// terminal. See ssh/internal/vt/event.zig.
 
-// event handles an event from c, if c owns the pane and draws it.
+// event handles an event from c, if c owns the pane.
 func (p *Pane) event(c *conn, data []byte) {
 	p.mu.Lock()
-	if p.client != c || !c.frames || p.done || p.fr.view == nil {
+	if p.client != c || p.done || p.fr.view == nil {
 		p.mu.Unlock()
 		return
 	}
@@ -39,10 +39,9 @@ func (p *Pane) event(c *conn, data []byte) {
 	p.autoscrollLocked(r.Autoscroll)
 	p.mu.Unlock()
 
-	// Outside the lock, as Input: a full input pipe blocks until the
-	// child reads, and the reader needs the lock to keep draining output.
-	// Events from one client come one at a time, so their input stays in
-	// order.
+	// Outside the lock: a full input pipe blocks until the child reads,
+	// and the reader needs the lock to keep draining output. Events from
+	// one client come one at a time, so their input stays in order.
 	if len(input) > 0 {
 		p.pty.Write(input)
 	}
@@ -52,8 +51,8 @@ func (p *Pane) event(c *conn, data []byte) {
 // (DEC 9001), which libghostty-vt leaves to us: ConPTY turns it on.
 func (p *Pane) win32InputLocked() bool {
 	for _, m := range p.modes {
-		if m.Mode == 9001 && !m.ANSI {
-			return m.Enabled
+		if m.num == 9001 && !m.ansi {
+			return m.enabled
 		}
 	}
 	return false

@@ -49,7 +49,7 @@ func TestUnixSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { c.Close() })
-		return &window{t: t, h: h, c: c, terms: map[uint32]*vt.Terminal{}}
+		return &window{t: t, h: h, c: c, screens: map[uint32]*vt.Screen{}}
 	}
 	command := `printf 'ready>'; while read l; do [ "$l" = exit ] && exit 3; printf 'got %s\r\nready>' "$l"; done`
 
@@ -69,7 +69,7 @@ func TestUnixSocket(t *testing.T) {
 	w1.absorb(a)
 	pane := a.Created.Pane
 	w1.until(pane, "ready>")
-	w1.c.Send(pane, &Input{Data: []byte("first\r")})
+	w1.c.Send(pane, &Event{Data: evText("first\r")})
 	w1.until(pane, "got first")
 	w1.c.Close()
 	eventually(t, "detach", func() bool { return !h.attached(w1.ws.ID) })
@@ -85,12 +85,10 @@ func TestUnixSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	w2.absorb(a)
-	if s := w2.text(pane); !strings.Contains(s, "got first") {
-		t.Errorf("restored text %q", s)
-	}
-	w2.c.Send(pane, &Input{Data: []byte("second\r")})
+	w2.until(pane, "got first")
+	w2.c.Send(pane, &Event{Data: evText("second\r")})
 	w2.until(pane, "got second")
-	w2.c.Send(pane, &Input{Data: []byte("exit\r")})
+	w2.c.Send(pane, &Event{Data: evText("exit\r")})
 	if _, e := next[*Exit](w2); e.Status != 3 {
 		t.Errorf("exit status %d, want 3", e.Status)
 	}

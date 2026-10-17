@@ -3,15 +3,14 @@
 //
 // Panes (a pty and its terminal) are arranged in tabs, each a layout
 // tree, and tabs are grouped in workspaces. A window attaches a whole
-// workspace, getting a snapshot of each pane's terminal and then its
-// live output from where the snapshot ends. The daemon owns the
-// structure; a window mirrors it, asking for changes and applying the
-// Workspace messages that come back.
+// workspace and draws the frames of each pane's screen the daemon sends
+// (framing.go), sending input back as events (events.go). The daemon
+// owns the structure; a window mirrors it, asking for changes and
+// applying the Workspace messages that come back.
 package persist
 
 import (
 	"cmp"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -36,8 +35,6 @@ type Server struct {
 	spawn func(pty.Options) (pty.Pty, error)
 	log   *slog.Logger
 	idle  time.Duration
-
-	snapshotVersion uint16
 
 	mu         sync.Mutex
 	nextID     uint32 // shared by workspaces, tabs, and panes
@@ -84,17 +81,6 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		hosts:      newHostTable(opts.Hosts),
 		idleC:      make(chan struct{}),
 	}
-	// The snapshot envelope: 8 bytes of magic, then a u16 version.
-	t, err := rt.New(1, 1)
-	if err != nil {
-		return nil, err
-	}
-	defer t.Close()
-	snap, err := t.Snapshot()
-	if err != nil || len(snap) < 10 {
-		return nil, fmt.Errorf("persist: reading the snapshot version: %v", err)
-	}
-	s.snapshotVersion = binary.LittleEndian.Uint16(snap[8:10])
 	return s, nil
 }
 
@@ -213,16 +199,14 @@ func (s *Server) handshake(c *conn, m Message, err error) bool {
 		return false
 	}
 	c.sendForce(0, &HelloReply{
-		Version:         Version,
-		SnapshotVersion: s.snapshotVersion,
-		PID:             uint32(os.Getpid()),
-		FrameLayout:     vt.FrameLayout(),
+		Version:     Version,
+		PID:         uint32(os.Getpid()),
+		FrameLayout: vt.FrameLayout(),
 	})
 	if hello.Version != Version {
 		c.sendForce(0, &Error{Message: fmt.Sprintf("slimed speaks version %d, not %d", Version, hello.Version)})
 		return false
 	}
-	c.frames = hello.Caps&CapFrames != 0
 	c.interval = defaultFrameInterval
 	if hello.FrameInterval != 0 {
 		c.interval = time.Duration(hello.FrameInterval) * time.Microsecond
@@ -265,10 +249,6 @@ func (s *Server) dispatch(c *conn, id uint32, m Message) {
 		if p := s.pane(id); p != nil {
 			p.kill()
 		}
-	case *Input:
-		if p := s.pane(id); p != nil {
-			p.input(c, m.Data)
-		}
 	case *Ack:
 		if p := s.pane(id); p != nil {
 			p.ack(c, m.Seq)
@@ -287,7 +267,7 @@ func (s *Server) dispatch(c *conn, id uint32, m Message) {
 			fail(m.Tag, errors.New("no such pane"))
 			return
 		}
-		fail(m.Tag, p.peek(c, m.Tag))
+		fail(m.Tag, p.peek(c, m.Tag, m.VT))
 	default:
 		if !s.hostDispatch(c, id, m) {
 			s.log.Warn("unexpected message", "type", m.Type())

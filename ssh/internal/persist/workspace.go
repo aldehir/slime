@@ -129,8 +129,8 @@ func (s *Server) workspaceNew(c *conn, m *WorkspaceNew) {
 	c.sendForce(0, &Created{Tag: m.Tag, WS: ws.id})
 }
 
-// workspaceAttach gives a workspace to c: each pane's snapshot, sized to
-// the window's tab area, then the structure.
+// workspaceAttach gives a workspace to c: each pane, sized to the
+// window's tab area, then the structure.
 func (s *Server) workspaceAttach(c *conn, m *WorkspaceAttach) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -268,7 +268,7 @@ func validArea(a Area) bool {
 	return a.Width != 0 && a.Height != 0 && a.CellW != 0 && a.CellH != 0
 }
 
-// tabNew starts a tab with one pane. Its owner gets the pane's snapshot,
+// tabNew starts a tab with one pane. Its owner gets the pane's Attached,
 // then the structure; the sender gets Created.
 func (s *Server) tabNew(c *conn, m *TabNew) error {
 	s.mu.Lock()
