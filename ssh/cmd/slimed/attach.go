@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/windows"
 	"golang.org/x/term"
 
 	"github.com/aldehir/slime/ssh/internal/persist"
@@ -32,8 +31,7 @@ func attach(c *persist.Client, ws, pane uint32, p *persist.PaneState) error {
 	if err != nil {
 		return err
 	}
-	stdin, stdout := windows.Handle(os.Stdin.Fd()), windows.Handle(os.Stdout.Fd())
-	restore, err := rawConsole(stdin, stdout)
+	restore, err := rawConsole()
 	if err != nil {
 		return err
 	}
@@ -155,23 +153,4 @@ func redrawSequence(snapshot []byte) ([]byte, error) {
 	}
 	defer t.Close()
 	return t.VT()
-}
-
-// rawConsole sends keys as VT input with no line editing or echo, and
-// interprets VT output, as a terminal would.
-func rawConsole(stdin, stdout windows.Handle) (restore func(), err error) {
-	state, err := term.MakeRaw(int(stdin))
-	if err != nil {
-		return nil, err
-	}
-	var outMode uint32
-	if err := windows.GetConsoleMode(stdout, &outMode); err != nil {
-		term.Restore(int(stdin), state)
-		return nil, err
-	}
-	windows.SetConsoleMode(stdout, outMode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING|windows.DISABLE_NEWLINE_AUTO_RETURN)
-	return func() {
-		term.Restore(int(stdin), state)
-		windows.SetConsoleMode(stdout, outMode)
-	}, nil
 }

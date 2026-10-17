@@ -1,32 +1,11 @@
 package pty
 
 import (
-	"bytes"
 	"io"
 	"strings"
 	"testing"
 	"time"
 )
-
-// readAll reads until EOF, failing after a timeout.
-func readAll(t *testing.T, p Pty) string {
-	t.Helper()
-	var buf bytes.Buffer
-	done := make(chan error, 1)
-	go func() {
-		_, err := io.Copy(&buf, p)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("read: %v", err)
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatalf("no EOF; got %q", buf.String())
-	}
-	return buf.String()
-}
 
 func TestOutputAndExit(t *testing.T) {
 	p, err := Start(Options{Command: `cmd.exe /c echo hello-pty & exit 7`, Cols: 80, Rows: 24})
@@ -51,7 +30,7 @@ func TestInputAndResize(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	if err := p.Resize(100, 30); err != nil {
+	if err := p.Resize(100, 30, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.Write([]byte("echo typed-%PROCESSOR_ARCHITECTURE%\r")); err != nil {

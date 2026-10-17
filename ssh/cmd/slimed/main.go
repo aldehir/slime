@@ -9,8 +9,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,8 +43,8 @@ func newCommand() *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
-	root.AddCommand(serveCommand(), lsCommand(), wsCommand(), tabCommand(), splitCommand(),
-		attachCommand(), peekCommand(), killCommand())
+	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
+		splitCommand(), attachCommand(), peekCommand(), killCommand())
 	return root
 }
 
@@ -52,6 +54,7 @@ func serveCommand() *cobra.Command {
 		logPath   string
 		verbose   bool
 		conptyDir string
+		termName  string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -78,10 +81,12 @@ func serveCommand() *cobra.Command {
 			if conptyDir != "" {
 				pty.SetConptyDir(conptyDir)
 			}
+			pty.SetTerm(termName)
 			return serve(logger, idle)
 		},
 	}
 	cmd.Flags().StringVar(&conptyDir, "conpty", "", "directory holding conpty.dll (default: next to slimed.exe, else the system's)")
+	cmd.Flags().StringVar(&termName, "term", "", "TERM for panes on Unix (default xterm-256color)")
 	cmd.Flags().DurationVar(&idle, "idle", 10*time.Second, "exit after this long with no workspaces and no clients (0 never)")
 	cmd.Flags().StringVar(&logPath, "log", "", "append logs to this file instead of stderr")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "log libghostty-vt's debug output too")
@@ -89,7 +94,7 @@ func serveCommand() *cobra.Command {
 }
 
 func serve(logger *slog.Logger, idle time.Duration) error {
-	name, err := persist.PipeName()
+	name, err := persist.Address()
 	if err != nil {
 		return err
 	}
@@ -109,6 +114,42 @@ func serve(logger *slog.Logger, idle time.Duration) error {
 	}
 	logger.Info("serving", "pipe", name, "pid", os.Getpid())
 	return srv.Serve(l)
+}
+
+func connectCommand() *cobra.Command {
+	var termName string
+	cmd := &cobra.Command{
+		Use:   "connect",
+		Short: "Bridge stdin and stdout to the daemon, starting it if needed",
+		Long: "Copies stdin to the daemon and the daemon's replies to stdout, for a client\n" +
+			"that can't reach the socket itself: slime runs it over an SSH exec channel.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var serve []string
+			if termName != "" {
+				serve = append(serve, "--term", termName)
+			}
+			conn, err := dial(true, serve...)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			go func() {
+				io.Copy(conn, os.Stdin)
+				// The client hung up: so do we, once the daemon has what
+				// it sent.
+				if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				} else {
+					conn.Close()
+				}
+			}()
+			_, err = io.Copy(os.Stdout, conn)
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&termName, "term", "", "TERM for panes, if this starts the daemon")
+	return cmd
 }
 
 func lsCommand() *cobra.Command {
@@ -585,10 +626,20 @@ func parseDirection(s string) (persist.Direction, error) {
 	return 0, fmt.Errorf("direction is right, down, left, or up, not %q", s)
 }
 
-// connect dials the daemon. If start is set and none is running, it
-// starts one.
+// connect dials the daemon and says hello. If start is set and none is
+// running, it starts one.
 func connect(start bool) (*persist.Client, error) {
-	name, err := persist.PipeName()
+	conn, err := dial(start)
+	if err != nil {
+		return nil, err
+	}
+	return persist.NewClient(conn)
+}
+
+// dial connects to the daemon. If start is set and none is running, it
+// starts one with serve's extra arguments.
+func dial(start bool, serve ...string) (net.Conn, error) {
+	name, err := persist.Address()
 	if err != nil {
 		return nil, err
 	}
@@ -596,7 +647,7 @@ func connect(start bool) (*persist.Client, error) {
 	conn, err := persist.Dial(ctx, name)
 	cancel()
 	if err != nil && start && isNotRunning(err) {
-		if err := startDaemon(); err != nil {
+		if err := startDaemon(serve...); err != nil {
 			return nil, fmt.Errorf("starting slimed: %w", err)
 		}
 		deadline := time.Now().Add(5 * time.Second)
@@ -616,5 +667,5 @@ func connect(start bool) (*persist.Client, error) {
 		}
 		return nil, err
 	}
-	return persist.NewClient(conn)
+	return conn, nil
 }

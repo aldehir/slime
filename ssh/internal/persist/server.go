@@ -295,7 +295,14 @@ func (s *Server) startPane(command, cwd string, size Size) (pty.Pty, *vt.Termina
 		term.Close()
 		return nil, nil, err
 	}
-	p, err := s.spawn(pty.Options{Command: command, Dir: cwd, Cols: size.Cols, Rows: size.Rows})
+	p, err := s.spawn(pty.Options{
+		Command: command,
+		Dir:     cwd,
+		Cols:    size.Cols,
+		Rows:    size.Rows,
+		Width:   uint32(size.Cols) * size.CellW,
+		Height:  uint32(size.Rows) * size.CellH,
+	})
 	if err != nil {
 		term.Close()
 		return nil, nil, err

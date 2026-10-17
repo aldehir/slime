@@ -94,7 +94,7 @@ func (p *fakePty) Write(b []byte) (int, error) {
 	return p.input.Write(b)
 }
 
-func (p *fakePty) Resize(cols, rows uint16) error {
+func (p *fakePty) Resize(cols, rows uint16, _, _ uint32) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.size = [2]uint16{cols, rows}

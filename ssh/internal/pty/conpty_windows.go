@@ -33,6 +33,9 @@ const pseudoconsoleGlyphWidthGraphemes = 0x08
 // conptyDir, if set, is where conpty.dll is, instead of next to us.
 var conptyDir string
 
+// SetTerm does nothing: ConPTY children don't read TERM.
+func SetTerm(string) {}
+
 // SetConptyDir loads conpty.dll from dir instead of from next to our
 // executable: slime runs slimed from a copy, and points it back at its
 // own. Call it before the first Start.
@@ -242,7 +245,7 @@ func (c *conpty) Read(p []byte) (int, error) {
 
 func (c *conpty) Write(p []byte) (int, error) { return c.in.Write(p) }
 
-func (c *conpty) Resize(cols, rows uint16) error {
+func (c *conpty) Resize(cols, rows uint16, _, _ uint32) error {
 	r, _, _ := c.api.resize.Call(uintptr(c.hpc), coord(cols, rows))
 	if hr := int32(r); hr < 0 {
 		return fmt.Errorf("pty: ResizePseudoConsole: 0x%08x", uint32(hr))

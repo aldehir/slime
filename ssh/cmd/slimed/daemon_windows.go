@@ -14,16 +14,16 @@ func isNotRunning(err error) bool {
 	return errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, os.ErrNotExist)
 }
 
-// startDaemon runs `slimed serve` so it outlives us: detached from our
-// console, and out of our job object if we're in one (slime puts its
-// children in a kill-on-close job). Its log goes to
+// startDaemon runs `slimed serve` with extra arguments so it outlives
+// us: detached from our console, and out of our job object if we're in
+// one (slime puts its children in a kill-on-close job). Its log goes to
 // %LOCALAPPDATA%\slime\slimed.log.
-func startDaemon() error {
+func startDaemon(extra ...string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	args := []string{"serve"}
+	args := append([]string{"serve"}, extra...)
 	if dir, err := os.UserCacheDir(); err == nil {
 		dir = filepath.Join(dir, "slime")
 		if os.MkdirAll(dir, 0o700) == nil {

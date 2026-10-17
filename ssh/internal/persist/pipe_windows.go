@@ -10,10 +10,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// PipeName is the current user's daemon pipe: one daemon per user, or
+// Address is the current user's daemon pipe: one daemon per user, or
 // per user and SLIMED_INSTANCE when that's set, so tests can run a
 // daemon beside the one in use.
-func PipeName() (string, error) {
+func Address() (string, error) {
 	sid, err := userSID()
 	if err != nil {
 		return "", err

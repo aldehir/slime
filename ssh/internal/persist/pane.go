@@ -184,7 +184,7 @@ func (p *Pane) resize(c *conn, size Size) {
 }
 
 func (p *Pane) resizeLocked(size Size) {
-	if err := p.pty.Resize(size.Cols, size.Rows); err != nil {
+	if err := p.pty.Resize(size.Cols, size.Rows, uint32(size.Cols)*size.CellW, uint32(size.Rows)*size.CellH); err != nil {
 		p.srv.log.Error("resizing pty", "pane", p.id, "err", err)
 	}
 	if err := p.term.Resize(size.Cols, size.Rows, size.CellW, size.CellH); err != nil {
