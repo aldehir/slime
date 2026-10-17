@@ -95,7 +95,7 @@ pub const Theme = struct {
             .dialog_outline = mix(b, f, 0.13),
             .pane_border = withAlpha(f, if (light) 0.14 else 0.09),
             // Shadows show less on a dark ground; they need more there.
-            .pane_shadow = .{ 0, 0, 0, if (light) 0.14 else 0.38 },
+            .pane_shadow = .{ 0, 0, 0, if (light) 0.07 else 0.19 },
         };
     }
 };
