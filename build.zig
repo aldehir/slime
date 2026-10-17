@@ -8,6 +8,9 @@ const conpty_version = "1.25.260930003";
 const conpty_sha256 = "02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee";
 const conpty_dir = "tools/conpty-" ++ conpty_version;
 
+/// Everything beside the exe: the daemon (slimed.exe) with its ConPTY and
+/// its Linux builds for SSH hosts, and the window (clients/gui), built as
+/// a path dependency that installs into the same prefix.
 pub fn build(b: *std.Build) void {
     // Building libghostty-vt's C++ dependencies against MSVC needs the
     // environment from scripts/setup-msvc.ps1.
@@ -16,142 +19,54 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    // A console subsystem build keeps stderr (std.log) visible while
-    // developing. Release builds are pure GUI apps.
-    const console = b.option(
-        bool,
-        "console",
-        "Build with the console subsystem (default: true in Debug)",
-    ) orelse (optimize == .Debug);
-
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    // The window's options, passed through to clients/gui/build.zig,
+    // which has the same defaults when built on its own.
+    const gui = b.dependency("gui", .{
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .console = b.option(
+            bool,
+            "console",
+            "Build with the console subsystem (default: true in Debug)",
+        ) orelse (optimize == .Debug),
+        .stats = b.option(
+            bool,
+            "stats",
+            "Show frame timing and throughput in the window title (default: true in Debug)",
+        ) orelse (optimize == .Debug),
+        .@"max-fps" = b.option(
+            u32,
+            "max-fps",
+            "Frame rate cap (default: 0, the display's refresh rate)",
+        ) orelse 0,
     });
-    const options = b.addOptions();
-    options.addOption(bool, "stats", b.option(
-        bool,
-        "stats",
-        "Show frame timing and throughput in the window title (default: true in Debug)",
-    ) orelse (optimize == .Debug));
-    options.addOption(u32, "max_fps", b.option(
-        u32,
-        "max-fps",
-        "Frame rate cap (default: 0, the display's refresh rate)",
-    ) orelse 0);
-    exe_mod.addOptions("build_options", options);
+    b.getInstallStep().dependOn(gui.builder.getInstallStep());
+    b.step("icons", "Render the app icon PNGs into zig-out/icons").dependOn(&gui.builder.top_level_steps.get("icons").?.step);
 
-    for ([_][]const u8{ "user32", "advapi32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler", "d2d1", "shlwapi" }) |lib| {
-        exe_mod.linkSystemLibrary(lib, .{});
-    }
-    // Drawn in the title bar, as the taskbar shows it at small sizes.
-    exe_mod.addAnonymousImport("slime-small.svg", .{ .root_source_file = b.path("assets/icon/slime-small.svg") });
-    // The chrome's icons, embedded by the module next to them.
-    exe_mod.addAnonymousImport("lucide", .{ .root_source_file = b.path("assets/icons/lucide/lucide.zig") });
-    // The frame and event codecs slimed's library shares (src/Screen.zig).
-    exe_mod.addAnonymousImport("frame", .{ .root_source_file = b.path("ssh/internal/vt/frame.zig") });
-    exe_mod.addAnonymousImport("event", .{ .root_source_file = b.path("ssh/internal/vt/event.zig") });
-
-    if (b.lazyDependency("ghostty", .{
-        .target = target,
-        .optimize = optimize,
-    })) |dep| {
-        exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-        // Already compiled into ghostty-vt for kitty graphics; we use its
-        // PNG decoder, which libghostty-vt leaves to the embedder.
-        if (dep.builder.lazyDependency("wuffs", .{
-            .target = target,
-            .optimize = optimize,
-        })) |wuffs| exe_mod.addImport("wuffs", wuffs.module("wuffs"));
-    }
-    exe_mod.addImport("z2d", b.dependency("z2d", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("z2d"));
-
-    // The app icon, rendered from assets/icon by a host tool. Zig's cache
-    // reruns it only when the tool or an SVG changes.
-    const icon = renderIcon(b);
-    exe_mod.addWin32ResourceFile(.{
-        .file = b.path("src/slime.rc"),
-        .include_paths = &.{icon.ico.dirname()},
-    });
-
-    const exe = b.addExecutable(.{
-        .name = "slime",
-        .root_module = exe_mod,
-    });
-    exe.subsystem = if (console) .console else .windows;
-
-    // The GUI subsystem defaults to the CRT's WinMain entry. Keep using
-    // the regular `main` (and std.process.Init) in both modes.
-    exe.entry = .{ .symbol_name = "mainCRTStartup" };
-    b.installArtifact(exe);
     installConpty(b);
     const remote = b.option(bool, "remote", "Build slimed and its builds for SSH hosts (need Go; default: if Go is found)");
     if (remote orelse true) installGoHelpers(b, remote != null);
 
-    // Themes for the `theme` config key, in `themes` next to the exe.
-    if (b.lazyDependency("iterm2_themes", .{})) |themes| {
-        b.installDirectory(.{
-            .source_dir = themes.path(""),
-            .install_dir = .bin,
-            .install_subdir = "themes",
-            .exclude_extensions = &.{".md"},
-        });
-    }
-
-    const icons = b.addInstallDirectory(.{
-        .source_dir = icon.png_dir,
-        .install_dir = .prefix,
-        .install_subdir = "icons",
-    });
-    b.step("icons", "Render the app icon PNGs into zig-out/icons").dependOn(&icons.step);
-
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addRunArtifact(gui.artifact("slime"));
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run the app").dependOn(&run_cmd.step);
 
-    const unit_tests = b.addTest(.{ .root_module = exe_mod });
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    test_step.dependOn(&gui.builder.top_level_steps.get("test").?.step);
     terminfoSteps(b, test_step);
 }
 
-const Icon = struct {
-    ico: std.Build.LazyPath,
-    png_dir: std.Build.LazyPath,
-};
-
-fn renderIcon(b: *std.Build) Icon {
-    const tool = b.addExecutable(.{
-        .name = "icon",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/build/icon.zig"),
-            .target = b.graph.host,
-        }),
-    });
-    const run = b.addRunArtifact(tool);
-    run.addFileArg(b.path("assets/icon/slime.svg"));
-    run.addFileArg(b.path("assets/icon/slime-small.svg"));
-    const ico = run.addOutputFileArg("slime.ico");
-    const png_dir = run.addOutputDirectoryArg("png");
-    return .{ .ico = ico, .png_dir = png_dir };
-}
-
-/// The xterm-ghostty terminfo source the SSH helper embeds, generated
-/// from ghostty's own definition. It's checked in so the helper builds
-/// with Go alone; `zig build terminfo` regenerates it, and the tests fail
-/// when it no longer matches the submodule.
+/// The xterm-ghostty terminfo source slimed embeds, generated from
+/// ghostty's own definition. It's checked in so slimed builds with Go
+/// alone; `zig build terminfo` regenerates it, and the tests fail when it
+/// no longer matches the submodule.
 fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
-    const checked_in = "ssh/internal/terminfo/xterm-ghostty.terminfo";
+    const checked_in = "internal/terminfo/xterm-ghostty.terminfo";
     const tool = b.addExecutable(.{
         .name = "terminfo",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/build/terminfo.zig"),
+            .root_source_file = b.path("build/terminfo.zig"),
             .target = b.graph.host,
             .imports = &.{.{
                 .name = "terminfo",
@@ -189,11 +104,11 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
         std.log.warn("go not found; building without slimed (slime will have nothing to run sessions in)", .{});
         return;
     };
-    // slimed links libghostty-vt with cgo (ssh/internal/vt), as a static
+    // slimed links libghostty-vt with cgo (internal/vt), as a static
     // library for each target from a nested build of the submodule, which
-    // tracks its own sources. ssh/internal/vt/slime.zig is compiled in
-    // for slimed's own exports. scripts/build-vt-lib.ps1 does the same.
-    const extra = b.fmt("-Dvt-extra={s}", .{b.path("ssh/internal/vt/slime.zig").getPath(b)});
+    // tracks its own sources. internal/vt/slime.zig is compiled in for
+    // slimed's own exports. scripts/build-vt-lib.ps1 does the same.
+    const extra = b.fmt("-Dvt-extra={s}", .{b.path("internal/vt/slime.zig").getPath(b)});
     const copy = b.addUpdateSourceFiles();
     for ([_]struct { zig: []const u8, go: []const u8, lib: []const u8 }{
         .{ .zig = "x86_64-windows-gnu", .go = "windows_amd64", .lib = "ghostty-vt-static.lib" },
@@ -205,7 +120,7 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
         lib.has_side_effects = true;
         // Named as an archive on both, for cgo's -l (its flag check
         // rejects a .lib path).
-        copy.addCopyFileToSource(prefix.path(b, b.fmt("lib/{s}", .{t.lib})), b.fmt("ssh/internal/vt/lib/{s}/libghostty-vt.a", .{t.go}));
+        copy.addCopyFileToSource(prefix.path(b, b.fmt("lib/{s}", .{t.lib})), b.fmt("internal/vt/lib/{s}/libghostty-vt.a", .{t.go}));
     }
     goBuild(b, go, "slimed").step.dependOn(&copy.step);
     installRemote(b, go, &copy.step);
@@ -218,15 +133,15 @@ const remote_targets = [_]struct { os: []const u8, arch: []const u8, zig: []cons
 };
 
 /// slimed for each of `remote_targets`, as files in `remote/` next to the
-/// exe (ssh/internal/remote): `go build` for the target, then
-/// src/build/pack.zig gzips them and writes the manifest. Linked fully
-/// static against musl, so it runs whatever the host's libc, and stripped
-/// by the C linker too: -s alone leaves the Zig library's debug info.
+/// exe (internal/remote): `go build` for the target, then build/pack.zig
+/// gzips them and writes the manifest. Linked fully static against musl,
+/// so it runs whatever the host's libc, and stripped by the C linker
+/// too: -s alone leaves the Zig library's debug info.
 fn installRemote(b: *std.Build, go: []const u8, libs: *std.Build.Step) void {
     const tool = b.addExecutable(.{
         .name = "pack",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/build/pack.zig"),
+            .root_source_file = b.path("build/pack.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseFast,
         }),
@@ -237,7 +152,7 @@ fn installRemote(b: *std.Build, go: []const u8, libs: *std.Build.Step) void {
         const run = b.addSystemCommand(&.{ go, "build", "-trimpath", "-ldflags=-s -w -linkmode external -extldflags '-static -s'", "-o" });
         const exe = run.addOutputFileArg(b.fmt("slimed-{s}-{s}", .{ t.os, t.arch }));
         run.addArg("./cmd/slimed");
-        run.setCwd(b.path("ssh"));
+        run.setCwd(b.path("."));
         run.setEnvironmentVariable("GOOS", t.os);
         run.setEnvironmentVariable("GOARCH", t.arch);
         run.setEnvironmentVariable("CGO_ENABLED", "1");
@@ -254,12 +169,12 @@ fn installRemote(b: *std.Build, go: []const u8, libs: *std.Build.Step) void {
     }).step);
 }
 
-/// `go build` of ssh/cmd/`name`, installed as `name`.exe.
+/// `go build` of cmd/`name`, installed as `name`.exe.
 fn goBuild(b: *std.Build, go: []const u8, comptime name: []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{ go, "build", "-trimpath", "-ldflags=-s -w", "-o" });
     const out = run.addOutputFileArg(name ++ ".exe");
     run.addArg("./cmd/" ++ name);
-    run.setCwd(b.path("ssh"));
+    run.setCwd(b.path("."));
     run.setEnvironmentVariable("GOOS", "windows");
     run.setEnvironmentVariable("GOARCH", "amd64");
     // slimed needs cgo for libghostty-vt, compiled by our Zig rather than
@@ -271,6 +186,7 @@ fn goBuild(b: *std.Build, go: []const u8, comptime name: []const u8) *std.Build.
     return run;
 }
 
+/// slimed's ConPTY, next to it.
 fn installConpty(b: *std.Build) void {
     const dll = b.addInstallBinFile(b.path(conpty_dir ++ "/conpty.dll"), "conpty.dll");
     const host = b.addInstallBinFile(b.path(conpty_dir ++ "/OpenConsole.exe"), "x64/OpenConsole.exe");

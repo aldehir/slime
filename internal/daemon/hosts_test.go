@@ -1,0 +1,603 @@
+//go:build windows
+
+package daemon
+
+import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aldehir/slime/internal/pty"
+	"github.com/aldehir/slime/internal/remote"
+	"github.com/aldehir/slime/internal/sshbridge"
+	"github.com/aldehir/slime/internal/sshtest"
+)
+
+const hostPassword = "hunter2"
+
+// fakeHost answers the daemon's commands on a host: the probe, the
+// install (into memory), and `slimed connect`, which it bridges to a
+// second in-process Server playing the host's daemon.
+type fakeHost struct {
+	daemon *Server
+
+	mu        sync.Mutex
+	installed []string
+	connects  []string
+}
+
+func (f *fakeHost) exec(command string, stdin io.Reader, stdout, stderr io.Writer) int {
+	args := shArgs(command)
+	switch {
+	case strings.Contains(command, "uname -sm"):
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		fmt.Fprintf(stdout, "Linux x86_64\n/home/alde/.cache/slime\n")
+		for _, name := range f.installed {
+			fmt.Fprintln(stdout, name)
+		}
+		return 0
+	case strings.Contains(command, "gzip -dc"):
+		zr, err := gzip.NewReader(stdin)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if _, err := io.ReadAll(zr); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		f.mu.Lock()
+		f.installed = append(f.installed, filepath.Base(args[0]))
+		f.mu.Unlock()
+		return 0
+	case strings.Contains(command, " connect --term "):
+		f.mu.Lock()
+		f.connects = append(f.connects, args[1])
+		f.mu.Unlock()
+		a, b := net.Pipe()
+		go f.daemon.handle(a)
+		go func() {
+			io.Copy(b, stdin)
+			b.Close()
+		}()
+		io.Copy(stdout, b)
+		return 0
+	}
+	fmt.Fprintf(stderr, "sh: %s: not found\n", command)
+	return 127
+}
+
+// shArgs are the arguments after the script in the daemon's sh -c
+// commands.
+func shArgs(command string) []string {
+	var args []string
+	for _, q := range strings.Split(command, "' '")[1:] {
+		args = append(args, strings.Trim(q, "'"))
+	}
+	return args
+}
+
+// fakeRemote is a manifest with a tiny stand-in for the Linux build.
+func fakeRemote(t *testing.T) *remote.Manifest {
+	t.Helper()
+	dir := t.TempDir()
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	w.Write([]byte("#!/bin/sh\necho fake slimed\n"))
+	w.Close()
+	sum := sha256.Sum256(gz.Bytes())
+	if err := os.WriteFile(filepath.Join(dir, remote.Name("linux", "amd64")), gz.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf("linux amd64 %s %d\n", hex.EncodeToString(sum[:]), gz.Len())
+	if err := os.WriteFile(filepath.Join(dir, remote.ManifestName), []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := remote.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// hostHarness is a local daemon whose hosts resolve to one fake host
+// over sshtest.
+type hostHarness struct {
+	*harness
+	ssh  *sshtest.Server
+	host *fakeHost
+	// remote is the host's daemon.
+	remote *harness
+	// ln accepts connections to the local daemon over TCP, which has
+	// buffers as the pipe does: a bridge's two ends may both be writing.
+	ln net.Listener
+}
+
+// dial connects to the local daemon over TCP, without saying hello.
+func (h *hostHarness) dial() net.Conn {
+	h.t.Helper()
+	conn, err := net.Dial("tcp", h.ln.Addr().String())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Cleanup(func() { conn.Close() })
+	return conn
+}
+
+func newHostHarness(t *testing.T, sshOpts sshtest.Options, idle time.Duration) *hostHarness {
+	t.Helper()
+	remoteH := newHarness(t)
+	host := &fakeHost{daemon: remoteH.srv}
+	sshOpts.Exec = host.exec
+	if sshOpts.Password == "" {
+		sshOpts.Password = hostPassword
+	}
+	srv, err := sshtest.Start(sshOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	kh := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(kh, []byte(srv.KnownHostsLine()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	builds := fakeRemote(t)
+
+	h := &harness{t: t}
+	local, err := NewServer(runtime(t), Options{
+		Spawn: func(o pty.Options) (pty.Pty, error) { return newFakePty(o), nil },
+		Idle:  idle,
+		Hosts: HostOptions{Resolve: func(dest string) (sshbridge.Options, error) {
+			if !strings.HasPrefix(dest, "dev") {
+				return sshbridge.Options{}, fmt.Errorf("no such host %q", dest)
+			}
+			return sshbridge.Options{
+				Dest:       sshbridge.Destination{User: "alde", Host: "127.0.0.1", Port: srv.Port()},
+				KnownHosts: []string{kh},
+				Remote:     builds,
+			}, nil
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.srv = local
+	t.Cleanup(local.Close)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go local.handle(c)
+		}
+	}()
+	return &hostHarness{harness: h, ssh: srv, host: host, remote: remoteH, ln: ln}
+}
+
+// recv reads the next message within the timeout.
+func recv(t *testing.T, c *Client) (uint32, Message) {
+	t.Helper()
+	type got struct {
+		id uint32
+		m  Message
+	}
+	ch := make(chan got, 1)
+	errc := make(chan error, 1)
+	go func() {
+		id, m, err := c.Recv()
+		if err != nil {
+			errc <- err
+			return
+		}
+		ch <- got{id, m}
+	}()
+	select {
+	case g := <-ch:
+		return g.id, g.m
+	case err := <-errc:
+		t.Fatalf("reading: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for a message")
+	}
+	return 0, nil
+}
+
+// hostConnect asks for dest and returns the host's id from the tagged
+// HostState.
+func hostConnect(t *testing.T, c *Client, dest string) uint32 {
+	t.Helper()
+	tag := c.NextTag()
+	c.Send(0, &HostConnect{Tag: tag, Dest: dest})
+	for {
+		id, m := recv(t, c)
+		if st, ok := m.(*HostState); ok && st.Tag == tag {
+			if st.Dest != dest {
+				t.Fatalf("HostState for %q, want %q", st.Dest, dest)
+			}
+			return id
+		}
+	}
+}
+
+// awaitState reads until host id reaches want, collecting the status
+// lines on the way. A terminal state other than want fails.
+func awaitState(t *testing.T, c *Client, id uint32, want HostStatus) (texts []string, state *HostState) {
+	t.Helper()
+	for {
+		got, m := recv(t, c)
+		st, ok := m.(*HostState)
+		if !ok || got != id {
+			continue
+		}
+		if st.State == want {
+			return texts, st
+		}
+		if st.State != HostConnecting {
+			t.Fatalf("host %d: %s (%s), want %s", id, st.State, st.Text, want)
+		}
+		texts = append(texts, st.Text)
+	}
+}
+
+// awaitPrompt reads until a Prompt for host id, applying HostState
+// messages to nothing.
+func awaitPrompt(t *testing.T, c *Client, id uint32) *Prompt {
+	t.Helper()
+	for {
+		got, m := recv(t, c)
+		switch m := m.(type) {
+		case *Prompt:
+			if got == id {
+				return m
+			}
+		case *HostState:
+			if got == id && m.State != HostConnecting {
+				t.Fatalf("host %d: %s (%s), want a prompt", id, m.State, m.Text)
+			}
+		}
+	}
+}
+
+// login connects dest with the password and returns the host's id.
+func (h *hostHarness) login(c *Client, dest string) uint32 {
+	h.t.Helper()
+	id := hostConnect(h.t, c, dest)
+	p := awaitPrompt(h.t, c, id)
+	if p.Kind != PromptPassword {
+		h.t.Fatalf("prompt = %#v, want a password", p)
+	}
+	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	awaitState(h.t, c, id, HostConnected)
+	return id
+}
+
+// bridge opens a second connection bridged to host id and says hello
+// to the host's daemon through it. A bridge the local daemon refuses
+// fails with its Error.
+func (h *hostHarness) bridge(id uint32, term string) (*Client, error) {
+	h.t.Helper()
+	b := h.dial()
+	frame, _ := Encode(id, &Bridge{Term: term})
+	if _, err := b.Write(frame); err != nil {
+		return nil, err
+	}
+	c := &Client{rw: b, r: NewReader(b)}
+	if err := c.Send(0, &Hello{Version: Version}); err != nil {
+		return nil, err
+	}
+	_, m, err := c.Recv()
+	if err != nil {
+		return nil, err
+	}
+	switch m := m.(type) {
+	case *HelloReply:
+		c.Hello = *m
+	case *Error:
+		b.Close()
+		return nil, fmt.Errorf("refused: %s", m.Message)
+	default:
+		b.Close()
+		return nil, fmt.Errorf("first reply %#v", m)
+	}
+	h.t.Cleanup(func() { c.Close() })
+	return c, nil
+}
+
+// expectBridgeClosed waits for the host's daemon to be gone from the
+// other end of b: it reads EOF, or an Error saying why.
+func expectBridgeClosed(t *testing.T, b *Client) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		for {
+			_, m, err := b.Recv()
+			if err != nil {
+				done <- nil
+				return
+			}
+			if _, ok := m.(*Error); !ok {
+				done <- fmt.Errorf("got %#v", m)
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("bridge still open: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("bridge still open")
+	}
+}
+
+func TestHostConnectPrompts(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	id := hostConnect(t, c, "dev1")
+
+	p := awaitPrompt(t, c, id)
+	if p.Kind != PromptPassword || p.Title != "Sign in to 127.0.0.1" || len(p.Questions) != 1 ||
+		p.Questions[0].Label != "alde@127.0.0.1's password: " || p.Questions[0].Echo {
+		t.Errorf("prompt = %#v", p)
+	}
+	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{"wrong"}})
+	if p := awaitPrompt(t, c, id); p.Error == "" {
+		t.Errorf("retry has no error: %#v", p)
+	}
+	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	texts, st := awaitState(t, c, id, HostConnected)
+	if st.Text != "" {
+		t.Errorf("connected with text %q", st.Text)
+	}
+	if !contains(texts, "installing slimed") {
+		t.Errorf("status lines %q lack the install", texts)
+	}
+	h.host.mu.Lock()
+	installed := h.host.installed
+	h.host.mu.Unlock()
+	if len(installed) != 1 || !strings.HasPrefix(installed[0], "slimed-") {
+		t.Errorf("installed %q", installed)
+	}
+
+	// Asking again answers with the state, without logging in again.
+	if again := hostConnect(t, c, "dev1"); again != id {
+		t.Errorf("second connect got host %d, want %d", again, id)
+	}
+	hosts := hostList(t, c)
+	if len(hosts) != 1 || hosts[0].ID != id || hosts[0].State != HostConnected {
+		t.Errorf("hosts = %+v", hosts)
+	}
+}
+
+func hostList(t *testing.T, c *Client) []HostInfo {
+	t.Helper()
+	c.Send(0, &HostList{})
+	for {
+		_, m := recv(t, c)
+		if hosts, ok := m.(*Hosts); ok {
+			return hosts.Hosts
+		}
+	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHostConnectRefused(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	id := hostConnect(t, c, "dev1")
+	for range 3 {
+		awaitPrompt(t, c, id)
+		c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{"wrong"}})
+	}
+	_, st := awaitState(t, c, id, HostFailed)
+	if !strings.Contains(st.Text, "Permission denied") {
+		t.Errorf("failed with %q", st.Text)
+	}
+	// Nothing to bridge to.
+	if _, err := h.bridge(id, ""); err == nil || !strings.Contains(err.Error(), "isn't connected") {
+		t.Errorf("bridge to a failed host: %v", err)
+	}
+	// A host nobody asked for.
+	nid := hostConnect(t, c, "nowhere")
+	_, st = awaitState(t, c, nid, HostFailed)
+	if !strings.Contains(st.Text, "no such host") {
+		t.Errorf("unresolvable host failed with %q", st.Text)
+	}
+}
+
+func TestHostConnectCancelled(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	id := hostConnect(t, c, "dev1")
+	awaitPrompt(t, c, id)
+	c.Send(id, &HostAnswer{Choice: ChoiceCancel})
+	if _, st := awaitState(t, c, id, HostFailed); st.Text != "cancelled" {
+		t.Errorf("failed with %q", st.Text)
+	}
+}
+
+// The bridge carries the client's Hello and requests to the host's
+// daemon, and its replies back.
+func TestBridge(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	id := h.login(c, "dev1")
+
+	b, err := h.bridge(id, "xterm-ghostty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Hello.PID != uint32(os.Getpid()) {
+		t.Errorf("hello from pid %d", b.Hello.PID)
+	}
+	tag := b.NextTag()
+	b.Send(0, &WorkspaceNew{Tag: tag, Name: "remote"})
+	a, err := b.Await(tag, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := h.remote.list(); len(l.Workspaces) != 1 || l.Workspaces[0].ID != a.Created.WS || l.Workspaces[0].Name != "remote" {
+		t.Errorf("host daemon's workspaces = %+v", l.Workspaces)
+	}
+	if l := h.list(); len(l.Workspaces) != 0 {
+		t.Errorf("local daemon took the workspace: %+v", l.Workspaces)
+	}
+	h.host.mu.Lock()
+	connects := h.host.connects
+	h.host.mu.Unlock()
+	// The fake host has no tic, so xterm-ghostty falls back.
+	if len(connects) != 1 || connects[0] != "xterm-256color" {
+		t.Errorf("connects = %q", connects)
+	}
+
+	// Hanging up on the bridge hangs up on the host's daemon.
+	b.Close()
+	eventually(t, "detach on the host", func() bool { return !h.remote.attached(a.Created.WS) })
+}
+
+func TestBridgeUnknownHost(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	if _, err := h.bridge(99, ""); err == nil || !strings.Contains(err.Error(), "no host 99") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestHostLost(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	id := h.login(c, "dev1")
+	b, err := h.bridge(id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.ssh.Close()
+	_, st := awaitState(t, c, id, HostLost)
+	if !strings.Contains(st.Text, "closed by remote host") {
+		t.Errorf("lost with %q", st.Text)
+	}
+	expectBridgeClosed(t, b)
+}
+
+func TestHostDisconnect(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	id := h.login(c, "dev1")
+	b, err := h.bridge(id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Send(id, &HostDisconnect{})
+	if _, st := awaitState(t, c, id, HostGone); st.Text != "disconnected" {
+		t.Errorf("gone with %q", st.Text)
+	}
+	expectBridgeClosed(t, b)
+	// Connecting again keeps the id.
+	if again := h.login(c, "dev1"); again != id {
+		t.Errorf("reconnected as host %d, want %d", again, id)
+	}
+}
+
+// Disconnecting while logging in gives up on it, as gone.
+func TestHostDisconnectWhileConnecting(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	id := hostConnect(t, c, "dev1")
+	awaitPrompt(t, c, id)
+	c.Send(id, &HostDisconnect{})
+	awaitState(t, c, id, HostGone)
+}
+
+// The client answering the prompts hanging up cancels logging in; other
+// clients see it fail.
+func TestHostClientHangsUpMidLogin(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	watcher := h.connect()
+	c := h.connect()
+	id := hostConnect(t, c, "dev1")
+	awaitPrompt(t, c, id)
+	c.Close()
+	if _, st := awaitState(t, watcher, id, HostFailed); st.Text != "cancelled" {
+		t.Errorf("failed with %q", st.Text)
+	}
+}
+
+// Another client's answers don't count.
+func TestHostAnswerFromAnotherClient(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	other := h.connect()
+	c := h.connect()
+	id := hostConnect(t, c, "dev1")
+	awaitPrompt(t, c, id)
+	other.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	time.Sleep(100 * time.Millisecond)
+	c.Send(id, &HostAnswer{Choice: ChoiceAccept, Answers: []string{hostPassword}})
+	awaitState(t, c, id, HostConnected)
+}
+
+// A connected host keeps the daemon alive with no clients.
+func TestHostKeepsDaemonAlive(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 50*time.Millisecond)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.srv.Serve(l) }()
+	dial := func() *Client {
+		conn, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := NewClient(conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := dial()
+	id := h.login(c, "dev1")
+	c.Close()
+	select {
+	case <-done:
+		t.Fatal("exited with a host connected")
+	case <-time.After(200 * time.Millisecond):
+	}
+	c = dial()
+	c.Send(id, &HostDisconnect{})
+	awaitState(t, c, id, HostGone)
+	c.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("didn't exit once the host was gone")
+	}
+}

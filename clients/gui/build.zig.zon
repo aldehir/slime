@@ -1,0 +1,29 @@
+.{
+    .name = .slime_gui,
+    .version = "0.1.0",
+    .fingerprint = 0xeb2525db07672daf,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The fork at the repository root, shared with the daemon's
+        // libghostty-vt build.
+        .ghostty = .{ .path = "../../ghostty" },
+        // For drawing sprites. The same z2d as ghostty/build.zig.zon.
+        .z2d = .{
+            .url = "https://deps.files.ghostty.org/z2d-7dbae85c81784dba9988320bf9543ed9a81350c8.tar.gz",
+            .hash = "z2d-0.12.1-j5P_Hsw8EQAKyZTQICCQnAH2xYkLDW8k9uefbsYdfPZ-",
+        },
+        // The same iTerm2-Color-Schemes release, in Ghostty's theme
+        // format, as ghostty/build.zig.zon.
+        .iterm2_themes = .{
+            .url = "https://deps.files.ghostty.org/ghostty-themes-release-20261005-151109-31756e7.tgz",
+            .hash = "N-V-__8AADNBBQDD4MFOa3Y7R_A8PHIeWQ1IZdOiBFZS3nZ7",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "assets",
+    },
+}

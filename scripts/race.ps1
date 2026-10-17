@@ -10,13 +10,13 @@
 $ErrorActionPreference = 'Stop'
 
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
-$lib = Join-Path $root 'ssh\internal\vt\lib\windows_amd64'
+$lib = Join-Path $root 'internal\vt\lib\windows_amd64'
 if (-not (Test-Path (Join-Path $lib 'libsynchronization.a'))) {
     throw "no $lib\libsynchronization.a; run scripts\build-vt-lib.ps1"
 }
 [string[]]$pkgs = if ($args.Count -gt 0) { $args } else { './...' }
 $env:CGO_LDFLAGS = "-L$($lib -replace '\\', '/')"
-Push-Location (Join-Path $root 'ssh')
+Push-Location $root
 try {
     go test -race '-ldflags=-extldflags=-Wl,--no-dynamicbase' @pkgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1,0 +1,1347 @@
+package daemon
+
+import (
+	"bufio"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+)
+
+// The wire protocol between slime and slimed. A frame is a little-endian
+// u32 length of what follows, a u8 type, a u32 pane id (0 when the message isn't about one pane; a host
+// id in the messages about one host), and a payload of fixed-size integers and strings (u32 length + bytes).
+// Decoders ignore bytes after the fields they know, so a later version
+// can append fields.
+//
+// Requests that create something or can fail carry a tag, which the
+// reply (Created, Workspace, PaneText) or Error echoes.
+
+// Version is exchanged in Hello and HelloReply; peers with different
+// versions don't talk.
+const Version = 1
+
+// MaxFrame bounds a frame so a corrupt stream can't make us allocate
+// gigabytes. Images go out in ImageChunk pieces. A full Draw of a big
+// screen whose every cell has its own style and grapheme can come near
+// a few MiB, and goes whole.
+const (
+	MaxFrame   = 8 << 20
+	ImageChunk = 1 << 20
+)
+
+// maxDepth bounds a layout tree's nesting on the wire.
+const maxDepth = 32
+
+const headerLen = 1 + 4
+
+type Type uint8
+
+// Client to daemon.
+const (
+	TypeHello           Type = 1
+	TypeList            Type = 2
+	TypeWorkspaceNew    Type = 3
+	TypeWorkspaceAttach Type = 4
+	TypeWorkspaceDetach Type = 5
+	TypeWorkspaceKill   Type = 6
+	TypeWorkspaceRename Type = 7
+	TypeWorkspaceResize Type = 8
+	TypeTabNew          Type = 9
+	TypeTabClose        Type = 10
+	TypeTabRename       Type = 11
+	TypeSplit           Type = 12
+	TypeLayout          Type = 13
+	TypePaneKill        Type = 14
+	TypeResize          Type = 16
+	TypePeek            Type = 17
+	TypeAck             Type = 18
+	TypeEvent           Type = 19
+	TypeHostConnect     Type = 20
+	TypeHostAnswer      Type = 21
+	TypeHostDisconnect  Type = 22
+	TypeHostList        Type = 23
+	TypeBridge          Type = 24
+)
+
+// Daemon to client.
+const (
+	TypeHelloReply Type = 65
+	TypeWorkspaces Type = 66
+	TypeWorkspace  Type = 67
+	TypeAttached   Type = 68
+	TypeExit       Type = 71
+	TypeDetached   Type = 72
+	TypeError      Type = 73
+	TypeCreated    Type = 74
+	TypeDraw       Type = 75
+	TypeCopied     Type = 76
+	TypeNotice     Type = 77
+	TypeImage      Type = 78
+	TypeHosts      Type = 79
+	TypeHostState  Type = 80
+	TypePrompt     Type = 81
+	TypePaneText   Type = 82
+)
+
+var (
+	ErrTooLarge    = errors.New("daemon: frame too large")
+	ErrShortFrame  = errors.New("daemon: frame shorter than its header")
+	ErrTruncated   = errors.New("daemon: payload truncated")
+	ErrUnknownType = errors.New("daemon: unknown message type")
+	ErrTooDeep     = errors.New("daemon: layout nested too deep")
+)
+
+// Frame is one undecoded message.
+type Frame struct {
+	Type    Type
+	ID      uint32
+	Payload []byte
+}
+
+// Message is a decoded payload.
+type Message interface {
+	Type() Type
+	encode(*encoder)
+	decode(*decoder)
+}
+
+// Size is a terminal's grid and, if known, its cell size in pixels.
+type Size struct {
+	Cols, Rows   uint16
+	CellW, CellH uint32
+}
+
+// Hello opens a connection. The client draws what the daemon sends
+// (Draw) and sends input back as Event messages; the daemon's terminal
+// answers the program's queries.
+type Hello struct {
+	Version uint32
+	// FrameInterval is the least time between a pane's frames, in
+	// microseconds: the client's refresh period. Zero for the default.
+	FrameInterval uint32
+}
+
+// List asks for every workspace; the reply is Workspaces.
+type List struct{}
+
+// WorkspaceNew creates an empty workspace attached to the sender. The
+// reply is Workspace; add tabs with TabNew.
+type WorkspaceNew struct {
+	Tag  uint32
+	Name string
+}
+
+// WorkspaceAttach takes a workspace from whichever window has it. Area
+// is what the window gives a tab, which the daemon sizes its panes to.
+// The reply is Attached per pane, then Workspace: panes come before the
+// structure that refers to them. Each pane's frames follow, starting
+// with a full one.
+type WorkspaceAttach struct {
+	Tag  uint32
+	WS   uint32
+	Area Area
+}
+
+// Area is a tab's space in pixels, which a layout's shares divide, and
+// the cell size for panes that haven't reported their own.
+type Area struct {
+	Width, Height uint32
+	CellW, CellH  uint32
+}
+
+type WorkspaceDetach struct{ WS uint32 }
+
+// WorkspaceKill ends every pane in a workspace, and the workspace.
+type WorkspaceKill struct{ WS uint32 }
+
+type WorkspaceRename struct {
+	WS   uint32
+	Name string
+}
+
+// WorkspaceResize tells the daemon the window's tab area, for estimating
+// pane sizes in its tabs. The window still resizes each pane itself.
+type WorkspaceResize struct {
+	WS   uint32
+	Area Area
+}
+
+// TabNew adds a tab with one pane running Command (CreateProcessW
+// syntax on Windows; empty for the default shell). The owner of the
+// workspace gets the new pane's Attached, then Workspace; the sender
+// gets Created.
+type TabNew struct {
+	Tag     uint32
+	WS      uint32
+	Command string
+	Cwd     string
+	Size    Size
+}
+
+type TabClose struct{ Tab uint32 }
+
+type TabRename struct {
+	Tab  uint32
+	Name string
+}
+
+// Split starts a pane beside Pane, on side Dir, taking Share basis
+// points of its space. Replies as TabNew does.
+type Split struct {
+	Tag     uint32
+	Pane    uint32
+	Dir     Direction
+	Share   uint16
+	Command string
+	Cwd     string
+}
+
+// Layout replaces a tab's tree, which must hold the same panes: a
+// divider was dragged. The owner gets Workspace back.
+type Layout struct {
+	Tab  uint32
+	Tree *Node
+}
+
+// PaneKill ends the pane in the frame's id.
+type PaneKill struct{}
+
+// Resize sizes the pane in the frame's id; only its owner's counts.
+type Resize struct{ Size Size }
+
+// Peek asks for the text of a pane's screen and scrollback without
+// taking it: the reply is PaneText with Tag. With VT, the text is the
+// VT sequences that redraw the screen instead of plain text.
+type Peek struct {
+	Tag uint32
+	VT  bool
+}
+
+// Ack says the client drew the pane's Draw Seq and those before it,
+// which frees room for more (see Pane's framing).
+type Ack struct{ Seq uint32 }
+
+// Event is input for the pane in the frame's id, from a CapFrames
+// client: a key, mouse, wheel, paste, focus change, or copy, encoded as
+// internal/vt/event.zig lays out.
+type Event struct{ Data []byte }
+
+// Hosts: SSH hosts the daemon connects to, on Windows. The frame's id
+// field carries the host's id in the messages about one host; a host's
+// id is stable for its destination while the daemon lives, so a window
+// can group by it across reconnects. A client reaches a connected
+// host's daemon through a second connection to the pipe whose first
+// frame is Bridge.
+
+// HostConnect logs in to Dest (ssh://[user@]host[:port], [user@]host,
+// or a Host alias), puts slimed there, and reports with HostState; the
+// one that answers carries Tag. A host already connected or connecting
+// answers at once with its state. Prompts while logging in go to the
+// sender only; if it hangs up, logging in is cancelled.
+type HostConnect struct {
+	Tag  uint32
+	Dest string
+}
+
+// HostAnswer replies to the last Prompt for the host in the frame's id:
+// the button pressed, and one answer per question. A cancel with no
+// Prompt waiting gives up on logging in.
+type HostAnswer struct {
+	Choice  Choice
+	Answers []string
+}
+
+// Choice is the button a Prompt was answered with.
+type Choice uint8
+
+const (
+	// ChoiceCancel gives up: on logging in for most prompts, on the
+	// host for host key prompts.
+	ChoiceCancel Choice = iota
+	// ChoiceAccept submits the answers, or trusts the host key.
+	ChoiceAccept
+	// ChoiceSkip moves on without this key (passphrase prompts).
+	ChoiceSkip
+)
+
+// HostDisconnect hangs up on the host in the frame's id, ending its
+// bridges, or gives up on logging in to it.
+type HostDisconnect struct{}
+
+// HostList asks for the hosts; the reply is Hosts.
+type HostList struct{}
+
+// Bridge, as a connection's first frame instead of Hello, splices the
+// connection to `slimed connect` on the host in the frame's id: every
+// frame after it goes to the host's daemon, and its replies come back.
+// Term is the TERM for panes it starts (xterm-ghostty falls back where
+// the host lacks it). A bridge that can't be served gets Error and the
+// connection closes; one that is gets nothing from the local daemon, so
+// the client sends Hello right after Bridge and reads the host daemon's
+// HelloReply.
+type Bridge struct{ Term string }
+
+// Hosts answers HostList with every host the daemon knows.
+type Hosts struct{ Hosts []HostInfo }
+
+type HostInfo struct {
+	ID    uint32
+	Dest  string
+	State HostStatus
+	Text  string
+}
+
+// HostState reports a host's state to every client, as it changes; Tag
+// is set on the one answering a HostConnect. Text is a status line
+// while connecting (the server's, or ours: "installing slimed"), or why
+// it failed, was lost, or went.
+type HostState struct {
+	Tag   uint32
+	Dest  string
+	State HostStatus
+	Text  string
+}
+
+type HostStatus uint8
+
+func (s HostStatus) String() string {
+	switch s {
+	case HostConnecting:
+		return "connecting"
+	case HostConnected:
+		return "connected"
+	case HostFailed:
+		return "failed"
+	case HostLost:
+		return "lost"
+	case HostGone:
+		return "gone"
+	}
+	return fmt.Sprintf("state %d", uint8(s))
+}
+
+const (
+	// HostConnecting: logging in or installing slimed.
+	HostConnecting HostStatus = iota + 1
+	HostConnected
+	// HostFailed: logging in or installing didn't work.
+	HostFailed
+	// HostLost: the connection dropped.
+	HostLost
+	// HostGone: disconnected on request.
+	HostGone
+)
+
+// Prompt asks the client whose HostConnect is logging in to the host in
+// the frame's id something: a password, a passphrase, a
+// keyboard-interactive round, or whether to trust a host key (no
+// questions; Accept trusts it). Text is the body, Detail is shown in a
+// monospace box (a key's path, fingerprints), and Error says why the
+// last answer didn't work. The reply is HostAnswer.
+type Prompt struct {
+	Kind                       PromptKind
+	Title, Text, Detail, Error string
+	Questions                  []Question
+}
+
+type PromptKind uint8
+
+const (
+	PromptPassword PromptKind = iota + 1
+	PromptPassphrase
+	PromptInteractive
+	PromptUnknownHost
+	PromptChangedHost
+)
+
+// Question is one field to fill in. Label may run over several lines,
+// as keyboard-interactive prompts do; its last line names the field.
+type Question struct {
+	Label string
+	Echo  bool
+}
+
+// Draw is a frame of the pane in the frame's id: what to draw, encoded
+// as internal/vt/frame.zig lays out. Seq counts the pane's frames to
+// this client from 1; Ack them.
+type Draw struct {
+	Seq  uint32
+	Data []byte
+}
+
+// Image carries a kitty image the pane in the frame's id places, before
+// the first Draw that places it (again, with a new Generation, if the
+// program retransmits it): its RGBA pixels, deflated (raw, no header),
+// in pieces of up to ImageChunk bytes. Total is the deflated length
+// and Offset where Data goes in it; a piece at Offset 0 starts the
+// image. Images aren't acked: a Draw's images come between its
+// predecessor and it, so they're bounded by the frames in flight.
+type Image struct {
+	ID         uint32
+	Generation uint64
+	Width      uint32
+	Height     uint32
+	Total      uint32
+	Offset     uint32
+	Data       []byte
+}
+
+// Copied answers a copy Event for the pane in the frame's id: Tag is the
+// event's, and Text the selection's (empty with none).
+type Copied struct {
+	Tag  uint32
+	Text string
+}
+
+// Notice tells the client what the pane in the frame's id did besides
+// change its screen: what a terminal of its own would have told it.
+type Notice struct {
+	Kind NoticeKind
+	// Text is the new title or pwd (as sent: OSC 7's is a file:// URI),
+	// or the clipboard's new text (empty to clear it).
+	Text string
+	// Status is every program status record, oldest update first, for
+	// NoticeStatus.
+	Status []StatusRecord
+}
+
+type NoticeKind uint8
+
+const (
+	NoticeTitle NoticeKind = iota + 1
+	NoticePwd
+	NoticeBell
+	NoticeClipboard
+	NoticeStatus
+)
+
+type HelloReply struct {
+	Version uint32
+	PID     uint32
+	// FrameLayout is the daemon's vt.FrameLayout. A client whose own
+	// differs can't draw its frames.
+	FrameLayout uint64
+}
+
+type Workspaces struct {
+	Workspaces []WorkspaceInfo
+	Panes      []PaneInfo
+}
+
+type WorkspaceInfo struct {
+	ID       uint32
+	Name     string
+	Attached bool
+	// DetachedAt is when it was last detached, in unix milliseconds;
+	// zero while attached or if it never was.
+	DetachedAt int64
+	Tabs       []TabInfo
+}
+
+type TabInfo struct {
+	ID   uint32
+	Name string // empty unless renamed
+	Tree *Node
+}
+
+type PaneInfo struct {
+	ID      uint32
+	Tab     uint32
+	Command string
+	Title   string
+	Pwd     string
+	Cols    uint16
+	Rows    uint16
+	Created int64 // unix milliseconds
+	PID     uint32
+}
+
+// Workspace describes an attached workspace's structure: on attach, and
+// to its owner whenever the structure changes.
+type Workspace struct {
+	Tag  uint32
+	ID   uint32
+	Name string
+	Tabs []TabInfo
+}
+
+// Attached starts a pane's attachment: its frames follow, the first a
+// full one, with a Notice for its title and pwd if it has them.
+type Attached struct {
+	// Command is what the pane runs, for a client that didn't start it.
+	Command string
+	// Status is what the pane's programs report doing (OSC 7501), oldest
+	// update first.
+	Status []StatusRecord
+}
+
+// StatusRecord is one program status record: its id (empty for the
+// program itself), state (vt.StatusState: idle, working, done, blocked,
+// or error), and progress (0 to 100, or -1 for none).
+type StatusRecord struct {
+	ID       string
+	State    uint8
+	Progress int8
+}
+
+// PaneText answers a Peek of the pane in the frame's id.
+type PaneText struct {
+	Tag  uint32
+	Data []byte
+}
+
+// Exit says the pane's child exited. The owner gets Workspace after,
+// with the pane gone from its tab.
+type Exit struct{ Status uint32 }
+
+// Detached ends a window's hold on a workspace it didn't let go of.
+type Detached struct {
+	WS     uint32
+	Reason string
+}
+
+type Error struct {
+	Tag     uint32
+	Message string
+}
+
+// Created answers TabNew, Split, and WorkspaceNew with what they made.
+type Created struct {
+	Tag  uint32
+	WS   uint32
+	Tab  uint32
+	Pane uint32
+}
+
+func (*Hello) Type() Type           { return TypeHello }
+func (*List) Type() Type            { return TypeList }
+func (*WorkspaceNew) Type() Type    { return TypeWorkspaceNew }
+func (*WorkspaceAttach) Type() Type { return TypeWorkspaceAttach }
+func (*WorkspaceDetach) Type() Type { return TypeWorkspaceDetach }
+func (*WorkspaceKill) Type() Type   { return TypeWorkspaceKill }
+func (*WorkspaceRename) Type() Type { return TypeWorkspaceRename }
+func (*WorkspaceResize) Type() Type { return TypeWorkspaceResize }
+func (*TabNew) Type() Type          { return TypeTabNew }
+func (*TabClose) Type() Type        { return TypeTabClose }
+func (*TabRename) Type() Type       { return TypeTabRename }
+func (*Split) Type() Type           { return TypeSplit }
+func (*Layout) Type() Type          { return TypeLayout }
+func (*PaneKill) Type() Type        { return TypePaneKill }
+func (*Resize) Type() Type          { return TypeResize }
+func (*Peek) Type() Type            { return TypePeek }
+func (*Ack) Type() Type             { return TypeAck }
+func (*Event) Type() Type           { return TypeEvent }
+func (*HelloReply) Type() Type      { return TypeHelloReply }
+func (*Workspaces) Type() Type      { return TypeWorkspaces }
+func (*Workspace) Type() Type       { return TypeWorkspace }
+func (*Attached) Type() Type        { return TypeAttached }
+func (*PaneText) Type() Type        { return TypePaneText }
+func (*Exit) Type() Type            { return TypeExit }
+func (*Detached) Type() Type        { return TypeDetached }
+func (*Error) Type() Type           { return TypeError }
+func (*Created) Type() Type         { return TypeCreated }
+func (*Draw) Type() Type            { return TypeDraw }
+func (*Copied) Type() Type          { return TypeCopied }
+func (*Notice) Type() Type          { return TypeNotice }
+func (*Image) Type() Type           { return TypeImage }
+func (*HostConnect) Type() Type     { return TypeHostConnect }
+func (*HostAnswer) Type() Type      { return TypeHostAnswer }
+func (*HostDisconnect) Type() Type  { return TypeHostDisconnect }
+func (*HostList) Type() Type        { return TypeHostList }
+func (*Bridge) Type() Type          { return TypeBridge }
+func (*Hosts) Type() Type           { return TypeHosts }
+func (*HostState) Type() Type       { return TypeHostState }
+func (*Prompt) Type() Type          { return TypePrompt }
+
+func (m *Hello) encode(e *encoder) {
+	e.u32(m.Version)
+	e.u32(m.FrameInterval)
+}
+
+func (m *Hello) decode(d *decoder) {
+	m.Version = d.u32()
+	m.FrameInterval = d.u32()
+}
+
+func (*List) encode(*encoder) {}
+func (*List) decode(*decoder) {}
+
+func (m *WorkspaceNew) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Name)
+}
+
+func (m *WorkspaceNew) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Name = d.str()
+}
+
+func (m *WorkspaceAttach) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.u32(m.WS)
+	e.area(m.Area)
+}
+
+func (m *WorkspaceAttach) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.WS = d.u32()
+	m.Area = d.area()
+}
+
+func (m *WorkspaceDetach) encode(e *encoder) { e.u32(m.WS) }
+func (m *WorkspaceDetach) decode(d *decoder) { m.WS = d.u32() }
+
+func (m *WorkspaceKill) encode(e *encoder) { e.u32(m.WS) }
+func (m *WorkspaceKill) decode(d *decoder) { m.WS = d.u32() }
+
+func (m *WorkspaceRename) encode(e *encoder) {
+	e.u32(m.WS)
+	e.str(m.Name)
+}
+
+func (m *WorkspaceRename) decode(d *decoder) {
+	m.WS = d.u32()
+	m.Name = d.str()
+}
+
+func (m *WorkspaceResize) encode(e *encoder) {
+	e.u32(m.WS)
+	e.area(m.Area)
+}
+
+func (m *WorkspaceResize) decode(d *decoder) {
+	m.WS = d.u32()
+	m.Area = d.area()
+}
+
+func (m *TabNew) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.u32(m.WS)
+	e.str(m.Command)
+	e.str(m.Cwd)
+	e.size(m.Size)
+}
+
+func (m *TabNew) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.WS = d.u32()
+	m.Command = d.str()
+	m.Cwd = d.str()
+	m.Size = d.size()
+}
+
+func (m *TabClose) encode(e *encoder) { e.u32(m.Tab) }
+func (m *TabClose) decode(d *decoder) { m.Tab = d.u32() }
+
+func (m *TabRename) encode(e *encoder) {
+	e.u32(m.Tab)
+	e.str(m.Name)
+}
+
+func (m *TabRename) decode(d *decoder) {
+	m.Tab = d.u32()
+	m.Name = d.str()
+}
+
+func (m *Split) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.u32(m.Pane)
+	e.u8(uint8(m.Dir))
+	e.u16(m.Share)
+	e.str(m.Command)
+	e.str(m.Cwd)
+}
+
+func (m *Split) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Pane = d.u32()
+	m.Dir = Direction(d.u8())
+	m.Share = d.u16()
+	m.Command = d.str()
+	m.Cwd = d.str()
+}
+
+func (m *Layout) encode(e *encoder) {
+	e.u32(m.Tab)
+	e.node(m.Tree)
+}
+
+func (m *Layout) decode(d *decoder) {
+	m.Tab = d.u32()
+	m.Tree = d.node(0)
+}
+
+func (*PaneKill) encode(*encoder) {}
+func (*PaneKill) decode(*decoder) {}
+
+func (m *Resize) encode(e *encoder) { e.size(m.Size) }
+func (m *Resize) decode(d *decoder) { m.Size = d.size() }
+
+func (m *Peek) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.bool(m.VT)
+}
+
+func (m *Peek) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.VT = d.bool()
+}
+
+func (m *Ack) encode(e *encoder) { e.u32(m.Seq) }
+func (m *Ack) decode(d *decoder) { m.Seq = d.u32() }
+
+func (m *Event) encode(e *encoder) { e.raw(m.Data) }
+func (m *Event) decode(d *decoder) { m.Data = d.rest() }
+
+func (m *Draw) encode(e *encoder) {
+	e.u32(m.Seq)
+	e.raw(m.Data)
+}
+
+func (m *Draw) decode(d *decoder) {
+	m.Seq = d.u32()
+	m.Data = d.rest()
+}
+
+func (m *Image) encode(e *encoder) {
+	e.u32(m.ID)
+	e.u64(m.Generation)
+	e.u32(m.Width)
+	e.u32(m.Height)
+	e.u32(m.Total)
+	e.u32(m.Offset)
+	e.raw(m.Data)
+}
+
+func (m *Image) decode(d *decoder) {
+	m.ID = d.u32()
+	m.Generation = d.u64()
+	m.Width = d.u32()
+	m.Height = d.u32()
+	m.Total = d.u32()
+	m.Offset = d.u32()
+	m.Data = d.rest()
+}
+
+func (m *Copied) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Text)
+}
+
+func (m *Copied) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Text = d.str()
+}
+
+func (m *Notice) encode(e *encoder) {
+	e.u8(uint8(m.Kind))
+	e.str(m.Text)
+	e.statusRecords(m.Status)
+}
+
+func (m *Notice) decode(d *decoder) {
+	m.Kind = NoticeKind(d.u8())
+	m.Text = d.str()
+	m.Status = d.statusRecords()
+}
+
+func (m *HelloReply) encode(e *encoder) {
+	e.u32(m.Version)
+	e.u32(m.PID)
+	e.u64(m.FrameLayout)
+}
+
+func (m *HelloReply) decode(d *decoder) {
+	m.Version = d.u32()
+	m.PID = d.u32()
+	m.FrameLayout = d.u64()
+}
+
+func (m *Workspaces) encode(e *encoder) {
+	e.u32(uint32(len(m.Workspaces)))
+	for _, w := range m.Workspaces {
+		e.u32(w.ID)
+		e.str(w.Name)
+		e.bool(w.Attached)
+		e.u64(uint64(w.DetachedAt))
+		e.tabs(w.Tabs)
+	}
+	e.u32(uint32(len(m.Panes)))
+	for _, p := range m.Panes {
+		e.u32(p.ID)
+		e.u32(p.Tab)
+		e.str(p.Command)
+		e.str(p.Title)
+		e.str(p.Pwd)
+		e.u16(p.Cols)
+		e.u16(p.Rows)
+		e.u64(uint64(p.Created))
+		e.u32(p.PID)
+	}
+}
+
+func (m *Workspaces) decode(d *decoder) {
+	n := d.count(4 + 4 + 1 + 8 + 4)
+	m.Workspaces = make([]WorkspaceInfo, n)
+	for i := range m.Workspaces {
+		w := &m.Workspaces[i]
+		w.ID = d.u32()
+		w.Name = d.str()
+		w.Attached = d.bool()
+		w.DetachedAt = int64(d.u64())
+		w.Tabs = d.tabs()
+	}
+	n = d.count(4 + 4 + 4*3 + 2*2 + 8 + 4)
+	m.Panes = make([]PaneInfo, n)
+	for i := range m.Panes {
+		p := &m.Panes[i]
+		p.ID = d.u32()
+		p.Tab = d.u32()
+		p.Command = d.str()
+		p.Title = d.str()
+		p.Pwd = d.str()
+		p.Cols = d.u16()
+		p.Rows = d.u16()
+		p.Created = int64(d.u64())
+		p.PID = d.u32()
+	}
+}
+
+func (m *Workspace) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.u32(m.ID)
+	e.str(m.Name)
+	e.tabs(m.Tabs)
+}
+
+func (m *Workspace) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.ID = d.u32()
+	m.Name = d.str()
+	m.Tabs = d.tabs()
+}
+
+func (m *Attached) encode(e *encoder) {
+	e.str(m.Command)
+	e.statusRecords(m.Status)
+}
+
+func (m *Attached) decode(d *decoder) {
+	m.Command = d.str()
+	m.Status = d.statusRecords()
+}
+
+func (m *PaneText) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.raw(m.Data)
+}
+
+func (m *PaneText) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Data = d.rest()
+}
+
+func (m *Exit) encode(e *encoder) { e.u32(m.Status) }
+func (m *Exit) decode(d *decoder) { m.Status = d.u32() }
+
+func (m *Detached) encode(e *encoder) {
+	e.u32(m.WS)
+	e.str(m.Reason)
+}
+
+func (m *Detached) decode(d *decoder) {
+	m.WS = d.u32()
+	m.Reason = d.str()
+}
+
+func (m *Error) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Message)
+}
+
+func (m *Error) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Message = d.str()
+}
+
+func (m *Created) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.u32(m.WS)
+	e.u32(m.Tab)
+	e.u32(m.Pane)
+}
+
+func (m *Created) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.WS = d.u32()
+	m.Tab = d.u32()
+	m.Pane = d.u32()
+}
+
+func (m *HostConnect) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Dest)
+}
+
+func (m *HostConnect) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Dest = d.str()
+}
+
+func (m *HostAnswer) encode(e *encoder) {
+	e.u8(uint8(m.Choice))
+	e.u32(uint32(len(m.Answers)))
+	for _, a := range m.Answers {
+		e.str(a)
+	}
+}
+
+func (m *HostAnswer) decode(d *decoder) {
+	m.Choice = Choice(d.u8())
+	n := d.count(4)
+	m.Answers = make([]string, n)
+	for i := range m.Answers {
+		m.Answers[i] = d.str()
+	}
+}
+
+func (*HostDisconnect) encode(*encoder) {}
+func (*HostDisconnect) decode(*decoder) {}
+
+func (*HostList) encode(*encoder) {}
+func (*HostList) decode(*decoder) {}
+
+func (m *Bridge) encode(e *encoder) { e.str(m.Term) }
+func (m *Bridge) decode(d *decoder) { m.Term = d.str() }
+
+func (m *Hosts) encode(e *encoder) {
+	e.u32(uint32(len(m.Hosts)))
+	for _, h := range m.Hosts {
+		e.u32(h.ID)
+		e.str(h.Dest)
+		e.u8(uint8(h.State))
+		e.str(h.Text)
+	}
+}
+
+func (m *Hosts) decode(d *decoder) {
+	n := d.count(4 + 4 + 1 + 4)
+	m.Hosts = make([]HostInfo, n)
+	for i := range m.Hosts {
+		h := &m.Hosts[i]
+		h.ID = d.u32()
+		h.Dest = d.str()
+		h.State = HostStatus(d.u8())
+		h.Text = d.str()
+	}
+}
+
+func (m *HostState) encode(e *encoder) {
+	e.u32(m.Tag)
+	e.str(m.Dest)
+	e.u8(uint8(m.State))
+	e.str(m.Text)
+}
+
+func (m *HostState) decode(d *decoder) {
+	m.Tag = d.u32()
+	m.Dest = d.str()
+	m.State = HostStatus(d.u8())
+	m.Text = d.str()
+}
+
+func (m *Prompt) encode(e *encoder) {
+	e.u8(uint8(m.Kind))
+	e.str(m.Title)
+	e.str(m.Text)
+	e.str(m.Detail)
+	e.str(m.Error)
+	e.u32(uint32(len(m.Questions)))
+	for _, q := range m.Questions {
+		e.str(q.Label)
+		e.bool(q.Echo)
+	}
+}
+
+func (m *Prompt) decode(d *decoder) {
+	m.Kind = PromptKind(d.u8())
+	m.Title = d.str()
+	m.Text = d.str()
+	m.Detail = d.str()
+	m.Error = d.str()
+	n := d.count(5)
+	m.Questions = make([]Question, n)
+	for i := range m.Questions {
+		m.Questions[i] = Question{Label: d.str(), Echo: d.bool()}
+	}
+}
+
+// Decode turns a frame's payload into its message. Byte payloads alias
+// the frame's.
+func Decode(f Frame) (Message, error) {
+	m := newMessage(f.Type)
+	if m == nil {
+		return nil, fmt.Errorf("%w %d", ErrUnknownType, f.Type)
+	}
+	d := decoder{buf: f.Payload}
+	m.decode(&d)
+	if d.err != nil {
+		return nil, fmt.Errorf("decoding type %d: %w", f.Type, d.err)
+	}
+	return m, nil
+}
+
+func newMessage(t Type) Message {
+	switch t {
+	case TypeHello:
+		return new(Hello)
+	case TypeList:
+		return new(List)
+	case TypeWorkspaceNew:
+		return new(WorkspaceNew)
+	case TypeWorkspaceAttach:
+		return new(WorkspaceAttach)
+	case TypeWorkspaceDetach:
+		return new(WorkspaceDetach)
+	case TypeWorkspaceKill:
+		return new(WorkspaceKill)
+	case TypeWorkspaceRename:
+		return new(WorkspaceRename)
+	case TypeWorkspaceResize:
+		return new(WorkspaceResize)
+	case TypeTabNew:
+		return new(TabNew)
+	case TypeTabClose:
+		return new(TabClose)
+	case TypeTabRename:
+		return new(TabRename)
+	case TypeSplit:
+		return new(Split)
+	case TypeLayout:
+		return new(Layout)
+	case TypePaneKill:
+		return new(PaneKill)
+	case TypeResize:
+		return new(Resize)
+	case TypePeek:
+		return new(Peek)
+	case TypeAck:
+		return new(Ack)
+	case TypeEvent:
+		return new(Event)
+	case TypeHelloReply:
+		return new(HelloReply)
+	case TypeWorkspaces:
+		return new(Workspaces)
+	case TypeWorkspace:
+		return new(Workspace)
+	case TypeAttached:
+		return new(Attached)
+	case TypePaneText:
+		return new(PaneText)
+	case TypeExit:
+		return new(Exit)
+	case TypeDetached:
+		return new(Detached)
+	case TypeError:
+		return new(Error)
+	case TypeCreated:
+		return new(Created)
+	case TypeDraw:
+		return new(Draw)
+	case TypeCopied:
+		return new(Copied)
+	case TypeNotice:
+		return new(Notice)
+	case TypeImage:
+		return new(Image)
+	case TypeHostConnect:
+		return new(HostConnect)
+	case TypeHostAnswer:
+		return new(HostAnswer)
+	case TypeHostDisconnect:
+		return new(HostDisconnect)
+	case TypeHostList:
+		return new(HostList)
+	case TypeBridge:
+		return new(Bridge)
+	case TypeHosts:
+		return new(Hosts)
+	case TypeHostState:
+		return new(HostState)
+	case TypePrompt:
+		return new(Prompt)
+	}
+	return nil
+}
+
+// Encode returns m as a frame for pane id (0 for none), ready to write.
+func Encode(id uint32, m Message) ([]byte, error) {
+	e := encoder{buf: make([]byte, 4+headerLen, 64)}
+	m.encode(&e)
+	if len(e.buf)-4 > MaxFrame {
+		return nil, ErrTooLarge
+	}
+	binary.LittleEndian.PutUint32(e.buf[0:4], uint32(len(e.buf)-4))
+	e.buf[4] = byte(m.Type())
+	binary.LittleEndian.PutUint32(e.buf[5:9], id)
+	return e.buf, nil
+}
+
+// Reader reads frames.
+type Reader struct{ r *bufio.Reader }
+
+func NewReader(r io.Reader) *Reader { return &Reader{r: bufio.NewReaderSize(r, 64<<10)} }
+
+// stream is the rest of the input, starting with what's buffered, for
+// splicing it elsewhere.
+func (r *Reader) stream() io.Reader { return r.r }
+
+// Read returns the next frame. It returns io.EOF only at a frame
+// boundary; a stream that ends mid-frame is io.ErrUnexpectedEOF.
+func (r *Reader) Read() (Frame, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r.r, lenBuf[:]); err != nil {
+		return Frame{}, err
+	}
+	n := binary.LittleEndian.Uint32(lenBuf[:])
+	if n > MaxFrame {
+		return Frame{}, ErrTooLarge
+	}
+	if n < headerLen {
+		return Frame{}, ErrShortFrame
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r.r, buf); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return Frame{}, err
+	}
+	return Frame{
+		Type:    Type(buf[0]),
+		ID:      binary.LittleEndian.Uint32(buf[1:5]),
+		Payload: buf[headerLen:],
+	}, nil
+}
+
+type encoder struct{ buf []byte }
+
+func (e *encoder) u8(v uint8) { e.buf = append(e.buf, v) }
+
+func (e *encoder) bool(v bool) {
+	if v {
+		e.u8(1)
+	} else {
+		e.u8(0)
+	}
+}
+
+func (e *encoder) u16(v uint16) { e.buf = binary.LittleEndian.AppendUint16(e.buf, v) }
+func (e *encoder) u32(v uint32) { e.buf = binary.LittleEndian.AppendUint32(e.buf, v) }
+func (e *encoder) u64(v uint64) { e.buf = binary.LittleEndian.AppendUint64(e.buf, v) }
+func (e *encoder) raw(b []byte) { e.buf = append(e.buf, b...) }
+
+func (e *encoder) str(s string) {
+	e.u32(uint32(len(s)))
+	e.buf = append(e.buf, s...)
+}
+
+func (e *encoder) statusRecords(rs []StatusRecord) {
+	e.u32(uint32(len(rs)))
+	for _, r := range rs {
+		e.str(r.ID)
+		e.u8(r.State)
+		e.u8(uint8(r.Progress))
+	}
+}
+
+func (e *encoder) size(s Size) {
+	e.u16(s.Cols)
+	e.u16(s.Rows)
+	e.u32(s.CellW)
+	e.u32(s.CellH)
+}
+
+func (e *encoder) area(a Area) {
+	e.u32(a.Width)
+	e.u32(a.Height)
+	e.u32(a.CellW)
+	e.u32(a.CellH)
+}
+
+// node writes a layout tree in pre-order: a pane is u8 0 and its u32 id;
+// a split is u8 1, its u8 axis, a u16 child count, and per child its u16
+// share then the child.
+func (e *encoder) node(n *Node) {
+	if n == nil || n.isLeaf() {
+		e.u8(0)
+		if n == nil {
+			e.u32(0)
+		} else {
+			e.u32(n.Pane)
+		}
+		return
+	}
+	e.u8(1)
+	e.u8(uint8(n.Axis))
+	e.u16(uint16(len(n.Children)))
+	for _, c := range n.Children {
+		e.u16(c.Share)
+		e.node(c.Node)
+	}
+}
+
+func (e *encoder) tabs(tabs []TabInfo) {
+	e.u32(uint32(len(tabs)))
+	for _, t := range tabs {
+		e.u32(t.ID)
+		e.str(t.Name)
+		e.node(t.Tree)
+	}
+}
+
+// decoder reads fields until the first error, after which every field
+// reads as zero and err says what went wrong.
+type decoder struct {
+	buf []byte
+	err error
+}
+
+func (d *decoder) take(n int) []byte {
+	if d.err != nil {
+		return nil
+	}
+	if len(d.buf) < n {
+		d.err = ErrTruncated
+		return nil
+	}
+	b := d.buf[:n]
+	d.buf = d.buf[n:]
+	return b
+}
+
+// more says whether anything is left: fields added later are optional.
+func (d *decoder) more() bool { return d.err == nil && len(d.buf) > 0 }
+
+func (d *decoder) rest() []byte {
+	b := d.buf
+	d.buf = nil
+	return b
+}
+
+func (d *decoder) u8() uint8 {
+	if b := d.take(1); b != nil {
+		return b[0]
+	}
+	return 0
+}
+
+func (d *decoder) bool() bool { return d.u8() != 0 }
+
+// count reads a list's length, which can't be more than the bytes left
+// allow at minSize bytes an item.
+func (d *decoder) count(minSize int) int {
+	n := d.u32()
+	if d.err != nil {
+		return 0
+	}
+	if uint64(n)*uint64(minSize) > uint64(len(d.buf)) {
+		d.err = ErrTruncated
+		return 0
+	}
+	return int(n)
+}
+
+func (d *decoder) u16() uint16 {
+	if b := d.take(2); b != nil {
+		return binary.LittleEndian.Uint16(b)
+	}
+	return 0
+}
+
+func (d *decoder) u32() uint32 {
+	if b := d.take(4); b != nil {
+		return binary.LittleEndian.Uint32(b)
+	}
+	return 0
+}
+
+func (d *decoder) u64() uint64 {
+	if b := d.take(8); b != nil {
+		return binary.LittleEndian.Uint64(b)
+	}
+	return 0
+}
+
+func (d *decoder) str() string {
+	n := d.u32()
+	if d.err != nil {
+		return ""
+	}
+	if uint64(n) > uint64(len(d.buf)) {
+		d.err = ErrTruncated
+		return ""
+	}
+	return string(d.take(int(n)))
+}
+
+func (d *decoder) statusRecords() []StatusRecord {
+	n := d.count(6)
+	rs := make([]StatusRecord, n)
+	for i := range rs {
+		rs[i] = StatusRecord{ID: d.str(), State: d.u8(), Progress: int8(d.u8())}
+	}
+	return rs
+}
+
+func (d *decoder) size() Size {
+	return Size{Cols: d.u16(), Rows: d.u16(), CellW: d.u32(), CellH: d.u32()}
+}
+
+func (d *decoder) area() Area {
+	return Area{Width: d.u32(), Height: d.u32(), CellW: d.u32(), CellH: d.u32()}
+}
+
+func (d *decoder) node(depth int) *Node {
+	if depth > maxDepth {
+		if d.err == nil {
+			d.err = ErrTooDeep
+		}
+		return nil
+	}
+	switch d.u8() {
+	case 0:
+		return &Node{Pane: d.u32()}
+	case 1:
+		n := &Node{Axis: Axis(d.u8())}
+		// Each child is at least a share and a pane: 2 + 5 bytes.
+		count := int(d.u16())
+		if d.err == nil && count*7 > len(d.buf) {
+			d.err = ErrTruncated
+		}
+		for range count {
+			if d.err != nil {
+				return nil
+			}
+			share := d.u16()
+			n.Children = append(n.Children, Child{share, d.node(depth + 1)})
+		}
+		return n
+	default:
+		if d.err == nil {
+			d.err = errors.New("daemon: bad layout node")
+		}
+		return nil
+	}
+}
+
+func (d *decoder) tabs() []TabInfo {
+	n := d.count(4 + 4 + 5)
+	tabs := make([]TabInfo, n)
+	for i := range tabs {
+		tabs[i] = TabInfo{ID: d.u32(), Name: d.str(), Tree: d.node(0)}
+	}
+	return tabs
+}

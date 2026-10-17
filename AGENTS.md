@@ -1,11 +1,12 @@
 # slime
 
-A Windows terminal on **libghostty-vt** (`ghostty/` submodule) with our own
-Win32 window, Direct3D 11 renderer, and DirectWrite text stack, in Zig.
-The terminals run in **slimed** (`ssh/cmd/slimed`, Go, libghostty-vt
-through cgo), locally or on SSH hosts; slime draws the frames it sends
-(`ssh/internal/vt/frame.zig`) and sends input back as events
-(`event.zig`).
+A Windows terminal on **libghostty-vt** (`ghostty/` submodule). The
+terminals run in **slimed** (`cmd/slimed`, Go module at the root,
+libghostty-vt through cgo), locally or on SSH hosts, which the daemon
+logs in to (`internal/sshbridge`). The window (`clients/gui`, Zig: Win32,
+Direct3D 11, DirectWrite) draws the frames slimed sends
+(`internal/vt/frame.zig`) and sends input back as events (`event.zig`).
+Plans live in `.plans/` (untracked); `rearchitect-plan.md` is the current one.
 
 ## Build
 

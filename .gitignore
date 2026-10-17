@@ -2,3 +2,6 @@
 zig-out/
 zig-pkg/
 tools/
+/internal/vt/lib/
+*.exe
+.plans/

@@ -35,18 +35,18 @@ jobs:
           if ($hash -ne $env:ZIG_SHA256) { throw "zig sha256 mismatch: $hash" }
           Expand-Archive $zip -DestinationPath tools
 
-      # For slimed. Caches the module and build caches by ssh/go.sum.
+      # For slimed. Caches the module and build caches by go.sum.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: ssh/go.mod
-          cache-dependency-path: ssh/go.sum
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - uses: actions/cache@v4
         with:
           path: |
             zig-pkg
             tools/conpty-*
-          key: deps-${{ hashFiles('build.zig', 'build.zig.zon', 'ghostty/build.zig.zon') }}
+          key: deps-${{ hashFiles('build.zig', 'build.zig.zon', 'clients/gui/build.zig.zon', 'ghostty/build.zig.zon') }}
 
       - name: Check tag matches build.zig.zon
         if: startsWith(github.ref, 'refs/tags/')
@@ -63,7 +63,6 @@ jobs:
           zig build test
 
       - name: Test slimed
-        working-directory: ssh
         run: |
           go vet ./...
           go test ./...

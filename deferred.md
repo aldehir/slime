@@ -5,11 +5,11 @@ item out when it's done.
 
 ## Chrome
 
-The window draws its own title bar and session list (`src/chrome/`) with
+The window draws its own title bar and session list (`clients/gui/src/chrome/`) with
 Direct2D over the terminal. The list has two layouts behind the title
 bar's toggle: a sidebar, which is done, and tabs, which isn't. The
 sidebar is a tree: each tab's row folds open to a row per pane, with what
-its programs report doing (OSC 7501, `src/ProgramStatus.zig`), which
+its programs report doing (OSC 7501, `clients/gui/src/ProgramStatus.zig`), which
 slimed keeps while no window is attached.
 
 - **Tabs in the title bar.** `chrome/tabs.zig` lays out the title bar
@@ -126,7 +126,7 @@ cell and Unicode placeholders (`U=1`, `U+10EEEE` cells) are drawn.
 ## SSH
 
 `command = ssh://[user@]host[:port]` (or `slime ssh://...`) opens a
-host: the local slimed logs in (ssh/internal/helper), puts its Linux
+host: the local slimed logs in (internal/sshbridge), puts its Linux
 build of slimed there from `remote/` beside the exe, and bridges the
 window to it. The connection is the daemon's: every window shares it,
 and it stays when the last window closes, so the next one finds the
@@ -174,10 +174,10 @@ one.
 
 ## Persistent workspaces
 
-Every session runs in slimed (ssh/cmd/slimed), a daemon that holds each
+Every session runs in slimed (cmd/slimed), a daemon that holds each
 pane's ConPTY and terminal, arranged in tabs (each a layout tree) and
 workspaces. slime draws what it sends: frames of each pane's screen
-(ssh/internal/vt/frame.zig), with scrollback, selection, and copying
+(internal/vt/frame.zig), with scrollback, selection, and copying
 done in the daemon; keys, the mouse, and the wheel go back as events
 (event.zig). A window attaches the workspace detached last, or a new
 one, and mirrors it: closing the window detaches the workspace, closing

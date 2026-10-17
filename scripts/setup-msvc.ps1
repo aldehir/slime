@@ -31,8 +31,8 @@ if (-not $vsPath) {
 $vcVersion = (Get-Content (Join-Path $vsPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt')).Trim()
 $env:VCToolsInstallDir = Join-Path $vsPath "VC\Tools\MSVC\$vcVersion\"
 
-# cgo (ssh/internal/vt links libghostty-vt) compiles with Zig's clang, so
-# `go build` and `go test` in ssh\ need no other C toolchain. build.zig
+# cgo (internal/vt links libghostty-vt) compiles with Zig's clang, so
+# `go build` and `go test` need no other C toolchain. build.zig
 # sets its own CC for each host target.
 $env:CGO_ENABLED = '1'
 $env:CC = 'zig cc -target x86_64-windows-gnu'
