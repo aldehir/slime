@@ -711,7 +711,7 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
 /// Send slimed an event for the pane, if it's live.
 fn send(self: *Session, ev: Events.Event) void {
     const s = self.live() orelse return;
-    var buf: [2048]u8 = undefined;
+    var buf: [Events.max_len]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     Events.encode(&w, ev) catch return log.warn("{t} event too big", .{ev});
     s.conn.event(s.pane, w.buffered());
@@ -725,7 +725,7 @@ fn sendSettings(self: *Session) void {
         .settings = .{
             .double_click_ms = win32.GetDoubleClickTime(),
             // What slimed has room for.
-            .word_boundary = words[0..@min(words.len, 256)],
+            .word_boundary = words[0..@min(words.len, Events.max_word_boundary)],
             .colors = .{
                 .background = config.background,
                 .foreground = config.foreground,

@@ -91,6 +91,13 @@ pub fn Codec(comptime vt: type) type {
         /// The most win32 records one key carries: one per UTF-16 unit of
         /// its text.
         pub const max_win32 = 16;
+        /// The most word boundary codepoints a settings event carries.
+        pub const max_word_boundary = 256;
+        /// The most bytes an event other than text or paste encodes to: a
+        /// settings event with `max_word_boundary` codepoints. A fixed
+        /// buffer this big takes any of them.
+        pub const max_len = 1 + 4 + 2 + max_word_boundary * 4 +
+            3 + 3 + 1 + 3 + @typeInfo(vt.color.Palette).array.len * 3;
 
         pub const Key = struct {
             event: KeyEvent,
@@ -204,7 +211,7 @@ pub fn Codec(comptime vt: type) type {
                 }) |v| try w.writeInt(u32, v, .little),
                 .settings => |s| {
                     try w.writeInt(u32, s.double_click_ms, .little);
-                    const n = @min(s.word_boundary.len, std.math.maxInt(u16));
+                    const n = @min(s.word_boundary.len, max_word_boundary);
                     try w.writeInt(u16, @intCast(n), .little);
                     for (s.word_boundary[0..n]) |cp| try w.writeInt(u32, cp, .little);
                     const c = &s.colors;
@@ -320,7 +327,7 @@ pub fn Codec(comptime vt: type) type {
         /// Room `decode` converts into.
         pub const Scratch = struct {
             win32: [max_win32]Win32Key = undefined,
-            word_boundary: [256]u21 = undefined,
+            word_boundary: [max_word_boundary]u21 = undefined,
             colors: Colors = undefined,
         };
 

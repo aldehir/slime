@@ -345,3 +345,27 @@ test "frames carry the mouse shape and whether to send motion" {
     try testing.expect(h.screen.motion);
     try testing.expectEqual(3, h.screen.mouse_shape);
 }
+
+test "max_len is the largest event" {
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    // A settings event with every word boundary codepoint slimed has
+    // room for; more are cut.
+    var words: [Events.max_word_boundary + 1]u21 = undefined;
+    @memset(&words, 0x10FFFF);
+    try Events.encode(&buf.writer, .{ .settings = .{
+        .double_click_ms = 500,
+        .word_boundary = &words,
+        .colors = .{ .background = .{}, .foreground = .{}, .cursor = .{}, .palette = ghostty_vt.color.default },
+    } });
+    try testing.expectEqual(Events.max_len, buf.written().len);
+
+    // A key with the most text and win32 records.
+    buf.clearRetainingCapacity();
+    const records = [_]event.Win32Key{.{ .down = true }} ** (Events.max_win32 + 1);
+    try Events.encode(&buf.writer, .{ .key = .{
+        .event = .{ .action = .press, .key = .key_a, .mods = .{}, .consumed_mods = .{}, .composing = false, .utf8 = "x" ** 300, .unshifted_codepoint = 'a' },
+        .win32 = &records,
+    } });
+    try testing.expect(buf.written().len <= Events.max_len);
+}
