@@ -133,8 +133,6 @@ that shows on hover.
   never apply, `ProxyCommand` is refused rather than bypassed, and a
   jump host's own `ProxyJump` isn't followed. Certificates
   (`CertificateFile`) and `HostKeyAlias` are ignored.
-- **Pixel sizes in `pty-req` and `window-change`.** Only cells are sent;
-  mode 2048 reports still carry pixels in-band.
 - **Ghostty's terminfo on the remote.** `TERM` is `xterm-256color`.
 - **Agent forwarding, port forwarding, SFTP.**
 - **Helper logs in GUI builds** go nowhere: there is no stderr to pass.

@@ -128,13 +128,6 @@ const Transport = union(enum) {
             .ssh => |ch| ch.write(data),
         }
     }
-
-    fn resize(self: *Transport, cols: u16, rows: u16) void {
-        switch (self.*) {
-            .conpty => |*pty| pty.resize(cols, rows),
-            .ssh => |ch| ch.resize(cols, rows),
-        }
-    }
 };
 
 /// What a new session starts.
@@ -219,7 +212,10 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
             defer alloc.free(cmd);
             self.transport = .{ .conpty = try .spawn(cmd, cols, rows) };
         },
-        .ssh => |ssh| self.transport = .{ .ssh = try ssh.conn.open(id, cols, rows, ssh.cwd) },
+        .ssh => |ssh| {
+            const cell = window.cellSizePx();
+            self.transport = .{ .ssh = try ssh.conn.open(id, cols, rows, cols * cell.width, rows * cell.height, ssh.cwd) };
+        },
     }
     errdefer self.stopTransport();
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
@@ -349,7 +345,12 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
     self.unlockTerminal();
 
     // After the terminal, so ConPTY's redraw lands on the new grid.
-    if (changed) if (self.transport) |*t| t.resize(cols, rows);
+    // ConPTY has no pixel size; an SSH pty does, which programs read to
+    // size images, so it hears about new fonts too.
+    if (self.transport) |*t| switch (t.*) {
+        .conpty => |*pty| if (changed) pty.resize(cols, rows),
+        .ssh => |ch| if (changed or px_changed) ch.resize(cols, rows, @as(u32, cols) * cell.width, @as(u32, rows) * cell.height),
+    };
 }
 
 /// Reader thread: feed child output to the terminal until EOF, which

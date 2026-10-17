@@ -191,10 +191,14 @@ pub const Channel = struct {
         writeAll(self.input, data) catch {};
     }
 
-    pub fn resize(self: *Channel, cols: u16, rows: u16) void {
+    /// Resize the remote pty, in cells and pixels. Programs read the
+    /// pixel size to size images.
+    pub fn resize(self: *Channel, cols: u16, rows: u16, width_px: u32, height_px: u32) void {
         var p: Payload = .{};
         p.putU16(cols);
         p.putU16(rows);
+        p.putU32(width_px);
+        p.putU32(height_px);
         self.conn.send(.resize, self.id, p.bytes()) catch {};
     }
 
@@ -395,9 +399,10 @@ pub fn isAlive(self: *SshConnection) bool {
     return self.alive;
 }
 
-/// Open a channel with a shell, in `cwd` if given. `id` must be unique
-/// and nonzero. UI thread only.
-pub fn open(self: *SshConnection, id: u32, cols: u16, rows: u16, cwd: ?[]const u8) !*Channel {
+/// Open a channel with a shell, in `cwd` if given, on a pty of the given
+/// size in cells and pixels. `id` must be unique and nonzero. UI thread
+/// only.
+pub fn open(self: *SshConnection, id: u32, cols: u16, rows: u16, width_px: u32, height_px: u32, cwd: ?[]const u8) !*Channel {
     std.debug.assert(id != 0);
     var input_read: win32.HANDLE = undefined;
     var input_write: win32.HANDLE = undefined;
@@ -451,6 +456,8 @@ pub fn open(self: *SshConnection, id: u32, cols: u16, rows: u16, cwd: ?[]const u
     p.putU16(rows);
     p.putStr("xterm-256color");
     p.putStr(cwd orelse "");
+    p.putU32(width_px);
+    p.putU32(height_px);
     if (p.overflow) return error.NameTooLong;
     try self.send(.open, id, p.bytes());
     self.refs += 1;
@@ -822,16 +829,23 @@ pub fn pwdFromUrl(buf: []u8, url: []const u8) ?[]const u8 {
 }
 
 test "frames match the Go side's wire format" {
-    // ssh/internal/proto TestWireFormat: Resize{0x0102, 0x0304} on 2.
+    // ssh/internal/proto TestWireFormat: Resize{0x0102, 0x0304,
+    // 0x05060708, 0x090a0b0c} on 2.
     var p: Payload = .{};
     p.putU16(0x0102);
     p.putU16(0x0304);
+    p.putU32(0x05060708);
+    p.putU32(0x090a0b0c);
     var header: [9]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], @intCast(5 + p.len), .little);
     header[4] = @intFromEnum(MsgType.resize);
     std.mem.writeInt(u32, header[5..9], 2, .little);
-    try std.testing.expectEqualSlices(u8, &.{ 9, 0, 0, 0, 3, 2, 0, 0, 0 }, &header);
-    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x04, 0x03 }, p.bytes());
+    try std.testing.expectEqualSlices(u8, &.{ 17, 0, 0, 0, 3, 2, 0, 0, 0 }, &header);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x02, 0x01, 0x04, 0x03,
+        0x08, 0x07, 0x06, 0x05,
+        0x0c, 0x0b, 0x0a, 0x09,
+    }, p.bytes());
 }
 
 test Reader {
