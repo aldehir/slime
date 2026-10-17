@@ -256,8 +256,9 @@ fn upper(buf: []u16, text: []const u16) []const u16 {
 fn paintTab(c: *const Chrome, p: *Painter, r: Rect, i: usize, tab: Chrome.View.Tab, active: bool, step: u32) void {
     const close_hovered = c.hover.eql(.{ .close_tab = i });
     const hovered = close_hovered or c.hover.eql(.{ .tab = i }) or c.hover.eql(.{ .fold = i });
-    // The active tab is told by its brighter text alone.
-    if (hovered) p.fillRounded(r, c.px(6), c.theme.row_hover);
+    // The active tab is told by its brighter text, and its focused pane's
+    // highlight; folded, it keeps the highlight itself.
+    if (hovered or (active and tab.folded)) p.fillRounded(r, c.px(6), c.theme.row_hover);
 
     paintFold(c, p, .{ .x = r.x, .y = r.y, .w = c.px(fold_width), .h = r.h }, tab.folded, if (c.hover.eql(.{ .fold = i })) c.theme.text_strong else c.theme.text_muted);
     // Lucide's panels-top-left spans 18 of its 24 units: 12 DIPs here.
@@ -333,16 +334,17 @@ fn paintPane(c: *const Chrome, p: *Painter, r: Rect, i: usize, j: usize, view: *
     const tab = view.tabs[i];
     const pane = tab.panes[j];
     const hit: Hit = .{ .tab_pane = .{ .tab = i, .pane = j } };
+    const focused = i == view.active and j == tab.focus;
     // The highlight starts past the guide, which runs on unbroken.
-    if (c.hover.eql(hit)) {
+    if (focused or c.hover.eql(hit)) {
         const inset = c.px(fold_width);
         p.fillRounded(.{ .x = r.x + inset, .y = r.y, .w = r.w - inset, .h = r.h }, c.px(6), c.theme.row_hover);
     }
     const guide_x = Chrome.crisp(r.x + c.px(fold_width / 2) + c.px(1), c.stroke());
     const last = j + 1 == tab.panes.len;
-    p.line(guide_x, r.y, guide_x, if (last) r.y + r.h / 2 else r.bottom(), c.stroke(), c.theme.outline);
+    // Up through the gap above, from the row there.
+    p.line(guide_x, r.y - c.px(row_gap), guide_x, if (last) r.y + r.h / 2 else r.bottom(), c.stroke(), c.theme.outline);
 
-    const focused = i == view.active and j == tab.focus;
     const icon = c.px(14);
     const x = r.x + c.px(pane_indent);
     c.drawIcon(p, .terminal, .{ .x = x, .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, if (focused) c.theme.accent else c.theme.text_muted);
@@ -443,6 +445,8 @@ const Walk = struct {
             const t = self.tab - 1;
             if (t < self.tabs.len and j < self.tabs[t].panes.len) {
                 self.pane = j + 1;
+                // Each pane's row is set off from the row above it.
+                self.y += self.row_gap;
                 return .{ .part = .{ .pane = .{ .tab = t, .pane = j } }, .rect = self.take(self.pane_h, 0) };
             }
             self.pane = null;
@@ -507,7 +511,7 @@ test "groups, rows, and their buttons" {
     const pane = walk.next().?;
     try std.testing.expectEqual(@as(usize, 1), pane.part.pane.tab);
     try std.testing.expectEqual(@as(usize, 0), pane.part.pane.pane);
-    try std.testing.expectEqual(second.bottom(), pane.rect.y);
+    try std.testing.expectEqual(second.bottom() + row_gap, pane.rect.y);
     try std.testing.expectEqual(@as(usize, 1), walk.next().?.part.pane.pane);
     const forgotten = walk.next().?;
     try std.testing.expectEqual(@as(usize, 2), forgotten.part.header);
