@@ -113,7 +113,9 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the app").dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
-    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    terminfoSteps(b, test_step);
 }
 
 const Icon = struct {
@@ -135,6 +137,39 @@ fn renderIcon(b: *std.Build) Icon {
     const ico = run.addOutputFileArg("slime.ico");
     const png_dir = run.addOutputDirectoryArg("png");
     return .{ .ico = ico, .png_dir = png_dir };
+}
+
+/// The xterm-ghostty terminfo source the SSH helper embeds, generated
+/// from ghostty's own definition. It's checked in so the helper builds
+/// with Go alone; `zig build terminfo` regenerates it, and the tests fail
+/// when it no longer matches the submodule.
+fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
+    const checked_in = "ssh/internal/terminfo/xterm-ghostty.terminfo";
+    const tool = b.addExecutable(.{
+        .name = "terminfo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/terminfo.zig"),
+            .target = b.graph.host,
+            .imports = &.{.{
+                .name = "terminfo",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("ghostty/src/terminfo/main.zig"),
+                    .target = b.graph.host,
+                }),
+            }},
+        }),
+    });
+
+    const generate = b.addRunArtifact(tool);
+    const source = generate.addOutputFileArg("xterm-ghostty.terminfo");
+    const update = b.addUpdateSourceFiles();
+    update.addCopyFileToSource(source, checked_in);
+    b.step("terminfo", "Regenerate " ++ checked_in ++ " from ghostty's terminfo").dependOn(&update.step);
+
+    const check = b.addRunArtifact(tool);
+    check.addArg("--check");
+    check.addFileArg(b.path(checked_in));
+    test_step.dependOn(&check.step);
 }
 
 /// slime-ssh.exe, next to the exe, for `ssh://` commands. Go caches its
