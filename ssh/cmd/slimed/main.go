@@ -11,6 +11,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -19,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/aldehir/slime/ssh/internal/persist"
+	"github.com/aldehir/slime/ssh/internal/pty"
 	"github.com/aldehir/slime/ssh/internal/vt"
 )
 
@@ -44,9 +46,10 @@ func newCommand() *cobra.Command {
 
 func serveCommand() *cobra.Command {
 	var (
-		idle    time.Duration
-		logPath string
-		verbose bool
+		idle      time.Duration
+		logPath   string
+		verbose   bool
+		conptyDir string
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -55,6 +58,9 @@ func serveCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out := os.Stderr
 			if logPath != "" {
+				if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+					return err
+				}
 				f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 				if err != nil {
 					return err
@@ -67,9 +73,13 @@ func serveCommand() *cobra.Command {
 				level = slog.LevelDebug
 			}
 			logger := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level}))
+			if conptyDir != "" {
+				pty.SetConptyDir(conptyDir)
+			}
 			return serve(logger, idle)
 		},
 	}
+	cmd.Flags().StringVar(&conptyDir, "conpty", "", "directory holding conpty.dll (default: next to slimed.exe, else the system's)")
 	cmd.Flags().DurationVar(&idle, "idle", 10*time.Second, "exit after this long with no sessions and no clients (0 never)")
 	cmd.Flags().StringVar(&logPath, "log", "", "append logs to this file instead of stderr")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "log libghostty-vt's debug output too")

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"unsafe"
 
@@ -29,8 +30,24 @@ type proc interface {
 // doesn't know it.
 const pseudoconsoleGlyphWidthGraphemes = 0x08
 
+// conptyDir, if set, is where conpty.dll is, instead of next to us.
+var conptyDir string
+
+// SetConptyDir loads conpty.dll from dir instead of from next to our
+// executable: slime runs slimed from a copy, and points it back at its
+// own. Call it before the first Start.
+func SetConptyDir(dir string) { conptyDir = dir }
+
+func loadConpty() (windows.Handle, error) {
+	if conptyDir != "" {
+		// conpty.dll finds OpenConsole.exe next to itself.
+		return windows.LoadLibraryEx(filepath.Join(conptyDir, "conpty.dll"), 0, windows.LOAD_WITH_ALTERED_SEARCH_PATH)
+	}
+	return windows.LoadLibraryEx("conpty.dll", 0, windows.LOAD_LIBRARY_SEARCH_APPLICATION_DIR)
+}
+
 var loadAPI = sync.OnceValues(func() (*conptyAPI, error) {
-	if dll, err := windows.LoadLibraryEx("conpty.dll", 0, windows.LOAD_LIBRARY_SEARCH_APPLICATION_DIR); err == nil {
+	if dll, err := loadConpty(); err == nil {
 		// Never unloaded.
 		d := &windows.DLL{Name: "conpty.dll", Handle: dll}
 		var create, resize, close *windows.Proc

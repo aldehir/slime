@@ -239,6 +239,15 @@ func (s *Server) newSession(c *conn, m *New) {
 			term.Close()
 		}
 	}
+	if err == nil {
+		// Grapheme clustering (mode 2027), as slime's terminals start
+		// with it and ConPTY measures text so. Only the current value: the
+		// C API can't set the default a full reset (RIS) goes back to.
+		_, err = term.Write([]byte("\x1b[?2027h"))
+		if err != nil {
+			term.Close()
+		}
+	}
 	if err != nil {
 		c.sendForce(0, &Error{Tag: m.Tag, Message: err.Error()})
 		return
