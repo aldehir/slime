@@ -131,6 +131,10 @@ one.
 - **Logging in, in the header.** A host shows `+` from the moment its
   helper starts, before it's logged in. Sessions left from a dead
   connection aren't dimmed.
+- **Persistent remote sessions.** A session ends with its SSH channel.
+  `ssh/internal/vt` hosts libghostty-vt as wasm, with snapshots, for a
+  remote daemon that would keep sessions alive across disconnects. The
+  daemon and attaching aren't built yet.
 - **The new session key hint** went with the "New session" button.
   Ctrl+Shift+T opens one in the active session's group.
 - **More of `~/.ssh/config`.** The helper reads Host blocks and
