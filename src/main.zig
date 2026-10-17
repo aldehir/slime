@@ -183,6 +183,7 @@ test {
     _ = @import("chrome/Dialog.zig");
     _ = @import("chrome/theme.zig");
     _ = @import("renderer/Painter.zig");
+    _ = @import("renderer/image.zig");
     _ = @import("font/font.zig");
     _ = @import("input.zig");
     _ = @import("binding.zig");

@@ -104,16 +104,24 @@ pub const Images = struct {
         const cell_width: f32 = @floatFromInt(t.width_px / t.cols);
         const cell_height: f32 = @floatFromInt(t.height_px / t.rows);
         const pages = &screen.pages;
-        const top_y = pages.pointFromPin(.screen, pages.getTopLeft(.viewport)).?.screen.y;
-        const bot_y = pages.pointFromPin(.screen, pages.getBottomRight(.viewport).?).?.screen.y;
+        const top = pages.getTopLeft(.viewport);
+        const bot = pages.getBottomRight(.viewport).?;
+        const top_y = pages.pointFromPin(.screen, top).?.screen.y;
+        const bot_y = pages.pointFromPin(.screen, bot).?.screen.y;
 
+        var virtual = false;
         var it = storage.placements.iterator();
         while (it.next()) |kv| {
             const p = kv.value_ptr;
             const pin = switch (p.location) {
                 .pin => |pin| pin,
-                // TODO: unicode placeholders and relative placements.
-                .virtual, .relative => continue,
+                // Shown where placeholder cells are; see below.
+                .virtual => {
+                    virtual = true;
+                    continue;
+                },
+                // TODO: relative placements.
+                .relative => continue,
             };
             if (pin.garbage) continue;
             const image = storage.imageById(kv.key_ptr.image_id) orelse continue;
@@ -137,6 +145,34 @@ pub const Images = struct {
                 .size = .{ @floatFromInt(size.width), @floatFromInt(size.height) },
                 .src_pos = .{ @floatFromInt(src.x), @floatFromInt(src.y) },
                 .src_size = .{ @floatFromInt(src.width), @floatFromInt(src.height) },
+            } });
+        }
+
+        // Unicode placeholders: cells of U+10EEEE whose colors and
+        // diacritics name an image and which part of it to show. A
+        // program draws them as text, so they scroll and redraw with it,
+        // which is what lets images work through tmux. Below the text,
+        // as in Ghostty.
+        if (!virtual) return;
+        var v_it = kitty.unicode.placementIterator(top, bot);
+        while (v_it.next()) |vp| {
+            const image = storage.imageById(vp.image_id) orelse continue;
+            if (image.data.isPending()) continue;
+            const rp = vp.renderPlacement(storage, &image, t.width_px / t.cols, t.height_px / t.rows) catch |err| {
+                log.debug("placeholder for image id={d} not drawn: {}", .{ vp.image_id, err });
+                continue;
+            };
+            if (rp.dest_width == 0 or rp.dest_height == 0) continue;
+            const y = pages.pointFromPin(.viewport, rp.top_left) orelse continue;
+
+            try self.copyImage(alloc, image);
+            const row: f32 = @floatFromInt(y.viewport.y);
+            const col: f32 = @floatFromInt(rp.top_left.x);
+            try self.sorted.append(alloc, .{ .z = -1, .id = image.id, .placement = .{
+                .pos = .{ col * cell_width + @as(f32, @floatFromInt(rp.offset_x)), row * cell_height + @as(f32, @floatFromInt(rp.offset_y)) },
+                .size = .{ @floatFromInt(rp.dest_width), @floatFromInt(rp.dest_height) },
+                .src_pos = .{ @floatFromInt(rp.source_x), @floatFromInt(rp.source_y) },
+                .src_size = .{ @floatFromInt(rp.source_width), @floatFromInt(rp.source_height) },
             } });
         }
     }
@@ -191,4 +227,54 @@ fn premultiply(rgba: []u8) void {
         if (a == 255) continue;
         for (rgba[i..][0..3]) |*c| c.* = @intCast((@as(u16, c.*) * a + 127) / 255);
     }
+}
+
+test "unicode placeholders place their image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // 10x10 pixel cells.
+    var t = try ghostty_vt.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    t.width_px = 50;
+    t.height_px = 50;
+    t.modes.set(.grapheme_cluster, true);
+
+    const storage = &t.screens.active.kitty_images;
+    const pixels = try alloc.alloc(u8, 10 * 10 * 3);
+    @memset(pixels, 0xff);
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 7,
+        .width = 10,
+        .height = 10,
+        .format = .rgb,
+        .data = .{ .complete = pixels },
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 7, 1, .{ .location = .{ .virtual = {} } });
+
+    var images: Images = .{};
+    defer images.deinit(alloc);
+
+    // No placeholder on screen yet: nothing to draw.
+    try images.update(alloc, &t);
+    try testing.expectEqual(0, images.placements.items.len);
+
+    // At column 2, row 2 (0-based). The image ID is the foreground
+    // color; the diacritics are row 0, column 0 of the image.
+    try t.setAttribute(.{ .@"256_fg" = 7 });
+    t.screens.active.cursorAbsolute(2, 2);
+    try t.printString("\u{10EEEE}\u{0305}\u{0305}");
+    try images.update(alloc, &t);
+
+    try testing.expectEqual(1, images.placements.items.len);
+    try testing.expectEqual(7, images.placement_ids.items[0]);
+    const p = images.placements.items[0];
+    try testing.expectEqual([2]f32{ 20, 20 }, p.pos);
+    try testing.expectEqual([2]f32{ 10, 10 }, p.size);
+    try testing.expectEqual([2]f32{ 10, 10 }, p.src_size);
+    // Under the text, like Ghostty.
+    const start, const end = images.layer(.below_text);
+    try testing.expectEqual(.{ 0, 1 }, .{ start, end });
+    try testing.expect(images.images.get(7).?.rgba != null);
 }

@@ -264,7 +264,8 @@ pub const Cells = struct {
             const text_color = if (under_cursor) cursor_text else fg;
             const alpha: u8 = if (style.flags.faint) 128 else 255;
 
-            if (raw.hasText()) {
+            // A kitty image placeholder is drawn as the image, not a glyph.
+            if (raw.hasText() and raw.codepoint() != ghostty_vt.kitty.graphics.unicode.placeholder) {
                 var cp_buf: [max_grapheme]u21 = undefined;
                 const cps = graphemeCodepoints(raw, row.graphemes[x], &cp_buf);
                 self.row_text.items[x] = .{
