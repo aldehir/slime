@@ -1,12 +1,12 @@
 //! Logging in to an SSH host as the stand-in session's dialog shows it:
-//! the daemon's prompts and status lines (`Slimed.HostEvent`) turned into
+//! the daemon's prompts and status lines (`Daemon.HostEvent`) turned into
 //! a `Dialog` for the user to answer, waiting while the server works on
 //! an answer, and failing with the reason if logging in doesn't work.
 const Login = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Slimed = @import("Slimed.zig");
+const Daemon = @import("Daemon.zig");
 const Dialog = @import("chrome/Dialog.zig");
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
@@ -16,7 +16,7 @@ alloc: Allocator,
 /// host table, which outlives it.
 host: []const u16,
 /// The prompt shown, which the dialog's strings point into.
-prompt: ?*Slimed.Prompt = null,
+prompt: ?*Daemon.Prompt = null,
 dialog: Dialog,
 status_buf: [512]u16 = undefined,
 title_buf: [160]u16 = undefined,
@@ -36,7 +36,7 @@ pub fn destroy(self: *Login) void {
 }
 
 /// Show `prompt`, which the login now owns.
-pub fn ask(self: *Login, prompt: *Slimed.Prompt) void {
+pub fn ask(self: *Login, prompt: *Daemon.Prompt) void {
     const old = self.prompt;
     self.prompt = prompt;
     var d: Dialog = .{
@@ -85,7 +85,7 @@ pub fn ask(self: *Login, prompt: *Slimed.Prompt) void {
 }
 
 /// A status line while waiting: the server's, or the daemon's
-/// ("installing slimed").
+/// ("installing slime").
 pub fn info(self: *Login, text: []const u16) void {
     self.setStatus(&.{text});
 }

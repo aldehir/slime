@@ -10,7 +10,7 @@ Direct2D over the terminal. The list has two layouts behind the title
 bar's toggle: a sidebar, which is done, and tabs, which isn't. The
 sidebar is a tree: each tab's row folds open to a row per pane, with what
 its programs report doing (OSC 7501, `clients/gui/src/ProgramStatus.zig`), which
-slimed keeps while no window is attached.
+slime keeps while no window is attached.
 
 - **Tabs in the title bar.** `chrome/tabs.zig` lays out the title bar
   alone; the tabs (titles, close buttons, overflow) aren't drawn.
@@ -26,7 +26,7 @@ slimed keeps while no window is attached.
   switching between a light/dark theme pair waits on following the
   system's mode live (see Configuration).
 - **Remembering the layout** (sidebar or tabs) and the sidebar width.
-  Folding a tab's panes isn't remembered either, nor kept by slimed.
+  Folding a tab's panes isn't remembered either, nor kept by slime.
 - **Pane rows have no close button**; a pane closes from its terminal.
 - **Program status shows only its state.** A report's message, title,
   progress, and kind (what a blocked program needs) aren't shown, say in
@@ -63,14 +63,14 @@ than being piecemealed with MessageBox and the like.
   general (OSC 8 hyperlinks, regex links, ctrl+click to open).
 - **Ctrl+triple-click selects a command's output.** Needs shell
   integration (OSC 133).
-- **Kitty paste events** (mode 5522). slimed encodes pastes itself
+- **Kitty paste events** (mode 5522). slime encodes pastes itself
   rather than going through libghostty-vt's `handler.paste`, so programs
   that ask for paste events get plain pastes.
-- **Large pastes** go to slimed as one event, so one over 8 MiB (the
-  protocol's largest message) is dropped. slimed writes them to the pty
+- **Large pastes** go to slime as one event, so one over 8 MiB (the
+  protocol's largest message) is dropped. slime writes them to the pty
   outside the pane's lock, but its connection reader waits until the
   child reads them.
-- **OSC 52 reads** aren't answered. The terminal is in slimed, which
+- **OSC 52 reads** aren't answered. The terminal is in slime, which
   would have to ask the window for the clipboard and wait for it inside
   the program's write.
 
@@ -94,7 +94,7 @@ than being piecemealed with MessageBox and the like.
 
 ## Kitty graphics
 
-slimed's terminals keep the images (PNGs decoded by Go's `image/png`,
+slime's terminals keep the images (PNGs decoded by Go's `image/png`,
 Ghostty's default storage limit of 320 MB a screen). Each image a frame
 places goes to the window once, deflated, in pieces (wire.go's `Image`),
 and every frame carries the placements in the viewport (`frame.zig`'s
@@ -104,15 +104,15 @@ cell and Unicode placeholders (`U=1`, `U+10EEEE` cells) are drawn.
 
 - **Relative placements** (`P=`/`Q=`). Ghostty's `renderer/image.zig`
   has the placement walk to port; `ImageSender.gather` skips them.
-- **Animation.** Nothing calls `ImageStorage.animationTick` in slimed,
+- **Animation.** Nothing calls `ImageStorage.animationTick` in slime,
   so animated images stay on one frame. Advancing one changes the
   image's generation, which resends it whole.
 - **File and temp-file media.** `image_limits` is left at `.direct`.
   Shared memory is POSIX `shm_open`; Windows would need its own scheme.
-- **`image-storage-limit`** config; slimed's is fixed.
+- **`image-storage-limit`** config; slime's is fixed.
 - **Device loss.** Image pixels are freed after upload, so recreating
-  textures would need slimed to send them again, which nothing asks.
-- **A placement's pixel size comes from slimed**, from the cell size
+  textures would need slime to send them again, which nothing asks.
+- **A placement's pixel size comes from slime**, from the cell size
   the window last sent, so a font size change draws images at the old
   size until the resize comes back.
 - **Images inflate on the connection's reader thread**, which holds
@@ -125,12 +125,12 @@ cell and Unicode placeholders (`U=1`, `U+10EEEE` cells) are drawn.
 
 ## SSH
 
-`command = ssh://[user@]host[:port]` (or `slime ssh://...`) opens a
-host: the local slimed logs in (internal/sshbridge), puts its Linux
-build of slimed there from `remote/` beside the exe, and bridges the
+`command = ssh://[user@]host[:port]` (or `slime-gui ssh://...`) opens a
+host: the local slime logs in (internal/sshbridge), puts its Linux
+build of slime there from `remote/` beside the exe, and bridges the
 window to it. The connection is the daemon's: every window shares it,
 and it stays when the last window closes, so the next one finds the
-host connected without logging in. `slimed host connect|ls|disconnect`
+host connected without logging in. `slime host connect|ls|disconnect`
 drive it from a console.
 
 The sidebar lists every host connected to before (`hosts` in the config
@@ -174,9 +174,9 @@ one.
 
 ## Persistent workspaces
 
-Every session runs in slimed (cmd/slimed), a daemon that holds each
+Every session runs in slime (cmd/slime), a daemon that holds each
 pane's ConPTY and terminal, arranged in tabs (each a layout tree) and
-workspaces. slime draws what it sends: frames of each pane's screen
+workspaces. The window draws what it sends: frames of each pane's screen
 (internal/vt/frame.zig), with scrollback, selection, and copying
 done in the daemon; keys, the mouse, and the wheel go back as events
 (event.zig). A window attaches the workspace detached last, or a new
@@ -185,35 +185,35 @@ a pane ends it. Each sidebar row is a tab, drawn as its tree of panes,
 each under a title strip whose buttons split it or zoom it. Dragging the
 gap between panes resizes them; dragging a pane by its strip moves it
 beside another, along a side of the tab, or into another's place.
-`slimed tab new`, `split`, and the rest change a workspace from scripts,
-attached or not. If slimed can't be started, a tab says why.
+`slime tab new`, `split`, and the rest change a workspace from scripts,
+attached or not. If slime can't be started, a tab says why.
 
 On SSH hosts it's the same daemon, built for Linux on x86-64 and
-carried in `remote/` beside the exe. The local slimed installs it as
-`~/.cache/slime/slimed-<build>` and splices each window's second
-connection to `slimed connect` there (its socket is
-`/tmp/slimed-<uid>/sock`). Until the host's panes come, a session stands
-in for them, where logging in asks what it needs. Where slimed can't
+carried in `remote/` beside the exe. The local slime installs it as
+`~/.cache/slime/bin/slime-<build>` and splices each window's second
+connection to `slime connect` there (its socket is
+`/tmp/slime-<uid>/sock`). Until the host's panes come, a session stands
+in for them, where logging in asks what it needs. Where slime can't
 run (another OS, no gzip, a full disk), connecting fails and the
 stand-in says why; ssh.exe in a local tab still reaches the host. A
 dropped connection leaves its panes saying so; the host's button
 reconnects, reattaches, and replaces them.
 
-- **Losing the local slimed** leaves its panes saying so, and new local
+- **Losing the local slime** leaves its panes saying so, and new local
   tabs say so too until the next window, which starts a new daemon.
-- **Frames pace to the display slime started on.** The refresh period
-  goes to slimed when connecting, not when the window moves to another
+- **Frames pace to the display the window started on.** The refresh period
+  goes to slime when connecting, not when the window moves to another
   display.
 - **A frame that fails to apply** (out of memory, or a bad one) leaves
   the pane wrong until the next full frame, which nothing asks for.
-- **The pwd (OSC 7) and the bell** come from slimed but aren't used: a
+- **The pwd (OSC 7) and the bell** come from slime but aren't used: a
   new tab doesn't start in the focused pane's directory, and the bell
   does nothing.
-- **Search and link detection** would run in slimed, over the terminal
+- **Search and link detection** would run in slime, over the terminal
   it holds, with matches marked in frames as the selection is.
 
 - **A pane can't be dragged to another tab**, or out into a tab of its
-  own: slimed's Layout only rearranges a tab's own panes, so that needs
+  own: slime's Layout only rearranges a tab's own panes, so that needs
   a message that moves a pane between tabs.
 - **Pane keys unzoom.** Moving focus or resizing from the keyboard while
   a pane is zoomed shows every pane again; there's no Ghostty
@@ -223,32 +223,32 @@ reconnects, reattaches, and replaces them.
   Holding resizes until the drag ends would need the panes drawn
   scaled or cropped meanwhile.
 - **Every pane shares the window's font size.** Panes keep their own
-  cell size in slimed's layout, but the window draws them all from one
+  cell size in slime's layout, but the window draws them all from one
   font grid, and Ctrl+= resizes every pane.
 - **Zoom is the window's**, not the workspace's: it's lost on reattach,
   and the zoomed pane's pty takes the whole tab's size meanwhile.
 - **A tab a script adds** goes at the end of the Local rows, not where
-  slimed lists it.
+  slime lists it.
 - **Workspaces have no UI**: no list to attach or detach one, create or
   rename one, or see which window has one. A window takes the most
   recently detached at startup and can't change it.
 - **A workspace another window took** ("attached elsewhere") leaves its
   panes saying so; they can only be closed.
-- **Daemon copies pile up.** slime runs slimed from a copy in
+- **Daemon copies pile up.** slime-gui runs slime from a copy in
   `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
   doesn't block the next install, and never deletes old ones.
 
-- **New panes take slimed's environment**, from whichever slime started
+- **New panes take slime's environment**, from whichever slime-gui started
   it, not the window's.
-- **Only Linux hosts on x86-64.** Others get a tab saying slimed can't
-  run there: slimed would need libghostty-vt built for them with Zig,
+- **Only Linux hosts on x86-64.** Others get a tab saying slime can't
+  run there: slime would need libghostty-vt built for them with Zig,
   and `remote/` carries none.
-- **Nothing shows while a host's slimed starts.** The stand-in is blank
+- **Nothing shows while a host's slime starts.** The stand-in is blank
   between logging in and the panes coming, which on a first install
   includes sending about 3 MiB.
-- **Builds pile up on hosts**, one `slimed-<build>` per slime build in
-  `~/.cache/slime`, never removed.
-- **A host's daemon from an older build keeps serving.** A slime whose
+- **Builds pile up on hosts**, one `slime-<build>` per slime-gui build in
+  `~/.cache/slime/bin`, never removed.
+- **A host's daemon from an older build keeps serving.** A slime-gui whose
   protocol or frame layout differs can't attach there until that daemon
   exits, which is when its panes have all ended.
 
@@ -258,7 +258,7 @@ reconnects, reattaches, and replaces them.
 - **A host's panes take the environment of the SSH session that started
   its daemon**, so `SSH_CONNECTION` and the like go stale once that
   connection's gone.
-- **Login notices** (banners, "Permanently added") go to slimed's log,
+- **Login notices** (banners, "Permanently added") go to slime's log,
   there being no terminal yet to print them in.
 - **Nothing reconnects by itself** when a host's connection drops. The
   daemon has the destination and could retry and reopen the bridges.

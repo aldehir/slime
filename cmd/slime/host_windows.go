@@ -36,7 +36,7 @@ func hostCommands() []*cobra.Command {
 		Use:   "connect <destination>",
 		Short: "Log in to a host and keep the connection in the daemon",
 		Long: "Logs in to destination ([user@]host[:port], ssh://[user@]host[:port], or a Host\n" +
-			"from ~/.ssh/config), answering its prompts on this console, and puts slimed\n" +
+			"from ~/.ssh/config), answering its prompts on this console, and puts slime\n" +
 			"there. The daemon keeps the connection for windows to use.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -116,7 +116,7 @@ func hostList(c *daemon.Client) (*daemon.Hosts, error) {
 		case *daemon.Hosts:
 			return m, nil
 		case *daemon.Error:
-			return nil, fmt.Errorf("slimed: %s", m.Message)
+			return nil, fmt.Errorf("slime: %s", m.Message)
 		}
 	}
 }

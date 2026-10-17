@@ -30,19 +30,19 @@ func dialHost(t *testing.T, host *fakeHost) *Conn {
 	return d.expectConnected()
 }
 
-// bridge is slime's end of a `slimed connect` session: what it writes
-// goes to the host's slimed, and what slimed sends comes back.
+// bridge is the client's end of a `slime connect` session: what it writes
+// goes to the host's slime, and what that sends comes back.
 type bridge struct {
 	in  *io.PipeWriter
 	out *io.PipeReader
-	sl  *Slimed
+	sl  *Daemon
 }
 
 func startBridge(t *testing.T, conn *Conn, term string) (*bridge, error) {
 	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	sl, err := conn.StartSlimed(term, inR, outW, nil)
+	sl, err := conn.StartDaemon(term, inR, outW, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +73,7 @@ func (b *bridge) echo(t *testing.T, s string) {
 	}
 }
 
-func TestSlimedInstallsThenBridges(t *testing.T) {
+func TestDaemonInstallsThenBridges(t *testing.T) {
 	needPayload(t)
 	host := &fakeHost{uname: "Linux x86_64"}
 	conn := dialHost(t, host)
@@ -82,9 +82,9 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b.echo(t, "hello slimed")
+	b.echo(t, "hello slime")
 	build, _ := testRemote().For("linux", "amd64")
-	exe := "/home/alde/.cache/slime/slimed-" + build.ID
+	exe := "/home/alde/.cache/slime/bin/slime-" + build.ID
 	host.mu.Lock()
 	got, ok := host.installed[exe]
 	connects := host.connects
@@ -110,7 +110,7 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 		t.Errorf("probed %d times", probes)
 	}
 
-	// Hanging up our end ends slimed there cleanly.
+	// Hanging up our end ends slime there cleanly.
 	b2.in.Close()
 	if err := b2.sl.Wait(); err != nil {
 		t.Errorf("Wait after hanging up = %v", err)
@@ -122,14 +122,14 @@ func TestSlimedInstallsThenBridges(t *testing.T) {
 	}
 }
 
-func TestSlimedFoundNotInstalled(t *testing.T) {
+func TestDaemonFoundNotInstalled(t *testing.T) {
 	needPayload(t)
 	build, _ := testRemote().For("linux", "amd64")
-	exe := "/home/alde/.cache/slime/slimed-" + build.ID
+	exe := "/home/alde/.cache/slime/bin/slime-" + build.ID
 	host := &fakeHost{uname: "Linux x86_64", installed: map[string][]byte{exe: nil}}
 	conn := dialHost(t, host)
-	if got, err := conn.EnsureSlimed(nil); err != nil || got != exe {
-		t.Fatalf("EnsureSlimed = %q, %v; want %q", got, err, exe)
+	if got, err := conn.EnsureDaemon(nil); err != nil || got != exe {
+		t.Fatalf("EnsureDaemon = %q, %v; want %q", got, err, exe)
 	}
 	host.mu.Lock()
 	defer host.mu.Unlock()
@@ -138,15 +138,15 @@ func TestSlimedFoundNotInstalled(t *testing.T) {
 	}
 }
 
-// Where slimed can't run, setting it up fails and says why; the
+// Where slime can't run, setting it up fails and says why; the
 // connection stays up.
-func TestSlimedUnsupported(t *testing.T) {
+func TestDaemonUnsupported(t *testing.T) {
 	for _, tc := range []struct {
 		name, uname, installErr, want string
 	}{
-		{"os", "FreeBSD amd64", "", "slimed doesn't run on FreeBSD amd64"},
-		{"no build", "Darwin arm64", "", "no build of slimed for darwin/arm64"},
-		{"install", "Linux x86_64", "sh: gzip: not found", "installing slimed: sh: gzip: not found"},
+		{"os", "FreeBSD amd64", "", "slime doesn't run on FreeBSD amd64"},
+		{"no build", "Darwin arm64", "", "no build of slime for darwin/arm64"},
+		{"install", "Linux x86_64", "sh: gzip: not found", "installing slime: sh: gzip: not found"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.uname == "Linux x86_64" {
@@ -155,11 +155,11 @@ func TestSlimedUnsupported(t *testing.T) {
 			host := &fakeHost{uname: tc.uname, installErr: tc.installErr}
 			conn := dialHost(t, host)
 			var status []string
-			_, err := conn.EnsureSlimed(func(s string) { status = append(status, s) })
+			_, err := conn.EnsureDaemon(func(s string) { status = append(status, s) })
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("EnsureSlimed = %v, want %q", err, tc.want)
+				t.Fatalf("EnsureDaemon = %v, want %q", err, tc.want)
 			}
-			if tc.installErr != "" && (len(status) != 1 || status[0] != "installing slimed") {
+			if tc.installErr != "" && (len(status) != 1 || status[0] != "installing slime") {
 				t.Errorf("status = %q", status)
 			}
 			select {
@@ -171,9 +171,9 @@ func TestSlimedUnsupported(t *testing.T) {
 	}
 }
 
-// slimed failing on the host (it couldn't start its daemon, say) is a
-// SlimedError with its last line of stderr.
-func TestSlimedFails(t *testing.T) {
+// slime failing on the host (it couldn't start its daemon, say) is a
+// DaemonError with its last line of stderr.
+func TestDaemonFails(t *testing.T) {
 	needPayload(t)
 	host := &failingHost{fakeHost{uname: "Linux x86_64"}}
 	srv := startServer(t, sshtest.Options{Password: password, Exec: host.exec})
@@ -181,22 +181,22 @@ func TestSlimedFails(t *testing.T) {
 	d.expectPrompt(PromptPassword)
 	d.answer(ChoiceAccept, password)
 	conn := d.expectConnected()
-	sl, err := conn.StartSlimed("", strings.NewReader(""), io.Discard, nil)
+	sl, err := conn.StartDaemon("", strings.NewReader(""), io.Discard, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var failed *SlimedError
-	if err := sl.Wait(); !errors.As(err, &failed) || failed.Why != "slimed: no socket directory" {
+	var failed *DaemonError
+	if err := sl.Wait(); !errors.As(err, &failed) || failed.Why != "slime: no socket directory" {
 		t.Errorf("Wait = %v", err)
 	}
 }
 
-// failingHost's slimed exits with an error instead of bridging.
+// failingHost's slime exits with an error instead of bridging.
 type failingHost struct{ fakeHost }
 
 func (f *failingHost) exec(command string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if strings.Contains(command, " connect --term ") {
-		io.WriteString(stderr, "slimed: no socket directory\n")
+		io.WriteString(stderr, "slime: no socket directory\n")
 		return 1
 	}
 	return f.fakeHost.exec(command, stdin, stdout, stderr)

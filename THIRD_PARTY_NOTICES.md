@@ -1,10 +1,11 @@
 # Third-party notices
 
 slime is built on [libghostty-vt](https://github.com/ghostty-org/ghostty),
-the terminal emulation core of Ghostty, which is compiled into the
-executable. Ghostty's bundled color themes are also installed alongside it,
+the terminal emulation core of Ghostty, which is compiled into both
+executables, `slime.exe` (the daemon) and `slime-gui.exe` (the window).
+Ghostty's bundled color themes are also installed alongside them,
 and its sprite drawing code (box drawing, blocks, and similar glyphs) is
-vendored in `src/font/sprite`.
+vendored in `clients/gui/src/font/sprite`.
 
 ## Ghostty
 
@@ -97,13 +98,13 @@ slime ships `conpty.dll` and `OpenConsole.exe` from the
 package, built from [microsoft/terminal](https://github.com/microsoft/terminal)
 under the MIT License, Copyright (c) Microsoft Corporation.
 
-## slimed
+## slime.exe
 
-`slimed.exe` is written in Go, and statically links the Go standard
+`slime.exe` is written in Go, and statically links the Go standard
 library and the modules below, unmodified. It also links libghostty-vt
 (above) as a static library, with the C runtime Zig provides for each
 target: MinGW-w64's on Windows, musl on Linux (see below). Builds of
-`slimed` for Linux sit beside it in `remote/`, to install on SSH hosts.
+`slime` for Linux sit beside it in `remote/`, to install on SSH hosts.
 
 The Go standard library, [golang.org/x/crypto](https://go.googlesource.com/crypto),
 [golang.org/x/sys](https://go.googlesource.com/sys), and
@@ -200,7 +201,7 @@ SOFTWARE.
 ```
 
 [creack/pty](https://github.com/creack/pty), in the Linux builds of
-`slimed`:
+`slime`:
 
 ```
 Copyright (c) 2011 Keith Rarick
@@ -410,7 +411,7 @@ Copyright 2022 Alan Shreve, are licensed under the Apache License 2.0:
       of your accepting any such warranty or additional liability.
 ```
 
-[musl](https://musl.libc.org/), linked into the Linux builds of `slimed`,
+[musl](https://musl.libc.org/), linked into the Linux builds of `slime`,
 is licensed as follows:
 
 ```
@@ -439,7 +440,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 The [MinGW-w64](https://www.mingw-w64.org/) runtime, linked into
-`slimed.exe`, is licensed as follows:
+`slime.exe`, is licensed as follows:
 
 ```
 With exception of certain parts that are prominently marked as being

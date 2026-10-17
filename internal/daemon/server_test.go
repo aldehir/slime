@@ -189,7 +189,7 @@ func (h *harness) connect() *Client {
 	return c
 }
 
-// window is a client playing slime: it owns workspaces and mirrors their
+// window is a client playing the GUI: it owns workspaces and mirrors their
 // panes' screens from the frames it's sent, acking each.
 type window struct {
 	t       *testing.T
@@ -406,7 +406,7 @@ func TestWireRoundTrip(t *testing.T) {
 		&HostList{},
 		&Bridge{Term: "xterm-ghostty"},
 		&Hosts{Hosts: []HostInfo{{ID: 11, Dest: "dev1", State: HostConnected}, {ID: 12, Dest: "dev2", State: HostFailed, Text: "Permission denied"}}},
-		&HostState{Tag: 13, Dest: "dev1", State: HostConnecting, Text: "installing slimed"},
+		&HostState{Tag: 13, Dest: "dev1", State: HostConnecting, Text: "installing slime"},
 		&Prompt{Kind: PromptInteractive, Title: "Sign in", Text: "body", Detail: "SHA256:x", Error: "try again", Questions: []Question{{Label: "Password: "}, {Label: "Code: ", Echo: true}}},
 	}
 	var stream bytes.Buffer

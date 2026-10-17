@@ -1,7 +1,7 @@
-// slimed keeps terminals alive while no window shows them: it owns
+// slime keeps terminals alive while no window shows them: it owns
 // each pane's pty and terminal state, arranged in tabs and workspaces,
 // and a window attaches a workspace to draw the frames of its panes.
-// slime is the client; the other commands here script workspaces and
+// slime-gui is the window; the other commands here script workspaces and
 // look at them from a console.
 package main
 
@@ -29,7 +29,7 @@ import (
 
 func main() {
 	log.SetFlags(0)
-	log.SetPrefix("slimed: ")
+	log.SetPrefix("slime: ")
 	if err := newCommand().Execute(); err != nil {
 		log.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func main() {
 
 func newCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "slimed",
+		Use:           "slime",
 		Short:         "Keep terminals alive between attaches",
 		Version:       fmt.Sprintf("protocol %d", daemon.Version),
 		SilenceErrors: true,
@@ -91,8 +91,8 @@ func serveCommand() *cobra.Command {
 			return serve(logger, idle, hosts)
 		},
 	}
-	cmd.Flags().StringVar(&conptyDir, "conpty", "", "directory holding conpty.dll (default: next to slimed.exe, else the system's)")
-	cmd.Flags().StringVar(&remoteDir, "remote", "", "directory holding the builds of slimed for hosts and their manifest (default: remote/ next to slimed.exe)")
+	cmd.Flags().StringVar(&conptyDir, "conpty", "", "directory holding conpty.dll (default: next to slime.exe, else the system's)")
+	cmd.Flags().StringVar(&remoteDir, "remote", "", "directory holding the builds of slime for hosts and their manifest (default: remote/ next to slime.exe)")
 	cmd.Flags().StringVar(&termName, "term", "", "TERM for panes on Unix (default xterm-256color)")
 	cmd.Flags().DurationVar(&idle, "idle", 10*time.Second, "exit after this long with no workspaces and no clients (0 never)")
 	cmd.Flags().StringVar(&logPath, "log", "", "append logs to this file instead of stderr")
@@ -107,7 +107,7 @@ func serve(logger *slog.Logger, idle time.Duration, hosts daemon.HostOptions) er
 	}
 	l, err := daemon.Listen(name)
 	if err != nil {
-		return fmt.Errorf("listening on %s (is slimed already running?): %w", name, err)
+		return fmt.Errorf("listening on %s (is slime already running?): %w", name, err)
 	}
 	ctx := context.Background()
 	rt, err := vt.NewRuntime(ctx, logger)
@@ -129,7 +129,7 @@ func connectCommand() *cobra.Command {
 		Use:   "connect",
 		Short: "Bridge stdin and stdout to the daemon, starting it if needed",
 		Long: "Copies stdin to the daemon and the daemon's replies to stdout, for a client\n" +
-			"that can't reach the socket itself: slime runs it over an SSH exec channel.",
+			"that can't reach the socket itself: the local slime runs it over an SSH exec channel.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var serve []string
@@ -586,7 +586,7 @@ func dial(start bool, serve ...string) (net.Conn, error) {
 	cancel()
 	if err != nil && start && isNotRunning(err) {
 		if err := startDaemon(serve...); err != nil {
-			return nil, fmt.Errorf("starting slimed: %w", err)
+			return nil, fmt.Errorf("starting slime: %w", err)
 		}
 		deadline := time.Now().Add(5 * time.Second)
 		for {
@@ -601,7 +601,7 @@ func dial(start bool, serve ...string) (net.Conn, error) {
 	}
 	if err != nil {
 		if isNotRunning(err) {
-			return nil, fmt.Errorf("slimed isn't running")
+			return nil, fmt.Errorf("slime isn't running")
 		}
 		return nil, err
 	}

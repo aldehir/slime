@@ -1,5 +1,5 @@
-//! What slime draws for a pane: the frames slimed sends, applied. The
-//! codec is shared with slimed (internal/vt/frame.zig).
+//! What the window draws for a pane: the frames slime sends, applied. The
+//! codec is shared with slime (internal/vt/frame.zig).
 
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
@@ -9,7 +9,7 @@ pub const Codec = frame.Codec(ghostty_vt);
 pub const Screen = Codec.Screen;
 pub const Flags = frame.Flags;
 
-/// Input to send slimed: the codec it decodes with (event.zig).
+/// Input to send slime: the codec it decodes with (event.zig).
 pub const event = @import("event");
 pub const Events = event.Codec(ghostty_vt);
 
@@ -349,7 +349,7 @@ test "frames carry the mouse shape and whether to send motion" {
 test "max_len is the largest event" {
     var buf: std.Io.Writer.Allocating = .init(testing.allocator);
     defer buf.deinit();
-    // A settings event with every word boundary codepoint slimed has
+    // A settings event with every word boundary codepoint slime has
     // room for; more are cut.
     var words: [Events.max_word_boundary + 1]u21 = undefined;
     @memset(&words, 0x10FFFF);

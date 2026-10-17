@@ -111,7 +111,7 @@ fn appsUseLightTheme() bool {
 }
 
 /// The command to run in the terminal: our own command line after the
-/// program name, verbatim (`slime pwsh -NoLogo`), else the
+/// program name, verbatim (`slime-gui pwsh -NoLogo`), else the
 /// configured `command`, else %COMSPEC%.
 fn shellCommand(alloc: std.mem.Allocator, configured: ?[]const u8) ![:0]u16 {
     const args = argsAfterProgram(std.mem.span(win32.GetCommandLineW()));
@@ -177,7 +177,7 @@ test {
     _ = @import("Hosts.zig");
     _ = @import("Screen.zig");
     _ = @import("Session.zig");
-    _ = @import("Slimed.zig");
+    _ = @import("Daemon.zig");
     _ = @import("Tab.zig");
     _ = @import("ProgramStatus.zig");
     _ = @import("Login.zig");

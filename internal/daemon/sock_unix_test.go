@@ -15,7 +15,7 @@ import (
 
 // testAddr is a socket in a fresh private directory.
 func testAddr(t *testing.T) string {
-	dir := filepath.Join(t.TempDir(), "slimed")
+	dir := filepath.Join(t.TempDir(), "slime")
 	return filepath.Join(dir, "sock")
 }
 

@@ -20,7 +20,7 @@ const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
 const Tab = @import("Tab.zig");
-const Slimed = @import("Slimed.zig");
+const Daemon = @import("Daemon.zig");
 const Hosts = @import("Hosts.zig");
 const Login = @import("Login.zig");
 const Chrome = @import("chrome/Chrome.zig");
@@ -35,7 +35,7 @@ const class_name = std.unicode.utf8ToUtf16LeStringLiteral("slime");
 /// The icon resource in src/slime.rc.
 const icon_id = 1;
 
-/// Posted from slimed's reader when a session's pane ends: its child
+/// Posted from slime's reader when a session's pane ends: its child
 /// exited, or the pane was lost to us. WPARAM is the session's ID, as for
 /// the messages below.
 pub const WM_APP_CHILD_EXITED = win32.WM_APP + 0;
@@ -44,10 +44,10 @@ pub const WM_APP_TITLE_CHANGED = win32.WM_APP + 1;
 /// Posted from a reader thread when the child writes the clipboard, or
 /// a copy's text comes.
 pub const WM_APP_CLIPBOARD_WRITE = win32.WM_APP + 2;
-/// Posted from a slimed connection's reader when panes arrive for
-/// sessions (`Slimed.take`), and when a host's has attached or failed
+/// Posted from a daemon connection's reader when panes arrive for
+/// sessions (`Daemon.take`), and when a host's has attached or failed
 /// to.
-pub const WM_APP_SLIMED = win32.WM_APP + 4;
+pub const WM_APP_DAEMON = win32.WM_APP + 4;
 
 /// Room for the stats report, in UTF-16 units.
 const max_stats_len = 160;
@@ -120,7 +120,7 @@ shown: std.ArrayList(*Session) = .empty,
 /// Scratch for `render`.
 frame_panes: std.ArrayList(Renderer.Pane) = .empty,
 
-/// Auto-reset event slimed's readers set after handing a session a
+/// Auto-reset event slime's readers set after handing a session a
 /// frame (or program status). The message loop waits on it alongside
 /// messages and calls `outputArrived`. Not a posted message: those are
 /// retrieved before input and timers, so a steady stream of them starves
@@ -140,11 +140,11 @@ blink_visible: bool = true,
 /// while set.
 connect_field: ?Chrome.TextField = null,
 
-/// The connection to slimed: local sessions are panes of the workspace
+/// The connection to slime: local sessions are panes of the workspace
 /// it holds for this window. Null if it couldn't be reached.
-slimed: ?*Slimed = null,
-/// Connections to slimed on SSH hosts, bridged through the local daemon:
-/// a host's sessions are panes of the workspace its slimed holds for
+daemon: ?*Daemon = null,
+/// Connections to slime on SSH hosts, bridged through the local daemon:
+/// a host's sessions are panes of the workspace its slime holds for
 /// this window.
 remotes: std.ArrayList(Remote) = .empty,
 /// The hosts the local daemon knows, by its id for each, as it last
@@ -213,10 +213,10 @@ const Drop = struct {
     rect: Chrome.Rect,
 };
 
-/// A host's slimed, bridged through the local daemon. A session stands in
+/// A host's slime, bridged through the local daemon. A session stands in
 /// for its panes until they come (`standIn`).
 const Remote = struct {
-    conn: *Slimed,
+    conn: *Daemon,
     /// The daemon's id for the host.
     host: u32,
 };
@@ -226,7 +226,7 @@ const HostEntry = struct {
     id: u32,
     /// As the sidebar remembers it. Owned.
     dest: []const u16,
-    state: Slimed.HostStatus,
+    state: Daemon.HostStatus,
     /// A status line while connecting, or why it ended. Owned.
     text: []const u16,
     /// This window asked the daemon to connect it, so its prompts come
@@ -234,7 +234,7 @@ const HostEntry = struct {
     ours: bool = false,
 };
 
-/// Create the window, attaching the workspace slimed kept for it, or a
+/// Create the window, attaching the workspace slime kept for it, or a
 /// new one running `command_line` (CreateProcessW syntax). An `ssh://`
 /// URL opens that host instead, and is remembered in `hosts`. Local
 /// sessions opened later run `local_command`.
@@ -302,9 +302,9 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     // attaches the local workspace, and opens the host beside it.
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     const on_host = std.mem.startsWith(u16, command_line, ssh_scheme);
-    try self.connectSlimed(if (on_host) local_command else command_line);
+    try self.connectDaemon(if (on_host) local_command else command_line);
     errdefer self.destroyTabs();
-    if (self.slimed) |conn| conn.hostList();
+    if (self.daemon) |conn| conn.hostList();
     if (on_host) try self.openOnHost(try hosts.add(command_line));
     self.showTitle();
 
@@ -330,9 +330,9 @@ pub fn destroy(self: *Window) void {
         self.chrome.deinit();
         self.grid.deinit();
     }
-    // Hanging up detaches the workspace; slimed keeps it for the next
+    // Hanging up detaches the workspace; slime keeps it for the next
     // window.
-    if (self.slimed) |conn| conn.deinit();
+    if (self.daemon) |conn| conn.deinit();
     for (self.remotes.items) |r| r.conn.deinit();
     self.remotes.deinit(self.alloc);
     for (self.host_states.items) |e| {
@@ -356,7 +356,7 @@ fn destroyTabs(self: *Window) void {
     self.tabs.clearAndFree(self.alloc);
 }
 
-/// Free a tab and its sessions, which only lets go of slimed panes.
+/// Free a tab and its sessions, which only lets go of daemon panes.
 fn destroyTab(self: *Window, t: *Tab) void {
     var it = t.iterator();
     while (it.next()) |s| s.destroy();
@@ -383,7 +383,7 @@ fn findSession(self: *const Window, id: u32) ?Found {
 }
 
 /// The session showing `conn`'s pane `id`.
-fn slimedSession(self: *const Window, conn: *Slimed, id: u32) ?*Session {
+fn daemonSession(self: *const Window, conn: *Daemon, id: u32) ?*Session {
     for (self.tabs.items) |t| {
         if (t.conn != conn) continue;
         if (t.findPane(id)) |s| return s;
@@ -397,33 +397,33 @@ fn tabIndex(self: *const Window, t: *const Tab) ?usize {
 
 /// What a new session shows.
 const Target = union(enum) {
-    /// A pane of a workspace slimed holds for us.
-    slimed: struct { conn: *Slimed, arrival: *const Slimed.Arrival },
+    /// A pane of a workspace slime holds for us.
+    daemon: struct { conn: *Daemon, arrival: *const Daemon.Arrival },
     /// Nothing yet, on a host (its destination as the sidebar remembers
-    /// it): standing in for its slimed's panes until they come.
+    /// it): standing in for its slime's panes until they come.
     waiting: []const u16,
     /// Why nothing can run, titled `title`.
     failed: struct { title: []const u16, why: []const u8 },
 };
 
-/// Connect to slimed and attach the workspace detached last (a new one
+/// Connect to slime and attach the workspace detached last (a new one
 /// running `command` if none), making a tab of each of its tabs. If that
 /// fails, a tab says why.
-fn connectSlimed(self: *Window, command: []const u16) !void {
-    const conn = Slimed.connect(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.frameInterval(), self.slimedArea(), self.slimedSize(), command) catch |err| {
-        log.err("connecting to slimed failed: {}", .{err});
-        return self.spawnFailed("couldn't start slimed", err);
+fn connectDaemon(self: *Window, command: []const u16) !void {
+    const conn = Daemon.connect(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_DAEMON }, self.frameInterval(), self.daemonArea(), self.daemonSize(), command) catch |err| {
+        log.err("connecting to slime failed: {}", .{err});
+        return self.spawnFailed("couldn't start slime", err);
     };
-    self.slimed = conn;
-    self.slimedChanged(conn);
+    self.daemon = conn;
+    self.daemonChanged(conn);
     conn.start() catch |err| {
-        log.err("starting slimed's reader failed: {}", .{err});
+        log.err("starting slime's reader failed: {}", .{err});
         self.destroyTabs();
         conn.deinit();
-        self.slimed = null;
-        return self.spawnFailed("couldn't read from slimed", err);
+        self.daemon = null;
+        return self.spawnFailed("couldn't read from slime", err);
     };
-    if (self.tabs.items.len == 0) return self.spawnFailed("slimed showed nothing", error.NoPanes);
+    if (self.tabs.items.len == 0) return self.spawnFailed("slime showed nothing", error.NoPanes);
 }
 
 /// A local tab saying why nothing could run in it: `what`, failing with
@@ -434,7 +434,7 @@ fn spawnFailed(self: *Window, what: []const u8, err: anyerror) !void {
     try self.spawnSession(.{ .failed = .{ .title = std.unicode.utf8ToUtf16LeStringLiteral("slime"), .why = why } });
 }
 
-/// The least time between a pane's frames to ask slimed for, in
+/// The least time between a pane's frames to ask slime for, in
 /// microseconds: the display's refresh period.
 fn frameInterval(self: *const Window) u32 {
     const r = &(self.renderer orelse return 0);
@@ -445,7 +445,7 @@ fn frameInterval(self: *const Window) u32 {
 /// and lay out tabs as its workspace has them. A pane we asked for (a new
 /// tab or split) is shown and focused; others (a script's) are added
 /// without taking focus.
-fn slimedChanged(self: *Window, conn: *Slimed) void {
+fn daemonChanged(self: *Window, conn: *Daemon) void {
     var taken = conn.take();
     defer taken.deinit(self.alloc);
 
@@ -453,8 +453,8 @@ fn slimedChanged(self: *Window, conn: *Slimed) void {
     defer arrived.deinit(self.alloc);
     var requested: ?*Session = null;
     for (taken.arrivals) |*a| {
-        const s = self.createSession(.{ .slimed = .{ .conn = conn, .arrival = a } }, self.gridSize()) catch |err| {
-            log.err("showing slimed pane {d} failed: {}", .{ a.pane, err });
+        const s = self.createSession(.{ .daemon = .{ .conn = conn, .arrival = a } }, self.gridSize()) catch |err| {
+            log.err("showing daemon pane {d} failed: {}", .{ a.pane, err });
             conn.release(a.pane);
             continue;
         };
@@ -464,8 +464,8 @@ fn slimedChanged(self: *Window, conn: *Slimed) void {
         };
         if (a.requested) requested = s;
     }
-    if (taken.structure) |st| self.applyStructure(conn, st, &arrived) catch |err| log.err("laying out slimed's tabs failed: {}", .{err});
-    // Panes no tab holds (which slimed doesn't send) aren't shown.
+    if (taken.structure) |st| self.applyStructure(conn, st, &arrived) catch |err| log.err("laying out slime's tabs failed: {}", .{err});
+    // Panes no tab holds (which slime doesn't send) aren't shown.
     var left = arrived.valueIterator();
     while (left.next()) |s| {
         if (requested == s.*) requested = null;
@@ -490,7 +490,7 @@ fn slimedChanged(self: *Window, conn: *Slimed) void {
 /// have, add tabs we don't (at the end of their group), and drop tabs and
 /// panes it no longer has. Sessions placed from `arrived` are taken out
 /// of it.
-fn applyStructure(self: *Window, conn: *Slimed, st: *const Slimed.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
+fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
     const alloc = self.alloc;
     self.cancelDrag();
     const was_active: ?*Tab = if (self.tabs.items.len > 0) self.activeTab() else null;
@@ -498,10 +498,10 @@ fn applyStructure(self: *Window, conn: *Slimed, st: *const Slimed.Structure, arr
 
     const Lookup = struct {
         window: *Window,
-        conn: *Slimed,
+        conn: *Daemon,
         arrived: *std.AutoHashMapUnmanaged(u32, *Session),
         pub fn session(l: @This(), id: u32) ?*Session {
-            return l.arrived.get(id) orelse l.window.slimedSession(l.conn, id);
+            return l.arrived.get(id) orelse l.window.daemonSession(l.conn, id);
         }
     };
     const lookup: Lookup = .{ .window = self, .conn = conn, .arrived = arrived };
@@ -520,7 +520,7 @@ fn applyStructure(self: *Window, conn: *Slimed, st: *const Slimed.Structure, arr
     }
     try self.tabs.ensureUnusedCapacity(alloc, st.tabs.len);
 
-    // Panes of ours slimed no longer has, freed once no tree holds them.
+    // Panes of ours slime no longer has, freed once no tree holds them.
     var dropped: std.ArrayList(*Session) = .empty;
     defer dropped.deinit(alloc);
     for (self.tabs.items) |t| {
@@ -529,7 +529,7 @@ fn applyStructure(self: *Window, conn: *Slimed, st: *const Slimed.Structure, arr
         while (it.next()) |s| if (!used.contains(s)) try dropped.append(alloc, s);
     }
 
-    // Tabs slimed has panes of ours in, by id.
+    // Tabs slime has panes of ours in, by id.
     var kept: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer kept.deinit(alloc);
     for (st.tabs, roots) |lt, *root| {
@@ -562,7 +562,7 @@ fn applyStructure(self: *Window, conn: *Slimed, st: *const Slimed.Structure, arr
     };
     for (dropped.items) |s| s.destroy();
     var placed = used.keyIterator();
-    while (placed.next()) |s| if (s.*.slimedPane()) |id| {
+    while (placed.next()) |s| if (s.*.daemonPane()) |id| {
         _ = arrived.remove(id);
     };
 
@@ -579,8 +579,8 @@ fn applyStructure(self: *Window, conn: *Slimed, st: *const Slimed.Structure, arr
     self.activated();
 }
 
-/// The grid a slimed pane gets: the terminal area, as for any session.
-fn slimedSize(self: *const Window) Slimed.Size {
+/// The grid a daemon pane gets: the terminal area, as for any session.
+fn daemonSize(self: *const Window) Daemon.Size {
     const grid = self.gridSize();
     const cell = self.cellSizePx();
     return .{ .cols = grid.cols, .rows = grid.rows, .cell_width = cell.width, .cell_height = cell.height };
@@ -588,7 +588,7 @@ fn slimedSize(self: *const Window) Slimed.Size {
 
 /// The pixels a tab's panes share, inside the padding, and the cell size
 /// of panes that haven't said their own.
-fn slimedArea(self: *const Window) Slimed.Area {
+fn daemonArea(self: *const Window) Daemon.Area {
     const size = self.terminalSize();
     const pad = self.paddingPx();
     const cell = self.cellSizePx();
@@ -625,7 +625,7 @@ fn spawnSession(self: *Window, target: Target) !void {
 /// Start a session on `target` with a grid of `size`.
 fn createSession(self: *Window, target: Target, size: GridSize) !*Session {
     const launch: Session.Launch = switch (target) {
-        .slimed => |sl| .{ .slimed = .{ .conn = sl.conn, .arrival = sl.arrival } },
+        .daemon => |sl| .{ .daemon = .{ .conn = sl.conn, .arrival = sl.arrival } },
         .waiting => |dest| .{ .waiting = .{ .dest = dest, .title = Hosts.label(dest) } },
         .failed => |f| .{ .failed = .{ .title = f.title, .why = f.why } },
     };
@@ -688,7 +688,7 @@ fn standIn(self: *const Window, dest: []const u16) ?Found {
     for (self.tabs.items, 0..) |t, i| {
         var it = t.iterator();
         while (it.next()) |s| {
-            if (s.ended or s.slimedPane() != null) continue;
+            if (s.ended or s.daemonPane() != null) continue;
             const d = s.hostDest() orelse continue;
             if (std.mem.eql(u16, d, dest)) return .{ .tab = i, .s = s };
         }
@@ -704,27 +704,27 @@ fn newSession(self: *Window) void {
 /// A tab in sidebar group `g`: a local one, or one on a host.
 fn newSessionIn(self: *Window, g: usize) void {
     if (g != 0) return self.openOnHost(g - 1) catch |err| log.err("new session failed: {}", .{err});
-    // The tab comes when its pane does (WM_APP_SLIMED).
-    const conn = self.slimed orelse return self.connectSlimed(self.local_command) catch |err| log.err("new session failed: {}", .{err});
+    // The tab comes when its pane does (WM_APP_DAEMON).
+    const conn = self.daemon orelse return self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
     if (conn.isLost()) {
-        // Its tabs say how; slimed comes back with the next window.
-        return self.spawnFailed("lost slimed", error.Disconnected) catch |err| log.err("new session failed: {}", .{err});
+        // Its tabs say how; slime comes back with the next window.
+        return self.spawnFailed("lost slime", error.Disconnected) catch |err| log.err("new session failed: {}", .{err});
     }
-    conn.tabNew(self.local_command, self.slimedSize()) catch |err| log.err("new tab in slimed failed: {}", .{err});
+    conn.tabNew(self.local_command, self.daemonSize()) catch |err| log.err("new tab in slime failed: {}", .{err});
 }
 
 /// A session on remembered host `h`: a tab of the workspace the host's
-/// slimed holds for us, through the slimed we're attached to there, or
+/// slime holds for us, through the daemon we're attached to there, or
 /// else one we bridge to, once the daemon has the host connected. Until
 /// then a session stands in, where logging in asks what it needs; the
 /// panes replace it once they come (`remoteChanged`). A host the daemon
-/// can't connect, or slimed can't run on, gets the reason there; ssh.exe
+/// can't connect, or slime can't run on, gets the reason there; ssh.exe
 /// in a local tab still reaches it.
 fn openOnHost(self: *Window, h: usize) !void {
     const dest = self.hosts.items.items[h];
     if (self.remoteOn(dest)) |r| switch (r.conn.attachState()) {
-        // The tab comes when its pane does (WM_APP_SLIMED).
-        .attached => return r.conn.tabNew(&.{}, self.slimedSize()),
+        // The tab comes when its pane does (WM_APP_DAEMON).
+        .attached => return r.conn.tabNew(&.{}, self.daemonSize()),
         // Still attaching: show where.
         .connecting => {
             if (self.standIn(dest)) |found| self.activate(found.tab);
@@ -732,9 +732,9 @@ fn openOnHost(self: *Window, h: usize) !void {
         },
         .failed => {},
     };
-    const slimed = self.slimed orelse {
+    const daemon = self.daemon orelse {
         try self.spawnSession(.{ .waiting = dest });
-        self.activeSession().showEnded("no local slimed to connect through");
+        self.activeSession().showEnded("no local slime to connect through");
         return;
     };
     if (self.standIn(dest)) |found| {
@@ -753,7 +753,7 @@ fn openOnHost(self: *Window, h: usize) !void {
     };
     try self.spawnSession(.{ .waiting = dest });
     const s = self.activeSession();
-    _ = slimed.hostConnect(dest) catch |err| {
+    _ = daemon.hostConnect(dest) catch |err| {
         log.err("connecting to {f} failed: {}", .{ std.unicode.fmtUtf16Le(dest), err });
         s.showEnded(@errorName(err));
         return;
@@ -765,7 +765,7 @@ fn openOnHost(self: *Window, h: usize) !void {
     self.updateSpinner();
 }
 
-/// Our slimed on host `dest` that's attached, or attaching, and not lost.
+/// Our daemon on host `dest` that's attached, or attaching, and not lost.
 fn remoteOn(self: *Window, dest: []const u16) ?*Remote {
     for (self.remotes.items) |*r| {
         if (!std.mem.eql(u16, r.conn.hostDest().?, dest)) continue;
@@ -775,7 +775,7 @@ fn remoteOn(self: *Window, dest: []const u16) ?*Remote {
     return null;
 }
 
-/// Bridge to the slimed on host `e`, which the daemon has connected. A
+/// Bridge to the slime on host `e`, which the daemon has connected. A
 /// session stands in for its panes (one already, if logging in made it)
 /// until they come.
 fn bridgeHost(self: *Window, e: *HostEntry) !void {
@@ -786,19 +786,19 @@ fn bridgeHost(self: *Window, e: *HostEntry) !void {
     };
     const s = found.s;
     if (s.login != null) self.closeLogin(s);
-    const remote = Slimed.connectRemote(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_SLIMED }, self.frameInterval(), e.id, e.dest, Session.sshTerm(self.config), self.slimedArea(), self.slimedSize()) catch |err| {
-        log.err("bridging to slimed on {f} failed: {}", .{ std.unicode.fmtUtf16Le(e.dest), err });
+    const remote = Daemon.connectRemote(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_DAEMON }, self.frameInterval(), e.id, e.dest, Session.sshTerm(self.config), self.daemonArea(), self.daemonSize()) catch |err| {
+        log.err("bridging to slime on {f} failed: {}", .{ std.unicode.fmtUtf16Le(e.dest), err });
         s.showEnded(@errorName(err));
         return;
     };
     self.remotes.appendAssumeCapacity(.{ .conn = remote, .host = e.id });
 }
 
-/// Take up what slimed connections posted: panes that arrived, what the
+/// Take up what slime connections posted: panes that arrived, what the
 /// daemon said about hosts, and how attaching to hosts' went.
-fn slimedPosted(self: *Window) void {
-    if (self.slimed) |conn| {
-        self.slimedChanged(conn);
+fn daemonPosted(self: *Window) void {
+    if (self.daemon) |conn| {
+        self.daemonChanged(conn);
         self.hostsChanged(conn);
     }
     var i: usize = 0;
@@ -816,11 +816,11 @@ fn slimedPosted(self: *Window) void {
     self.pruneRemotes();
 }
 
-/// Take up what host's slimed `r` sent. Once its panes have come, they
-/// replace the session that stood in for them, and the tabs of slimeds
+/// Take up what host's slime `r` sent. Once its panes have come, they
+/// replace the session that stood in for them, and the tabs of daemons
 /// we lost on the host, which showed the same panes as they were.
 fn remoteChanged(self: *Window, r: *Remote) void {
-    self.slimedChanged(r.conn);
+    self.daemonChanged(r.conn);
     const dest = r.conn.hostDest().?;
     const found = self.standIn(dest) orelse return;
     // In tabs of their own by now.
@@ -844,7 +844,7 @@ fn remoteChanged(self: *Window, r: *Remote) void {
     if (show) self.activate(self.tabIndex(first).?);
 }
 
-/// Host's slimed `remotes[i]` couldn't attach: let it go. Its stand-in
+/// Host's slime `remotes[i]` couldn't attach: let it go. Its stand-in
 /// says why.
 fn remoteFailed(self: *Window, i: usize) void {
     const r = self.remotes.orderedRemove(i);
@@ -855,7 +855,7 @@ fn remoteFailed(self: *Window, i: usize) void {
     found.s.showEnded(r.conn.failure.text());
 }
 
-/// Let go of hosts' slimeds nothing shows any more: one whose stand-in
+/// Let go of hosts' daemons nothing shows any more: one whose stand-in
 /// was closed before its panes came, or whose tabs have all gone.
 fn pruneRemotes(self: *Window) void {
     var i: usize = 0;
@@ -875,7 +875,7 @@ fn pruneRemotes(self: *Window) void {
 /// Take up what the daemon said about hosts: keep each host's state,
 /// show its prompts and status in the session standing in for it, and
 /// bridge to it once it's connected.
-fn hostsChanged(self: *Window, conn: *Slimed) void {
+fn hostsChanged(self: *Window, conn: *Daemon) void {
     const events = conn.takeHosts();
     defer {
         for (events) |*e| e.deinit(self.alloc);
@@ -906,7 +906,7 @@ fn hostsChanged(self: *Window, conn: *Slimed) void {
 
 /// Record host `h`'s state, and act on it for the session standing in
 /// for the host, if one does.
-fn hostState(self: *Window, h: Slimed.HostInfo) void {
+fn hostState(self: *Window, h: Daemon.HostInfo) void {
     const e = self.hostEntryById(h.host) orelse e: {
         const dest = self.alloc.dupe(u16, h.dest) catch return;
         // A stand-in already logging in asked for this host.
@@ -963,30 +963,30 @@ fn loginFor(self: *Window, s: *Session, e: *const HostEntry) ?*Login {
 /// A stand-in is closing: if the daemon is logging in to its host for
 /// us, give up on that.
 fn standInClosing(self: *Window, s: *Session) void {
-    if (s.slimedPane() != null or s.ended) return;
+    if (s.daemonPane() != null or s.ended) return;
     const dest = s.hostDest() orelse return;
     const e = self.hostEntry(dest) orelse return;
-    const slimed = self.slimed orelse return;
-    if (e.state == .connecting and e.ours) slimed.hostDisconnect(e.id);
+    const daemon = self.daemon orelse return;
+    if (e.state == .connecting and e.ours) daemon.hostDisconnect(e.id);
 }
 
 /// What a new pane in `conn` runs: the local command, or for a host's,
 /// its shell.
-fn slimedCommand(self: *const Window, conn: *const Slimed) []const u16 {
+fn daemonCommand(self: *const Window, conn: *const Daemon) []const u16 {
     return if (conn.host() == null) self.local_command else &.{};
 }
 
 /// Split the active tab's pane `s`, starting a shell on side `dir` of
-/// it. The new pane comes from slimed (WM_APP_SLIMED).
-fn splitPane(self: *Window, s: *Session, dir: Slimed.Direction) void {
-    const pane = s.slimedPane() orelse return;
+/// it. The new pane comes from slime (WM_APP_DAEMON).
+fn splitPane(self: *Window, s: *Session, dir: Daemon.Direction) void {
+    const pane = s.daemonPane() orelse return;
     const t = self.activeTab();
     const conn = t.conn orelse return;
     if (t.zoom != null) {
         t.zoom = null;
         self.layoutTab(t);
     }
-    conn.split(pane, dir, self.slimedCommand(conn)) catch |err| log.err("split failed: {}", .{err});
+    conn.split(pane, dir, self.daemonCommand(conn)) catch |err| log.err("split failed: {}", .{err});
     self.dirty = true;
 }
 
@@ -1018,15 +1018,15 @@ fn gotoPane(self: *Window, to: binding.GotoSplit) void {
     const next = switch (to) {
         .previous => t.following(t.focus, false),
         .next => t.following(t.focus, true),
-        inline else => |side| t.neighbor(t.focus, @field(Slimed.Direction, @tagName(side))) orelse return,
+        inline else => |side| t.neighbor(t.focus, @field(Daemon.Direction, @tagName(side))) orelse return,
     };
     self.focusPane(next);
     self.dirty = true;
 }
 
 /// Move the divider beside the focused pane `cells` cells toward `side`,
-/// as dragging it would, and send slimed the tree.
-fn resizePane(self: *Window, side: Slimed.Direction, cells: u16) void {
+/// as dragging it would, and send slime the tree.
+fn resizePane(self: *Window, side: Daemon.Direction, cells: u16) void {
     const t = self.activeTab();
     self.unzoom(t);
     const d = t.dividerFor(t.focus, side) orelse return;
@@ -1041,7 +1041,7 @@ fn resizePane(self: *Window, side: Slimed.Direction, cells: u16) void {
     self.dirty = true;
 }
 
-/// Give the active tab's panes the same sizes, and send slimed the tree.
+/// Give the active tab's panes the same sizes, and send slime the tree.
 fn equalizePanes(self: *Window) void {
     const t = self.activeTab();
     if (t.count() < 2) return;
@@ -1051,7 +1051,7 @@ fn equalizePanes(self: *Window) void {
     self.dirty = true;
 }
 
-/// Start dragging divider `i` of the active tab, if slimed has its tree.
+/// Start dragging divider `i` of the active tab, if slime has its tree.
 fn startDrag(self: *Window, i: usize, pos: win32.POINT) void {
     const t = self.activeTab();
     if (t.conn == null or i >= t.dividers.items.len) return;
@@ -1084,7 +1084,7 @@ fn dragTo(self: *Window, d: Drag, pos: win32.POINT) void {
     self.dirty = true;
 }
 
-/// Let go of the dragged divider and send slimed the tree it left.
+/// Let go of the dragged divider and send slime the tree it left.
 fn endDrag(self: *Window) void {
     const d = self.drag orelse return;
     // First: releasing the capture comes back as WM_CAPTURECHANGED.
@@ -1094,7 +1094,7 @@ fn endDrag(self: *Window) void {
     self.sendLayout(d.tab);
 }
 
-/// Send slimed tab `t`'s tree, changed here.
+/// Send slime tab `t`'s tree, changed here.
 fn sendLayout(self: *Window, t: *const Tab) void {
     const conn = t.conn orelse return;
     var arena: std.heap.ArenaAllocator = .init(self.alloc);
@@ -1104,7 +1104,7 @@ fn sendLayout(self: *Window, t: *const Tab) void {
 }
 
 /// Drop a drag (of a divider or a pane) whose tree is about to change, as
-/// it stands: slimed's tree, or the pane closing, decides the layout now.
+/// it stands: slime's tree, or the pane closing, decides the layout now.
 fn cancelDrag(self: *Window) void {
     if (self.drag == null and self.pane_drag == null) return;
     self.drag = null;
@@ -1124,7 +1124,7 @@ fn startPaneDrag(self: *Window, s: *Session, pos: win32.POINT) void {
 
 /// Follow the mouse with the dragged pane: once it's gone past the
 /// system's drag distance, find where the pane would land. Only a tab of
-/// several slimed panes rearranges; others just took focus.
+/// several daemon panes rearranges; others just took focus.
 fn paneDragTo(self: *Window, d: *PaneDrag, pos: win32.POINT) void {
     if (d.tab.conn == null or d.tab.count() < 2) return;
     if (d.at == null) {
@@ -1164,7 +1164,7 @@ fn dropAt(self: *Window, d: *const PaneDrag, pos: win32.POINT) ?Drop {
     const area = self.chrome.paneArea(&self.chrome_layout);
     if (!area.contains(x, y)) return null;
     const band = self.chrome.px(24);
-    const edge: ?Slimed.Direction = if (x < area.x + band)
+    const edge: ?Daemon.Direction = if (x < area.x + band)
         .left
     else if (x >= area.right() - band)
         .right
@@ -1194,7 +1194,7 @@ fn dropAt(self: *Window, d: *const PaneDrag, pos: win32.POINT) ?Drop {
         .place = .{ .swap = target },
         .rect = f.inset(inset, inset),
     };
-    const side: Slimed.Direction = if (@abs(nx) > @abs(ny))
+    const side: Daemon.Direction = if (@abs(nx) > @abs(ny))
         (if (nx < 0) .left else .right)
     else
         (if (ny < 0) .up else .down);
@@ -1205,7 +1205,7 @@ fn dropAt(self: *Window, d: *const PaneDrag, pos: win32.POINT) ?Drop {
 }
 
 /// The half of `r` on `side`.
-fn half(r: Chrome.Rect, side: Slimed.Direction) Chrome.Rect {
+fn half(r: Chrome.Rect, side: Daemon.Direction) Chrome.Rect {
     return switch (side) {
         .left => .{ .x = r.x, .y = r.y, .w = @round(r.w / 2), .h = r.h },
         .right => .{ .x = r.x + @round(r.w / 2), .y = r.y, .w = r.w - @round(r.w / 2), .h = r.h },
@@ -1274,7 +1274,7 @@ fn closePane(self: *Window, ti: usize, s: *Session) void {
 fn closeTab(self: *Window, i: usize) void {
     self.cancelDrag();
     if (self.tabs.items.len <= 1) {
-        // Closing the window only detaches slimed's panes.
+        // Closing the window only detaches slime's panes.
         var it = self.tabs.items[i].iterator();
         while (it.next()) |s| {
             self.standInClosing(s);
@@ -1293,7 +1293,7 @@ fn closeTab(self: *Window, i: usize) void {
 }
 
 /// Take tab `i` out and free it with its sessions, which lets go of
-/// slimed's panes without ending them. Not the last tab.
+/// slime's panes without ending them. Not the last tab.
 fn dropTab(self: *Window, i: usize) void {
     const was_active = i == self.active;
     if (was_active) self.deactivate();
@@ -1416,7 +1416,7 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
 }
 
 /// Returns false if the action couldn't run: copy with no selection,
-/// paste with no text on the clipboard, a pane action in a tab slimed
+/// paste with no text on the clipboard, a pane action in a tab slime
 /// doesn't run.
 fn runAction(self: *Window, action: binding.Action) bool {
     const s = self.activeSession();
@@ -1438,11 +1438,11 @@ fn runAction(self: *Window, action: binding.Action) bool {
         .decrease_font_size => |pt| self.setFontSize(self.grid.size_pt - pt),
         .reset_font_size => self.setFontSize(self.config.@"font-size"),
         .new_split => |dir| self.splitPane(s, switch (dir) {
-            inline else => |d| @field(Slimed.Direction, @tagName(d)),
+            inline else => |d| @field(Daemon.Direction, @tagName(d)),
         }),
         .goto_split => |to| self.gotoPane(to),
         .resize_split => |r| self.resizePane(switch (r.direction) {
-            inline else => |d| @field(Slimed.Direction, @tagName(d)),
+            inline else => |d| @field(Daemon.Direction, @tagName(d)),
         }, r.amount),
         .equalize_splits => self.equalizePanes(),
         .toggle_split_zoom => if (self.activeTab().count() > 1 or self.activeTab().zoom != null) self.toggleZoom(s),
@@ -1634,19 +1634,19 @@ fn loginKey(self: *Window, vk: u32) bool {
 fn loginAction(self: *Window, action: Chrome.Dialog.Action) void {
     const s = self.activeSession();
     const login = s.login orelse return;
-    const slimed = self.slimed orelse return;
+    const daemon = self.daemon orelse return;
     const e = self.hostEntry(s.hostDest() orelse return) orelse return;
     switch (action) {
         .accept, .skip => {
             var buf: [Chrome.Dialog.max_fields][]const u16 = undefined;
-            const choice: Slimed.Choice = if (action == .accept) .accept else .skip;
-            slimed.hostAnswer(e.id, choice, login.answers(&buf)) catch |err| log.warn("answering failed: {}", .{err});
+            const choice: Daemon.Choice = if (action == .accept) .accept else .skip;
+            daemon.hostAnswer(e.id, choice, login.answers(&buf)) catch |err| log.warn("answering failed: {}", .{err});
             login.answered();
         },
         .cancel => {
             // A prompt takes it as its answer; while the server works on
             // one, it gives up on logging in.
-            slimed.hostAnswer(e.id, .cancel, &.{}) catch {};
+            daemon.hostAnswer(e.id, .cancel, &.{}) catch {};
             self.closeLogin(s);
         },
         .close => self.closeLogin(s),
@@ -1747,7 +1747,7 @@ fn view(self: *Window) Chrome.View {
             .rect = s.rect,
             .title = s.title(),
             .focused = s == tab.focus,
-            .splittable = s.slimedPane() != null,
+            .splittable = s.daemonPane() != null,
             .zoomable = several,
             .zoomed = tab.zoom == s,
             .bg = toColor(s.cells.default_bg),
@@ -2221,8 +2221,8 @@ fn layout(self: *Window) void {
 
     self.quiet_until = win32.GetTickCount64() + resize_quiet_ms;
     for (self.tabs.items) |t| self.layoutTab(t);
-    if (self.slimed) |conn| conn.resizeWorkspace(self.slimedArea());
-    for (self.remotes.items) |remote| if (remote.conn.attachState() == .attached) remote.conn.resizeWorkspace(self.slimedArea());
+    if (self.daemon) |conn| conn.resizeWorkspace(self.daemonArea());
+    for (self.remotes.items) |remote| if (remote.conn.attachState() == .attached) remote.conn.resizeWorkspace(self.daemonArea());
 
     // Render synchronously so live resize doesn't show stale frames.
     self.render();
@@ -2403,8 +2403,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         WM_APP_CHILD_EXITED => {
             const found = self.findSession(@intCast(wparam)) orelse return 0;
             const s = found.s;
-            // A slimed pane lost to us while it runs stays to say why.
-            if (s.slimedLoss()) |loss| {
+            // A daemon pane lost to us while it runs stays to say why.
+            if (s.daemonLoss()) |loss| {
                 if (!s.ended) s.showEnded(loss.text());
                 self.dirty = true;
                 return 0;
@@ -2413,8 +2413,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             return 0;
         },
 
-        WM_APP_SLIMED => {
-            self.slimedPosted();
+        WM_APP_DAEMON => {
+            self.daemonPosted();
             return 0;
         },
 

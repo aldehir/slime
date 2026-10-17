@@ -1,7 +1,7 @@
 // Package prompt talks to the user through a channel's terminal before
 // the remote shell exists, as ssh does for passwords and host keys.
 //
-// Input is what slime sends for keys with no terminal modes set: plain
+// Input is what the GUI sends for keys with no terminal modes set: plain
 // bytes, CR for Enter, DEL or BS for Backspace, and VT sequences for
 // cursor and function keys. Nothing translates output for us, so lines
 // end in CRLF.

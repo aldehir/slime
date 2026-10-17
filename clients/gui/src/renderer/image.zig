@@ -1,4 +1,4 @@
-//! Kitty graphics: the images slimed sent for a pane and where its last
+//! Kitty graphics: the images slime sent for a pane and where its last
 //! frame placed them, laid out for the renderer. Independent of the
 //! graphics API.
 const std = @import("std");
@@ -32,7 +32,7 @@ pub const Image = struct {
 pub const Layer = enum { below_bg, below_text, above_text };
 
 pub const Images = struct {
-    /// Every image slimed sent that no frame has dropped, by kitty image
+    /// Every image slime sent that no frame has dropped, by kitty image
     /// ID. The renderer keeps a texture of each.
     images: std.AutoArrayHashMapUnmanaged(u32, Image) = .empty,
     /// Placements in the viewport, in draw order (by z).
@@ -78,7 +78,7 @@ pub const Images = struct {
         img.rgba = null;
     }
 
-    /// Take an image slimed sent, in place of any with its id. Its
+    /// Take an image slime sent, in place of any with its id. Its
     /// pixels are owned from here, whether or not this fails.
     pub fn put(self: *Images, alloc: Allocator, id: u32, img: Image) !void {
         const gop = try self.images.getOrPut(alloc, id);

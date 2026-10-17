@@ -1,7 +1,7 @@
 # Smoke test: launch the app, screenshot it at two sizes, close it via
 # WM_CLOSE, and print its exit code and log.
 #
-#   .\scripts\smoke.ps1 -Out <dir> [-Exe zig-out\bin\slime.exe]
+#   .\scripts\smoke.ps1 -Out <dir> [-Exe zig-out\bin\slime-gui.exe]
 #
 # Writes <Out>\shot1.png (900x600), <Out>\shot2.png (1300x800) and
 # <Out>\stderr.txt. Resizing exercises swap chain resize and terminal reflow.
@@ -10,7 +10,7 @@
 # other slime windows that are open are left alone. Captures with
 # PrintWindow, which works even when the window is covered.
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot '..\zig-out\bin\slime.exe'),
+    [string]$Exe = (Join-Path $PSScriptRoot '..\zig-out\bin\slime-gui.exe'),
     [Parameter(Mandatory)][string]$Out
 )
 

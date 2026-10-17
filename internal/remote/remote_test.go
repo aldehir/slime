@@ -28,7 +28,7 @@ func TestLoad(t *testing.T) {
 	if !ok {
 		t.Fatal("no linux/amd64")
 	}
-	if b.ID != "0123456789abcdef" || b.Size != 1234 || b.Path != filepath.Join(dir, "slimed-linux-amd64.gz") {
+	if b.ID != "0123456789abcdef" || b.Size != 1234 || b.Path != filepath.Join(dir, "slime-linux-amd64.gz") {
 		t.Errorf("build %+v", b)
 	}
 	f, err := b.Open()

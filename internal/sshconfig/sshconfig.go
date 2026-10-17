@@ -1,5 +1,5 @@
 // Package sshconfig reads OpenSSH client configuration, ssh_config(5),
-// as far as slime-ssh uses it.
+// as far as slime uses it.
 //
 // Settings come from Host blocks whose patterns match the name given
 // on the command line (before HostName replaces it). For each keyword

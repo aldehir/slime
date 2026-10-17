@@ -1,5 +1,5 @@
-// Package sshbridge logs in to SSH hosts for slimed (Dial) and runs slimed
-// on them (Conn.StartSlimed), asking the user what logging in needs
+// Package sshbridge logs in to SSH hosts for slime (Dial) and runs slime
+// on them (Conn.StartDaemon), asking the user what logging in needs
 // through an Asker.
 package sshbridge
 
@@ -58,7 +58,7 @@ type Options struct {
 
 	// DialAgent connects to an SSH agent. Nil means no agent.
 	DialAgent func() (io.ReadWriteCloser, error)
-	// Remote holds the builds of slimed to install on hosts. Nil means
+	// Remote holds the builds of slime to install on hosts. Nil means
 	// the ones beside the executable (remote.Beside).
 	Remote *remote.Manifest
 }
@@ -85,9 +85,9 @@ type Conn struct {
 	// ghosttyTerm.
 	terminfo    bool
 	ghosttyTerm bool
-	// slimedExe is where slimed is on the host, once it's been found or
+	// daemonExe is where slime is on the host, once it's been found or
 	// installed there.
-	slimedExe string
+	daemonExe string
 
 	done chan struct{}
 	err  error

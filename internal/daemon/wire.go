@@ -8,7 +8,7 @@ import (
 	"io"
 )
 
-// The wire protocol between slime and slimed. A frame is a little-endian
+// The wire protocol between a client and the daemon. A frame is a little-endian
 // u32 length of what follows, a u8 type, a u32 pane id (0 when the message isn't about one pane; a host
 // id in the messages about one host), and a payload of fixed-size integers and strings (u32 length + bytes).
 // Decoders ignore bytes after the fields they know, so a later version
@@ -235,7 +235,7 @@ type Event struct{ Data []byte }
 // frame is Bridge.
 
 // HostConnect logs in to Dest (ssh://[user@]host[:port], [user@]host,
-// or a Host alias), puts slimed there, and reports with HostState; the
+// or a Host alias), puts slime there, and reports with HostState; the
 // one that answers carries Tag. A host already connected or connecting
 // answers at once with its state. Prompts while logging in go to the
 // sender only; if it hangs up, logging in is cancelled.
@@ -273,7 +273,7 @@ type HostDisconnect struct{}
 type HostList struct{}
 
 // Bridge, as a connection's first frame instead of Hello, splices the
-// connection to `slimed connect` on the host in the frame's id: every
+// connection to `slime connect` on the host in the frame's id: every
 // frame after it goes to the host's daemon, and its replies come back.
 // Term is the TERM for panes it starts (xterm-ghostty falls back where
 // the host lacks it). A bridge that can't be served gets Error and the
@@ -294,7 +294,7 @@ type HostInfo struct {
 
 // HostState reports a host's state to every client, as it changes; Tag
 // is set on the one answering a HostConnect. Text is a status line
-// while connecting (the server's, or ours: "installing slimed"), or why
+// while connecting (the server's, or ours: "installing slime"), or why
 // it failed, was lost, or went.
 type HostState struct {
 	Tag   uint32
@@ -322,7 +322,7 @@ func (s HostStatus) String() string {
 }
 
 const (
-	// HostConnecting: logging in or installing slimed.
+	// HostConnecting: logging in or installing slime.
 	HostConnecting HostStatus = iota + 1
 	HostConnected
 	// HostFailed: logging in or installing didn't work.

@@ -1,7 +1,7 @@
-// Package remote finds the slimed builds this program carries for other
+// Package remote finds the slime builds this program carries for other
 // systems, to install on hosts. `remote/manifest` beside the executable
 // names each as `os arch sha256 size`, one per line, and the build sits
-// beside it gzipped as slimed-<os>-<arch>.gz. build.zig writes them
+// beside it gzipped as slime-<os>-<arch>.gz. build.zig writes them
 // (src/build/pack.zig); a program without them has nothing to install.
 package remote
 
@@ -25,10 +25,10 @@ const ManifestName = "manifest"
 
 // Name is the file a build is kept in, here and on the host.
 func Name(goos, goarch string) string {
-	return fmt.Sprintf("slimed-%s-%s.gz", goos, goarch)
+	return fmt.Sprintf("slime-%s-%s.gz", goos, goarch)
 }
 
-// Build is slimed for one system.
+// Build is slime for one system.
 type Build struct {
 	OS, Arch string
 	// ID names this build: the first 16 hex digits of the gzipped

@@ -26,7 +26,7 @@ import (
 const hostPassword = "hunter2"
 
 // fakeHost answers the daemon's commands on a host: the probe, the
-// install (into memory), and `slimed connect`, which it bridges to a
+// install (into memory), and `slime connect`, which it bridges to a
 // second in-process Server playing the host's daemon.
 type fakeHost struct {
 	daemon *Server
@@ -42,7 +42,7 @@ func (f *fakeHost) exec(command string, stdin io.Reader, stdout, stderr io.Write
 	case strings.Contains(command, "uname -sm"):
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		fmt.Fprintf(stdout, "Linux x86_64\n/home/alde/.cache/slime\n")
+		fmt.Fprintf(stdout, "Linux x86_64\n/home/alde/.cache/slime/bin\n")
 		for _, name := range f.installed {
 			fmt.Fprintln(stdout, name)
 		}
@@ -94,7 +94,7 @@ func fakeRemote(t *testing.T) *remote.Manifest {
 	dir := t.TempDir()
 	var gz bytes.Buffer
 	w := gzip.NewWriter(&gz)
-	w.Write([]byte("#!/bin/sh\necho fake slimed\n"))
+	w.Write([]byte("#!/bin/sh\necho fake slime\n"))
 	w.Close()
 	sum := sha256.Sum256(gz.Bytes())
 	if err := os.WriteFile(filepath.Join(dir, remote.Name("linux", "amd64")), gz.Bytes(), 0o644); err != nil {
@@ -367,13 +367,13 @@ func TestHostConnectPrompts(t *testing.T) {
 	if st.Text != "" {
 		t.Errorf("connected with text %q", st.Text)
 	}
-	if !contains(texts, "installing slimed") {
+	if !contains(texts, "installing slime") {
 		t.Errorf("status lines %q lack the install", texts)
 	}
 	h.host.mu.Lock()
 	installed := h.host.installed
 	h.host.mu.Unlock()
-	if len(installed) != 1 || !strings.HasPrefix(installed[0], "slimed-") {
+	if len(installed) != 1 || !strings.HasPrefix(installed[0], "slime-") {
 		t.Errorf("installed %q", installed)
 	}
 

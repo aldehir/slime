@@ -37,7 +37,7 @@ var conptyDir string
 func SetTerm(string) {}
 
 // SetConptyDir loads conpty.dll from dir instead of from next to our
-// executable: slime runs slimed from a copy, and points it back at its
+// executable: slime-gui runs slime from a copy, and points it back at its
 // own. Call it before the first Start.
 func SetConptyDir(dir string) { conptyDir = dir }
 

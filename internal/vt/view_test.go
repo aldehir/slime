@@ -39,7 +39,7 @@ const (
 )
 
 // TestFrames checks the header of frames cut from a terminal; frame.zig's
-// own tests, in slime's, check the contents round trip.
+// own tests, in the GUI's, check the contents round trip.
 func TestFrames(t *testing.T) {
 	term := newTerm(t, 30, 5)
 	write(t, term, "hello\r\n\x1b[31mworld")
@@ -202,7 +202,7 @@ func BenchmarkFrameFull(b *testing.B) {
 	b.ReportMetric(float64(n), "frame-bytes")
 }
 
-// Events, encoded as event.zig lays them out. slime encodes them with
+// Events, encoded as event.zig lays them out. The GUI encodes them with
 // event.zig itself; these are the few the tests need.
 
 func evText(kind byte, s string) []byte { return append([]byte{kind}, s...) }

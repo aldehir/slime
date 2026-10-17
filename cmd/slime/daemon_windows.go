@@ -14,10 +14,10 @@ func isNotRunning(err error) bool {
 	return errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, os.ErrNotExist)
 }
 
-// startDaemon runs `slimed serve` with extra arguments so it outlives
+// startDaemon runs `slime serve` with extra arguments so it outlives
 // us: detached from our console, and out of our job object if we're in
-// one (slime puts its children in a kill-on-close job). Its log goes to
-// %LOCALAPPDATA%\slime\slimed.log.
+// one (slime-gui puts its children in a kill-on-close job). Its log goes to
+// %LOCALAPPDATA%\slime\slime.log.
 func startDaemon(extra ...string) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -27,7 +27,7 @@ func startDaemon(extra ...string) error {
 	if dir, err := os.UserCacheDir(); err == nil {
 		dir = filepath.Join(dir, "slime")
 		if os.MkdirAll(dir, 0o700) == nil {
-			args = append(args, "--log", filepath.Join(dir, "slimed.log"))
+			args = append(args, "--log", filepath.Join(dir, "slime.log"))
 		}
 	}
 	const flags = windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP

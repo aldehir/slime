@@ -59,7 +59,7 @@ import (
 )
 
 // FrameLayout identifies the frame encoding (frame.zig) and the cell
-// and style layouts it copies. slime decodes frames only from a daemon
+// and style layouts it copies. A client decodes frames only from a daemon
 // whose FrameLayout matches its own.
 func FrameLayout() uint64 { return uint64(C.slime_vt_frame_layout()) }
 

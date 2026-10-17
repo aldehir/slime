@@ -1,6 +1,6 @@
-//! Packs the slimed builds for other systems into the `remote` directory
+//! Packs the slime builds for other systems into the `remote` directory
 //! that goes beside the exe (internal/remote): each gzipped as
-//! slimed-<os>-<arch>.gz, and a manifest naming them, one per line as
+//! slime-<os>-<arch>.gz, and a manifest naming them, one per line as
 //! `os arch sha256 size`. build.zig runs it on the host:
 //!
 //!   pack <out-dir> [<os> <arch> <exe>]...
@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
         const gz = try gzip(arena, exe);
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(gz, &digest, .{});
-        const name = try std.fmt.allocPrint(arena, "slimed-{s}-{s}.gz", .{ os_name, arch });
+        const name = try std.fmt.allocPrint(arena, "slime-{s}-{s}.gz", .{ os_name, arch });
         try out_dir.writeFile(io, .{ .sub_path = name, .data = gz });
         try manifest.writer.print("{s} {s} {x} {d}\n", .{ os_name, arch, &digest, gz.len });
     }

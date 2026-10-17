@@ -1,24 +1,24 @@
 //! A row of the sidebar: one or more panes (sessions) laid out in a tree,
-//! as slimed keeps them (internal/daemon/layout.go). Splits share
+//! as slime keeps them (internal/daemon/layout.go). Splits share
 //! their space between children by basis points, along a row or down a
 //! column; a tab's panes and the dividers between them tile its area.
 //!
-//! slimed owns a split tab's layout: the window asks it to split or close
+//! slime owns a split tab's layout: the window asks it to split or close
 //! panes and takes the tree it sends back (`fromLayout`). A session that
-//! doesn't run in slimed is a tab of its own, one pane. Each slimed, the
+//! doesn't run in slime is a tab of its own, one pane. Each slime, the
 //! local one or a host's, numbers its own tabs.
 const Tab = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Session = @import("Session.zig");
-const Slimed = @import("Slimed.zig");
+const Daemon = @import("Daemon.zig");
 const Rect = @import("renderer/Painter.zig").Rect;
 
-/// slimed's id for the tab, or 0 for a session of its own.
+/// slime's id for the tab, or 0 for a session of its own.
 id: u32,
-/// The slimed whose tab it is, or null for a session of its own.
-conn: ?*Slimed = null,
+/// The daemon whose tab it is, or null for a session of its own.
+conn: ?*Daemon = null,
 root: Node,
 /// The pane that gets the keys.
 focus: *Session,
@@ -30,7 +30,7 @@ folded: bool = false,
 /// Between panes, from the last `place`.
 dividers: std.ArrayList(Divider) = .empty,
 
-pub const Axis = Slimed.Axis;
+pub const Axis = Daemon.Axis;
 
 pub const Node = union(enum) {
     pane: *Session,
@@ -49,7 +49,7 @@ pub const Child = struct {
     node: Node,
 };
 
-pub fn create(alloc: Allocator, conn: ?*Slimed, id: u32, root: Node, focus: *Session) !*Tab {
+pub fn create(alloc: Allocator, conn: ?*Daemon, id: u32, root: Node, focus: *Session) !*Tab {
     const self = try alloc.create(Tab);
     self.* = .{ .id = id, .conn = conn, .root = root, .focus = focus };
     return self;
@@ -62,7 +62,7 @@ pub fn destroy(self: *Tab, alloc: Allocator) void {
     alloc.destroy(self);
 }
 
-/// Swap in a new tree from slimed, keeping focus and zoom on panes still
+/// Swap in a new tree from slime, keeping focus and zoom on panes still
 /// in it. Frees the old tree.
 pub fn setRoot(self: *Tab, alloc: Allocator, root: Node) void {
     freeNode(alloc, self.root);
@@ -98,7 +98,7 @@ pub fn iterator(self: *const Tab) Iterator {
 
 pub const Iterator = struct {
     single: ?*Session = null,
-    /// slimed's trees are at most 32 deep.
+    /// slime's trees are at most 32 deep.
     stack: [34]struct { children: []const Child, next: usize = 0 } = undefined,
     len: usize = 0,
 
@@ -128,10 +128,10 @@ pub const Iterator = struct {
     }
 };
 
-/// The pane showing slimed's pane `id`.
+/// The pane showing slime's pane `id`.
 pub fn findPane(self: *const Tab, id: u32) ?*Session {
     var it = self.iterator();
-    while (it.next()) |s| if (s.slimedPane() == id) return s;
+    while (it.next()) |s| if (s.daemonPane() == id) return s;
     return null;
 }
 
@@ -190,7 +190,7 @@ pub fn first(node: Node) *Session {
     };
 }
 
-/// Take `s` out of the tree, as slimed will once it hears: its siblings
+/// Take `s` out of the tree, as slime will once it hears: its siblings
 /// share its space, and a split left with one child gives way to it.
 /// Returns the pane nearest to where it was, to focus, or null if it was
 /// the tab's last.
@@ -210,7 +210,7 @@ fn removeNode(alloc: Allocator, node: *Node, s: *const Session) ?*Session {
     for (sp.children, 0..) |*c, i| switch (c.node) {
         .pane => |p| if (p == s) {
             const rest = alloc.alloc(Child, sp.children.len - 1) catch {
-                // Leave it in, sharing nothing: slimed's tree replaces
+                // Leave it in, sharing nothing: slime's tree replaces
                 // this one soon.
                 c.share = 0;
                 return first(sp.children[if (i == 0) 1 else i - 1].node);
@@ -237,9 +237,9 @@ pub const Place = union(enum) {
     /// Where this pane is, which takes its place.
     swap: *Session,
     /// On `side` of `target`, taking half its space.
-    beside: struct { target: *Session, side: Slimed.Direction },
+    beside: struct { target: *Session, side: Daemon.Direction },
     /// Along the tab's whole `side`, taking half the tab.
-    edge: Slimed.Direction,
+    edge: Daemon.Direction,
 };
 
 /// Move pane `s` to `to`, and focus it. The tree changes whole or not at
@@ -325,11 +325,11 @@ fn parentOf(node: *Node, s: *const Session) ?struct { split: *Split, index: usiz
     return null;
 }
 
-fn axisOf(side: Slimed.Direction) Axis {
+fn axisOf(side: Daemon.Direction) Axis {
     return if (side == .right or side == .left) .row else .column;
 }
 
-fn after(side: Slimed.Direction) bool {
+fn after(side: Daemon.Direction) bool {
     return side == .right or side == .down;
 }
 
@@ -345,7 +345,7 @@ fn insertChild(alloc: Allocator, sp: *Split, at: usize, child: Child) !void {
 
 /// Put `s` on `side` of `target`: into the split holding it if that runs
 /// the same way, sharing its space, else in a new split with it.
-fn insertBeside(alloc: Allocator, root: *Node, s: *Session, target: *Session, side: Slimed.Direction) !void {
+fn insertBeside(alloc: Allocator, root: *Node, s: *Session, target: *Session, side: Daemon.Direction) !void {
     const axis = axisOf(side);
     if (parentOf(root, target)) |p| if (p.split.axis == axis) {
         const t = &p.split.children[p.index];
@@ -361,7 +361,7 @@ fn insertBeside(alloc: Allocator, root: *Node, s: *Session, target: *Session, si
 }
 
 /// Put `s` along `side` of the whole tree, taking half of it.
-fn insertEdge(alloc: Allocator, root: *Node, s: *Session, side: Slimed.Direction) !void {
+fn insertEdge(alloc: Allocator, root: *Node, s: *Session, side: Daemon.Direction) !void {
     const axis = axisOf(side);
     switch (root.*) {
         .split => |*sp| if (sp.axis == axis) {
@@ -433,7 +433,7 @@ fn placeNode(self: *Tab, alloc: Allocator, node: *Node, r: Rect, gap: f32) !void
 /// The pane next to `from` on `side`, as the last `place` drew them: of
 /// those past that edge and level with it, the nearest, then the one
 /// most in line with it.
-pub fn neighbor(self: *const Tab, from: *const Session, side: Slimed.Direction) ?*Session {
+pub fn neighbor(self: *const Tab, from: *const Session, side: Daemon.Direction) ?*Session {
     const f = from.frame;
     const along = axisOf(side) == .row;
     var best: ?*Session = null;
@@ -485,7 +485,7 @@ pub fn following(self: *const Tab, from: *const Session, forward: bool) *Session
 /// The divider that resizing `s` toward `side` moves, from the last
 /// `place`: the nearest on that side of it, across that way, else the
 /// nearest on the other.
-pub fn dividerFor(self: *const Tab, s: *const Session, side: Slimed.Direction) ?Divider {
+pub fn dividerFor(self: *const Tab, s: *const Session, side: Daemon.Direction) ?Divider {
     var found: [2]?DividerAt = .{ null, null };
     _ = dividerIn(&self.root, s, axisOf(side), after(side), &found);
     const at = found[0] orelse found[1] orelse return null;
@@ -595,17 +595,17 @@ pub const Divider = struct {
     }
 };
 
-/// The tree as slimed's, in `arena`, for sending back after a drag. Null
-/// if a pane isn't slimed's.
-pub fn toLayout(self: *const Tab, arena: Allocator) !?Slimed.Node {
+/// The tree as slime's, in `arena`, for sending back after a drag. Null
+/// if a pane isn't slime's.
+pub fn toLayout(self: *const Tab, arena: Allocator) !?Daemon.Node {
     return toLayoutNode(arena, self.root);
 }
 
-fn toLayoutNode(arena: Allocator, node: Node) !?Slimed.Node {
+fn toLayoutNode(arena: Allocator, node: Node) !?Daemon.Node {
     switch (node) {
-        .pane => |s| return .{ .pane = s.slimedPane() orelse return null },
+        .pane => |s| return .{ .pane = s.daemonPane() orelse return null },
         .split => |sp| {
-            const children = try arena.alloc(Slimed.Child, sp.children.len);
+            const children = try arena.alloc(Daemon.Child, sp.children.len);
             for (children, sp.children) |*out, c| out.* = .{
                 .share = c.share,
                 .node = try toLayoutNode(arena, c.node) orelse return null,
@@ -615,10 +615,10 @@ fn toLayoutNode(arena: Allocator, node: Node) !?Slimed.Node {
     }
 }
 
-/// slimed's tree for a tab as one of ours, with each pane's session from
+/// slime's tree for a tab as one of ours, with each pane's session from
 /// `ctx.session(pane)`. Panes without one are left out, and splits that
 /// leaves empty or alone collapse. Null if no pane has a session.
-pub fn fromLayout(alloc: Allocator, node: Slimed.Node, ctx: anytype) !?Node {
+pub fn fromLayout(alloc: Allocator, node: Daemon.Node, ctx: anytype) !?Node {
     switch (node) {
         .pane => |id| return if (ctx.session(id)) |s| .{ .pane = s } else null,
         .split => |sp| {
@@ -808,8 +808,8 @@ test fromLayout {
             };
         }
     };
-    var inner = [_]Slimed.Child{ .{ .share = 5000, .node = .{ .pane = 2 } }, .{ .share = 5000, .node = .{ .pane = 3 } } };
-    var outer = [_]Slimed.Child{ .{ .share = 5000, .node = .{ .pane = 1 } }, .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = &inner } } } };
+    var inner = [_]Daemon.Child{ .{ .share = 5000, .node = .{ .pane = 2 } }, .{ .share = 5000, .node = .{ .pane = 3 } } };
+    var outer = [_]Daemon.Child{ .{ .share = 5000, .node = .{ .pane = 1 } }, .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = &inner } } } };
     // Pane 3 has no session, so the column gives way to b.
     const root = (try fromLayout(alloc, .{ .split = .{ .axis = .row, .children = &outer } }, Ctx{ .a = &a, .b = &b })).?;
     defer freeNode(alloc, root);

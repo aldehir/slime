@@ -1,7 +1,7 @@
-//! One pane in a window: what slimed draws of it, and the input it sends.
-//! slimed runs the terminal (cmd/slimed); the session applies the
-//! frames slimed sends to `screen`, and turns window messages into events
-//! (internal/vt/event.zig) that slimed handles against the terminal:
+//! One pane in a window: what slime draws of it, and the input it sends.
+//! slime runs the terminal (cmd/slime); the session applies the
+//! frames slime sends to `screen`, and turns window messages into events
+//! (internal/vt/event.zig) that slime handles against the terminal:
 //! keys, mouse reports and selection, the wheel, pastes. Heap allocated,
 //! as the connection's reader holds a pointer to it.
 //!
@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const input = @import("input.zig");
-const Slimed = @import("Slimed.zig");
+const Daemon = @import("Daemon.zig");
 const Config = @import("Config.zig");
 const Login = @import("Login.zig");
 const ProgramStatus = @import("ProgramStatus.zig");
@@ -52,7 +52,7 @@ default_title: []const u16,
 /// The program's title (OSC 0/2). Empty for none. UI thread only.
 title_buf: [max_title_len]u16 = undefined,
 title_len: usize = 0,
-/// The title as slimed last said, for `titleUpdate` to take. Guarded by
+/// The title as slime last said, for `titleUpdate` to take. Guarded by
 /// `lock`.
 next_title_buf: [max_title_len]u16 = undefined,
 next_title_len: usize = 0,
@@ -66,7 +66,7 @@ title_pending: std.atomic.Value(bool) = .init(false),
 clipboard_write: ?[]u8 = null,
 
 lock: win32.SRWLOCK = .{},
-/// Frames slimed sent that aren't applied yet, each u32 seq, u32 length,
+/// Frames slime sent that aren't applied yet, each u32 seq, u32 length,
 /// then the frame. Guarded by `lock`.
 frames: std.ArrayList(u8) = .empty,
 /// What `applyFrames` swaps `frames` for, to apply them unlocked.
@@ -77,11 +77,11 @@ screen: Frames.Screen = .{},
 applied: u32 = 0,
 acked: u32 = 0,
 cells: Cells = .{},
-/// The kitty images slimed sent and where the last frame placed them.
+/// The kitty images slime sent and where the last frame placed them.
 /// UI thread only.
 images: Images = .{},
 textures: Renderer.ImageTextures = .{},
-/// The image slimed is sending in pieces, until it's whole. Reader
+/// The image slime is sending in pieces, until it's whole. Reader
 /// thread only.
 image_in: ImageIn = .{},
 /// Images received, inflated, for `applyFrames` to install before the
@@ -100,9 +100,9 @@ pad: Window.PaddingPx = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 },
 /// takes itself.
 cols: u16 = 0,
 rows: u16 = 0,
-/// What slimed was last told of the pane's size and geometry, so a
+/// What slime was last told of the pane's size and geometry, so a
 /// layout that changes nothing sends nothing.
-sized: ?Slimed.Size = null,
+sized: ?Daemon.Size = null,
 geometry: ?event.Geometry = null,
 
 transport: ?Transport = null,
@@ -111,10 +111,10 @@ transport: ?Transport = null,
 /// until a key closes it. UI thread only.
 ended: bool = false,
 
-/// The slimed pane was lost to us while its program ran (its workspace
-/// was taken by another window, or slimed went away). Written by the
+/// The daemon pane was lost to us while its program ran (its workspace
+/// was taken by another window, or slime went away). Written by the
 /// connection's reader before it posts WM_APP_CHILD_EXITED.
-slimed_loss: ?SlimedLoss = null,
+daemon_loss: ?DaemonLoss = null,
 
 /// Logging in to the SSH host, while there's something to show: a
 /// question, the server working on an answer, or why it failed. Shown
@@ -133,7 +133,7 @@ high_surrogate: ?u16 = null,
 /// The tag of the last copy asked for.
 copy_tag: u32 = 0,
 
-/// What programs in the session report doing (OSC 7501), as slimed
+/// What programs in the session report doing (OSC 7501), as slime
 /// keeps it. Guarded by `lock`.
 program_status: ProgramStatus = .{},
 /// `program_status` changed since the window last looked. Set by the
@@ -142,25 +142,25 @@ status_changed: std.atomic.Value(bool) = .init(false),
 
 /// What a session shows.
 const Transport = union(enum) {
-    /// A pane slimed holds, which outlives us. Its messages come from the
+    /// A pane slime holds, which outlives us. Its messages come from the
     /// connection's reader through our sink.
-    slimed: Pane,
-    /// Nothing yet: standing in for an SSH host's slimed panes until they
+    daemon: Pane,
+    /// Nothing yet: standing in for an SSH host's daemon panes until they
     /// come, logging in meanwhile. The host's destination, as the sidebar
     /// remembers it (borrowed from the window's list, which keeps a host
     /// while sessions use it).
     waiting: []const u16,
 };
 
-const Pane = struct { conn: *Slimed, pane: u32 };
+const Pane = struct { conn: *Daemon, pane: u32 };
 
 /// What a new session shows.
 pub const Launch = union(enum) {
-    /// A pane of the workspace slimed keeps for this window. The arrival
+    /// A pane of the workspace slime keeps for this window. The arrival
     /// stays the caller's.
-    slimed: struct {
-        conn: *Slimed,
-        arrival: *const Slimed.Arrival,
+    daemon: struct {
+        conn: *Daemon,
+        arrival: *const Daemon.Arrival,
     },
     /// Nothing yet, on host `dest`: see `Transport.waiting`.
     waiting: struct {
@@ -174,19 +174,19 @@ pub const Launch = union(enum) {
     },
 };
 
-/// Why a slimed session's connection ended without its program exiting,
+/// Why a daemon session's connection ended without its program exiting,
 /// for the session to show. Set by the reader thread before it posts
 /// WM_APP_CHILD_EXITED.
-pub const SlimedLoss = struct {
+pub const DaemonLoss = struct {
     const text_buf_len = 256;
     text_buf: [text_buf_len]u8 = undefined,
     text_len: usize = 0,
 
-    pub fn text(self: *const SlimedLoss) []const u8 {
+    pub fn text(self: *const DaemonLoss) []const u8 {
         return self.text_buf[0..self.text_len];
     }
 
-    fn set(self: *SlimedLoss, comptime fmt: []const u8, args: anytype) void {
+    fn set(self: *DaemonLoss, comptime fmt: []const u8, args: anytype) void {
         // Too long for the buffer: keep what fit.
         self.text_len = if (std.fmt.bufPrint(&self.text_buf, fmt, args)) |s| s.len else |_| self.text_buf.len;
     }
@@ -199,9 +199,9 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     const self = try alloc.create(Session);
     errdefer alloc.destroy(self);
     const default_title = try alloc.dupe(u16, switch (launch) {
-        // A host's shell, which slimed lists with no command, goes by the
+        // A host's shell, which slime lists with no command, goes by the
         // host until it sets a title.
-        .slimed => |s| if (s.arrival.command.len == 0 and s.conn.host() != null)
+        .daemon => |s| if (s.arrival.command.len == 0 and s.conn.host() != null)
             s.conn.hostLabel()
         else
             programName(s.arrival.command),
@@ -224,22 +224,22 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     self.screen.colors.palette = config.palette.colors;
 
     switch (launch) {
-        .slimed => |s| {
+        .daemon => |s| {
             for (s.arrival.status) |rec| {
                 const state = std.enums.fromInt(ProgramStatus.State, rec.state) orelse continue;
                 self.program_status.restore(rec.id, state, rec.progress);
             }
-            self.transport = .{ .slimed = .{ .conn = s.conn, .pane = s.arrival.pane } };
+            self.transport = .{ .daemon = .{ .conn = s.conn, .pane = s.arrival.pane } };
             self.sendSettings();
             // What came while the pane waited for us goes to the sink
             // first, then what comes live.
             s.conn.adopt(s.arrival.pane, .{
                 .ctx = self,
-                .draw = slimedDraw,
-                .image = slimedImage,
-                .notice = slimedNotice,
-                .copied = slimedCopied,
-                .ended = slimedEnded,
+                .draw = daemonDraw,
+                .image = daemonImage,
+                .notice = daemonNotice,
+                .copied = daemonCopied,
+                .ended = daemonEnded,
             });
         },
         .waiting => |w| {
@@ -274,42 +274,42 @@ pub fn destroy(self: *Session) void {
     alloc.destroy(self);
 }
 
-/// Let go of the pane. It runs on in slimed; once released, the
+/// Let go of the pane. It runs on in slime; once released, the
 /// connection's reader no longer calls our sink.
 fn stopTransport(self: *Session) void {
     const transport = self.transport orelse return;
     self.transport = null;
     switch (transport) {
-        .slimed => |s| s.conn.release(s.pane),
+        .daemon => |s| s.conn.release(s.pane),
         .waiting => {},
     }
 }
 
-/// End a slimed pane for good, not just our view of it, before the
+/// End a daemon pane for good, not just our view of it, before the
 /// session is destroyed: the user closed it. Destroying alone leaves it
-/// to slimed, as closing the window does. A pane already lost to us is
+/// to slime, as closing the window does. A pane already lost to us is
 /// left alone.
 pub fn kill(self: *Session) void {
-    if (self.slimed_loss != null) return;
+    if (self.daemon_loss != null) return;
     switch (self.transport orelse return) {
-        .slimed => |s| s.conn.kill(s.pane),
+        .daemon => |s| s.conn.kill(s.pane),
         .waiting => {},
     }
 }
 
-/// The slimed pane the session shows, while it does: not once it's
+/// The daemon pane the session shows, while it does: not once it's
 /// ended.
 fn live(self: *const Session) ?Pane {
     if (self.ended) return null;
     return switch (self.transport orelse return null) {
-        .slimed => |s| s,
+        .daemon => |s| s,
         .waiting => null,
     };
 }
 
-/// Sink for a slimed pane's frames. On the connection's reader thread,
+/// Sink for a daemon pane's frames. On the connection's reader thread,
 /// under its lock.
-fn slimedDraw(ctx: *anyopaque, seq: u32, data: []const u8) void {
+fn daemonDraw(ctx: *anyopaque, seq: u32, data: []const u8) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
     self.lockTerminal();
     const queued = self.queueFrame(seq, data);
@@ -335,7 +335,7 @@ fn queueFrame(self: *Session, seq: u32, data: []const u8) !void {
     self.frames.appendSliceAssumeCapacity(data);
 }
 
-/// A kitty image on its way from slimed, in pieces (Slimed.ImagePiece).
+/// A kitty image on its way from slime, in pieces (Daemon.ImagePiece).
 const ImageIn = struct {
     id: u32 = 0,
     generation: u64 = 0,
@@ -351,7 +351,7 @@ const QueuedImage = struct { id: u32, image: image.Image };
 /// Sink for a piece of a kitty image. On the connection's reader
 /// thread, under its lock. A whole image is inflated here, off the UI
 /// thread, and queued for `applyFrames`.
-fn slimedImage(ctx: *anyopaque, piece: Slimed.ImagePiece) void {
+fn daemonImage(ctx: *anyopaque, piece: Daemon.ImagePiece) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
     const in = &self.image_in;
     if (piece.offset == 0) {
@@ -427,7 +427,7 @@ test inflateImage {
     try std.testing.expectError(error.BadImage, inflateImage(alloc, &in));
 }
 
-/// Apply the frames slimed sent since the last draw to `screen`, with
+/// Apply the frames slime sent since the last draw to `screen`, with
 /// the images that came before them, and lay the images out for the
 /// renderer. UI thread.
 pub fn applyFrames(self: *Session) void {
@@ -455,7 +455,7 @@ pub fn applyFrames(self: *Session) void {
         rest = rest[8 + len ..];
         self.applied = seq;
         // Half applied, the screen is wrong until the next full frame.
-        self.screen.apply(self.alloc, data) catch |err| log.err("bad frame {d} from slimed: {}", .{ seq, err });
+        self.screen.apply(self.alloc, data) catch |err| log.err("bad frame {d} from slime: {}", .{ seq, err });
     }
     for (self.screen.dropped.items) |id| self.images.remove(self.alloc, id);
     self.screen.dropped.clearRetainingCapacity();
@@ -463,7 +463,7 @@ pub fn applyFrames(self: *Session) void {
     self.images.update(self.alloc, self.screen.placements.items, cell.width, cell.height) catch |err| log.err("laying out images failed: {}", .{err});
 }
 
-/// Tell slimed the frames applied are drawn, which lets more come. UI
+/// Tell slime the frames applied are drawn, which lets more come. UI
 /// thread, after drawing.
 pub fn drawn(self: *Session) void {
     if (self.applied == self.acked) return;
@@ -472,9 +472,9 @@ pub fn drawn(self: *Session) void {
     s.conn.ack(s.pane, self.applied);
 }
 
-/// Sink for what a slimed pane did besides draw. On the connection's
+/// Sink for what a daemon pane did besides draw. On the connection's
 /// reader thread, under its lock.
-fn slimedNotice(ctx: *anyopaque, n: Slimed.Notice) void {
+fn daemonNotice(ctx: *anyopaque, n: Daemon.Notice) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
     switch (n.kind) {
         // Posted for the UI thread to take: SetWindowTextW waits on it.
@@ -509,9 +509,9 @@ fn slimedNotice(ctx: *anyopaque, n: Slimed.Notice) void {
 
 /// Sink for a copy's text. On the connection's reader thread, under its
 /// lock.
-fn slimedCopied(ctx: *anyopaque, tag: u32, text: []const u8) void {
+fn daemonCopied(ctx: *anyopaque, tag: u32, text: []const u8) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
-    // Nothing was selected by the time slimed looked.
+    // Nothing was selected by the time slime looked.
     if (text.len == 0 or tag != @atomicLoad(u32, &self.copy_tag, .monotonic)) return;
     self.queueClipboard(text);
 }
@@ -544,38 +544,38 @@ pub fn clipboardWriteFlush(self: *Session) void {
     result catch |err| log.warn("clipboard write failed: {}", .{err});
 }
 
-/// Sink for a slimed pane's end. On the connection's reader thread (or
+/// Sink for a daemon pane's end. On the connection's reader thread (or
 /// the UI thread, adopting a pane already lost), under its lock.
-fn slimedEnded(ctx: *anyopaque, why: ?[]const u8) void {
+fn daemonEnded(ctx: *anyopaque, why: ?[]const u8) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
     if (why) |text| {
-        var loss: SlimedLoss = .{};
+        var loss: DaemonLoss = .{};
         loss.set("{s}", .{text});
         // Read on the UI thread only after the post, which orders it.
-        self.slimed_loss = loss;
+        self.daemon_loss = loss;
     }
     _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
 }
 
-/// Why the slimed pane was lost to us, once WM_APP_CHILD_EXITED says
+/// Why the daemon pane was lost to us, once WM_APP_CHILD_EXITED says
 /// it ended, if its program didn't exit.
-pub fn slimedLoss(self: *const Session) ?*const SlimedLoss {
-    return if (self.slimed_loss) |*l| l else null;
+pub fn daemonLoss(self: *const Session) ?*const DaemonLoss {
+    return if (self.daemon_loss) |*l| l else null;
 }
 
-/// The slimed pane the session shows, if it's one.
-pub fn slimedPane(self: *const Session) ?u32 {
+/// The daemon pane the session shows, if it's one.
+pub fn daemonPane(self: *const Session) ?u32 {
     return switch (self.transport orelse return null) {
-        .slimed => |s| s.pane,
+        .daemon => |s| s.pane,
         .waiting => null,
     };
 }
 
 /// The SSH host the session's pane runs on, if it's remote, as the
-/// sidebar remembers it: its slimed's host, or the one it waits on.
+/// sidebar remembers it: its daemon's host, or the one it waits on.
 pub fn hostDest(self: *const Session) ?[]const u16 {
     return switch (self.transport orelse return null) {
-        .slimed => |s| s.conn.hostDest(),
+        .daemon => |s| s.conn.hostDest(),
         .waiting => |dest| dest,
     };
 }
@@ -669,7 +669,7 @@ pub fn statusSummary(self: *Session) ?ProgramStatus.Summary {
     return self.program_status.summary();
 }
 
-/// Fit the pane to a new grid or cell size, and tell slimed where the
+/// Fit the pane to a new grid or cell size, and tell slime where the
 /// grid is in it, for mapping the mouse to cells. UI thread.
 pub fn resize(self: *Session, cols: u16, rows: u16) void {
     self.cols = cols;
@@ -682,7 +682,7 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
     // daemon's terminal answers pixel size reports, so it hears about new
     // fonts too.
     const cell = self.window.cellSizePx();
-    const size: Slimed.Size = .{ .cols = cols, .rows = rows, .cell_width = cell.width, .cell_height = cell.height };
+    const size: Daemon.Size = .{ .cols = cols, .rows = rows, .cell_width = cell.width, .cell_height = cell.height };
     if (self.sized == null or !std.meta.eql(self.sized.?, size)) {
         self.sized = size;
         s.conn.resize(s.pane, size);
@@ -707,7 +707,7 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
     self.send(.{ .geometry = g });
 }
 
-/// Send slimed an event for the pane, if it's live.
+/// Send slime an event for the pane, if it's live.
 fn send(self: *Session, ev: Events.Event) void {
     const s = self.live() orelse return;
     var buf: [Events.max_len]u8 = undefined;
@@ -716,14 +716,14 @@ fn send(self: *Session, ev: Events.Event) void {
     s.conn.event(s.pane, w.buffered());
 }
 
-/// Tell slimed what selection and the terminal's colors go by here.
+/// Tell slime what selection and the terminal's colors go by here.
 fn sendSettings(self: *Session) void {
     const config = self.window.config;
     const words = config.@"selection-word-chars".codepoints;
     self.send(.{
         .settings = .{
             .double_click_ms = win32.GetDoubleClickTime(),
-            // What slimed has room for.
+            // What slime has room for.
             .word_boundary = words[0..@min(words.len, Events.max_word_boundary)],
             .colors = .{
                 .background = config.background,
@@ -741,7 +741,7 @@ fn sendSettings(self: *Session) void {
 }
 
 /// Send a key message: the key, and the same key as win32-input-mode
-/// (mode 9001) has it, which slimed sends instead while the program asks
+/// (mode 9001) has it, which slime sends instead while the program asks
 /// for that.
 pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
     // TranslateMessage already posted the WM_(SYS)CHAR / WM_(SYS)DEADCHAR
@@ -782,8 +782,8 @@ pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     self.send(.{ .key = .{ .event = ev, .win32 = records[0..@max(len, 1)] } });
 }
 
-/// Have slimed copy the selected text to the clipboard: it comes back
-/// through `slimedCopied`. Returns false if the screen shows no
+/// Have slime copy the selected text to the clipboard: it comes back
+/// through `daemonCopied`. Returns false if the screen shows no
 /// selection.
 pub fn copySelection(self: *Session) bool {
     const selected = for (self.screen.row_data.items) |row| {
@@ -796,7 +796,7 @@ pub fn copySelection(self: *Session) bool {
     return true;
 }
 
-/// Send the clipboard's text, which slimed brackets if the program asked
+/// Send the clipboard's text, which slime brackets if the program asked
 /// for that (mode 2004) and makes safe.
 pub fn paste(self: *Session) void {
     const s = self.live() orelse return;
@@ -836,14 +836,14 @@ pub fn charInput(self: *Session, unit: u16) void {
     self.send(.{ .text = utf8[0..len] });
 }
 
-/// Tell slimed about a focus change, which it reports to a program that
+/// Tell slime about a focus change, which it reports to a program that
 /// asked (mode 1004). ConPTY always asks, and passes them on to console
 /// programs as FOCUS_EVENT records.
 pub fn reportFocus(self: *Session, focused: bool) void {
     self.send(.{ .focus = focused });
 }
 
-/// Send a mouse button press or release, or motion: slimed reports it to
+/// Send a mouse button press or release, or motion: slime reports it to
 /// the program or selects with it. Motion without a button goes only to
 /// a program that asked for it.
 pub fn mouseInput(self: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
@@ -870,7 +870,7 @@ pub fn cancelSelection(self: *Session) void {
     self.send(.cancel);
 }
 
-/// Send the wheel: slimed reports it, sends arrow keys for alternate
+/// Send the wheel: slime reports it, sends arrow keys for alternate
 /// scroll (mode 1007), or scrolls back.
 pub fn mouseWheel(self: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
     var lines: u32 = 3;

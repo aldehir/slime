@@ -1,11 +1,11 @@
-//! A window's connection to slimed (cmd/slimed), the daemon that
+//! A window's connection to slime (cmd/slime), the daemon that
 //! owns local ptys so they outlive the window. The daemon keeps panes in
 //! tabs and tabs in workspaces; a window attaches one workspace and
 //! mirrors it. The protocol is internal/daemon's (wire.go).
 //!
-//! slimed runs each pane's terminal; we draw what it sends (CapFrames):
+//! slime runs each pane's terminal; we draw what it sends (CapFrames):
 //! frames of the pane's screen, and notices of what else it did (a new
-//! title, a clipboard write). Input goes back as events, which slimed
+//! title, a clipboard write). Input goes back as events, which slime
 //! handles against the terminal. One reader thread reads the connection
 //! and hands each pane's messages to its session through a `Sink`.
 //!
@@ -19,10 +19,10 @@
 //! also holds the SSH connections to hosts: the host messages on the same
 //! connection log in to one (`hostConnect`, with its prompts coming back
 //! as `HostEvent`s for the window to take) and report every host's state.
-//! A host's own slimed is reached through a second connection to the
+//! A host's own slime is reached through a second connection to the
 //! local pipe that the daemon splices to it (`connectRemote`), whose
 //! reader attaches before it routes frames.
-const Slimed = @This();
+const Daemon = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,7 +30,7 @@ const win32 = @import("win32/win32.zig");
 const Screen = @import("Screen.zig");
 const Hosts = @import("Hosts.zig");
 
-const log = std.log.scoped(.slimed);
+const log = std.log.scoped(.daemon);
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -40,7 +40,7 @@ const protocol_version = 1;
 const max_frame = 8 << 20;
 /// Long enough for long-path-aware installs.
 const max_path = 32 * 1024;
-const daemon_name = L("slimed.exe");
+const daemon_name = L("slime.exe");
 
 const MsgType = enum(u8) {
     hello = 1,
@@ -137,7 +137,7 @@ lost: bool = false,
 closing: std.atomic.Value(bool) = .init(false),
 
 /// A window message posted from the reader thread when panes arrive, and
-/// when a host's slimed has attached or failed to.
+/// when a host's slime has attached or failed to.
 pub const Notify = struct {
     hwnd: win32.HWND,
     msg: u32,
@@ -145,7 +145,7 @@ pub const Notify = struct {
 
 pub const State = enum(u8) { connecting, attached, failed };
 
-/// A host's slimed, reached through the local daemon.
+/// A host's slime, reached through the local daemon.
 const Remote = struct {
     /// The daemon's id for the host.
     host: u32,
@@ -272,7 +272,7 @@ pub const Choice = enum(u8) {
     skip = 2,
 };
 
-/// Why attaching to a host's slimed failed, for the window to show.
+/// Why attaching to a host's slime failed, for the window to show.
 pub const Failure = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
@@ -493,7 +493,7 @@ const Pending = struct {
         while (rest.len >= 5) {
             const len = std.mem.readInt(u32, rest[1..5], .little);
             const f: Frame = .{ .type = @enumFromInt(rest[0]), .id = 0, .payload = rest[5..][0..len] };
-            deliver(sink, f) catch |err| log.warn("bad message {d} from slimed: {}", .{ rest[0], err });
+            deliver(sink, f) catch |err| log.warn("bad message {d} from slime: {}", .{ rest[0], err });
             rest = rest[5 + len ..];
         }
     }
@@ -504,13 +504,13 @@ const Pending = struct {
 /// `command`. Panes' frames come at most every `frame_interval` µs. The
 /// workspace's panes wait in `arrivals`; `start` the reader after
 /// adopting them. UI thread.
-pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16) !*Slimed {
+pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16) !*Daemon {
     var pipe: Pipe = try .open(true);
     errdefer pipe.close();
     const buf = try alloc.alloc(u8, max_frame);
     defer alloc.free(buf);
 
-    const self = try alloc.create(Slimed);
+    const self = try alloc.create(Daemon);
     errdefer alloc.destroy(self);
     self.* = .{ .alloc = alloc, .pipe = pipe, .notify = notify, .frame_interval = frame_interval };
     errdefer self.freeState();
@@ -518,21 +518,21 @@ pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area
     return self;
 }
 
-/// Connect to the slimed on host `host` (the daemon's id for it, which it
+/// Connect to the slime on host `host` (the daemon's id for it, which it
 /// has `connected`), through a second connection to the local daemon's
 /// pipe that it splices to the host's. The reader does the rest: it
 /// attaches as `connect` does, a new workspace's tab running the host's
 /// shell, and posts `notify` once `state` says how that went. The panes
 /// then wait in `arrivals`. `term` is the TERM the host's panes get. UI
 /// thread.
-pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host_id: u32, dest: []const u16, term: []const u8, area: Area, size: Size) !*Slimed {
+pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host_id: u32, dest: []const u16, term: []const u8, area: Area, size: Size) !*Daemon {
     var pipe: Pipe = try .open(false);
     errdefer pipe.close();
     const owned_dest = try alloc.dupe(u16, dest);
     errdefer alloc.free(owned_dest);
     const owned_term = try alloc.dupe(u8, term);
     errdefer alloc.free(owned_term);
-    const self = try alloc.create(Slimed);
+    const self = try alloc.create(Daemon);
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
@@ -551,7 +551,7 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host
 /// Say hello, then attach the most recently detached workspace, or a new
 /// one with a tab running `command`, reading the replies in line. Before
 /// the reader routes frames.
-fn attachFirst(self: *Slimed, buf: []u8, area: Area, size: Size, command: []const u16) !void {
+fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16) !void {
     const alloc = self.alloc;
     try self.handshake(buf);
 
@@ -591,14 +591,14 @@ fn attachFirst(self: *Slimed, buf: []u8, area: Area, size: Size, command: []cons
 }
 
 /// Start the reader, once the panes from `connect` are adopted.
-pub fn start(self: *Slimed) !void {
+pub fn start(self: *Daemon) !void {
     self.posting.store(true, .release);
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
 }
 
 /// Hang up, which detaches the workspace; the daemon keeps it. Every
 /// session must have released its pane. UI thread.
-pub fn deinit(self: *Slimed) void {
+pub fn deinit(self: *Daemon) void {
     self.closing.store(true, .release);
     if (self.reader) |t| {
         // Wake it until it's gone: a cancel that lands before it blocks in
@@ -616,29 +616,29 @@ pub fn deinit(self: *Slimed) void {
 
 /// The daemon's id for the host this is bridged to; null for the local
 /// daemon.
-pub fn host(self: *const Slimed) ?u32 {
+pub fn host(self: *const Daemon) ?u32 {
     return if (self.remote) |r| r.host else null;
 }
 
 /// The host's destination as the sidebar remembers it; null for the
 /// local daemon.
-pub fn hostDest(self: *const Slimed) ?[]const u16 {
+pub fn hostDest(self: *const Daemon) ?[]const u16 {
     return if (self.remote) |r| r.dest else null;
 }
 
 /// The host, for showing; empty for the local daemon.
-pub fn hostLabel(self: *const Slimed) []const u16 {
+pub fn hostLabel(self: *const Daemon) []const u16 {
     return if (self.remote) |r| Hosts.label(r.dest) else &.{};
 }
 
 /// How attaching went. The reader posts `notify` when it changes.
-pub fn attachState(self: *const Slimed) State {
+pub fn attachState(self: *const Daemon) State {
     return self.state.load(.acquire);
 }
 
 /// Every pane was lost to us: the connection ended, or another window
 /// took the workspace. UI thread.
-pub fn isLost(self: *Slimed) bool {
+pub fn isLost(self: *Daemon) bool {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     return self.lost;
@@ -646,7 +646,7 @@ pub fn isLost(self: *Slimed) bool {
 
 /// A host's reader: ask the local daemon for the bridge, attach, then
 /// route frames as `readLoop` does.
-fn remoteLoop(self: *Slimed) void {
+fn remoteLoop(self: *Daemon) void {
     const buf = self.alloc.alloc(u8, max_frame) catch return self.fail(error.OutOfMemory);
     defer self.alloc.free(buf);
     const r = self.remote.?;
@@ -654,7 +654,7 @@ fn remoteLoop(self: *Slimed) void {
     defer p.deinit(self.alloc);
     p.putStr(self.alloc, r.term) catch return self.fail(error.OutOfMemory);
     self.send(.bridge, r.host, p.bytes()) catch |err| return self.fail(err);
-    // The host's own shell: the command is for its slimed to run.
+    // The host's own shell: the command is for its slime to run.
     self.attachFirst(buf, self.area, self.size, &.{}) catch |err| return self.fail(err);
     log.info("attached workspace {d} on {f}", .{ self.workspace, std.unicode.fmtUtf16Le(self.hostLabel()) });
     self.state.store(.attached, .release);
@@ -663,25 +663,25 @@ fn remoteLoop(self: *Slimed) void {
     self.route(buf);
 }
 
-/// A host's slimed couldn't attach: say why, which for a bridge the
+/// A host's slime couldn't attach: say why, which for a bridge the
 /// daemon refused or ended is what it said. Nobody's told if `deinit`
 /// is hanging up.
-fn fail(self: *Slimed, err: anyerror) void {
+fn fail(self: *Daemon, err: anyerror) void {
     if (self.closing.load(.acquire)) return;
     const text = switch (err) {
-        error.Refused => if (self.failure.len > 0) self.failure.text() else "slimed refused to attach",
-        error.EndOfStream => if (self.lost_reason.len > 0) self.lost_reason.text() else "slimed hung up",
-        error.VersionMismatch => "its slimed doesn't match this slime",
+        error.Refused => if (self.failure.len > 0) self.failure.text() else "slime refused to attach",
+        error.EndOfStream => if (self.lost_reason.len > 0) self.lost_reason.text() else "slime hung up",
+        error.VersionMismatch => "its slime doesn't match this slime-gui",
         error.OutOfMemory => "out of memory",
         else => @errorName(err),
     };
-    log.info("no slimed on {f}: {s}", .{ std.unicode.fmtUtf16Le(self.hostLabel()), text });
+    log.info("no slime on {f}: {s}", .{ std.unicode.fmtUtf16Le(self.hostLabel()), text });
     self.failure.set(text);
     self.state.store(.failed, .release);
     _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
 }
 
-fn freeState(self: *Slimed) void {
+fn freeState(self: *Daemon) void {
     var it = self.panes.valueIterator();
     while (it.next()) |slot| switch (slot.*) {
         .pending => |*pend| pend.deinit(self.alloc),
@@ -703,18 +703,18 @@ fn freeState(self: *Slimed) void {
 /// Take what the daemon said about hosts since the last look, in order.
 /// The caller owns them (`HostEvent.deinit` each, then free the slice).
 /// UI thread.
-pub fn takeHosts(self: *Slimed) []HostEvent {
+pub fn takeHosts(self: *Daemon) []HostEvent {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     return self.host_events.toOwnedSlice(self.alloc) catch &.{};
 }
 
 /// Ask the daemon to log in to `dest` (`ssh://[user@]host[:port]`, or
-/// whatever its ssh config knows) and put slimed there. Its prompts and
+/// whatever its ssh config knows) and put slime there. Its prompts and
 /// states come as `HostEvent`s; a host already connected answers with its
 /// state. Returns the request's tag, which the answering state carries.
 /// UI thread.
-pub fn hostConnect(self: *Slimed, dest: []const u16) !u32 {
+pub fn hostConnect(self: *Daemon, dest: []const u16) !u32 {
     const utf8 = try commandUtf8(self.alloc, dest);
     defer self.alloc.free(utf8);
     const t = self.nextTag();
@@ -728,7 +728,7 @@ pub fn hostConnect(self: *Slimed, dest: []const u16) !u32 {
 
 /// Reply to the last prompt for `host_id`, one answer per question. A
 /// cancel with no prompt waiting gives up on logging in. UI thread.
-pub fn hostAnswer(self: *Slimed, host_id: u32, choice: Choice, answers: []const []const u16) !void {
+pub fn hostAnswer(self: *Daemon, host_id: u32, choice: Choice, answers: []const []const u16) !void {
     var p: Payload = .{};
     defer p.deinit(self.alloc);
     try p.list.append(self.alloc, @intFromEnum(choice));
@@ -743,12 +743,12 @@ pub fn hostAnswer(self: *Slimed, host_id: u32, choice: Choice, answers: []const 
 
 /// Hang up on `host_id`, ending its bridges, or give up on logging in to
 /// it. UI thread.
-pub fn hostDisconnect(self: *Slimed, host_id: u32) void {
+pub fn hostDisconnect(self: *Daemon, host_id: u32) void {
     self.send(.host_disconnect, host_id, &.{}) catch {};
 }
 
 /// Ask for every host; the answer is a `HostEvent.hosts`. UI thread.
-pub fn hostList(self: *Slimed) void {
+pub fn hostList(self: *Daemon) void {
     self.send(.host_list, 0, &.{}) catch {};
 }
 
@@ -756,7 +756,7 @@ pub fn hostList(self: *Slimed) void {
 /// the tabs name no pane the caller hasn't seen. The caller owns them
 /// (`Taken.deinit`) and must `adopt` or `release` each arrival. UI
 /// thread.
-pub fn take(self: *Slimed) Taken {
+pub fn take(self: *Daemon) Taken {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     const structure = self.structure;
@@ -766,7 +766,7 @@ pub fn take(self: *Slimed) Taken {
 
 /// Make `sink` the pane's: what came while it waited goes first, then
 /// what comes live. UI thread.
-pub fn adopt(self: *Slimed, pane: u32, sink: Sink) void {
+pub fn adopt(self: *Daemon, pane: u32, sink: Sink) void {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     const slot = self.panes.getPtr(pane) orelse {
@@ -782,11 +782,11 @@ pub fn adopt(self: *Slimed, pane: u32, sink: Sink) void {
         .live => {},
     }
     slot.* = .{ .live = sink };
-    if (self.lost) sink.ended(sink.ctx, "lost slimed");
+    if (self.lost) sink.ended(sink.ctx, "lost slime");
 }
 
 /// Forget a pane: its session is going. Doesn't end it. UI thread.
-pub fn release(self: *Slimed, pane: u32) void {
+pub fn release(self: *Daemon, pane: u32) void {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     if (self.panes.fetchRemove(pane)) |kv| switch (kv.value) {
@@ -800,20 +800,20 @@ pub fn release(self: *Slimed, pane: u32) void {
 
 /// Send a pane an event (event.zig), which must fit a message. UI
 /// thread.
-pub fn event(self: *Slimed, pane: u32, data: []const u8) void {
+pub fn event(self: *Daemon, pane: u32, data: []const u8) void {
     if (data.len > max_frame - 5) return log.warn("dropped a {d}-byte event: too big", .{data.len});
     self.send(.event, pane, data) catch {};
 }
 
 /// Say the pane's frame `seq` and those before it are drawn, which lets
 /// more come. UI thread.
-pub fn ack(self: *Slimed, pane: u32, seq: u32) void {
+pub fn ack(self: *Daemon, pane: u32, seq: u32) void {
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, seq, .little);
     self.send(.ack, pane, &b) catch {};
 }
 
-pub fn resize(self: *Slimed, pane: u32, size: Size) void {
+pub fn resize(self: *Daemon, pane: u32, size: Size) void {
     var b: [12]u8 = undefined;
     writeSize(&b, size);
     self.send(.resize, pane, &b) catch {};
@@ -821,7 +821,7 @@ pub fn resize(self: *Slimed, pane: u32, size: Size) void {
 
 /// Tell the daemon the window's tab area, for sizing panes it lays out
 /// while the window is away.
-pub fn resizeWorkspace(self: *Slimed, area: Area) void {
+pub fn resizeWorkspace(self: *Daemon, area: Area) void {
     var b: [20]u8 = undefined;
     std.mem.writeInt(u32, b[0..4], self.workspace, .little);
     writeArea(b[4..20], area);
@@ -829,17 +829,17 @@ pub fn resizeWorkspace(self: *Slimed, area: Area) void {
 }
 
 /// End a pane, not just our view of it.
-pub fn kill(self: *Slimed, pane: u32) void {
+pub fn kill(self: *Daemon, pane: u32) void {
     self.send(.pane_kill, pane, &.{}) catch {};
 }
 
 /// Ask for a new tab running `command`. Its pane arrives through
 /// `arrivals`, marked requested. UI thread.
-pub fn tabNew(self: *Slimed, command: []const u16, size: Size) !void {
+pub fn tabNew(self: *Daemon, command: []const u16, size: Size) !void {
     _ = try self.tabNewTagged(command, size);
 }
 
-fn tabNewTagged(self: *Slimed, command: []const u16, size: Size) !u32 {
+fn tabNewTagged(self: *Daemon, command: []const u16, size: Size) !u32 {
     const t = try self.requestTag();
     const cmd = try commandUtf8(self.alloc, command);
     defer self.alloc.free(cmd);
@@ -856,7 +856,7 @@ fn tabNewTagged(self: *Slimed, command: []const u16, size: Size) !u32 {
 
 /// Ask for a pane running `command` on side `dir` of `pane`, taking half
 /// its space. It arrives through `arrivals`, marked requested. UI thread.
-pub fn split(self: *Slimed, pane: u32, dir: Direction, command: []const u16) !void {
+pub fn split(self: *Daemon, pane: u32, dir: Direction, command: []const u16) !void {
     const t = try self.requestTag();
     const cmd = try commandUtf8(self.alloc, command);
     defer self.alloc.free(cmd);
@@ -873,9 +873,9 @@ pub fn split(self: *Slimed, pane: u32, dir: Direction, command: []const u16) !vo
 
 /// Replace tab `tab`'s tree with `root`, which must hold the same panes:
 /// a divider was dragged. Each split's shares are scaled to sum to the
-/// whole slimed wants. The tree comes back as a Workspace message. UI
+/// whole slime wants. The tree comes back as a Workspace message. UI
 /// thread.
-pub fn layout(self: *Slimed, tab: u32, root: Node) !void {
+pub fn layout(self: *Daemon, tab: u32, root: Node) !void {
     var p: Payload = .{};
     defer p.deinit(self.alloc);
     try p.putU32(self.alloc, tab);
@@ -916,7 +916,7 @@ fn putNode(alloc: Allocator, p: *Payload, node: Node) !void {
 }
 
 /// A tag for a request whose panes the window shows when they come.
-fn requestTag(self: *Slimed) !u32 {
+fn requestTag(self: *Daemon) !u32 {
     const t = self.nextTag();
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
@@ -931,14 +931,14 @@ fn commandUtf8(alloc: Allocator, command: []const u16) ![]u8 {
     };
 }
 
-fn nextTag(self: *Slimed) u32 {
+fn nextTag(self: *Daemon) u32 {
     while (true) {
         const t = self.next_tag.fetchAdd(1, .monotonic) +% 1;
         if (t != 0) return t;
     }
 }
 
-fn send(self: *Slimed, msg: MsgType, id: u32, payload: []const u8) !void {
+fn send(self: *Daemon, msg: MsgType, id: u32, payload: []const u8) !void {
     win32.AcquireSRWLockExclusive(&self.write_lock);
     defer win32.ReleaseSRWLockExclusive(&self.write_lock);
     try self.pipe.send(msg, id, payload);
@@ -946,7 +946,7 @@ fn send(self: *Slimed, msg: MsgType, id: u32, payload: []const u8) !void {
 
 /// Read frames in line until the Workspace reply tagged `t` (and Created,
 /// if `created`), as the reader would. Before the reader starts.
-fn awaitReply(self: *Slimed, buf: []u8, t: u32, created: bool) !void {
+fn awaitReply(self: *Daemon, buf: []u8, t: u32, created: bool) !void {
     var got_workspace = false;
     var got_created = !created;
     while (!got_workspace or !got_created) {
@@ -963,7 +963,7 @@ fn awaitReply(self: *Slimed, buf: []u8, t: u32, created: bool) !void {
                 var r: Reader = .{ .buf = f.payload };
                 const et = try r.readU32();
                 const msg = try r.readStr();
-                log.err("slimed: {s}", .{msg});
+                log.err("slime: {s}", .{msg});
                 if (et == t) return error.Refused;
             },
             else => _ = try self.handle(f),
@@ -972,7 +972,7 @@ fn awaitReply(self: *Slimed, buf: []u8, t: u32, created: bool) !void {
 }
 
 /// Reader thread for the local daemon.
-fn readLoop(self: *Slimed) void {
+fn readLoop(self: *Daemon) void {
     const buf = self.alloc.alloc(u8, max_frame) catch {
         if (!self.closing.load(.acquire)) self.loseAll("out of memory");
         return;
@@ -983,19 +983,19 @@ fn readLoop(self: *Slimed) void {
 
 /// Route frames until the connection ends, then tell every live pane:
 /// for a host's, why the daemon ended the bridge, if it said.
-fn route(self: *Slimed, buf: []u8) void {
+fn route(self: *Daemon, buf: []u8) void {
     while (true) {
         const f = self.pipe.readFrame(buf) catch break;
         _ = self.handle(f) catch |err| {
-            log.warn("bad message {d} from slimed: {}", .{ @intFromEnum(f.type), err });
+            log.warn("bad message {d} from slime: {}", .{ @intFromEnum(f.type), err });
         };
     }
     if (self.closing.load(.acquire)) return;
-    self.loseAll(if (self.lost_reason.len > 0) self.lost_reason.text() else "lost slimed");
+    self.loseAll(if (self.lost_reason.len > 0) self.lost_reason.text() else "lost slime");
 }
 
 /// Act on one frame. Returns a Workspace message's tag, else 0.
-fn handle(self: *Slimed, f: Frame) !u32 {
+fn handle(self: *Daemon, f: Frame) !u32 {
     var r: Reader = .{ .buf = f.payload };
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
@@ -1035,7 +1035,7 @@ fn handle(self: *Slimed, f: Frame) !u32 {
         .@"error" => {
             const tag = try r.readU32();
             const msg = try r.readStr();
-            log.warn("slimed: {s}", .{msg});
+            log.warn("slime: {s}", .{msg});
             if (tag == 0) self.lost_reason.set(msg);
         },
         .host_state => {
@@ -1079,7 +1079,7 @@ fn handle(self: *Slimed, f: Frame) !u32 {
 
 /// Keep a host event for the UI thread, which is told. Under the lock;
 /// takes `e` even on failure.
-fn hostEventLocked(self: *Slimed, e: HostEvent) !void {
+fn hostEventLocked(self: *Daemon, e: HostEvent) !void {
     var ev = e;
     self.host_events.append(self.alloc, ev) catch |err| {
         ev.deinit(self.alloc);
@@ -1090,7 +1090,7 @@ fn hostEventLocked(self: *Slimed, e: HostEvent) !void {
 
 /// A Workspace message: panes in it that attached go to `arrivals`, in
 /// layout order, and its tabs replace `structure`. Returns its tag.
-fn workspaceChanged(self: *Slimed, r: *Reader) !u32 {
+fn workspaceChanged(self: *Daemon, r: *Reader) !u32 {
     const st = try self.alloc.create(Structure);
     st.* = .{ .arena = .init(self.alloc), .tabs = &.{} };
     errdefer st.destroy(self.alloc);
@@ -1251,14 +1251,14 @@ fn readPanes(r: *Reader, ids: []u32, n: *usize, depth: usize) !void {
     }
 }
 
-fn loseAll(self: *Slimed, why: []const u8) void {
+fn loseAll(self: *Daemon, why: []const u8) void {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     self.loseAllLocked(why);
 }
 
 /// Tell every live pane it's gone from us. Pending ones are dropped.
-fn loseAllLocked(self: *Slimed, why: []const u8) void {
+fn loseAllLocked(self: *Daemon, why: []const u8) void {
     if (self.lost) return;
     self.lost = true;
     log.info("{s}", .{why});
@@ -1312,7 +1312,7 @@ fn toUtf16(a: Allocator, s: []const u8) ![]const u16 {
 /// Say hello, asking for frames every `frame_interval` µs, and check the
 /// daemon's frames are laid out as ours. A bridge the local daemon
 /// refuses answers with an Error instead, kept in `failure`.
-fn handshake(self: *Slimed, buf: []u8) !void {
+fn handshake(self: *Daemon, buf: []u8) !void {
     var hello: [8]u8 = undefined;
     std.mem.writeInt(u32, hello[0..4], protocol_version, .little);
     std.mem.writeInt(u32, hello[4..8], self.frame_interval, .little);
@@ -1331,11 +1331,11 @@ fn handshake(self: *Slimed, buf: []u8) !void {
     // A daemon too old to say draws no frames.
     const frame_layout = r.readU64() catch 0;
     if (version != protocol_version) {
-        log.err("slimed speaks protocol {d}, we speak {d}", .{ version, protocol_version });
+        log.err("slime speaks protocol {d}, we speak {d}", .{ version, protocol_version });
         return error.VersionMismatch;
     }
     if (frame_layout != Screen.Codec.layout_id) {
-        log.err("slimed's frames are laid out as {x}, ours as {x}", .{ frame_layout, Screen.Codec.layout_id });
+        log.err("slime's frames are laid out as {x}, ours as {x}", .{ frame_layout, Screen.Codec.layout_id });
         return error.VersionMismatch;
     }
 }
@@ -1383,8 +1383,8 @@ fn openPipe(start_daemon: bool) !win32.HANDLE {
     }
 }
 
-/// `\\.\pipe\slimed-<user SID>`, NUL-terminated: one daemon per user.
-/// With SLIMED_INSTANCE set, `-<instance>` follows, as the daemon names
+/// `\\.\pipe\slime-<user SID>`, NUL-terminated: one daemon per user.
+/// With SLIME_INSTANCE set, `-<instance>` follows, as the daemon names
 /// it (daemon.Address).
 fn pipeName(buf: *WideBuf) ![:0]const u16 {
     var token_buf: [256]u8 align(@alignOf(win32.TOKEN_USER)) = undefined;
@@ -1392,7 +1392,7 @@ fn pipeName(buf: *WideBuf) ![:0]const u16 {
     var str: ?win32.LPWSTR = null;
     if (win32.ConvertSidToStringSidW(sid, &str) == 0) return win32.lastError("ConvertSidToStringSidW");
     defer _ = win32.LocalFree(str);
-    try buf.put(L("\\\\.\\pipe\\slimed-"));
+    try buf.put(L("\\\\.\\pipe\\slime-"));
     try buf.put(std.mem.span(str.?));
     var inst: [64]u16 = undefined;
     if (instance(&inst)) |name| {
@@ -1402,9 +1402,9 @@ fn pipeName(buf: *WideBuf) ![:0]const u16 {
     return buf.z();
 }
 
-/// SLIMED_INSTANCE, if it's set: a daemon of its own, for tests.
+/// SLIME_INSTANCE, if it's set: a daemon of its own, for tests.
 fn instance(buf: *[64]u16) ?[]const u16 {
-    const len = win32.GetEnvironmentVariableW(L("SLIMED_INSTANCE"), buf, buf.len);
+    const len = win32.GetEnvironmentVariableW(L("SLIME_INSTANCE"), buf, buf.len);
     if (len == 0 or len >= buf.len) return null;
     return buf[0..len];
 }
@@ -1435,21 +1435,21 @@ fn checkServer(pipe: win32.HANDLE) !void {
     var theirs_buf: [256]u8 align(@alignOf(win32.TOKEN_USER)) = undefined;
     var ours_buf: [256]u8 align(@alignOf(win32.TOKEN_USER)) = undefined;
     if (win32.EqualSid(try tokenUser(process, &theirs_buf), try currentUser(&ours_buf)) == 0) {
-        log.err("slimed's pipe is served by another user's process (pid {d})", .{pid});
+        log.err("slime's pipe is served by another user's process (pid {d})", .{pid});
         return error.ForeignServer;
     }
 }
 
-/// Run slimed so it outlives us: detached, and out of any job we're in.
+/// Run slime so it outlives us: detached, and out of any job we're in.
 ///
 /// It runs from a copy in %LOCALAPPDATA%\slime\bin, named for the size
-/// and time of the slimed.exe next to us: a running exe can't be
+/// and time of the slime.exe next to us: a running exe can't be
 /// replaced, and the daemon runs as long as its sessions, so running ours
 /// in place would stop the next build from installing over it. It loads
 /// the ConPTY next to us (which doesn't change between builds), and the
-/// builds of slimed for hosts from `remote/` next to us. Its log
-/// goes to %LOCALAPPDATA%\slime\slimed.log (slimed-<instance>.log with
-/// SLIMED_INSTANCE).
+/// builds of slime for hosts from `remote/` next to us. Its log
+/// goes to %LOCALAPPDATA%\slime\slime.log (slime-<instance>.log with
+/// SLIME_INSTANCE).
 fn startDaemon() !void {
     var dir_buf: [max_path]u16 = undefined;
     const dir = try exeDir(&dir_buf);
@@ -1466,8 +1466,8 @@ fn startDaemon() !void {
         if (len == 0 or len >= appdata.len) break :copy;
         var attrs: win32.WIN32_FILE_ATTRIBUTE_DATA = undefined;
         if (win32.GetFileAttributesExW(try src.z(), win32.GetFileExInfoStandard, &attrs) == 0) {
-            if (win32.GetLastError() == win32.ERROR_FILE_NOT_FOUND) return error.SlimedNotFound;
-            return win32.lastError("GetFileAttributesExW(slimed.exe)");
+            if (win32.GetLastError() == win32.ERROR_FILE_NOT_FOUND) return error.DaemonNotFound;
+            return win32.lastError("GetFileAttributesExW(slime.exe)");
         }
 
         var base: WideBuf = .{};
@@ -1475,7 +1475,7 @@ fn startDaemon() !void {
         try base.put(L("\\slime"));
         try makeDir(&base);
         try log_path.put(base.slice());
-        try log_path.put(L("\\slimed"));
+        try log_path.put(L("\\slime"));
         var inst: [64]u16 = undefined;
         if (instance(&inst)) |name| {
             try log_path.put(L("-"));
@@ -1487,11 +1487,11 @@ fn startDaemon() !void {
 
         var name_buf: [64]u8 = undefined;
         const size = @as(u64, attrs.nFileSizeHigh) << 32 | attrs.nFileSizeLow;
-        const name = std.fmt.bufPrint(&name_buf, "\\slimed-{x}-{x}.exe", .{ size, attrs.ftLastWriteTime }) catch unreachable;
+        const name = std.fmt.bufPrint(&name_buf, "\\slime-{x}-{x}.exe", .{ size, attrs.ftLastWriteTime }) catch unreachable;
         try exe.put(base.slice());
         try exe.putAscii(name);
         if (win32.CopyFileW(try src.z(), try exe.z(), win32.TRUE) == 0 and win32.GetLastError() != win32.ERROR_FILE_EXISTS)
-            return win32.lastError("CopyFileW(slimed.exe)");
+            return win32.lastError("CopyFileW(slime.exe)");
     }
     if (exe.len == 0) try exe.put(src.slice());
 
@@ -1521,11 +1521,11 @@ fn startDaemon() !void {
         if (win32.CreateProcessW(null, @constCast(cmd_z.ptr), null, null, win32.FALSE, flags | extra, null, null, &si, &pi) != 0) {
             _ = win32.CloseHandle(pi.hThread);
             _ = win32.CloseHandle(pi.hProcess);
-            log.info("started slimed (pid {d}){s}", .{ pi.dwProcessId, if (extra == 0) " inside our job" else "" });
+            log.info("started slime (pid {d}){s}", .{ pi.dwProcessId, if (extra == 0) " inside our job" else "" });
             return;
         }
     }
-    return win32.lastError("CreateProcessW(slimed.exe)");
+    return win32.lastError("CreateProcessW(slime.exe)");
 }
 
 fn makeDir(path: *WideBuf) !void {

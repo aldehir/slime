@@ -18,7 +18,7 @@ func (s *Server) hostsActiveLocked() int { return 0 }
 
 func (s *Server) hostClientGoneLocked(*conn) {}
 
-const noHosts = "this slimed connects to no hosts (not Windows)"
+const noHosts = "this slime connects to no hosts (not Windows)"
 
 func (s *Server) hostDispatch(c *conn, id uint32, m Message) bool {
 	switch m := m.(type) {

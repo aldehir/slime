@@ -1,4 +1,4 @@
-//! Events: slime's input to a pane, which slimed handles against the
+//! Events: a client's input to a pane, which slime handles against the
 //! pane's terminal (slime.zig). slime turns window messages into these;
 //! anything that depends on the terminal's state (its modes, the
 //! selection, scrollback) is the daemon's to decide.
@@ -133,7 +133,7 @@ pub fn Codec(comptime vt: type) type {
             double_click_ms: u32,
             word_boundary: []const u21,
             /// The colors OSC 4/10/11/12 override and their resets
-            /// return to: slime's config.
+            /// return to: the window's config.
             colors: Colors,
         };
 

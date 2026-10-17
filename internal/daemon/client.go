@@ -6,8 +6,8 @@ import (
 	"sync"
 )
 
-// Client is the client end of a connection, for slimed's own commands
-// and tests. slime speaks the protocol itself.
+// Client is the client end of a connection, for slime's own commands
+// and tests. The GUI speaks the protocol itself.
 type Client struct {
 	rw    io.ReadWriteCloser
 	r     *Reader
@@ -39,7 +39,7 @@ func NewClientWith(rw io.ReadWriteCloser, hello Hello) (*Client, error) {
 	}
 	c.Hello = *reply
 	if reply.Version != Version {
-		return nil, fmt.Errorf("daemon: slimed speaks version %d, not %d", reply.Version, Version)
+		return nil, fmt.Errorf("daemon: slime speaks version %d, not %d", reply.Version, Version)
 	}
 	return c, nil
 }
@@ -88,7 +88,7 @@ func (c *Client) List() (*Workspaces, error) {
 		case *Workspaces:
 			return m, nil
 		case *Error:
-			return nil, fmt.Errorf("slimed: %s", m.Message)
+			return nil, fmt.Errorf("slime: %s", m.Message)
 		}
 	}
 }
@@ -139,7 +139,7 @@ func (c *Client) Await(tag uint32, wantCreated bool) (*Attachment, error) {
 			}
 		case *Error:
 			if m.Tag == tag {
-				return nil, fmt.Errorf("slimed: %s", m.Message)
+				return nil, fmt.Errorf("slime: %s", m.Message)
 			}
 		}
 	}
@@ -161,7 +161,7 @@ func (c *Client) AwaitCreated(tag uint32) (*Created, error) {
 			}
 		case *Error:
 			if m.Tag == tag {
-				return nil, fmt.Errorf("slimed: %s", m.Message)
+				return nil, fmt.Errorf("slime: %s", m.Message)
 			}
 		}
 	}
@@ -186,7 +186,7 @@ func (c *Client) Peek(pane uint32, asVT bool) ([]byte, error) {
 			}
 		case *Error:
 			if m.Tag == tag {
-				return nil, fmt.Errorf("slimed: %s", m.Message)
+				return nil, fmt.Errorf("slime: %s", m.Message)
 			}
 		}
 	}

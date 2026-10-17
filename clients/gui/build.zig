@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// The Win32 window: slime.exe. Built on its own from this directory, or
+/// The Win32 window: slime-gui.exe. Built on its own from this directory, or
 /// as a path dependency of the repository's build.zig, which installs
 /// it beside the daemon.
 pub fn build(b: *std.Build) void {
@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addAnonymousImport("slime-small.svg", .{ .root_source_file = b.path("assets/icon/slime-small.svg") });
     // The chrome's icons, embedded by the module next to them.
     exe_mod.addAnonymousImport("lucide", .{ .root_source_file = b.path("assets/icons/lucide/lucide.zig") });
-    // The frame and event codecs slimed's library defines (src/Screen.zig),
+    // The frame and event codecs slime's library defines (src/Screen.zig),
     // imported from the daemon's tree rather than copied.
     exe_mod.addAnonymousImport("frame", .{ .root_source_file = b.path("../../internal/vt/frame.zig") });
     exe_mod.addAnonymousImport("event", .{ .root_source_file = b.path("../../internal/vt/event.zig") });
@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "slime",
+        .name = "slime-gui",
         .root_module = exe_mod,
     });
     exe.subsystem = if (console) .console else .windows;

@@ -1,4 +1,4 @@
-//! slimed's own exports, compiled into libghostty-vt (`-Dvt-extra`) next
+//! slime's own exports, compiled into libghostty-vt (`-Dvt-extra`) next
 //! to its C API. The library's Zig API is `@import("root")`; terminals
 //! come in as the C API's handles. vt.go and view.go declare these.
 //!

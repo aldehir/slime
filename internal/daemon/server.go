@@ -1,4 +1,4 @@
-// Package daemon is slimed: a daemon that owns ptys and the terminal
+// Package daemon is slime: a daemon that owns ptys and the terminal
 // state of each (internal/vt), so they outlive the windows showing them.
 //
 // Panes (a pty and its terminal) are arranged in tabs, each a layout
@@ -204,7 +204,7 @@ func (s *Server) handshake(c *conn, m Message, err error) bool {
 		FrameLayout: vt.FrameLayout(),
 	})
 	if hello.Version != Version {
-		c.sendForce(0, &Error{Message: fmt.Sprintf("slimed speaks version %d, not %d", Version, hello.Version)})
+		c.sendForce(0, &Error{Message: fmt.Sprintf("slime speaks version %d, not %d", Version, hello.Version)})
 		return false
 	}
 	c.interval = defaultFrameInterval

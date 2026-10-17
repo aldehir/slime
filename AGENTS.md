@@ -1,12 +1,13 @@
 # slime
 
 A Windows terminal on **libghostty-vt** (`ghostty/` submodule). The
-terminals run in **slimed** (`cmd/slimed`, Go module at the root,
-libghostty-vt through cgo), locally or on SSH hosts, which the daemon
-logs in to (`internal/sshbridge`). The window (`clients/gui`, Zig: Win32,
-Direct3D 11, DirectWrite) draws the frames slimed sends
-(`internal/vt/frame.zig`) and sends input back as events (`event.zig`).
-Plans live in `.plans/` (untracked); `rearchitect-plan.md` is the current one.
+terminals run in the daemon, **slime** (`slime.exe`: `cmd/slime`, Go
+module at the root, libghostty-vt through cgo), locally or on SSH hosts,
+which the daemon logs in to (`internal/sshbridge`). The window,
+**slime-gui** (`slime-gui.exe`: `clients/gui`, Zig: Win32, Direct3D 11,
+DirectWrite) draws the frames slime sends (`internal/vt/frame.zig`) and
+sends input back as events (`event.zig`). Plans live in `.plans/` (untracked);
+`rearchitect-plan.md` is the current one.
 
 ## Build
 
@@ -17,10 +18,13 @@ zig build test
 ```
 
 - Zig 0.16.0 lives in `tools\` (gitignored; download from ziglang.org).
-- slimed links libghostty-vt with cgo, compiled by `zig cc` (the setup
+- slime links libghostty-vt with cgo, compiled by `zig cc` (the setup
   script sets `CC`); no other C toolchain. `zig build` builds the static
-  libs into `ssh\internal\vt\lib`; for `go test` alone, run
+  libs into `internal\vt\lib`; for `go test` alone, run
   `scripts\build-vt-lib.ps1` once. `scripts\race.ps1` runs `-race`.
+- A test build attaches to the daemon already running (one pipe per user,
+  `\\.\pipe\slime-<sid>`). Set `SLIME_INSTANCE=<name>` so it starts its
+  own, and stop that one by PID when done.
 - Without the setup script, clang picks a legacy MSVC and the C++ deps fail
   with `char16_t` undeclared. Don't remove the machine's old VS installs.
 

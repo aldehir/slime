@@ -15,10 +15,10 @@ func isNotRunning(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
-// startDaemon runs `slimed serve` with extra arguments so it outlives us:
+// startDaemon runs `slime serve` with extra arguments so it outlives us:
 // in a session of its own, so the hangup that ends an SSH session doesn't
 // reach it, with nothing open but its log, which goes to
-// ~/.cache/slime/slimed.log.
+// ~/.cache/slime/slime.log.
 func startDaemon(extra ...string) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -28,7 +28,7 @@ func startDaemon(extra ...string) error {
 	if dir, err := os.UserCacheDir(); err == nil {
 		dir = filepath.Join(dir, "slime")
 		if os.MkdirAll(dir, 0o700) == nil {
-			args = append(args, "--log", filepath.Join(dir, "slimed.log"))
+			args = append(args, "--log", filepath.Join(dir, "slime.log"))
 		}
 	}
 	cmd := exec.Command(exe, args...)

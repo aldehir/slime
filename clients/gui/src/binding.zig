@@ -74,7 +74,7 @@ pub const defaults = [_]Binding{
     // Windows' default input language hotkeys take ctrl+shift+0 (direct
     // switch to the Japanese IME), so it never arrives on most machines.
     .{ .trigger = .{ .vk = '0', .mods = ctrl }, .action = .reset_font_size },
-    // Only slimed's tabs split; elsewhere the keys go to the child.
+    // Only slime's tabs split; elsewhere the keys go to the child.
     .{ .trigger = .{ .vk = 'O', .mods = ctrl_shift }, .action = .{ .new_split = .right }, .performable = true },
     .{ .trigger = .{ .vk = 'E', .mods = ctrl_shift }, .action = .{ .new_split = .down }, .performable = true },
     .{ .trigger = .{ .vk = win32.VK_RETURN, .mods = ctrl_shift }, .action = .toggle_split_zoom, .performable = true },

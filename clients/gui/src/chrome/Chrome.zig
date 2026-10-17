@@ -180,7 +180,7 @@ pub const View = struct {
         title: []const u16,
         /// It gets the keys. Others are dimmed while the tab has several.
         focused: bool,
-        /// It can be split (it runs in slimed), and zoomed if not alone.
+        /// It can be split (it runs in slime), and zoomed if not alone.
         splittable: bool,
         zoomable: bool,
         zoomed: bool,

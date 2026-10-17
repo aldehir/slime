@@ -18,7 +18,7 @@ import (
 // Hosts: the SSH connections the daemon holds. Each host is logged in
 // to once (HostConnect), with the prompts going to the client that
 // asked, and then any client reaches the host's own daemon through a
-// bridge: a connection whose first frame is Bridge, spliced to `slimed
+// bridge: a connection whose first frame is Bridge, spliced to `slime
 // connect` on the host. The connection lives until the host hangs up
 // or a client asks (HostDisconnect), whatever windows come and go.
 
@@ -28,7 +28,7 @@ type HostOptions struct {
 	// connect. Nil resolves it against the user's ssh config
 	// (sshbridge.ResolveDestination).
 	Resolve func(dest string) (sshbridge.Options, error)
-	// Remote holds the builds of slimed to install on hosts, when
+	// Remote holds the builds of slime to install on hosts, when
 	// Resolve doesn't say. Nil means the ones beside the executable.
 	Remote *remote.Manifest
 }
@@ -138,7 +138,7 @@ func (s *Server) hostConnect(c *conn, m *HostConnect) {
 	go s.hostLogin(h, gen, ctx)
 }
 
-// hostLogin logs in to h and sets slimed up there, in attempt gen.
+// hostLogin logs in to h and sets slime up there, in attempt gen.
 func (s *Server) hostLogin(h *host, gen int, ctx context.Context) {
 	opts, err := s.hosts.opts.Resolve(h.dest)
 	if err != nil {
@@ -155,7 +155,7 @@ func (s *Server) hostLogin(h *host, gen int, ctx context.Context) {
 	}
 	// Before any pane starts, so they all get the same TERM.
 	conn.InstallTerminfo()
-	if _, err := conn.EnsureSlimed(func(text string) { s.hostText(h, gen, text) }); err != nil {
+	if _, err := conn.EnsureDaemon(func(text string) { s.hostText(h, gen, text) }); err != nil {
 		conn.Close()
 		s.hostFailed(h, gen, err.Error())
 		return
@@ -305,7 +305,7 @@ func (s *Server) hostList(c *conn) {
 	c.sendForce(0, out)
 }
 
-// bridge splices a connection whose first frame was Bridge to `slimed
+// bridge splices a connection whose first frame was Bridge to `slime
 // connect` on host id, until either end hangs up. What the client
 // sends next (its Hello) is in r's buffer, and goes through.
 func (s *Server) bridge(rw io.ReadWriteCloser, r *Reader, id uint32, m *Bridge) {
@@ -324,14 +324,14 @@ func (s *Server) bridge(rw io.ReadWriteCloser, r *Reader, id uint32, m *Bridge) 
 		writeError(rw, fmt.Sprintf("%s isn't connected (%s: %s)", h.dest, h.state, h.text))
 		return
 	}
-	sl, err := conn.StartSlimed(m.Term, r.stream(), rw, nil)
+	sl, err := conn.StartDaemon(m.Term, r.stream(), rw, nil)
 	if err != nil {
 		writeError(rw, err.Error())
 		return
 	}
 	s.log.Debug("bridge opened", "dest", h.dest)
 	err = sl.Wait()
-	var failed *sshbridge.SlimedError
+	var failed *sshbridge.DaemonError
 	if errors.As(err, &failed) {
 		writeError(rw, failed.Why)
 		return

@@ -1,10 +1,10 @@
-//! Frames: what slimed sends slime to draw a pane. A frame carries the
+//! Frames: what slime sends a client to draw a pane. A frame carries the
 //! grid size, colors, the cursor, the rows of the viewport that changed
 //! since the last one (all of them in a full frame), with the selection
 //! on each row, and the kitty images placed in the viewport.
 //!
-//! Both ends use this file. slimed's library (slime.zig) instantiates
-//! `Codec` with libghostty-vt's root, slime with its ghostty-vt module:
+//! Both ends use this file. slime's library (slime.zig) instantiates
+//! `Codec` with libghostty-vt's root, the GUI with its ghostty-vt module:
 //! the same source either way, so the types agree. A raw cell is a
 //! `packed struct(u64)` and goes over as is; styles, whose layout isn't
 //! fixed, go field by field.
@@ -42,7 +42,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// Bumped with any change to the encoding. It's also derived from the
-/// cell and style layouts (`layout_id`), so a slime and a slimed built
+/// cell and style layouts (`layout_id`), so a client and a slime built
 /// from different libghostty-vt versions refuse each other's frames.
 pub const version = 2;
 
@@ -438,7 +438,7 @@ pub fn Codec(comptime vt: type) type {
             try w.writeInt(u16, @bitCast(s.flags), .little);
         }
 
-        /// What slime draws: the last frames applied.
+        /// What the client draws: the last frames applied.
         pub const Screen = struct {
             cols: u16 = 0,
             rows: u16 = 0,

@@ -12,8 +12,8 @@ import (
 	"syscall"
 )
 
-// Address is the current user's daemon socket, /tmp/slimed-<uid>/sock:
-// one daemon per user, or per user and SLIMED_INSTANCE when that's set
+// Address is the current user's daemon socket, /tmp/slime-<uid>/sock:
+// one daemon per user, or per user and SLIME_INSTANCE when that's set
 // (sock-<instance>), so tests can run a daemon beside the one in use.
 //
 // Not under $XDG_RUNTIME_DIR, which logind removes when the user's last
@@ -21,10 +21,10 @@ import (
 // socket in /tmp for the same reason.
 func Address() (string, error) {
 	name := "sock"
-	if inst := os.Getenv("SLIMED_INSTANCE"); inst != "" {
+	if inst := os.Getenv("SLIME_INSTANCE"); inst != "" {
 		name += "-" + inst
 	}
-	return filepath.Join(os.TempDir(), fmt.Sprintf("slimed-%d", os.Getuid()), name), nil
+	return filepath.Join(os.TempDir(), fmt.Sprintf("slime-%d", os.Getuid()), name), nil
 }
 
 // Listen creates the daemon's socket, in a directory only the current
@@ -46,7 +46,7 @@ func Listen(addr string) (net.Listener, error) {
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		lock.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, fmt.Errorf("daemon: another slimed serves %s", addr)
+			return nil, fmt.Errorf("daemon: another slime serves %s", addr)
 		}
 		return nil, fmt.Errorf("daemon: locking %s: %w", lock.Name(), err)
 	}

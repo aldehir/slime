@@ -11,7 +11,7 @@ import (
 const maxStatusRecords = 64
 
 // programStatus keeps what the programs in a pane say they're doing
-// (OSC 7501), as slime does (src/ProgramStatus.zig), so a window
+// (OSC 7501), as the GUI does (clients/gui/src/ProgramStatus.zig), so a window
 // attaching later sees it: each report sets one record by its id,
 // replacing it whole; clear removes a record and those under it; a new
 // shell prompt drops what was in progress.

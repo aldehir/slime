@@ -8,9 +8,9 @@ const conpty_version = "1.25.260930003";
 const conpty_sha256 = "02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee";
 const conpty_dir = "tools/conpty-" ++ conpty_version;
 
-/// Everything beside the exe: the daemon (slimed.exe) with its ConPTY and
-/// its Linux builds for SSH hosts, and the window (clients/gui), built as
-/// a path dependency that installs into the same prefix.
+/// Everything beside the exe: the daemon (slime.exe) with its ConPTY and
+/// its Linux builds for SSH hosts, and the window (slime-gui.exe), built
+/// as a path dependency (clients/gui) and installed beside it.
 pub fn build(b: *std.Build) void {
     // Building libghostty-vt's C++ dependencies against MSVC needs the
     // environment from scripts/setup-msvc.ps1.
@@ -40,14 +40,26 @@ pub fn build(b: *std.Build) void {
             "Frame rate cap (default: 0, the display's refresh rate)",
         ) orelse 0,
     });
-    b.getInstallStep().dependOn(gui.builder.getInstallStep());
+    // A dependency installs into a prefix of its own under .zig-cache, so
+    // the window and its themes are installed here, into ours, the way
+    // clients/gui/build.zig does for itself.
+    const gui_exe = gui.artifact("slime-gui");
+    b.installArtifact(gui_exe);
+    if (gui.builder.lazyDependency("iterm2_themes", .{})) |themes| {
+        b.installDirectory(.{
+            .source_dir = themes.path(""),
+            .install_dir = .bin,
+            .install_subdir = "themes",
+            .exclude_extensions = &.{".md"},
+        });
+    }
     b.step("icons", "Render the app icon PNGs into zig-out/icons").dependOn(&gui.builder.top_level_steps.get("icons").?.step);
 
     installConpty(b);
-    const remote = b.option(bool, "remote", "Build slimed and its builds for SSH hosts (need Go; default: if Go is found)");
+    const remote = b.option(bool, "remote", "Build slime and its builds for SSH hosts (need Go; default: if Go is found)");
     if (remote orelse true) installGoHelpers(b, remote != null);
 
-    const run_cmd = b.addRunArtifact(gui.artifact("slime"));
+    const run_cmd = b.addRunArtifact(gui_exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run the app").dependOn(&run_cmd.step);
@@ -57,8 +69,8 @@ pub fn build(b: *std.Build) void {
     terminfoSteps(b, test_step);
 }
 
-/// The xterm-ghostty terminfo source slimed embeds, generated from
-/// ghostty's own definition. It's checked in so slimed builds with Go
+/// The xterm-ghostty terminfo source slime embeds, generated from
+/// ghostty's own definition. It's checked in so slime builds with Go
 /// alone; `zig build terminfo` regenerates it, and the tests fail when it
 /// no longer matches the submodule.
 fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
@@ -90,24 +102,24 @@ fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
     test_step.dependOn(&check.step);
 }
 
-/// The daemon, next to the exe: slimed.exe, which runs every session
-/// and connects to SSH hosts, with slimed for Linux in `remote/` for it
+/// The daemon, next to the exe: slime.exe, which runs every session
+/// and connects to SSH hosts, with slime for Linux in `remote/` for it
 /// to install on them. Go caches its own builds, so this runs `go build`
 /// every time rather than tracking the sources. Without Go it warns and
 /// leaves them out, unless `-Dremote=true` asked for them.
 fn installGoHelpers(b: *std.Build, required: bool) void {
     const go = b.findProgram(&.{"go"}, &.{}) catch {
         if (required) {
-            b.getInstallStep().dependOn(&b.addFail("go not found; -Dremote=true needs it to build slimed").step);
+            b.getInstallStep().dependOn(&b.addFail("go not found; -Dremote=true needs it to build slime").step);
             return;
         }
-        std.log.warn("go not found; building without slimed (slime will have nothing to run sessions in)", .{});
+        std.log.warn("go not found; building without slime (slime-gui will have nothing to run sessions in)", .{});
         return;
     };
-    // slimed links libghostty-vt with cgo (internal/vt), as a static
+    // slime links libghostty-vt with cgo (internal/vt), as a static
     // library for each target from a nested build of the submodule, which
     // tracks its own sources. internal/vt/slime.zig is compiled in for
-    // slimed's own exports. scripts/build-vt-lib.ps1 does the same.
+    // slime's own exports. scripts/build-vt-lib.ps1 does the same.
     const extra = b.fmt("-Dvt-extra={s}", .{b.path("internal/vt/slime.zig").getPath(b)});
     const copy = b.addUpdateSourceFiles();
     for ([_]struct { zig: []const u8, go: []const u8, lib: []const u8 }{
@@ -122,17 +134,17 @@ fn installGoHelpers(b: *std.Build, required: bool) void {
         // rejects a .lib path).
         copy.addCopyFileToSource(prefix.path(b, b.fmt("lib/{s}", .{t.lib})), b.fmt("internal/vt/lib/{s}/libghostty-vt.a", .{t.go}));
     }
-    goBuild(b, go, "slimed").step.dependOn(&copy.step);
+    goBuild(b, go, "slime").step.dependOn(&copy.step);
     installRemote(b, go, &copy.step);
 }
 
-/// The systems slimed is built for to install on SSH hosts, with the
+/// The systems slime is built for to install on SSH hosts, with the
 /// `zig cc` target cgo compiles for each.
 const remote_targets = [_]struct { os: []const u8, arch: []const u8, zig: []const u8 }{
     .{ .os = "linux", .arch = "amd64", .zig = "x86_64-linux-musl" },
 };
 
-/// slimed for each of `remote_targets`, as files in `remote/` next to the
+/// slime for each of `remote_targets`, as files in `remote/` next to the
 /// exe (internal/remote): `go build` for the target, then build/pack.zig
 /// gzips them and writes the manifest. Linked fully static against musl,
 /// so it runs whatever the host's libc, and stripped by the C linker
@@ -150,8 +162,8 @@ fn installRemote(b: *std.Build, go: []const u8, libs: *std.Build.Step) void {
     const dir = pack.addOutputDirectoryArg("remote");
     for (remote_targets) |t| {
         const run = b.addSystemCommand(&.{ go, "build", "-trimpath", "-ldflags=-s -w -linkmode external -extldflags '-static -s'", "-o" });
-        const exe = run.addOutputFileArg(b.fmt("slimed-{s}-{s}", .{ t.os, t.arch }));
-        run.addArg("./cmd/slimed");
+        const exe = run.addOutputFileArg(b.fmt("slime-{s}-{s}", .{ t.os, t.arch }));
+        run.addArg("./cmd/slime");
         run.setCwd(b.path("."));
         run.setEnvironmentVariable("GOOS", t.os);
         run.setEnvironmentVariable("GOARCH", t.arch);
@@ -177,7 +189,7 @@ fn goBuild(b: *std.Build, go: []const u8, comptime name: []const u8) *std.Build.
     run.setCwd(b.path("."));
     run.setEnvironmentVariable("GOOS", "windows");
     run.setEnvironmentVariable("GOARCH", "amd64");
-    // slimed needs cgo for libghostty-vt, compiled by our Zig rather than
+    // slime needs cgo for libghostty-vt, compiled by our Zig rather than
     // whatever C compiler is on PATH.
     run.setEnvironmentVariable("CGO_ENABLED", "1");
     run.setEnvironmentVariable("CC", b.fmt("\"{s}\" cc -target x86_64-windows-gnu", .{b.graph.zig_exe}));
@@ -186,7 +198,7 @@ fn goBuild(b: *std.Build, go: []const u8, comptime name: []const u8) *std.Build.
     return run;
 }
 
-/// slimed's ConPTY, next to it.
+/// slime's ConPTY, next to it.
 fn installConpty(b: *std.Build) void {
     const dll = b.addInstallBinFile(b.path(conpty_dir ++ "/conpty.dll"), "conpty.dll");
     const host = b.addInstallBinFile(b.path(conpty_dir ++ "/OpenConsole.exe"), "x64/OpenConsole.exe");

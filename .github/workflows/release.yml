@@ -35,7 +35,7 @@ jobs:
           if ($hash -ne $env:ZIG_SHA256) { throw "zig sha256 mismatch: $hash" }
           Expand-Archive $zip -DestinationPath tools
 
-      # For slimed. Caches the module and build caches by go.sum.
+      # For the daemon. Caches the module and build caches by go.sum.
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -62,7 +62,7 @@ jobs:
           . .\scripts\setup-msvc.ps1
           zig build test
 
-      - name: Test slimed
+      - name: Test the daemon
         run: |
           go vet ./...
           go test ./...

@@ -1,4 +1,4 @@
-//! Converts a pane's screen (slimed's frames, applied) into GPU-ready
+//! Converts a pane's screen (slime's frames, applied) into GPU-ready
 //! data: one background color per cell, and a list of quads (glyphs and
 //! solid rectangles for the cursor and text decorations). Independent of
 //! the graphics API.

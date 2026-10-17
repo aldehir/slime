@@ -17,7 +17,7 @@ import (
 )
 
 // shellHost runs exec requests with sh, as a real host does, in a home
-// and temp directory of their own, so slimed installs and runs its
+// and temp directory of their own, so slime installs and runs its
 // daemon there.
 func shellHost(t *testing.T) (run func(string, io.Reader, io.Writer, io.Writer) int, home string) {
 	root := t.TempDir()
@@ -33,7 +33,7 @@ func shellHost(t *testing.T) (run func(string, io.Reader, io.Writer, io.Writer) 
 		"TMPDIR=" + tmp,
 		"SHELL=/bin/sh",
 		"PATH=" + os.Getenv("PATH"),
-		"SLIMED_INSTANCE=sshbridge-test",
+		"SLIME_INSTANCE=sshbridge-test",
 	}
 	return func(command string, stdin io.Reader, stdout, stderr io.Writer) int {
 		cmd := osexec.Command("/bin/sh", "-c", command)
@@ -55,7 +55,7 @@ func shellHost(t *testing.T) (run func(string, io.Reader, io.Writer, io.Writer) 
 	}, home
 }
 
-// rw joins slime's ends of a slimed session.
+// rw joins the client's ends of a daemon session.
 type rw struct {
 	io.Writer
 	io.Reader
@@ -64,9 +64,9 @@ type rw struct {
 
 func (c rw) Close() error { return c.close() }
 
-// dialSlimed logs in over a new connection and returns a daemon client
-// talking to the host's slimed.
-func dialSlimed(t *testing.T, srv *sshtest.Server, knownHosts string) *daemon.Client {
+// dialDaemon logs in over a new connection and returns a daemon client
+// talking to the host's slime.
+func dialDaemon(t *testing.T, srv *sshtest.Server, knownHosts string) *daemon.Client {
 	t.Helper()
 	d := startDialog(t, srv, knownHosts)
 	d.expectPrompt(PromptPassword)
@@ -85,16 +85,16 @@ func dialSlimed(t *testing.T, srv *sshtest.Server, knownHosts string) *daemon.Cl
 
 const terminfoName = "xterm-ghostty"
 
-func TestSlimedOnLinux(t *testing.T) {
+func TestDaemonOnLinux(t *testing.T) {
 	needPayload(t)
 	host, home := shellHost(t)
 	srv := startServer(t, sshtest.Options{Password: password, Exec: host})
 	kh := knownHostsFile(t, srv.KnownHostsLine())
 
-	c := dialSlimed(t, srv, kh)
+	c := dialDaemon(t, srv, kh)
 	t.Cleanup(func() { syscall.Kill(int(c.Hello.PID), syscall.SIGKILL) })
 	build, _ := testRemote().For("linux", "amd64")
-	if _, err := os.Stat(filepath.Join(home, ".cache", "slime", "slimed-"+build.ID)); err != nil {
+	if _, err := os.Stat(filepath.Join(home, ".cache", "slime", "bin", "slime-"+build.ID)); err != nil {
 		t.Fatalf("not installed: %v", err)
 	}
 
@@ -117,7 +117,7 @@ func TestSlimedOnLinux(t *testing.T) {
 	// Hanging up the SSH connection detaches the workspace.
 	c.Close()
 
-	c2 := dialSlimed(t, srv, kh)
+	c2 := dialDaemon(t, srv, kh)
 	defer c2.Close()
 	if c2.Hello.PID != c.Hello.PID {
 		t.Errorf("a second daemon: pid %d, then %d", c.Hello.PID, c2.Hello.PID)
