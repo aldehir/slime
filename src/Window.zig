@@ -20,6 +20,7 @@ const Stats = @import("Stats.zig");
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
 const SshConnection = @import("SshConnection.zig");
+const Slimed = @import("Slimed.zig");
 const Hosts = @import("Hosts.zig");
 const Login = @import("Login.zig");
 const Chrome = @import("chrome/Chrome.zig");
@@ -255,7 +256,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     if (std.mem.startsWith(u16, command_line, ssh_scheme)) {
         try self.spawnSession(.{ .host = try hosts.add(command_line) });
-    } else {
+    } else if (!(config.@"persist-sessions" and self.reattach())) {
         try self.spawnSession(.{ .command = command_line });
     }
     errdefer self.destroySessions();
@@ -308,12 +309,38 @@ fn sessionIndex(self: *const Window, id: u32) ?usize {
 
 /// Where a new session runs.
 const Target = union(enum) {
-    /// A command line on this machine, CreateProcessW syntax.
+    /// A command line on this machine, CreateProcessW syntax: in slimed
+    /// with `persist-sessions`.
     command: []const u16,
     /// A shell on remembered host `i`: on a live connection its sessions
     /// use, else a new one.
     host: usize,
+    /// A session slimed kept after an earlier window, by its id there.
+    slimed: struct { id: u32, command: []const u16 },
 };
+
+/// Attach every session slimed holds detached, as the last window left
+/// them. Returns whether any came back.
+fn reattach(self: *Window) bool {
+    const detached = Slimed.list(self.alloc) catch |err| {
+        log.err("listing slimed's sessions failed: {}", .{err});
+        return false;
+    };
+    defer Slimed.freeList(self.alloc, detached);
+    var any = false;
+    for (detached) |d| {
+        self.spawnSession(.{ .slimed = .{ .id = d.id, .command = d.command } }) catch |err| {
+            log.err("reattaching slimed session {d} failed: {}", .{ d.id, err });
+            continue;
+        };
+        any = true;
+    }
+    if (any) {
+        // Show the first, as it was likely the first opened.
+        self.activate(0);
+    }
+    return any;
+}
 
 /// Start a session on `target`, at the end of its group, and show it.
 /// One that joins a connection doesn't log in again, and starts in the
@@ -330,7 +357,7 @@ fn spawnSession(self: *Window, target: Target) !void {
 
     var new_conn: ?*SshConnection = null;
     const conn: ?*SshConnection = switch (target) {
-        .command => null,
+        .command, .slimed => null,
         .host => |h| self.hostConnection(h) orelse conn: {
             new_conn = try SshConnection.spawn(self.alloc, self.hosts.items.items[h], .{ .hwnd = self.hwnd.?, .msg = WM_APP_SSH_LOGIN });
             break :conn new_conn;
@@ -344,9 +371,22 @@ fn spawnSession(self: *Window, target: Target) !void {
             self.activeSession().pwd(&cwd_buf)
         else
             null,
-    } } else .{ .command = target.command };
-    const s = Session.create(self, self.next_session_id, launch, grid_size.cols, grid_size.rows) catch |err| {
+    } } else switch (target) {
+        .command => |command| if (self.config.@"persist-sessions")
+            .{ .slimed = .{ .target = .{ .new = .{ .command = command } }, .command = command } }
+        else
+            .{ .command = command },
+        .slimed => |s| .{ .slimed = .{ .target = .{ .attach = s.id }, .command = s.command } },
+        .host => unreachable,
+    };
+    const s = Session.create(self, self.next_session_id, launch, grid_size.cols, grid_size.rows) catch |err| retry: {
         if (new_conn) |c| c.shutdownIfUnused();
+        // Without slimed, a new local session still runs, just not past
+        // the window.
+        if (launch == .slimed and target == .command) {
+            log.err("starting a session in slimed failed ({}); running it directly", .{err});
+            break :retry try Session.create(self, self.next_session_id, .{ .command = target.command }, grid_size.cols, grid_size.rows);
+        }
         return err;
     };
     self.next_session_id +%= 1;
@@ -422,12 +462,15 @@ fn forgetHost(self: *Window, g: usize) void {
 /// closes the window.
 fn closeSession(self: *Window, i: usize) void {
     if (self.sessions.items.len <= 1) {
+        // Closing the window only detaches a slimed session.
+        self.sessions.items[i].kill();
         _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
         return;
     }
     const was_active = i == self.active;
     if (was_active) self.deactivate();
     const s = self.sessions.orderedRemove(i);
+    s.kill();
     s.destroy();
     // Rows moved under the mouse.
     _ = self.chrome.setHover(.none);
@@ -1411,6 +1454,12 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         WM_APP_CHILD_EXITED => {
             const i = self.sessionIndex(@intCast(wparam)) orelse return 0;
             const s = self.sessions.items[i];
+            // So does a slimed session lost to us while it runs.
+            if (s.slimedLoss()) |loss| {
+                if (!s.ended) s.showEnded(loss.text());
+                self.dirty = true;
+                return 0;
+            }
             // A failed SSH channel (login, connection, or open) stays to
             // say why. A shell that exited closes like a local one.
             if (s.sshEnding()) |ending| if (!ending.exited) {

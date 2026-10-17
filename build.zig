@@ -87,8 +87,8 @@ pub fn build(b: *std.Build) void {
     exe.entry = .{ .symbol_name = "mainCRTStartup" };
     b.installArtifact(exe);
     installConpty(b);
-    const ssh = b.option(bool, "ssh", "Build the slime-ssh helper (needs Go; default: if Go is found)");
-    if (ssh orelse true) installSshHelper(b, ssh != null);
+    const ssh = b.option(bool, "ssh", "Build the slime-ssh and slimed helpers (need Go; default: if Go is found)");
+    if (ssh orelse true) installGoHelpers(b, ssh != null);
 
     // Themes for the `theme` config key, in `themes` next to the exe.
     if (b.lazyDependency("iterm2_themes", .{})) |themes| {
@@ -172,28 +172,45 @@ fn terminfoSteps(b: *std.Build, test_step: *std.Build.Step) void {
     test_step.dependOn(&check.step);
 }
 
-/// slime-ssh.exe, next to the exe, for `ssh://` commands. Go caches its
-/// own builds, so this runs `go build` every time rather than tracking
-/// the sources. Without Go it warns and leaves the helper out, unless
-/// `-Dssh=true` asked for it.
-fn installSshHelper(b: *std.Build, required: bool) void {
+/// The Go helpers, next to the exe: slime-ssh.exe for `ssh://` commands,
+/// and slimed.exe for `persist-sessions`. Go caches its own builds, so
+/// this runs `go build` every time rather than tracking the sources.
+/// Without Go it warns and leaves them out, unless `-Dssh=true` asked for
+/// them.
+fn installGoHelpers(b: *std.Build, required: bool) void {
     const go = b.findProgram(&.{"go"}, &.{}) catch {
         if (required) {
-            b.getInstallStep().dependOn(&b.addFail("go not found; -Dssh=true needs it to build slime-ssh").step);
+            b.getInstallStep().dependOn(&b.addFail("go not found; -Dssh=true needs it to build slime-ssh and slimed").step);
             return;
         }
-        std.log.warn("go not found; building without slime-ssh (ssh:// commands won't work)", .{});
+        std.log.warn("go not found; building without slime-ssh and slimed (ssh:// commands and persist-sessions won't work)", .{});
         return;
     };
-    const build_helper = b.addSystemCommand(&.{ go, "build", "-trimpath", "-ldflags=-s -w", "-o" });
-    const out = build_helper.addOutputFileArg("slime-ssh.exe");
-    build_helper.addArg("./cmd/slime-ssh");
-    build_helper.setCwd(b.path("ssh"));
-    build_helper.setEnvironmentVariable("GOOS", "windows");
-    build_helper.setEnvironmentVariable("GOARCH", "amd64");
-    build_helper.setEnvironmentVariable("CGO_ENABLED", "0");
-    build_helper.has_side_effects = true;
-    b.getInstallStep().dependOn(&b.addInstallBinFile(out, "slime-ssh.exe").step);
+    _ = goBuild(b, go, "slime-ssh");
+
+    // slimed embeds libghostty-vt built as wasm (ssh/internal/vt), from a
+    // nested build of the submodule, which tracks its own sources.
+    const wasm = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "-Demit-lib-vt", "-Dtarget=wasm32-freestanding", "-Doptimize=ReleaseSmall", "--prefix" });
+    const prefix = wasm.addOutputDirectoryArg("vt-wasm");
+    wasm.setCwd(b.path("ghostty"));
+    wasm.has_side_effects = true;
+    const copy = b.addUpdateSourceFiles();
+    copy.addCopyFileToSource(prefix.path(b, "bin/ghostty-vt.wasm"), "ssh/internal/vt/ghostty-vt.wasm");
+    goBuild(b, go, "slimed").step.dependOn(&copy.step);
+}
+
+/// `go build` of ssh/cmd/`name`, installed as `name`.exe.
+fn goBuild(b: *std.Build, go: []const u8, comptime name: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{ go, "build", "-trimpath", "-ldflags=-s -w", "-o" });
+    const out = run.addOutputFileArg(name ++ ".exe");
+    run.addArg("./cmd/" ++ name);
+    run.setCwd(b.path("ssh"));
+    run.setEnvironmentVariable("GOOS", "windows");
+    run.setEnvironmentVariable("GOARCH", "amd64");
+    run.setEnvironmentVariable("CGO_ENABLED", "0");
+    run.has_side_effects = true;
+    b.getInstallStep().dependOn(&b.addInstallBinFile(out, name ++ ".exe").step);
+    return run;
 }
 
 fn installConpty(b: *std.Build) void {

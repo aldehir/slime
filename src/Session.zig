@@ -15,6 +15,7 @@ const win32 = @import("win32/win32.zig");
 const input = @import("input.zig");
 const Pty = @import("Pty.zig");
 const SshConnection = @import("SshConnection.zig");
+const Slimed = @import("Slimed.zig");
 const Login = @import("Login.zig");
 const clipboard = @import("clipboard.zig");
 const build_options = @import("build_options");
@@ -71,6 +72,11 @@ exit_wait: ?win32.HANDLE = null,
 /// closes it. UI thread only.
 ended: bool = false,
 
+/// The slimed session was lost to us while its child ran (taken by
+/// another client, or slimed went away). Written by the reader thread
+/// before it posts WM_APP_CHILD_EXITED.
+slimed_loss: ?SlimedLoss = null,
+
 /// Logging in to the SSH host, while there's something to show: a
 /// question, the server working on an answer, or why it failed. Shown
 /// as a dialog over the terminal. UI thread only.
@@ -114,18 +120,14 @@ const Transport = union(enum) {
     conpty: Pty,
     /// A remote shell on an SSH connection.
     ssh: *SshConnection.Channel,
-
-    fn read(self: *Transport, buf: []u8) !usize {
-        return switch (self.*) {
-            .conpty => |*pty| pty.read(buf),
-            .ssh => |ch| ch.read(buf),
-        };
-    }
+    /// A local child in a pseudoconsole slimed holds, which outlives us.
+    slimed: *Slimed,
 
     fn write(self: *Transport, data: []const u8) void {
         switch (self.*) {
             .conpty => |*pty| pty.write(data),
             .ssh => |ch| ch.write(data),
+            .slimed => |s| s.write(data),
         }
     }
 };
@@ -141,6 +143,30 @@ pub const Launch = union(enum) {
         title: []const u16,
         cwd: ?[]const u8 = null,
     },
+    /// A session slimed keeps: a new one, or one left detached. `command`
+    /// is what it runs, for the default title.
+    slimed: struct {
+        target: Slimed.Target,
+        command: []const u16,
+    },
+};
+
+/// Why a slimed session's connection ended without its child exiting,
+/// for the session to show. Set by the reader thread before it posts
+/// WM_APP_CHILD_EXITED.
+pub const SlimedLoss = struct {
+    const text_buf_len = 256;
+    text_buf: [text_buf_len]u8 = undefined,
+    text_len: usize = 0,
+
+    pub fn text(self: *const SlimedLoss) []const u8 {
+        return self.text_buf[0..self.text_len];
+    }
+
+    fn set(self: *SlimedLoss, comptime fmt: []const u8, args: anytype) void {
+        // Too long for the buffer: keep what fit.
+        self.text_len = if (std.fmt.bufPrint(&self.text_buf, fmt, args)) |s| s.len else |_| self.text_buf.len;
+    }
 };
 
 /// Start `launch` in a new session with a grid of `cols` x `rows`.
@@ -152,6 +178,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     const default_title = try alloc.dupe(u16, switch (launch) {
         .command => |command_line| programName(command_line),
         .ssh => |ssh| ssh.title,
+        .slimed => |s| programName(s.command),
     });
     errdefer alloc.free(default_title);
     self.* = .{
@@ -163,7 +190,36 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
         .stream = undefined,
     };
 
-    self.terminal = try .init(window.io, alloc, .{
+    // A slimed session's terminal comes from the daemon's snapshot of it.
+    var slimed: ?*Slimed = null;
+    // A session we just made would otherwise wait, detached, for the next
+    // window.
+    errdefer if (slimed) |s| {
+        if (launch.slimed.target == .new) s.kill();
+        s.deinit();
+    };
+    var restored: ?ghostty_vt.snapshot.Decoded = null;
+    defer if (restored) |*d| d.deinit(alloc);
+    if (launch == .slimed) {
+        const cell = window.cellSizePx();
+        const s, const attachment = try Slimed.open(alloc, launch.slimed.target, .{
+            .cols = cols,
+            .rows = rows,
+            .cell_width = cell.width,
+            .cell_height = cell.height,
+        });
+        slimed = s;
+        defer alloc.free(attachment.snapshot);
+        var reader: std.Io.Reader = .fixed(attachment.snapshot);
+        restored = try ghostty_vt.snapshot.decode(alloc, window.io, &reader, .{
+            // slimed's own limit (ssh/internal/vt ContinuationLimit).
+            .max_continuation_bytes = 64 * 1024,
+            .compress_history = true,
+        });
+        self.win32_input = attachment.win32_input;
+    }
+
+    self.terminal = if (restored) |*d| d.toOwned() else try .init(window.io, alloc, .{
         .cols = cols,
         .rows = rows,
         // Defaults that OSC 4/10/11/12 override and their resets return
@@ -185,6 +241,7 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
         .default_cursor_blink = null,
     });
     errdefer self.terminal.deinit(alloc);
+    if (restored != null) try self.applyDefaults();
     // Init takes no pixel size, and kitty images and pixel size reports
     // need one before the first resize.
     try self.terminal.resize(alloc, .{
@@ -194,8 +251,9 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     });
     // An arrow until the child asks for another shape with OSC 22. An
     // I-beam (Ghostty's default) looks wrong over TUIs. An empty OSC 22
-    // still resets it to the I-beam.
-    self.terminal.mouse_shape = .default;
+    // still resets it to the I-beam. A restored terminal can't tell the
+    // default I-beam from one the child asked for, and takes the arrow.
+    if (restored == null or self.terminal.mouse_shape == .text) self.terminal.mouse_shape = .default;
     self.stream = self.terminal.vtStream();
     errdefer self.stream.deinit();
     self.stream.handler.effects.write_pty = &writePty;
@@ -204,6 +262,14 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     self.stream.handler.effects.clipboard_write = &clipboardWrite;
     self.stream.handler.effects.clipboard_read = &clipboardRead;
     self.stream.handler.unknown_sequence = &unknownSequence;
+    // The snapshot was cut inside an escape sequence or codepoint: feed
+    // its start so the live output continues it. Replies it causes go
+    // nowhere, as the transport isn't set yet; the daemon answered.
+    if (restored) |d| switch (d.continuation) {
+        .ground => {},
+        .bytes => |b| self.stream.nextSlice(b),
+    };
+    if (restored != null) self.title_len = titleToUtf16(&self.title_buf, self.terminal.getTitle() orelse "");
 
     switch (launch) {
         .command => |command_line| {
@@ -217,14 +283,19 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
             const term = if (config.@"ssh-terminfo") "xterm-ghostty" else "xterm-256color";
             self.transport = .{ .ssh = try ssh.conn.open(id, term, cols, rows, cols * cell.width, rows * cell.height, ssh.cwd) };
         },
+        .slimed => {
+            self.transport = .{ .slimed = slimed.? };
+            slimed = null;
+        },
     }
     errdefer self.stopTransport();
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
 
-    // An SSH channel has no process here; its reader reports the end.
+    // An SSH channel or slimed's pty has no process here; the reader
+    // reports the end.
     const pty = switch (self.transport.?) {
         .conpty => |*pty| pty,
-        .ssh => return self,
+        .ssh, .slimed => return self,
     };
     var wait: win32.HANDLE = undefined;
     if (win32.RegisterWaitForSingleObject(
@@ -267,20 +338,65 @@ fn stopTransport(self: *Session) void {
     switch (transport.*) {
         .conpty => |*pty| pty.close(),
         .ssh => |ch| ch.close(),
+        // Wake the reader until it's gone: a cancel that lands before
+        // it blocks in ReadFile again is lost.
+        .slimed => |s| if (self.reader) |t| {
+            while (win32.WaitForSingleObject(t.getHandle(), 0) != win32.WAIT_OBJECT_0) {
+                s.cancel();
+                _ = win32.WaitForSingleObject(t.getHandle(), 20);
+            }
+        },
     }
     if (self.reader) |t| t.join();
     self.reader = null;
     switch (transport.*) {
         .conpty => |*pty| pty.deinit(),
         .ssh => |ch| ch.deinit(),
+        // Hanging up detaches; slimed keeps the session.
+        .slimed => |s| s.deinit(),
     }
     self.transport = null;
+}
+
+/// End a slimed session for good, not just our attachment, before the
+/// session is destroyed: the user closed it. Destroying alone detaches,
+/// as closing the window does. A session already lost to us is left
+/// alone.
+pub fn kill(self: *Session) void {
+    if (self.slimed_loss != null) return;
+    switch (self.transport orelse return) {
+        .slimed => |s| s.kill(),
+        else => {},
+    }
+}
+
+/// Why the slimed session was lost to us, once WM_APP_CHILD_EXITED says
+/// it ended, if its child didn't exit.
+pub fn slimedLoss(self: *const Session) ?*const SlimedLoss {
+    return if (self.slimed_loss) |*l| l else null;
+}
+
+/// After restoring from a snapshot, which carries the daemon's defaults:
+/// put back ours, as `create` gives a new terminal, keeping what the
+/// child changed (OSC 4/10/11/12 colors, the current modes).
+fn applyDefaults(self: *Session) !void {
+    const config = self.window.config;
+    const colors = &self.terminal.colors;
+    colors.background.default = config.background;
+    colors.foreground.default = config.foreground;
+    colors.cursor.default = if (config.@"cursor-color") |c| switch (c) {
+        .color => |rgb| rgb,
+        else => null,
+    } else null;
+    try colors.palette.changeDefault(self.alloc, config.palette.colors);
+    self.terminal.modes.default.grapheme_cluster = true;
+    self.terminal.setDefaultCursorBlink(null);
 }
 
 /// The SSH connection the session's shell runs on, if it's remote.
 pub fn sshConnection(self: *const Session) ?*SshConnection {
     return switch (self.transport orelse return null) {
-        .conpty => null,
+        .conpty, .slimed => null,
         .ssh => |ch| ch.conn,
     };
 }
@@ -289,7 +405,7 @@ pub fn sshConnection(self: *const Session) ?*SshConnection {
 /// after WM_APP_CHILD_EXITED.
 pub fn sshEnding(self: *const Session) ?*const SshConnection.Ending {
     return switch (self.transport orelse return null) {
-        .conpty => null,
+        .conpty, .slimed => null,
         .ssh => |ch| &ch.ending,
     };
 }
@@ -351,6 +467,14 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
     if (self.transport) |*t| switch (t.*) {
         .conpty => |*pty| if (changed) pty.resize(cols, rows),
         .ssh => |ch| if (changed or px_changed) ch.resize(cols, rows, @as(u32, cols) * cell.width, @as(u32, rows) * cell.height),
+        // The daemon's terminal answers pixel size reports while we're
+        // detached, so it hears about new fonts too.
+        .slimed => |s| if (changed or px_changed) s.resize(.{
+            .cols = cols,
+            .rows = rows,
+            .cell_width = cell.width,
+            .cell_height = cell.height,
+        }),
     };
 }
 
@@ -359,17 +483,55 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
 fn readLoop(self: *Session) void {
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = self.transport.?.read(&buf) catch break;
+        const n = switch (self.transport.?) {
+            .conpty => |*pty| pty.read(&buf),
+            .ssh => |ch| ch.read(&buf),
+            .slimed => |s| return self.readSlimed(s),
+        } catch break;
         if (n == 0) break;
-
-        self.lockTerminal();
-        self.stream.nextSlice(buf[0..n]);
-        self.unlockTerminal();
-        if (build_options.stats) _ = self.window.stats.bytes.fetchAdd(n, .monotonic);
-        self.unseen.store(true, .release);
-        _ = win32.SetEvent(self.window.output_event);
+        self.output(buf[0..n]);
     }
     self.channelEnded();
+}
+
+fn output(self: *Session, data: []const u8) void {
+    self.lockTerminal();
+    self.stream.nextSlice(data);
+    self.unlockTerminal();
+    if (build_options.stats) _ = self.window.stats.bytes.fetchAdd(data.len, .monotonic);
+    self.unseen.store(true, .release);
+    _ = win32.SetEvent(self.window.output_event);
+}
+
+/// Reader thread for a slimed session: output until the child exits,
+/// the session is taken from us, or the connection ends (slimed went
+/// away, or `stopTransport` cancelled it).
+fn readSlimed(self: *Session, s: *Slimed) void {
+    var loss: SlimedLoss = .{};
+    if (self.alloc.alloc(u8, 1 << 20)) |buf| {
+        defer self.alloc.free(buf);
+        while (true) {
+            const event = s.next(buf) catch {
+                loss.set("lost slimed", .{});
+                break;
+            };
+            switch (event) {
+                .output => |data| self.output(data),
+                .exit => |status| {
+                    log.info("slimed session {d} exited with status {d}", .{ s.id, status });
+                    _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
+                    return;
+                },
+                .detached => |reason| {
+                    loss.set("detached: {s}", .{reason});
+                    break;
+                },
+            }
+        }
+    } else |_| loss.set("out of memory", .{});
+    // Read on the UI thread only after the post, which orders it.
+    self.slimed_loss = loss;
+    _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
 }
 
 /// Send input (keys, pastes, query replies) to the child.
@@ -381,7 +543,7 @@ fn writeChild(self: *Session, data: []const u8) void {
 /// control thread knows how it ended, which the helper sends first.
 fn channelEnded(self: *Session) void {
     const ch = switch (self.transport.?) {
-        .conpty => return,
+        .conpty, .slimed => return,
         .ssh => |ch| ch,
     };
     ch.waitEnded(5000);

@@ -131,10 +131,8 @@ one.
 - **Logging in, in the header.** A host shows `+` from the moment its
   helper starts, before it's logged in. Sessions left from a dead
   connection aren't dimmed.
-- **Persistent sessions.** A session ends with slime, or with its SSH
-  channel. `slimed` (ssh/cmd/slimed) keeps local ConPTY sessions alive
-  and serves attach-by-snapshot over a named pipe, but slime doesn't
-  use it yet, and it doesn't run on remote hosts yet.
+- **Persistent remote sessions.** An SSH session ends with its channel.
+  slimed (below) doesn't run on remote hosts yet.
 - **The new session key hint** went with the "New session" button.
   Ctrl+Shift+T opens one in the active session's group.
 - **More of `~/.ssh/config`.** The helper reads Host blocks and
@@ -146,6 +144,35 @@ one.
   (`CertificateFile`) and `HostKeyAlias` are ignored.
 - **Agent forwarding, port forwarding, SFTP.**
 - **Helper logs in GUI builds** go nowhere: there is no stderr to pass.
+
+## Persistent sessions
+
+`persist-sessions = true` runs local sessions in slimed (ssh/cmd/slimed),
+a daemon that holds their ConPTYs and terminal state. Closing the window
+detaches them, and the next window reattaches every detached one from a
+snapshot. Closing a session ends it. Off by default.
+
+- **Detaching one session** without closing the window, and listing
+  detached sessions in the sidebar to attach one, rather than taking all
+  of them at startup.
+- **A session another client took** ("attached elsewhere") can only be
+  closed; there's no reattach.
+- **Daemon copies pile up.** slime runs slimed from a copy in
+  `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
+  doesn't block the next install, and never deletes old ones.
+- **A full reset (RIS) in a session** drops grapheme clustering on the
+  daemon's copy of its terminal: libghostty-vt's C API can't set default
+  modes, so slimed sets mode 2027's current value only. The next attach
+  then shows that session without clustering.
+- **New sessions take slimed's environment**, from whichever slime
+  started it, not the window's.
+- **Several windows** each take whatever's detached when they open, and
+  a session belongs to one window at a time.
+- **Several clients on one session.** Attaching takes a session from
+  whoever has it. Sharing needs a rule for whose replies to device
+  queries reach the program (clients would send them as their own frame
+  type, not input) and whose size the pty takes; a read-only attach
+  would sidestep both.
 
 ## Configuration
 

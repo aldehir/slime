@@ -371,7 +371,66 @@ pub const WT_EXECUTEONLYONCE = 0x00000008;
 pub const INFINITE: u32 = 0xFFFFFFFF;
 pub const LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
 
+pub const ERROR_FILE_NOT_FOUND = 2;
 pub const ERROR_BROKEN_PIPE = 109;
+pub const ERROR_PIPE_BUSY = 231;
+pub const ERROR_OPERATION_ABORTED = 995;
+pub const ERROR_IO_PENDING = 997;
+
+// Files and pipes
+pub const GENERIC_READ = 0x80000000;
+pub const GENERIC_WRITE = 0x40000000;
+pub const OPEN_EXISTING = 3;
+pub const FILE_FLAG_OVERLAPPED = 0x40000000;
+pub const ERROR_FILE_EXISTS = 80;
+pub const ERROR_ALREADY_EXISTS = 183;
+pub const GetFileExInfoStandard = 0;
+pub const WIN32_FILE_ATTRIBUTE_DATA = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: u64 align(4),
+    ftLastAccessTime: u64 align(4),
+    ftLastWriteTime: u64 align(4),
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+};
+pub extern "kernel32" fn GetFileAttributesExW(LPCWSTR, i32, *WIN32_FILE_ATTRIBUTE_DATA) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CopyFileW(LPCWSTR, LPCWSTR, BOOL) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CreateDirectoryW(LPCWSTR, ?*anyopaque) callconv(.winapi) BOOL;
+pub const OVERLAPPED = extern struct {
+    Internal: usize = 0,
+    InternalHigh: usize = 0,
+    Offset: u32 = 0,
+    OffsetHigh: u32 = 0,
+    hEvent: ?HANDLE = null,
+};
+/// For a pipe client: the server can't impersonate us.
+pub const SECURITY_SQOS_PRESENT = 0x00100000;
+pub const SECURITY_IDENTIFICATION = 0x00010000;
+
+// Processes, tokens
+pub const DETACHED_PROCESS = 0x00000008;
+pub const CREATE_NEW_PROCESS_GROUP = 0x00000200;
+pub const CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+pub const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+pub const TOKEN_QUERY = 0x0008;
+pub const TokenUser = 1;
+pub const SID = opaque {};
+pub const TOKEN_USER = extern struct {
+    User: extern struct { Sid: *SID, Attributes: u32 },
+};
+
+pub extern "advapi32" fn OpenProcessToken(HANDLE, u32, *HANDLE) callconv(.winapi) BOOL;
+pub extern "advapi32" fn GetTokenInformation(HANDLE, i32, ?*anyopaque, u32, *u32) callconv(.winapi) BOOL;
+pub extern "advapi32" fn EqualSid(*SID, *SID) callconv(.winapi) BOOL;
+pub extern "advapi32" fn ConvertSidToStringSidW(*SID, *?LPWSTR) callconv(.winapi) BOOL;
+pub extern "kernel32" fn LocalFree(?*anyopaque) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn CreateFileW(LPCWSTR, u32, u32, ?*anyopaque, u32, u32, ?HANDLE) callconv(.winapi) HANDLE;
+pub extern "kernel32" fn WaitNamedPipeW(LPCWSTR, u32) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetNamedPipeServerProcessId(HANDLE, *u32) callconv(.winapi) BOOL;
+pub extern "kernel32" fn OpenProcess(u32, BOOL, u32) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn CancelIoEx(HANDLE, ?*OVERLAPPED) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetOverlappedResult(HANDLE, *OVERLAPPED, *u32, BOOL) callconv(.winapi) BOOL;
+pub extern "kernel32" fn Sleep(u32) callconv(.winapi) void;
 
 // Clipboard
 pub const CF_UNICODETEXT = 13;

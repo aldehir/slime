@@ -97,13 +97,15 @@ slime ships `conpty.dll` and `OpenConsole.exe` from the
 package, built from [microsoft/terminal](https://github.com/microsoft/terminal)
 under the MIT License, Copyright (c) Microsoft Corporation.
 
-## slime-ssh
+## slime-ssh and slimed
 
-`slime-ssh.exe` is written in Go, and statically links the Go standard
-library and the modules below, unmodified.
+`slime-ssh.exe` and `slimed.exe` are written in Go, and statically link
+the Go standard library and the modules below, unmodified. `slimed.exe`
+also embeds libghostty-vt (above), compiled to WebAssembly.
 
 The Go standard library, [golang.org/x/crypto](https://go.googlesource.com/crypto),
-and [golang.org/x/sys](https://go.googlesource.com/sys) are licensed as
+[golang.org/x/sys](https://go.googlesource.com/sys), and
+[golang.org/x/term](https://go.googlesource.com/term) are licensed as
 follows:
 
 ```
@@ -196,9 +198,11 @@ SOFTWARE.
 ```
 
 [spf13/cobra](https://github.com/spf13/cobra), Copyright 2013-2023 The
-Cobra Authors, and
+Cobra Authors,
 [inconshreveable/mousetrap](https://github.com/inconshreveable/mousetrap),
-Copyright 2022 Alan Shreve, are licensed under the Apache License 2.0:
+Copyright 2022 Alan Shreve, and
+[tetratelabs/wazero](https://github.com/tetratelabs/wazero), Copyright
+2020-2023 wazero authors, are licensed under the Apache License 2.0:
 
 ```
                                 Apache License

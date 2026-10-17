@@ -63,6 +63,11 @@ palette: Palette = .{},
 /// overrides it; with neither, %COMSPEC%.
 command: ?[]const u8 = null,
 
+/// Run local sessions in slimed, a daemon that keeps them alive after the
+/// window closes; the next window reattaches the ones it left. Closing a
+/// session still ends it. slimed.exe must be next to slime.exe.
+@"persist-sessions": bool = false,
+
 /// Give SSH sessions TERM=xterm-ghostty, compiling Ghostty's terminfo
 /// into ~/.terminfo on hosts that lack it (Ghostty's ssh-terminfo). Hosts
 /// it can't be installed on get xterm-256color, as do all with this off.
