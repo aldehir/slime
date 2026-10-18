@@ -837,11 +837,18 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         win32.WM_LBUTTONDOWN,
         win32.WM_LBUTTONUP,
         win32.WM_RBUTTONDOWN,
-        win32.WM_RBUTTONUP,
         win32.WM_MBUTTONDOWN,
         win32.WM_MBUTTONUP,
         => {
             self.mouseInput(msg, wparam, lparam);
+            return 0;
+        },
+
+        // A right click opens a context menu as it comes up, as
+        // DefWindowProc's WM_CONTEXTMENU would.
+        win32.WM_RBUTTONUP => {
+            self.mouseInput(msg, wparam, lparam);
+            _ = app.update(.{ .context_menu = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) } });
             return 0;
         },
 

@@ -30,11 +30,13 @@ pub const Id = Ui.Id;
 const Rect = Ui.Rect;
 const TextField = Ui.TextField;
 const Dialog = Ui.Dialog;
+const Menu = Ui.Menu;
 const Tree = Ui.Tree;
 
 const log = std.log.scoped(.app);
 
-const app_name = std.unicode.utf8ToUtf16LeStringLiteral("slime");
+const L = std.unicode.utf8ToUtf16LeStringLiteral;
+const app_name = L("slime");
 
 const spinner_ms = 100;
 /// How long after a tooltip hides the next shows without waiting.
@@ -168,6 +170,9 @@ pub const Mode = union(enum) {
     rename: Rename,
     /// Asking before killing a workspace, over the terminal area.
     confirm: Confirm,
+    /// A context menu, over everything, until it's chosen from or
+    /// dismissed.
+    menu: Menu,
 };
 
 /// A workspace's name being edited.
@@ -193,6 +198,7 @@ pub const Keyboard = union(enum) {
     connect: *TextField,
     rename: *TextField,
     confirm: *Dialog,
+    menu: *Menu,
     login: *Login,
 
     /// The text field typed into, if one has the keyboard.
@@ -200,7 +206,7 @@ pub const Keyboard = union(enum) {
         return switch (self) {
             .connect, .rename => |f| f,
             .login => |l| l.dialog.focused(),
-            .terminal, .confirm => null,
+            .terminal, .confirm, .menu => null,
         };
     }
 };
@@ -312,6 +318,9 @@ pub const Msg = union(enum) {
     daemon_posted,
     /// A session's reader posted about session `id`.
     session: struct { id: u32, what: enum { exited, title, clipboard } },
+    /// A right click came up at a client position: what's there may
+    /// open its context menu.
+    context_menu: win32.POINT,
 
     pub const Mouse = struct { msg: u32, wparam: win32.WPARAM, pos: win32.POINT };
     pub const Key = struct { msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM };
@@ -621,6 +630,7 @@ pub fn update(self: *App, msg: Msg) Result {
         .output => self.outputArrived(),
         .daemon_posted => self.daemonPosted(),
         .session => |s| self.sessionEvent(s.id, s.what),
+        .context_menu => |pos| self.contextMenu(pos),
     }
     return .handled;
 }
@@ -916,6 +926,7 @@ fn workspaceGone(self: *App, id: u32) void {
     switch (self.mode) {
         .rename => |r| if (r.ws == id) self.cancelRename(),
         .confirm => |c| if (c.ws == id) self.closeConfirm(),
+        .menu => |m| if (std.meta.eql(m.target, Id.Target{ .workspace = id })) self.closeMenu(),
         .terminal, .connect => {},
     }
     for (self.workspaces.items, 0..) |w, k| {
@@ -1091,6 +1102,153 @@ fn confirmKey(self: *App, d: *Dialog, vk: u32) bool {
         win32.VK_SPACE => if (d.focusedButton()) |b| self.confirmAction(b.action) else return false,
         win32.VK_ESCAPE => self.confirmAction(.cancel),
         win32.VK_TAB => if (self.shell.keyDown(win32.VK_CONTROL)) return false else d.cycleFocus(!self.shell.keyDown(win32.VK_SHIFT)),
+        else => return false,
+    }
+    self.keyHandled();
+    return true;
+}
+
+/// Open `target`'s context menu at `anchor`, with the entries for what
+/// it is now. Takes the keyboard from a field or dialog.
+fn openMenu(self: *App, target: Id.Target, anchor: Menu.Anchor) void {
+    var m: Menu = .{ .target = target, .anchor = anchor };
+    switch (target) {
+        // Local's header makes a workspace, or a tab with no daemon to
+        // list workspaces, as its button does.
+        .local => if (self.workspaces.items.len == 0)
+            m.add(.{ .label = L("New tab"), .icon = .plus, .action = .{ .part = .new_tab } })
+        else
+            m.add(.{ .label = L("New workspace"), .icon = .plus, .action = .{ .part = .new_tab } }),
+        .workspace => |id| {
+            const w = self.workspaceEntry(id) orelse return;
+            m.add(.{ .label = L("New tab"), .icon = .plus, .action = .{ .part = .new_tab } });
+            m.separator();
+            if (w.shown)
+                m.add(.{ .label = L("Hide"), .icon = .eye_off, .action = .{ .part = .hide } })
+            else
+                m.add(.{ .label = L("Show"), .icon = .eye, .action = .{ .part = .show } });
+            m.add(.{ .label = L("Rename"), .icon = .pencil, .action = .{ .part = .rename } });
+            m.separator();
+            m.add(.{ .label = L("Kill"), .icon = .trash, .action = .{ .part = .kill }, .danger = true });
+        },
+        .host => |h| {
+            if (h >= self.hosts.items.items.len) return;
+            const live = self.hostLive(h);
+            m.add(.{ .label = if (live) L("New tab") else L("Connect"), .icon = if (live) .plus else .plug, .action = .{ .part = .new_tab } });
+            m.separator();
+            m.add(.{ .label = L("Forget host"), .icon = .x, .action = .{ .part = .forget }, .disabled = self.hostHasTabs(h) });
+        },
+        .tab => {
+            if (self.tabIndexOf(target) == null) return;
+            m.add(.{ .label = L("Close tab"), .icon = .x, .action = .{ .part = .close }, .danger = true });
+        },
+        .pane => {
+            const found = self.sessionOf(target) orelse return;
+            const s = found.s;
+            const t = self.tabs.items[found.tab];
+            // Only slime's panes split and zoom.
+            const in_slime = s.daemonPane() != null;
+            m.add(.{ .label = L("Copy"), .icon = .copy, .action = .{ .binding = .copy_to_clipboard }, .disabled = !s.hasSelection() });
+            m.add(.{ .label = L("Paste"), .icon = .clipboard, .action = .{ .binding = .paste_from_clipboard }, .disabled = !self.shell.clipboardHasText() });
+            m.separator();
+            m.add(.{ .label = L("Split right"), .icon = .columns_2, .action = .{ .binding = .{ .new_split = .right } }, .disabled = !in_slime });
+            m.add(.{ .label = L("Split down"), .icon = .rows_2, .action = .{ .binding = .{ .new_split = .down } }, .disabled = !in_slime });
+            if (t.count() > 1) {
+                const zoomed = t.zoom == s;
+                m.add(.{ .label = if (zoomed) L("Unzoom") else L("Zoom"), .icon = if (zoomed) .minimize_2 else .maximize_2, .action = .{ .binding = .toggle_split_zoom } });
+            }
+            m.separator();
+            m.add(.{ .label = L("Close pane"), .icon = .x, .action = .{ .binding = .close_surface }, .danger = true });
+        },
+        else => return,
+    }
+    self.cancelConnect();
+    self.cancelRename();
+    self.closeConfirm();
+    self.mode = .{ .menu = m };
+    self.hideTip();
+    _ = self.ui.setHover(.none);
+    self.setPressed(.none);
+    self.markDirty();
+}
+
+fn closeMenu(self: *App) void {
+    if (self.mode != .menu) return;
+    self.mode = .terminal;
+    _ = self.ui.setHover(.none);
+    self.setPressed(.none);
+    self.markDirty();
+}
+
+/// Whether the open menu is still about something that's listed. What
+/// it was about can go while it's open: a tab closed by another window,
+/// a workspace killed.
+fn menuTargetExists(self: *App) bool {
+    const target = switch (self.mode) {
+        .menu => |m| m.target,
+        else => return true,
+    };
+    return switch (target) {
+        .local => true,
+        .host => |h| h < self.hosts.items.items.len,
+        .workspace => |id| self.workspaceEntry(id) != null,
+        .tab => self.tabIndexOf(target) != null,
+        .pane => self.sessionOf(target) != null,
+        else => false,
+    };
+}
+
+/// A right click came up at `pos`: open the menu of the row or pane
+/// there, in place of any open. A field being edited keeps its click.
+fn contextMenu(self: *App, pos: win32.POINT) void {
+    self.closeMenu();
+    const hit = self.hitAt(pos);
+    if (hit.part == .field) return;
+    switch (hit.target) {
+        .local, .host, .workspace, .tab, .pane => {},
+        else => return,
+    }
+    self.openMenu(hit.target, .{ .point = .{ .x = @floatFromInt(pos.x), .y = @floatFromInt(pos.y) } });
+}
+
+/// Open the focused pane's menu under its title strip, for the Menu key.
+fn menuForFocused(self: *App) void {
+    const s = self.focusedSession() orelse return;
+    const p = self.placed().find(s) orelse return;
+    const strip: Rect = .{ .x = p.frame.x, .y = p.frame.y, .w = p.frame.w, .h = self.geometry.title_height };
+    self.openMenu(.{ .pane = s.id }, .{ .below = strip });
+}
+
+/// Act on the open menu's entry `i`: close the menu, then do what the
+/// entry says, as a click on the control would, or the key.
+fn chooseItem(self: *App, i: usize) void {
+    const m = switch (self.mode) {
+        .menu => |m| m,
+        else => return,
+    };
+    const e = m.entry(i) orelse return;
+    if (e.disabled) return;
+    self.closeMenu();
+    switch (e.action) {
+        .part => |part| self.widgetClick(.{ .target = m.target, .part = part }),
+        .binding => |action| {
+            // Bindings act on the focused pane: a pane's menu makes it so.
+            if (m.target == .pane) self.showPane(m.target);
+            _ = self.runAction(action);
+        },
+    }
+}
+
+/// A key down for a context menu. Returns false for keys it doesn't
+/// take.
+fn menuKey(self: *App, m: *Menu, vk: u32) bool {
+    switch (vk) {
+        win32.VK_DOWN => m.moveFocus(true),
+        win32.VK_UP => m.moveFocus(false),
+        win32.VK_HOME => m.focusEnd(true),
+        win32.VK_END => m.focusEnd(false),
+        win32.VK_RETURN, win32.VK_SPACE => if (m.focus) |i| self.chooseItem(i) else return false,
+        win32.VK_ESCAPE => self.closeMenu(),
         else => return false,
     }
     self.keyHandled();
@@ -2039,12 +2197,17 @@ fn focusPane(self: *App, s: *Session) void {
     self.activated();
 }
 
+/// Whether a tab is on remembered host `h`.
+fn hostHasTabs(self: *const App, h: usize) bool {
+    for (self.tabs.items) |t| {
+        if (self.groupOf(t) == self.hostGroup(h)) return true;
+    }
+    return false;
+}
+
 /// Drop remembered host `h` from the sidebar, if no tab uses it.
 fn forgetHost(self: *App, h: usize) void {
-    if (h >= self.hosts.items.items.len) return;
-    for (self.tabs.items) |t| {
-        if (self.groupOf(t) == self.hostGroup(h)) return;
-    }
+    if (h >= self.hosts.items.items.len or self.hostHasTabs(h)) return;
     self.hosts.remove(h);
     _ = self.ui.setHover(.none);
     self.markDirty();
@@ -2255,6 +2418,8 @@ fn setFocus(self: *App, focused: bool) void {
     self.focused = focused;
     self.markDirty();
     if (!focused) self.hideTip();
+    // Menus go with the focus, as Windows' do.
+    if (!focused) self.closeMenu();
     if (focused) {
         self.resetBlink();
     } else {
@@ -2289,7 +2454,7 @@ fn blinkTick(self: *App) void {
     }
     switch (self.keyboard()) {
         .connect, .rename => self.markDirty(),
-        .terminal, .confirm, .login => {},
+        .terminal, .confirm, .menu, .login => {},
     }
 }
 
@@ -2398,6 +2563,7 @@ pub fn keyboard(self: *App) Keyboard {
         .connect => |*f| return .{ .connect = f },
         .rename => |*r| return .{ .rename = &r.field },
         .confirm => |*c| return .{ .confirm = &c.dialog },
+        .menu => |*m| return .{ .menu = m },
         .terminal => {},
     }
     const s = self.focusedSession() orelse return .terminal;
@@ -2509,6 +2675,8 @@ fn anyWorking(self: *App) bool {
 /// is gone. The renderer calls this once a frame; `hitAt` reuses the
 /// tree while nothing has changed (`currentTree`).
 pub fn view(self: *App) *const Tree {
+    // A menu about something that's gone goes too.
+    if (!self.menuTargetExists()) self.closeMenu();
     // The builder reads the placement.
     _ = self.placed();
     _ = self.arena.reset(.retain_capacity);
@@ -2579,6 +2747,8 @@ fn toPane(self: *App, s: *const Session, pos: win32.POINT) win32.POINT {
 fn setHover(self: *App, hit: Id) bool {
     const had_tip = self.ui.tip.target != .none;
     if (!self.ui.setHover(hit)) return false;
+    // The keyboard follows the mouse through a menu's entries.
+    if (hit.target == .menu and self.mode == .menu) self.mode.menu.focus = hit.target.menu;
     self.markDirty();
     self.shell.killTimer(.tip);
     const now = self.shell.tickCount();
@@ -2641,6 +2811,8 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
         _ = self.setHover(hit);
     }
     if (press) self.hideTip();
+    // A press outside an open menu closes it, and goes no further.
+    if (press and self.mode == .menu and hit.target != .menu and !hit.eql(.window(.menu))) return self.closeMenu();
     // Clicking anywhere else closes the host field, and a rename.
     if (press and !hit.eql(.window(.connect))) self.cancelConnect();
     if (press and !(hit.part == .field and hit.target == .workspace)) self.cancelRename();
@@ -2719,9 +2891,13 @@ fn widgetClick(self: *App, hit: Id) void {
             .host => |h| self.forgetHost(h),
             else => {},
         },
-        .body => if (self.workspaceOf(hit.target)) |ws| {
-            if (ws.shown) self.hideWorkspace(ws.id) else self.showWorkspace(ws.id);
+        .body => switch (hit.target) {
+            .menu => |i| self.chooseItem(i),
+            else => if (self.workspaceOf(hit.target)) |ws| {
+                if (ws.shown) self.hideWorkspace(ws.id) else self.showWorkspace(ws.id);
+            },
         },
+        .show => if (self.workspaceOf(hit.target)) |ws| self.showWorkspace(ws.id),
         .hide => if (self.workspaceOf(hit.target)) |ws| self.hideWorkspace(ws.id),
         .kill => if (self.workspaceOf(hit.target)) |ws| self.askKillWorkspace(ws.id),
         .rename => if (self.workspaceOf(hit.target)) |ws| self.startRename(ws.id),
@@ -2776,6 +2952,7 @@ fn keyInput(self: *App, k: Msg.Key) Result {
                 .connect => self.connectKey(owner, vk),
                 .rename => self.renameKey(owner, vk),
                 .confirm => self.confirmKey(owner, vk),
+                .menu => self.menuKey(owner, vk),
                 .login => self.loginKey(owner, vk),
                 .terminal => unreachable,
             };
@@ -2799,6 +2976,12 @@ fn keyInput(self: *App, k: Msg.Key) Result {
             self.shell.dropPendingChars();
             self.closePane(self.active, self.activeSession());
         }
+        return .handled;
+    }
+    // The Menu key opens the focused pane's menu; shift+F10 is the
+    // program's.
+    if (down and wparam == win32.VK_APPS) {
+        self.menuForFocused();
         return .handled;
     }
     switch (wparam) {
@@ -2889,8 +3072,10 @@ fn placeTab(self: *App, t: *Tab, into: *Placement) void {
 /// pane's grid to it, and tell the daemons. The window draws after.
 pub fn layout(self: *App, geometry: Geometry) void {
     self.geometry = geometry;
-    // The tree is built for the frame; the window draws after.
+    // The tree is built for the frame; the window draws after. A menu's
+    // anchor moved with everything else.
     self.markDirty();
+    self.closeMenu();
     self.quiet_until = self.shell.tickCount() + resize_quiet_ms;
     for (self.tabs.items) |t| self.layoutTab(t);
     if (self.daemon) |conn| conn.resizeWorkspaces(self.daemonArea());
@@ -3055,7 +3240,6 @@ test "the connect field opens on its button, takes text, and closes on Escape" {
     try t.init(&shell);
     defer t.deinit();
     const app = &t.app;
-    const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
     try std.testing.expectEqual(Keyboard.terminal, app.keyboard());
     try std.testing.expectEqual(Result.handled, app.update(.{ .click = .window(.connect) }));
@@ -3110,6 +3294,98 @@ test "the keyboard goes to the host field, a rename, or the kill dialog, one at 
     try std.testing.expect(app.mode == .connect);
     app.cancelConnect();
     try std.testing.expectEqual(Keyboard.terminal, app.keyboard());
+}
+
+test "a right click opens a workspace's menu, which the keyboard works and a click outside closes" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    const alloc = std.testing.allocator;
+    try app.workspaces.append(alloc, .{ .id = 7, .name = try alloc.dupe(u16, L("alpha")), .tabs = 2, .viewers = 1, .shown = false });
+
+    const row = Ui.find(app.view(), .{ .target = .{ .workspace = 7 } }).?.rect;
+    const at: win32.POINT = .{ .x = @intFromFloat(row.x + 30), .y = @intFromFloat(row.y + 5) };
+    _ = app.update(.{ .context_menu = at });
+    try std.testing.expect(app.mode == .menu);
+    try std.testing.expect(app.keyboard() == .menu);
+    const m = &app.mode.menu;
+    try std.testing.expectEqual(Id.Target{ .workspace = 7 }, m.target);
+    // New tab, Show (it's hidden), Rename, and Kill, in groups.
+    try std.testing.expectEqual(@as(usize, 6), m.count);
+    try std.testing.expectEqualSlices(u16, L("Show"), m.entry(2).?.label);
+    try std.testing.expectEqual(Id.Part.show, m.entry(2).?.action.part);
+    try std.testing.expect(m.entry(5).?.danger);
+    try std.testing.expectEqual(@as(?usize, null), m.focus);
+    // The box is at the click, and the window around it is its scrim.
+    const built = app.view();
+    const box = Ui.find(built, .window(.menu)).?.rect;
+    try std.testing.expectEqual(@as(f32, @floatFromInt(at.x)), box.x);
+    try std.testing.expectEqual(Id.window(.scrim), app.hitAt(.{ .x = 500, .y = 300 }));
+
+    // Down goes to the first entry; the mouse over another moves it.
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_DOWN, .lparam = 0 } });
+    try std.testing.expectEqual(@as(?usize, 0), m.focus);
+    const second = Ui.find(app.view(), .window(.menu)).?.rect;
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = 0, .pos = .{ .x = @intFromFloat(second.x + 20), .y = @intFromFloat(second.y + 6 + 28 + 9 + 5) } } });
+    try std.testing.expectEqual(@as(?usize, 2), m.focus);
+    try std.testing.expect(app.ui.hover.eql(.{ .target = .{ .menu = 2 } }));
+
+    // Escape closes it; a press outside does too, and goes no further.
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_ESCAPE, .lparam = 0 } });
+    try std.testing.expect(app.mode == .terminal);
+    _ = app.update(.{ .context_menu = at });
+    try std.testing.expect(app.mode == .menu);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONDOWN, .wparam = win32.MK_LBUTTON, .pos = .{ .x = 500, .y = 300 } } });
+    try std.testing.expect(app.mode == .terminal);
+    try std.testing.expect(!shell.captured);
+
+    // Losing focus closes it, and so does its workspace going away.
+    _ = app.update(.{ .focus = true });
+    _ = app.update(.{ .context_menu = at });
+    _ = app.update(.{ .focus = false });
+    try std.testing.expect(app.mode == .terminal);
+    _ = app.update(.{ .context_menu = at });
+    app.workspaceGone(7);
+    try std.testing.expect(app.mode == .terminal);
+    // Nothing there: no menu.
+    _ = app.update(.{ .context_menu = .{ .x = 500, .y = 300 } });
+    try std.testing.expect(app.mode == .terminal);
+}
+
+test "choosing a menu entry clicks the control, after the menu has closed" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    const alloc = std.testing.allocator;
+    try app.workspaces.append(alloc, .{ .id = 7, .name = try alloc.dupe(u16, L("alpha")), .tabs = 0, .viewers = 1, .shown = true });
+
+    app.openMenu(.{ .workspace = 7 }, .{ .point = .{ .x = 100, .y = 100 } });
+    // Rename is the fourth item: Enter on it edits the name in the row.
+    app.mode.menu.focus = 3;
+    try std.testing.expectEqualSlices(u16, L("Rename"), app.mode.menu.entry(3).?.label);
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_RETURN, .lparam = 0 } });
+    try std.testing.expect(app.mode == .rename);
+    try std.testing.expectEqual(@as(u32, 7), app.mode.rename.ws);
+    try std.testing.expectEqualSlices(u16, L("alpha"), app.mode.rename.field.text());
+    // Opening a menu ends the rename.
+    app.openMenu(.{ .workspace = 7 }, .{ .point = .{ .x = 100, .y = 100 } });
+    try std.testing.expect(app.mode == .menu);
+    // A click on an entry chooses it too: Hide, as the workspace is shown.
+    try std.testing.expectEqualSlices(u16, L("Hide"), app.mode.menu.entry(2).?.label);
+    _ = app.update(.{ .click = .{ .target = .{ .menu = 2 } } });
+    try std.testing.expect(app.mode == .terminal);
+    // A disabled entry can't be chosen.
+    _ = try app.hosts.add(L("ssh://devbox"));
+    app.openMenu(.{ .host = 0 }, .{ .point = .{ .x = 100, .y = 100 } });
+    try std.testing.expect(!app.mode.menu.entry(2).?.disabled);
+    app.mode.menu.items[2].entry.disabled = true;
+    _ = app.update(.{ .click = .{ .target = .{ .menu = 2 } } });
+    try std.testing.expect(app.mode == .menu);
+    try std.testing.expectEqual(@as(usize, 1), app.hosts.items.items.len);
 }
 
 test "the blink timer toggles the phase and redraws only what blinks" {

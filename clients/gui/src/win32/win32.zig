@@ -341,6 +341,8 @@ pub const VK_INSERT = 0x2D;
 pub const VK_DELETE = 0x2E;
 pub const VK_LWIN = 0x5B;
 pub const VK_RWIN = 0x5C;
+/// The Menu key.
+pub const VK_APPS = 0x5D;
 pub const VK_NUMPAD0 = 0x60;
 pub const VK_NUMPAD9 = 0x69;
 pub const VK_DECIMAL = 0x6E;

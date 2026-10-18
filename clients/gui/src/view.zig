@@ -2,9 +2,9 @@
 //! has (workspaces, tabs, panes, hosts) and what the UI draws (`ui/Tree`).
 //! `build` makes a tree each frame, in an arena: the title bar, the
 //! sidebar as a tree of sections, workspaces, tabs, and panes, the
-//! terminal area's pane strips, and a dialog over it. What a row shows
-//! under the mouse (the buttons that appear) is decided here, from the
-//! UI's hover.
+//! terminal area's pane strips, a dialog over it, and a context menu over
+//! everything. What a row shows under the mouse (the buttons that
+//! appear) is decided here, from the UI's hover.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,8 +20,10 @@ const Ui = @import("ui/Ui.zig");
 const tree = @import("ui/Tree.zig");
 const TreeList = @import("ui/widgets/TreeList.zig");
 const PaneStrip = @import("ui/widgets/PaneStrip.zig");
+const Popup = @import("ui/widgets/Popup.zig");
 
 const Id = Ui.Id;
+const Menu = Ui.Menu;
 const Tree = tree.Tree;
 const Node = tree.Node;
 const TreeRow = tree.TreeRow;
@@ -79,6 +81,12 @@ const Builder = struct {
         if (self.ui.sidebar_shown) try regions.append(self.arena, try self.sidebar());
         try regions.append(self.arena, try self.terminal());
         if (self.dialog()) |d| try regions.append(self.arena, d);
+        // A menu is over everything: the window under it is its scrim,
+        // which takes the click that closes it.
+        if (self.app.mode == .menu) {
+            try regions.append(self.arena, .{ .id = .window(.scrim), .kind = .hit_area, .rect = self.frame.window });
+            try regions.append(self.arena, self.menu(&self.app.mode.menu));
+        }
         return .{
             .root = .{ .kind = .{ .canvas = regions.items } },
             .frame = self.frame,
@@ -242,11 +250,10 @@ const Builder = struct {
     }
 
     /// Workspace `w`'s row: a fold arrow (its tabs are listed while
-    /// shown), its name, and buttons at the right: one to open a tab in
-    /// it always; while the mouse is over the row, kill, rename, and
-    /// (while shown) hide. At rest a hidden workspace shows how many tabs
-    /// it has, and one other windows show, an eye. Being renamed, the row
-    /// is the field.
+    /// shown), its name, and at the right a button to open a tab in it,
+    /// before which a hidden workspace shows how many tabs it has, and
+    /// one other windows show, an eye. Hiding, renaming, and killing it
+    /// are in its context menu. Being renamed, the row is the field.
     fn workspaceRow(self: *const Builder, w: App.Workspace, index: usize) Allocator.Error!TreeRow {
         const app = self.app;
         const t = &self.ui.theme;
@@ -280,28 +287,16 @@ const Builder = struct {
         try items.append(self.arena, .{ .kind = .{ .spacer = label_gap } });
         try items.append(self.arena, .{ .kind = .{ .label = .{ .text = w.name, .font = .body_strong, .color = text } } });
         try items.append(self.arena, .{ .kind = .{ .spacer = label_gap } });
-        if (hovered) {
-            // Hide, rename, and kill, then the tab button. Each icon
-            // spans 16 to 18 of its 24 units: about 11 DIPs in these
-            // boxes.
-            if (w.shown) {
-                try items.append(self.arena, .{ .id = id.with(.hide), .kind = .{ .icon_button = .{ .icon = .eye_off, .size = 17, .tip = L("Hide workspace (it keeps running)") } } });
-                try items.append(self.arena, .{ .kind = .{ .spacer = button_gap } });
-            }
-            try items.append(self.arena, .{ .id = id.with(.rename), .kind = .{ .icon_button = .{ .icon = .pencil, .size = 16, .tip = L("Rename workspace") } } });
+        if (!w.shown and w.tabs > 0) {
+            try items.append(self.arena, .{ .kind = .{ .label = .{ .text = try self.number(w.tabs), .color = t.text_inactive, .width = .{ .fit = 4 } } } });
             try items.append(self.arena, .{ .kind = .{ .spacer = button_gap } });
-            try items.append(self.arena, .{ .id = id.with(.kill), .kind = .{ .icon_button = .{ .icon = .trash, .size = 16, .hover_color = t.danger, .tip = L("Kill workspace") } } });
+        }
+        const others = w.viewers -| @intFromBool(w.shown);
+        if (others > 0) {
+            // Lucide's eye spans 18 of its 24 units: about 13 DIPs in
+            // this box.
+            try items.append(self.arena, .{ .kind = .{ .icon = .{ .icon = .eye, .size = 17, .box = 20, .color = t.text_muted } } });
             try items.append(self.arena, .{ .kind = .{ .spacer = button_gap } });
-        } else {
-            if (!w.shown and w.tabs > 0) {
-                try items.append(self.arena, .{ .kind = .{ .label = .{ .text = try self.number(w.tabs), .color = t.text_inactive, .width = .{ .fit = 4 } } } });
-                try items.append(self.arena, .{ .kind = .{ .spacer = button_gap } });
-            }
-            const others = w.viewers -| @intFromBool(w.shown);
-            if (others > 0) {
-                try items.append(self.arena, .{ .kind = .{ .icon = .{ .icon = .eye, .size = 17, .box = 20, .color = t.text_muted } } });
-                try items.append(self.arena, .{ .kind = .{ .spacer = button_gap } });
-            }
         }
         const key: []const u16 = if (self.activeGroupIs(target)) new_tab_key.slice() else &.{};
         try items.append(self.arena, .{ .id = id.with(.new_tab), .kind = .{ .icon_button = .{ .icon = .plus, .size = 17, .tip = L("New tab"), .key = key } } });
@@ -515,6 +510,12 @@ const Builder = struct {
         } }, .rect = self.frame.terminal };
     }
 
+    /// The open context menu's box, by its anchor, inside the window.
+    fn menu(self: *const Builder, m: *const Menu) Node {
+        const size = Popup.size(self.ui, m);
+        return .{ .id = .window(.menu), .kind = .{ .menu = .{ .menu = m } }, .rect = Popup.place(self.ui, m, self.frame.window, size) };
+    }
+
     /// A pane being dragged, once the mouse has moved enough.
     fn drag(self: *const Builder) ?Tree.Drag {
         const d = self.app.pane_drag orelse return null;
@@ -585,22 +586,45 @@ test "sections and their rows come in the sidebar's order, by id" {
     try std.testing.expect(Ui.find(built, .{ .target = .{ .host = 0 }, .part = .forget }) == null);
     app.ui.hover = .{ .target = .{ .host = 0 } };
     try std.testing.expect(Ui.find(app.view(), .{ .target = .{ .host = 0 }, .part = .forget }) != null);
-    // Over a workspace's row its kill, rename, and (shown) hide buttons
-    // appear.
+    // A workspace's row lights under the mouse, with no buttons but its
+    // tab button: its actions are in its menu.
     app.ui.hover = .{ .target = .{ .workspace = 11 } };
     const lit = app.view();
-    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .kill }) != null);
-    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .hide }) != null);
-    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = 10 }, .part = .kill }) == null);
-    // Hit testing finds the row and its buttons where they are.
-    const kill = Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .kill }).?;
-    try std.testing.expectEqual(Id{ .target = .{ .workspace = 11 }, .part = .kill }, app.ui.hitTest(lit, kill.rect.x + 1, kill.rect.y + 1));
+    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .kill }) == null);
+    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .hide }) == null);
+    // Hit testing finds the row and its button where they are.
+    const plus = Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .new_tab }).?;
+    try std.testing.expectEqual(Id{ .target = .{ .workspace = 11 }, .part = .new_tab }, app.ui.hitTest(lit, plus.rect.x + 1, plus.rect.y + 1));
     // (`shown` was in the tree before this one, which the arena dropped.)
     const shown_lit = Ui.find(lit, .{ .target = .{ .workspace = 11 } }).?;
     try std.testing.expectEqual(Id{ .target = .{ .workspace = 11 } }, app.ui.hitTest(lit, shown_lit.rect.x + 25, shown_lit.rect.y + 2));
     try std.testing.expectEqual(Id.window(.connect), app.ui.hitTest(lit, t.frame.sidebar.x + 20, t.frame.sidebar.bottom() - sidebar_pad_bottom - 5));
     // With nothing shown, the terminal area says what the sidebar is for.
     try std.testing.expectEqual(Id.none, app.ui.hitTest(lit, t.frame.terminal.x + 100, t.frame.terminal.y + 100));
+}
+
+test "a context menu is over everything, and the window under it is scrim" {
+    var shell: App.TestShell = .{};
+    var t: App.TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    const alloc = std.testing.allocator;
+    try app.workspaces.append(alloc, .{ .id = 5, .name = try alloc.dupe(u16, L("alpha")), .tabs = 0, .viewers = 1, .shown = true });
+    var m: Menu = .{ .target = .{ .workspace = 5 }, .anchor = .{ .point = .{ .x = 100, .y = 100 } } };
+    m.add(.{ .label = L("New tab"), .action = .{ .part = .new_tab } });
+    m.add(.{ .label = L("Kill"), .action = .{ .part = .kill }, .danger = true });
+    app.mode = .{ .menu = m };
+    const built = app.view();
+    const box = Ui.find(built, .window(.menu)).?;
+    try std.testing.expectEqual(@as(f32, 100), box.rect.x);
+    try std.testing.expectEqual(@as(f32, 100), box.rect.y);
+    try std.testing.expectEqual(Id{ .target = .{ .menu = 0 } }, app.ui.hitTest(built, box.rect.x + 20, box.rect.y + 10));
+    try std.testing.expectEqual(Id{ .target = .{ .menu = 1 } }, app.ui.hitTest(built, box.rect.x + 20, box.rect.bottom() - 10));
+    // The row it's about, and the title bar, are under the scrim.
+    const row = Ui.find(built, .{ .target = .{ .workspace = 5 } }).?;
+    try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, row.rect.x + 2, row.rect.y + 2));
+    try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, 500, 5));
 }
 
 test "a workspace being renamed is all field" {

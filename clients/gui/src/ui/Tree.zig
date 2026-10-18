@@ -10,6 +10,7 @@ const Id = @import("Id.zig");
 const Painter = @import("../renderer/Painter.zig");
 const TextField = @import("TextField.zig");
 const Dialog = @import("Dialog.zig");
+const Menu = @import("Menu.zig");
 const ProgramStatus = @import("../ProgramStatus.zig");
 const Ui = @import("Ui.zig");
 
@@ -89,6 +90,8 @@ pub const Kind = union(enum) {
     pane: Pane,
     /// A dialog over the terminal area, which it dims.
     dialog: DialogView,
+    /// A context menu's box, over everything.
+    menu: MenuView,
     /// The title bar's minimize, maximize, and close.
     caption_button: CaptionButton,
 };
@@ -263,6 +266,10 @@ pub const DialogView = struct {
     /// The terminal's default background, behind the detail box and
     /// disabled fields.
     terminal_bg: Color,
+};
+
+pub const MenuView = struct {
+    menu: *const Menu,
 };
 
 pub const CaptionButton = struct {

@@ -3,7 +3,9 @@
 //! `currentColor`. Painter recolors and restrokes them as it draws.
 
 pub const check = @embedFile("check.svg");
+pub const clipboard = @embedFile("clipboard.svg");
 pub const columns_2 = @embedFile("columns-2.svg");
+pub const copy = @embedFile("copy.svg");
 pub const eye = @embedFile("eye.svg");
 pub const eye_off = @embedFile("eye-off.svg");
 pub const key_round = @embedFile("key-round.svg");

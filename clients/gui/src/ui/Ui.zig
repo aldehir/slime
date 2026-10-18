@@ -1,7 +1,7 @@
 //! The window's own UI around the terminal, drawn with Direct2D over each
 //! frame from a `Tree` of widgets: a title bar with caption buttons, a
 //! sidebar listing the tabs, and over the terminal area, the active
-//! tab's panes' title strips, a dialog, a tooltip. `frame` splits the
+//! tab's panes' title strips, a dialog, a context menu, a tooltip. `frame` splits the
 //! window into those regions; `layout` places a tree's nodes, `hitTest`
 //! finds what's under a point, and `paint` draws it. The tree is a
 //! function of the app's state (`view.zig`); the UI itself only tracks
@@ -35,6 +35,7 @@ const colors = @import("theme.zig");
 pub const Theme = colors.Theme;
 pub const TextField = @import("TextField.zig");
 pub const Dialog = @import("Dialog.zig");
+pub const Menu = @import("Menu.zig");
 pub const Id = @import("Id.zig");
 pub const Tree = @import("Tree.zig").Tree;
 pub const Node = @import("Tree.zig").Node;
@@ -51,6 +52,7 @@ const widgets = struct {
     const TreeList = @import("widgets/TreeList.zig");
     const PaneStrip = @import("widgets/PaneStrip.zig");
     const Modal = @import("widgets/Modal.zig");
+    const Popup = @import("widgets/Popup.zig");
     const CaptionButton = @import("widgets/CaptionButton.zig");
     const Tooltip = @import("widgets/Tooltip.zig");
 };
@@ -179,6 +181,7 @@ fn Widget(comptime tag: std.meta.Tag(Kind)) type {
         .fold, .tree => widgets.TreeList,
         .pane => widgets.PaneStrip,
         .dialog => widgets.Modal,
+        .menu => widgets.Popup,
         .caption_button => widgets.CaptionButton,
     };
 }
@@ -633,6 +636,8 @@ test {
     _ = widgets.TreeList;
     _ = widgets.PaneStrip;
     _ = widgets.Modal;
+    _ = widgets.Popup;
     _ = widgets.CaptionButton;
     _ = widgets.Tooltip;
+    _ = Menu;
 }

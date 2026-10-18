@@ -820,14 +820,19 @@ pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     self.send(.{ .key = .{ .event = ev, .win32 = records[0..@max(len, 1)] } });
 }
 
+/// Whether the screen shows a selection.
+pub fn hasSelection(self: *const Session) bool {
+    for (self.screen.row_data.items) |row| {
+        if (row.selection != null) return true;
+    }
+    return false;
+}
+
 /// Have slime copy the selected text to the clipboard: it comes back
 /// through `daemonCopied`. Returns false if the screen shows no
 /// selection.
 pub fn copySelection(self: *Session) bool {
-    const selected = for (self.screen.row_data.items) |row| {
-        if (row.selection != null) break true;
-    } else false;
-    if (!selected) return false;
+    if (!self.hasSelection()) return false;
     const tag = self.copy_tag +% 1;
     @atomicStore(u32, &self.copy_tag, tag, .monotonic);
     self.send(.{ .copy = tag });

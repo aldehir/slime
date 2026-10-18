@@ -40,6 +40,8 @@ pub const Target = union(enum) {
     divider: u16,
     /// A dialog's field or button, by its index.
     dialog: u8,
+    /// A context menu's entry, by its index into the menu's items.
+    menu: u8,
 };
 
 /// Which control of the target.
@@ -53,8 +55,11 @@ pub const Part = enum {
     /// The caption button, or a tab's close button.
     close,
     toggle_sidebar,
-    /// The terminal area under a dialog, away from its controls.
+    /// The terminal area under a dialog, away from its controls; or the
+    /// window under a context menu.
     scrim,
+    /// A context menu's box, between its entries.
+    menu,
     /// The host field, or the button that opens it.
     connect,
     /// A row's fold arrow.
@@ -69,7 +74,9 @@ pub const Part = enum {
     forget,
     kill,
     rename,
+    /// A workspace's menu entries that hide it, and show it.
     hide,
+    show,
     split_right,
     split_down,
     zoom,

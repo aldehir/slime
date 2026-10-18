@@ -17,7 +17,16 @@ is attached.
 - **Tabs in the title bar.** The toggle only hides the sidebar; the
   tabs (titles, close buttons, overflow) aren't drawn in the bar.
 - **Sidebar scrolling.** Rows past the bottom are clipped.
-- **Reordering, renaming,** and a context menu on rows.
+- **Reordering and renaming** tab rows. Rows have a context menu
+  (`clients/gui/src/ui/Menu.zig`, built in `App.openMenu`); a tab's
+  only closes it.
+- **Right-click goes to the program** that tracks the mouse: the frame
+  carries only whether it wants motion (`Flags.motion`), not that it
+  tracks buttons, so a right click in a pane opens the menu as well as
+  reporting. Ghostty gives the click to the program and keeps the menu
+  for shift+right-click.
+- **The Menu key** opens the focused pane's menu; shift+F10 goes to the
+  program. Menus can't be opened on rows from the keyboard.
 - **Closing a window with several sessions** doesn't ask.
 - **A session whose child exits** closes its row at once, whatever the
   exit status. The mockups keep a failed one open with its status.
@@ -49,7 +58,9 @@ than being piecemealed with MessageBox and the like.
   control-byte stripping in `encodePaste` still applies.
 - **Config errors on screen.** Unknown keys and bad values only go to
   the log (Ghostty shows them in a banner).
-- **Context menu** (copy, paste, select all) on right-click.
+- **Select all** in a pane's context menu: slime has no event for it.
+- **A field's context menu** (cut, copy, paste) on the host field and a
+  workspace's name being edited; a right click there does nothing.
 - **Scrollbar.**
 
 ## Clipboard and selection
