@@ -1,7 +1,6 @@
 //! A one-line text box's contents and editing: a caret, a selection
 //! from `anchor` to `caret`, and the keys Windows edit controls take.
-//! The chrome draws it; the window feeds it keys, characters and the
-//! clipboard.
+//! `Ui` draws it; the app feeds it keys, characters and the clipboard.
 const TextField = @This();
 
 const std = @import("std");

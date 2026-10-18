@@ -7,7 +7,7 @@ const Login = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Daemon = @import("Daemon.zig");
-const Dialog = @import("chrome/Dialog.zig");
+const Dialog = @import("ui/Dialog.zig");
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 

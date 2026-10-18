@@ -122,8 +122,11 @@ workspace_events: std.ArrayList(WorkspaceEvent) = .empty,
 /// the UI thread last looked, in the order they first did.
 structures: std.ArrayList(*Structure) = .empty,
 /// The workspaces attached here, from `attach` (or `newWorkspace`) until
-/// `detach`, or the daemon takes one away.
-attached: std.AutoHashMapUnmanaged(u32, Attached) = .empty,
+/// `detach`, or the daemon takes one away: what the reader routes a
+/// `workspace.changed` for as a structure. The app keeps what it knows
+/// of each (`App.Workspace`); this is only which ones this connection
+/// has.
+attached: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// Workspaces the daemon said to open here (`workspace.open`): a script
 /// run from one of ours made them for this window. Taken by
 /// `takeOpens`.
@@ -149,13 +152,6 @@ pub const Notify = struct {
 };
 
 pub const State = enum(u8) { connecting, attached, failed };
-
-/// A workspace attached here.
-pub const Attached = struct {
-    /// The tab the daemon shows as active, as its structure last said or
-    /// we last told it (Window's syncFocus). UI thread.
-    active_tab: TabRef = .none,
-};
 
 /// An `attach` or `newWorkspace` call out: `ws` is 0 for a new one,
 /// whose id the reply gives.
@@ -1150,7 +1146,7 @@ pub fn attach(self: *Daemon, ws: u32, area: Area) !void {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     // From now: a structure that beats the reply is this workspace's.
-    self.attached.putAssumeCapacity(ws, .{});
+    self.attached.putAssumeCapacity(ws, {});
     self.attach_calls.appendAssumeCapacity(.{ .id = id, .ws = ws });
 }
 
@@ -1194,35 +1190,20 @@ pub fn renameWorkspace(self: *Daemon, ws: u32, name: []const u16) !void {
     _ = try self.call("workspace.rename", .{ .id = ws, .name = utf8 });
 }
 
-/// Whether workspace `ws` is attached here. UI thread.
-pub fn isAttached(self: *Daemon, ws: u32) bool {
+/// Whether workspace `ws` is attached here. Any thread.
+fn isAttached(self: *Daemon, ws: u32) bool {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     return self.attached.contains(ws);
 }
 
-/// Some workspace attached here, if any: where a host's new tab goes.
+/// Some workspace attached here, if any: where a host's new tab goes,
+/// the app having no list of a host's workspaces. UI thread.
 pub fn anyAttached(self: *Daemon) ?u32 {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     var it = self.attached.keyIterator();
     return if (it.next()) |k| k.* else null;
-}
-
-/// The tab the daemon shows as active in workspace `ws`, as its
-/// structure last said or we last told it. None if it isn't attached
-/// here. UI thread.
-pub fn activeTab(self: *Daemon, ws: u32) TabRef {
-    win32.AcquireSRWLockExclusive(&self.lock);
-    defer win32.ReleaseSRWLockExclusive(&self.lock);
-    return if (self.attached.get(ws)) |a| a.active_tab else .none;
-}
-
-/// Note the tab a structure of workspace `ws` says is active. UI thread.
-pub fn setActiveTab(self: *Daemon, ws: u32, tab: TabRef) void {
-    win32.AcquireSRWLockExclusive(&self.lock);
-    defer win32.ReleaseSRWLockExclusive(&self.lock);
-    if (self.attached.getPtr(ws)) |a| a.active_tab = tab;
 }
 
 /// Make `sink` the pane's: what came while it waited goes first, then
@@ -1339,7 +1320,6 @@ pub fn layout(self: *Daemon, tab: TabRef, root: Node) !void {
 pub fn focus(self: *Daemon, f: Focus) !void {
     win32.AcquireSRWLockExclusive(&self.lock);
     try self.focus_calls.ensureUnusedCapacity(self.alloc, 1);
-    if (self.attached.getPtr(f.tab.ws)) |a| a.active_tab = f.tab;
     win32.ReleaseSRWLockExclusive(&self.lock);
     const id = try self.call("workspace.focus", .{ .tab = f.tab, .pane = f.pane, .zoomed = f.zoomed });
     win32.AcquireSRWLockExclusive(&self.lock);
@@ -1708,8 +1688,7 @@ fn applyWorkspace(self: *Daemon, value: std.json.Value) !u32 {
 
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
-    const gop = try self.attached.getOrPut(self.alloc, ws.id);
-    if (!gop.found_existing) gop.value_ptr.* = .{};
+    try self.attached.put(self.alloc, ws.id, {});
     st.focus_known = self.focus_calls.items.len == 0;
     for (tabs) |t| try self.arriveLocked(t.root);
     for (self.structures.items) |*old| {

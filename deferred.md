@@ -5,15 +5,17 @@ item out when it's done.
 
 ## Chrome
 
-The window draws its own title bar and session list (`clients/gui/src/chrome/`) with
-Direct2D over the terminal. The list has two layouts behind the title
-bar's toggle: a sidebar, which is done, and tabs, which isn't. The
-sidebar is a tree: each tab's row folds open to a row per pane, with what
-its programs report doing (OSC 7501, `clients/gui/src/ProgramStatus.zig`), which
-slime keeps while no window is attached.
+The window draws its own title bar and session list with Direct2D over
+the terminal, from a tree of widgets (`clients/gui/src/ui/`) that
+`clients/gui/src/view.zig` builds from the app's state each frame. The
+list has two layouts behind the title bar's toggle: a sidebar, which is
+done, and tabs, which isn't. The sidebar is a tree: each tab's row folds
+open to a row per pane, with what its programs report doing (OSC 7501,
+`clients/gui/src/ProgramStatus.zig`), which slime keeps while no window
+is attached.
 
-- **Tabs in the title bar.** `chrome/tabs.zig` lays out the title bar
-  alone; the tabs (titles, close buttons, overflow) aren't drawn.
+- **Tabs in the title bar.** The toggle only hides the sidebar; the
+  tabs (titles, close buttons, overflow) aren't drawn in the bar.
 - **Sidebar scrolling.** Rows past the bottom are clipped.
 - **Reordering, renaming,** and a context menu on rows.
 - **Closing a window with several sessions** doesn't ask.
@@ -146,7 +148,7 @@ one.
   Layouts flyout takes hover over maximize.
 
 - **Reordering hosts.** They're listed in the order first connected to.
-- **The mouse in text fields** (`chrome/TextField.zig`): clicking to
+- **The mouse in text fields** (`ui/TextField.zig`): clicking to
   place the caret, dragging to select, double-click for a word. Only
   the keyboard edits them.
 - **IME composition in text fields.** Committed text arrives as

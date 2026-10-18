@@ -176,6 +176,7 @@ test argsAfterProgram {
 test {
     _ = win32;
     _ = Window;
+    _ = @import("App.zig");
     _ = Config;
     _ = @import("Hosts.zig");
     _ = @import("Shown.zig");
@@ -183,14 +184,16 @@ test {
     _ = @import("Session.zig");
     _ = @import("Daemon.zig");
     _ = @import("Tab.zig");
+    _ = @import("Placement.zig");
+    _ = @import("messages.zig");
     _ = @import("ProgramStatus.zig");
     _ = @import("Login.zig");
-    _ = @import("chrome/Chrome.zig");
-    _ = @import("chrome/sidebar.zig");
-    _ = @import("chrome/panes.zig");
-    _ = @import("chrome/TextField.zig");
-    _ = @import("chrome/Dialog.zig");
-    _ = @import("chrome/theme.zig");
+    _ = @import("view.zig");
+    _ = @import("ui/Ui.zig");
+    _ = @import("ui/TextField.zig");
+    _ = @import("ui/Dialog.zig");
+    _ = @import("ui/theme.zig");
+    _ = @import("ui/Id.zig");
     _ = @import("renderer/Painter.zig");
     _ = @import("renderer/image.zig");
     _ = @import("font/font.zig");

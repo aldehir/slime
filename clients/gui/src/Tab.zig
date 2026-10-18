@@ -1,7 +1,8 @@
 //! A row of the sidebar: one or more panes (sessions) laid out in a tree,
 //! as slime keeps them (internal/daemon/layout.go). Splits share
 //! their space between children by basis points, along a row or down a
-//! column; a tab's panes and the dividers between them tile its area.
+//! column; a tab's panes and the dividers between them tile its area
+//! (`place`, into a `Placement`).
 //!
 //! slime owns a split tab's layout: the window asks it to split or close
 //! panes and takes the tree it sends back (`fromLayout`). A session that
@@ -13,8 +14,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Session = @import("Session.zig");
 const Daemon = @import("Daemon.zig");
+const Placement = @import("Placement.zig");
 const Rect = @import("renderer/Painter.zig").Rect;
 
+/// The window's number for the tab, never reused: what the chrome names
+/// it by (`Id.Target.tab`). slime's ids repeat across daemons.
+key: u32 = 0,
 /// slime's id for the tab, or none for a session of its own.
 id: Daemon.TabRef,
 /// The daemon whose tab it is, or null for a session of its own.
@@ -33,8 +38,6 @@ zoom: ?*Session = null,
 sent_focus: ?Daemon.Focus = null,
 /// Its panes aren't listed under it in the sidebar.
 folded: bool = false,
-/// Between panes, from the last `place`.
-dividers: std.ArrayList(Divider) = .empty,
 
 pub const Axis = Daemon.Axis;
 
@@ -55,16 +58,15 @@ pub const Child = struct {
     node: Node,
 };
 
-pub fn create(alloc: Allocator, conn: ?*Daemon, ws: u32, id: Daemon.TabRef, root: Node, focus: *Session) !*Tab {
+pub fn create(alloc: Allocator, key: u32, conn: ?*Daemon, ws: u32, id: Daemon.TabRef, root: Node, focus: *Session) !*Tab {
     const self = try alloc.create(Tab);
-    self.* = .{ .id = id, .conn = conn, .ws = ws, .root = root, .focus = focus };
+    self.* = .{ .key = key, .id = id, .conn = conn, .ws = ws, .root = root, .focus = focus };
     return self;
 }
 
 /// Free the tab and its tree; its sessions are the caller's.
 pub fn destroy(self: *Tab, alloc: Allocator) void {
     freeNode(alloc, self.root);
-    self.dividers.deinit(alloc);
     alloc.destroy(self);
 }
 
@@ -384,23 +386,21 @@ fn insertEdge(alloc: Allocator, root: *Node, s: *Session, side: Daemon.Direction
     root.* = .{ .split = .{ .axis = axis, .children = kids } };
 }
 
-/// Give each pane its part of `area` (in `Session.frame`), with `gap`
-/// pixel dividers between them; a zoomed pane gets all of it.
-pub fn place(self: *Tab, alloc: Allocator, area: Rect, gap: f32) !void {
-    self.dividers.clearRetainingCapacity();
+/// Give each pane its part of `area` as its frame in `p`, replacing what
+/// `p` held, with `gap` pixel dividers between them; a zoomed pane gets
+/// all of it. The rest of each pane's placement is the caller's to fill.
+pub fn place(self: *Tab, alloc: Allocator, p: *Placement, area: Rect, gap: f32) !void {
+    p.clear();
     if (self.zoom) |z| {
-        z.frame = area;
+        try p.panes.append(alloc, .{ .session = z, .frame = area });
         return;
     }
-    try self.placeNode(alloc, &self.root, area, gap);
+    try placeNode(alloc, p, &self.root, area, gap);
 }
 
-fn placeNode(self: *Tab, alloc: Allocator, node: *Node, r: Rect, gap: f32) !void {
+fn placeNode(alloc: Allocator, p: *Placement, node: *Node, r: Rect, gap: f32) !void {
     const sp = switch (node.*) {
-        .pane => |s| {
-            s.frame = r;
-            return;
-        },
+        .pane => |s| return p.panes.append(alloc, .{ .session = s, .frame = r }),
         .split => |*sp| sp,
     };
     const row = sp.axis == .row;
@@ -422,8 +422,8 @@ fn placeNode(self: *Tab, alloc: Allocator, node: *Node, r: Rect, gap: f32) !void
             .{ .x = start, .y = r.y, .w = @max(0, end - start), .h = r.h }
         else
             .{ .x = r.x, .y = start, .w = r.w, .h = @max(0, end - start) };
-        try self.placeNode(alloc, &c.node, child, gap);
-        if (!last) try self.dividers.append(alloc, .{
+        try placeNode(alloc, p, &c.node, child, gap);
+        if (!last) try p.dividers.append(alloc, .{
             .rect = if (row)
                 .{ .x = end, .y = r.y, .w = gap, .h = r.h }
             else
@@ -434,41 +434,6 @@ fn placeNode(self: *Tab, alloc: Allocator, node: *Node, r: Rect, gap: f32) !void
         });
         start = end + gap;
     }
-}
-
-/// The pane next to `from` on `side`, as the last `place` drew them: of
-/// those past that edge and level with it, the nearest, then the one
-/// most in line with it.
-pub fn neighbor(self: *const Tab, from: *const Session, side: Daemon.Direction) ?*Session {
-    const f = from.frame;
-    const along = axisOf(side) == .row;
-    var best: ?*Session = null;
-    var best_gap: f32 = 0;
-    var best_off: f32 = 0;
-    var it = self.iterator();
-    while (it.next()) |s| {
-        if (s == from) continue;
-        const r = s.frame;
-        const gap = switch (side) {
-            .left => f.x - r.right(),
-            .right => r.x - f.right(),
-            .up => f.y - r.bottom(),
-            .down => r.y - f.bottom(),
-        };
-        if (gap < 0) continue;
-        const level = if (along)
-            @min(f.bottom(), r.bottom()) - @max(f.y, r.y)
-        else
-            @min(f.right(), r.right()) - @max(f.x, r.x);
-        if (level <= 0) continue;
-        const off = if (along) @abs((r.y + r.h / 2) - (f.y + f.h / 2)) else @abs((r.x + r.w / 2) - (f.x + f.w / 2));
-        if (best == null or gap < best_gap or (gap == best_gap and off < best_off)) {
-            best = s;
-            best_gap = gap;
-            best_off = off;
-        }
-    }
-    return best;
 }
 
 /// The pane after `from` in layout order, or before it, wrapping.
@@ -488,14 +453,14 @@ pub fn following(self: *const Tab, from: *const Session, forward: bool) *Session
     return if (forward) head.? else prev.?;
 }
 
-/// The divider that resizing `s` toward `side` moves, from the last
-/// `place`: the nearest on that side of it, across that way, else the
-/// nearest on the other.
-pub fn dividerFor(self: *const Tab, s: *const Session, side: Daemon.Direction) ?Divider {
+/// The divider that resizing `s` toward `side` moves, among `dividers`
+/// from the last `place`: the nearest on that side of it, across that
+/// way, else the nearest on the other.
+pub fn dividerFor(self: *const Tab, dividers: []const Divider, s: *const Session, side: Daemon.Direction) ?Divider {
     var found: [2]?DividerAt = .{ null, null };
     _ = dividerIn(&self.root, s, axisOf(side), after(side), &found);
     const at = found[0] orelse found[1] orelse return null;
-    for (self.dividers.items) |d| {
+    for (dividers) |d| {
         if (d.split == at.split and d.index == at.index) return d;
     }
     return null;
@@ -665,19 +630,24 @@ test "placing and removing panes" {
     const row = try alloc.alloc(Child, 2);
     row[0] = .{ .share = 7500, .node = .{ .pane = &a } };
     row[1] = .{ .share = 2500, .node = .{ .split = .{ .axis = .column, .children = column } } };
-    const tab = try create(alloc, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &c);
+    const tab = try create(alloc, 1, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &c);
     defer tab.destroy(alloc);
 
-    try tab.place(alloc, .{ .x = 10, .y = 20, .w = 401, .h = 201 }, 1);
-    try std.testing.expectEqual(Rect{ .x = 10, .y = 20, .w = 300, .h = 201 }, a.frame);
-    try std.testing.expectEqual(Rect{ .x = 311, .y = 20, .w = 100, .h = 100 }, b.frame);
-    try std.testing.expectEqual(Rect{ .x = 311, .y = 121, .w = 100, .h = 100 }, c.frame);
-    try std.testing.expectEqual(@as(usize, 2), tab.dividers.items.len);
+    var p: Placement = .{};
+    defer p.deinit(alloc);
+    try tab.place(alloc, &p, .{ .x = 10, .y = 20, .w = 401, .h = 201 }, 1);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 20, .w = 300, .h = 201 }, p.find(&a).?.frame);
+    try std.testing.expectEqual(Rect{ .x = 311, .y = 20, .w = 100, .h = 100 }, p.find(&b).?.frame);
+    try std.testing.expectEqual(Rect{ .x = 311, .y = 121, .w = 100, .h = 100 }, p.find(&c).?.frame);
+    try std.testing.expectEqual(@as(usize, 3), p.panes.items.len);
+    try std.testing.expectEqual(@as(usize, 2), p.dividers.items.len);
     try std.testing.expectEqual(@as(usize, 3), tab.count());
+    try std.testing.expectEqual(&b, p.at(350, 50).?.session);
+    try std.testing.expect(p.at(5, 50) == null);
 
     // Dragging the row's divider 100 of its 400 pixels left makes it
     // 50/50; past the minimum, it stops there.
-    const d = tab.dividers.items[0];
+    const d = p.dividers.items[0];
     try std.testing.expectEqual(Axis.row, d.axis());
     const from = d.shares();
     d.drag(from, -100, 50);
@@ -691,13 +661,16 @@ test "placing and removing panes" {
     try std.testing.expectEqual(&b, tab.remove(alloc, &c).?);
     try std.testing.expectEqual(&b, tab.focus);
     try std.testing.expect(!tab.contains(&c));
-    try tab.place(alloc, .{ .w = 401, .h = 100 }, 1);
-    try std.testing.expectEqual(Rect{ .x = 301, .w = 100, .h = 100 }, b.frame);
+    try tab.place(alloc, &p, .{ .w = 401, .h = 100 }, 1);
+    try std.testing.expectEqual(Rect{ .x = 301, .w = 100, .h = 100 }, p.find(&b).?.frame);
+    try std.testing.expect(p.find(&c) == null);
 
+    // Zoomed, a is all that's placed.
     tab.zoom = &a;
-    try tab.place(alloc, .{ .w = 401, .h = 100 }, 1);
-    try std.testing.expectEqual(Rect{ .w = 401, .h = 100 }, a.frame);
-    try std.testing.expectEqual(@as(usize, 0), tab.dividers.items.len);
+    try tab.place(alloc, &p, .{ .w = 401, .h = 100 }, 1);
+    try std.testing.expectEqual(Rect{ .w = 401, .h = 100 }, p.find(&a).?.frame);
+    try std.testing.expectEqual(@as(usize, 1), p.panes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.dividers.items.len);
 
     try std.testing.expectEqual(&b, tab.remove(alloc, &a).?);
     try std.testing.expect(tab.zoom == null);
@@ -720,18 +693,20 @@ test "navigating, resizing, and equalizing panes" {
     const row = try alloc.alloc(Child, 2);
     row[0] = .{ .share = 5000, .node = .{ .pane = &a } };
     row[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = column } } };
-    const tab = try create(alloc, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    const tab = try create(alloc, 1, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
     defer tab.destroy(alloc);
-    try tab.place(alloc, .{ .w = 401, .h = 201 }, 1);
+    var p: Placement = .{};
+    defer p.deinit(alloc);
+    try tab.place(alloc, &p, .{ .w = 401, .h = 201 }, 1);
 
     // From a, right is b: b and c touch it and are as far off its middle,
     // and b comes first. From c, up is b, and left is a.
-    try std.testing.expectEqual(&b, tab.neighbor(&a, .right).?);
-    try std.testing.expectEqual(null, tab.neighbor(&a, .left));
-    try std.testing.expectEqual(&b, tab.neighbor(&c, .up).?);
-    try std.testing.expectEqual(&a, tab.neighbor(&c, .left).?);
-    try std.testing.expectEqual(&c, tab.neighbor(&b, .down).?);
-    try std.testing.expectEqual(&d, tab.neighbor(&c, .right).?);
+    try std.testing.expectEqual(&b, p.neighbor(&a, .right).?);
+    try std.testing.expectEqual(null, p.neighbor(&a, .left));
+    try std.testing.expectEqual(&b, p.neighbor(&c, .up).?);
+    try std.testing.expectEqual(&a, p.neighbor(&c, .left).?);
+    try std.testing.expectEqual(&c, p.neighbor(&b, .down).?);
+    try std.testing.expectEqual(&d, p.neighbor(&c, .right).?);
 
     try std.testing.expectEqual(&b, tab.following(&a, true));
     try std.testing.expectEqual(&a, tab.following(&d, true));
@@ -743,14 +718,15 @@ test "navigating, resizing, and equalizing panes" {
     // the one on its left.
     const row_split = &tab.root.split;
     const pair_split = &row_split.children[1].node.split.children[1].node.split;
-    const left = tab.dividerFor(&c, .left).?;
+    const dividers = p.dividers.items;
+    const left = tab.dividerFor(dividers, &c, .left).?;
     try std.testing.expect(left.split == row_split and left.index == 0);
-    const right = tab.dividerFor(&c, .right).?;
+    const right = tab.dividerFor(dividers, &c, .right).?;
     try std.testing.expect(right.split == pair_split and right.index == 0);
-    try std.testing.expect(tab.dividerFor(&d, .right).?.split == pair_split);
+    try std.testing.expect(tab.dividerFor(dividers, &d, .right).?.split == pair_split);
     // b up has only the column's divider below it.
-    try std.testing.expectEqual(@as(usize, 0), tab.dividerFor(&b, .up).?.index);
-    try std.testing.expectEqual(null, tab.dividerFor(&a, .up));
+    try std.testing.expectEqual(@as(usize, 0), tab.dividerFor(dividers, &b, .up).?.index);
+    try std.testing.expectEqual(null, tab.dividerFor(dividers, &a, .up));
 
     // a takes half the row's width in panes across: a third.
     tab.equalize();
@@ -768,7 +744,7 @@ test "moving panes" {
     row[0] = .{ .share = 3334, .node = .{ .pane = &a } };
     row[1] = .{ .share = 3333, .node = .{ .pane = &b } };
     row[2] = .{ .share = 3333, .node = .{ .pane = &c } };
-    const tab = try create(alloc, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    const tab = try create(alloc, 1, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
     defer tab.destroy(alloc);
 
     // c along the top: a column of c over the rest.

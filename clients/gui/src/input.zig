@@ -9,7 +9,7 @@ const win32 = @import("win32/win32.zig");
 
 const Key = ghostty_vt.input.Key;
 const KeyEvent = ghostty_vt.input.KeyEvent;
-const Mods = ghostty_vt.input.KeyMods;
+pub const Mods = ghostty_vt.input.KeyMods;
 const MouseButton = ghostty_vt.input.MouseButton;
 const Win32Key = @import("event").Win32Key;
 

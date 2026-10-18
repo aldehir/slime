@@ -110,13 +110,14 @@ fn toColor(c: RGB) Color {
 }
 
 /// `t` of the way from `a` to `b`.
-fn mix(a: Color, b: Color, t: f32) Color {
+pub fn mix(a: Color, b: Color, t: f32) Color {
     var out: Color = undefined;
     for (&out, a, b) |*o, x, y| o.* = x + (y - x) * t;
     return out;
 }
 
-fn withAlpha(c: Color, a: f32) Color {
+/// `c` with alpha `a`.
+pub fn withAlpha(c: Color, a: f32) Color {
     return .{ c[0], c[1], c[2], a };
 }
 

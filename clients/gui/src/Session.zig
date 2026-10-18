@@ -18,11 +18,11 @@ const input = @import("input.zig");
 const Daemon = @import("Daemon.zig");
 const Config = @import("Config.zig");
 const Login = @import("Login.zig");
+const Placement = @import("Placement.zig");
 const ProgramStatus = @import("ProgramStatus.zig");
 const Frames = @import("Screen.zig");
 const clipboard = @import("clipboard.zig");
-const build_options = @import("build_options");
-const Window = @import("Window.zig");
+const messages = @import("messages.zig");
 const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
 const image = @import("renderer/image.zig");
@@ -41,8 +41,10 @@ pub const max_title_len = 1024;
 const MouseButton = ghostty_vt.input.MouseButton;
 const MouseAction = ghostty_vt.input.MouseAction;
 
-window: *Window,
 alloc: Allocator,
+/// How the window is woken, and what it's asked.
+wake: Wake,
+env: Env,
 /// Names the session in messages posted from other threads, which may
 /// arrive after it's gone.
 id: u32,
@@ -90,14 +92,9 @@ pending_images: std.ArrayList(QueuedImage) = .empty,
 /// What `applyFrames` swaps `pending_images` for.
 installing: std.ArrayList(QueuedImage) = .empty,
 
-/// Where the session's pane is in the window, in client pixels: all of
-/// it (`frame`, its title strip and terminal), its terminal (`rect`), and
-/// the space around the grid in that. Set by the window's layout.
-frame: Rect = .{},
-rect: Rect = .{},
-pad: Window.PaddingPx = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 },
-/// The grid the layout fits the pane, which a screen no frames come to
-/// takes itself.
+/// The grid the layout fits the pane (`resize`), which a screen no frames
+/// come to takes itself. Where the pane is on screen isn't the session's
+/// to know: the window's `Placement` has it.
 cols: u16 = 0,
 rows: u16 = 0,
 /// What slime was last told of the pane's size and geometry, so a
@@ -177,6 +174,39 @@ pub const Launch = union(enum) {
     },
 };
 
+/// How the window is woken from the connection's reader thread: handles
+/// and values any thread may use, so the reader never waits on the UI
+/// thread. UI-thread code may use them too.
+pub const Wake = struct {
+    hwnd: win32.HWND,
+    /// Set when a frame or program status came, for the message loop.
+    output_event: win32.HANDLE,
+    /// Child output fed to the terminal, counted for the stats, if built.
+    bytes: ?*std.atomic.Value(u64),
+    /// Whether a program may write the clipboard (OSC 52).
+    clipboard_write: Config.ClipboardAccess,
+};
+
+pub const CellSize = struct { width: u32, height: u32 };
+
+/// What the session asks the window on the UI thread only.
+pub const Env = struct {
+    config: *const Config,
+    ctx: *anyopaque,
+    /// The window's cell size, which every pane shares.
+    cell_size: *const fn (*anyopaque) CellSize,
+    /// The user typed or pasted into the session.
+    on_input: *const fn (*anyopaque) void,
+
+    fn cellSize(self: Env) CellSize {
+        return self.cell_size(self.ctx);
+    }
+
+    fn input(self: Env) void {
+        self.on_input(self.ctx);
+    }
+};
+
 /// Why a daemon session's connection ended without its program exiting,
 /// for the session to show. Set by the reader thread before it posts
 /// WM_APP_CHILD_EXITED.
@@ -196,9 +226,8 @@ pub const DaemonLoss = struct {
 };
 
 /// Start showing `launch` in a new session with a grid of `cols` x `rows`.
-pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*Session {
-    const alloc = window.alloc;
-    const config = window.config;
+pub fn create(alloc: Allocator, wake: Wake, env: Env, id: u32, launch: Launch, cols: u16, rows: u16) !*Session {
+    const config = env.config;
     const self = try alloc.create(Session);
     errdefer alloc.destroy(self);
     const default_title = try alloc.dupe(u16, switch (launch) {
@@ -213,8 +242,9 @@ pub fn create(window: *Window, id: u32, launch: Launch, cols: u16, rows: u16) !*
     });
     errdefer alloc.free(default_title);
     self.* = .{
-        .window = window,
         .alloc = alloc,
+        .wake = wake,
+        .env = env,
         .id = id,
         .default_title = default_title,
         .cols = cols,
@@ -319,9 +349,9 @@ fn daemonDraw(ctx: *anyopaque, seq: u32, data: []const u8) void {
     self.unlockTerminal();
     // The screen is wrong until the next full frame.
     queued catch return log.err("dropped frame {d}: out of memory", .{seq});
-    if (build_options.stats) _ = self.window.stats.bytes.fetchAdd(data.len, .monotonic);
+    if (self.wake.bytes) |bytes| _ = bytes.fetchAdd(data.len, .monotonic);
     self.unseen.store(true, .release);
-    _ = win32.SetEvent(self.window.output_event);
+    _ = win32.SetEvent(self.wake.output_event);
 }
 
 /// Keep a frame for `applyFrames`. A full frame stands alone, so what
@@ -372,7 +402,7 @@ fn daemonImage(ctx: *anyopaque, piece: Daemon.ImagePiece) void {
     }
     if (@as(u64, piece.offset) + piece.data.len > in.total) return log.warn("image {d}: more than its {d} bytes", .{ piece.id, in.total });
     in.data.appendSlice(self.alloc, piece.data) catch return log.err("image {d} dropped: out of memory", .{piece.id});
-    if (build_options.stats) _ = self.window.stats.bytes.fetchAdd(piece.data.len, .monotonic);
+    if (self.wake.bytes) |bytes| _ = bytes.fetchAdd(piece.data.len, .monotonic);
     if (in.data.items.len < in.total) return;
 
     const rgba = inflateImage(self.alloc, in) catch |err| return log.err("image {d} ({d}x{d}) dropped: {}", .{ in.id, in.width, in.height, err });
@@ -462,7 +492,7 @@ pub fn applyFrames(self: *Session) void {
     }
     for (self.screen.dropped.items) |id| self.images.remove(self.alloc, id);
     self.screen.dropped.clearRetainingCapacity();
-    const cell = self.window.cellSizePx();
+    const cell = self.env.cellSize();
     self.images.update(self.alloc, self.screen.placements.items, cell.width, cell.height) catch |err| log.err("laying out images failed: {}", .{err});
 }
 
@@ -486,10 +516,10 @@ fn daemonNotice(ctx: *anyopaque, n: Daemon.Notice) void {
             self.next_title_len = titleToUtf16(&self.next_title_buf, n.text);
             self.unlockTerminal();
             if (self.title_pending.swap(true, .acq_rel)) return;
-            _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_TITLE_CHANGED, self.id, 0);
+            _ = win32.PostMessageW(self.wake.hwnd, messages.WM_APP_TITLE_CHANGED, self.id, 0);
         },
         .clipboard => {
-            const access = self.window.config.@"clipboard-write";
+            const access = self.wake.clipboard_write;
             if (access != .allow) return log.info("denied a clipboard write (clipboard-write = {t})", .{access});
             self.queueClipboard(n.text);
         },
@@ -503,7 +533,7 @@ fn daemonNotice(ctx: *anyopaque, n: Daemon.Notice) void {
             }
             self.unlockTerminal();
             self.status_changed.store(true, .release);
-            _ = win32.SetEvent(self.window.output_event);
+            _ = win32.SetEvent(self.wake.output_event);
         },
         // Nothing shows these yet.
         .pwd, .bell, _ => {},
@@ -528,7 +558,7 @@ fn queueClipboard(self: *Session, text: []const u8) void {
     if (self.clipboard_write) |pending| {
         self.alloc.free(pending);
     } else {
-        _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CLIPBOARD_WRITE, self.id, 0);
+        _ = win32.PostMessageW(self.wake.hwnd, messages.WM_APP_CLIPBOARD_WRITE, self.id, 0);
     }
     self.clipboard_write = copy;
 }
@@ -542,7 +572,7 @@ pub fn clipboardWriteFlush(self: *Session) void {
 
     const text = pending orelse return;
     defer self.alloc.free(text);
-    const hwnd = self.window.hwnd.?;
+    const hwnd = self.wake.hwnd;
     const result = if (text.len == 0) clipboard.clear(hwnd) else clipboard.set(hwnd, text);
     result catch |err| log.warn("clipboard write failed: {}", .{err});
 }
@@ -559,7 +589,7 @@ fn daemonEnded(ctx: *anyopaque, why: ?[]const u8) void {
     } else {
         self.exited = true;
     }
-    _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
+    _ = win32.PostMessageW(self.wake.hwnd, messages.WM_APP_CHILD_EXITED, self.id, 0);
 }
 
 /// Why the daemon pane was lost to us, once WM_APP_CHILD_EXITED says
@@ -674,9 +704,12 @@ pub fn statusSummary(self: *Session) ?ProgramStatus.Summary {
     return self.program_status.summary();
 }
 
-/// Fit the pane to a new grid or cell size, and tell slime where the
-/// grid is in it, for mapping the mouse to cells. UI thread.
-pub fn resize(self: *Session, cols: u16, rows: u16) void {
+/// Fit the pane to its place `p` from the window's layout: a new grid or
+/// cell size, and where the grid is in the pane, which slime is told for
+/// mapping the mouse to cells. UI thread.
+pub fn resize(self: *Session, p: Placement.Pane) void {
+    const cols = p.cols;
+    const rows = p.rows;
     self.cols = cols;
     self.rows = rows;
     const s = self.live() orelse {
@@ -686,23 +719,23 @@ pub fn resize(self: *Session, cols: u16, rows: u16) void {
     // A new font size (e.g. on a DPI change) can keep the grid size. The
     // daemon's terminal answers pixel size reports, so it hears about new
     // fonts too.
-    const cell = self.window.cellSizePx();
+    const cell = self.env.cellSize();
     const size: Daemon.Size = .{ .cols = cols, .rows = rows, .cell_width = cell.width, .cell_height = cell.height };
     if (self.sized == null or !std.meta.eql(self.sized.?, size)) {
         self.sized = size;
         s.conn.resize(s.pane, size);
     }
 
-    const width: u32 = @intFromFloat(self.rect.w);
-    const height: u32 = @intFromFloat(self.rect.h);
+    const width: u32 = @intFromFloat(p.rect.w);
+    const height: u32 = @intFromFloat(p.rect.h);
     const g: event.Geometry = .{
         .cell_width = cell.width,
         .cell_height = cell.height,
         .padding = .{
-            .left = self.pad.left,
-            .top = self.pad.top,
-            .right = width -| self.pad.left -| @as(u32, cols) * cell.width,
-            .bottom = height -| self.pad.top -| @as(u32, rows) * cell.height,
+            .left = p.pad.left,
+            .top = p.pad.top,
+            .right = width -| p.pad.left -| @as(u32, cols) * cell.width,
+            .bottom = height -| p.pad.top -| @as(u32, rows) * cell.height,
         },
         .width = width,
         .height = height,
@@ -723,7 +756,7 @@ fn send(self: *Session, ev: Events.Event) void {
 
 /// Tell slime what selection and the terminal's colors go by here.
 fn sendSettings(self: *Session) void {
-    const config = self.window.config;
+    const config = self.env.config;
     const words = config.@"selection-word-chars".codepoints;
     self.send(.{
         .settings = .{
@@ -752,7 +785,7 @@ pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
     // TranslateMessage already posted the WM_(SYS)CHAR / WM_(SYS)DEADCHAR
     // messages this key produced. Take them so the key and its text go
     // together, as one event.
-    const hwnd = self.window.hwnd;
+    const hwnd = self.wake.hwnd;
     var utf16: [Events.max_win32]u16 = undefined;
     var len: usize = 0;
     var composing = false;
@@ -783,7 +816,7 @@ pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
         records[0] = input.win32Key(msg, wparam, lparam, if (up) input.releaseChar(wparam, lparam) else 0);
     }
 
-    if (ev.action != .release and !ev.key.modifier()) self.window.resetBlink();
+    if (ev.action != .release and !ev.key.modifier()) self.env.input();
     self.send(.{ .key = .{ .event = ev, .win32 = records[0..@max(len, 1)] } });
 }
 
@@ -805,7 +838,7 @@ pub fn copySelection(self: *Session) bool {
 /// for that (mode 2004) and makes safe.
 pub fn paste(self: *Session) void {
     const s = self.live() orelse return;
-    const text = (clipboard.get(self.alloc, self.window.hwnd.?) catch |err| {
+    const text = (clipboard.get(self.alloc, self.wake.hwnd) catch |err| {
         log.err("paste failed: {}", .{err});
         return;
     }) orelse return;
@@ -815,7 +848,7 @@ pub fn paste(self: *Session) void {
     var w: std.Io.Writer.Allocating = .init(self.alloc);
     defer w.deinit();
     Events.encode(&w.writer, .{ .paste = text }) catch return log.err("paste failed: out of memory", .{});
-    self.window.resetBlink();
+    self.env.input();
     s.conn.event(s.pane, w.written());
 }
 
@@ -837,7 +870,7 @@ pub fn charInput(self: *Session, unit: u16) void {
 
     var utf8: [8]u8 = undefined;
     const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
-    self.window.resetBlink();
+    self.env.input();
     self.send(.{ .text = utf8[0..len] });
 }
 
