@@ -234,6 +234,18 @@ reconnects, reattaches, and replaces them.
   rename one, or see which windows have it. A window takes the most
   recently detached at startup (or `SLIME_WORKSPACE`) and can't change
   it, and nothing shows that another window is on the same workspace.
+  The one way in is `workspace.new` with `attach` (what a script or
+  `slime ws new` run from a pane does): the window opens that workspace
+  on a connection of its own, beside its first, and lets it go when its
+  tabs have.
+- **`workspace.open` from a host's slime isn't followed.** A script run
+  in a pane on a host that makes a workspace tells the bridged
+  connection to open it, and the window only logs it: opening one there
+  takes a second bridge to the host, and the stand-in bookkeeping is
+  per host.
+- **`SLIME_WORKSPACE` is in every pane's shell**, so a `slime-gui`
+  started from a pane attaches that pane's workspace, as the variable
+  has always meant, rather than the most recently detached one.
 - **Daemon copies pile up.** slime-gui runs slime from a copy in
   `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
   doesn't block the next install, and never deletes old ones.

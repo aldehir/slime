@@ -124,6 +124,9 @@ func TestContextAndNamespaces(t *testing.T) {
 		slime.workspace.info{}
 		slime.workspace.list{}
 		slime.workspace.new{ name = "z" }
+		slime.workspace.new{ name = "d", attach = false }
+		slime.workspace.new{ name = "t", attach = true }
+		slime.workspace.new{ name = "e", attach = 5 }
 		slime.pane_id = 7
 		slime.pane.info()
 		slime.call("host.list")
@@ -144,7 +147,10 @@ func TestContextAndNamespaces(t *testing.T) {
 		{"tab.rename", `{"id":2,"name":"y"}`},
 		{"workspace.info", `{"id":1}`},
 		{"workspace.list", `{}`},
-		{"workspace.new", `{"name":"z"}`},
+		{"workspace.new", `{"attach":1,"name":"z"}`},
+		{"workspace.new", `{"name":"d"}`},
+		{"workspace.new", `{"attach":1,"name":"t"}`},
+		{"workspace.new", `{"attach":5,"name":"e"}`},
 		{"pane.info", `{"id":7}`},
 		{"host.list", ``},
 		{"workspace.focus", `{"tab":2}`},

@@ -266,10 +266,11 @@ func (s *Server) newIDLocked() uint32 {
 	return s.nextID
 }
 
-// startPane starts a child and its terminal for pane id, outside the
-// server's lock: spawning takes a while. The caller registers it
-// (addPaneLocked), or closes it if what it was for is gone by then.
-func (s *Server) startPane(id uint32, spec *rpc.PaneSpec, size Size) (*started, error) {
+// startPane starts a child and its terminal for pane id of workspace
+// ws, outside the server's lock: spawning takes a while. The caller
+// registers it (addPaneLocked), or closes it if what it was for is gone
+// by then.
+func (s *Server) startPane(id, ws uint32, spec *rpc.PaneSpec, size Size) (*started, error) {
 	if size.Cols == 0 || size.Rows == 0 {
 		size.Cols, size.Rows = defaultSize.Cols, defaultSize.Rows
 	}
@@ -284,7 +285,7 @@ func (s *Server) startPane(id uint32, spec *rpc.PaneSpec, size Size) (*started, 
 	p, err := s.spawn(pty.Options{
 		Command: spec.Command,
 		Dir:     spec.Cwd,
-		Env:     paneEnv(id, spec),
+		Env:     paneEnv(id, ws, spec),
 		Cols:    size.Cols,
 		Rows:    size.Rows,
 		Width:   uint32(size.Cols) * size.CellW,

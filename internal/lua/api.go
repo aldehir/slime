@@ -17,7 +17,8 @@ import (
 //	slime.args                       the script's arguments
 //	slime.workspace_id, tab_id, pane_id   what it runs for, or nil
 //	slime.call(method, params)       any method, by its wire name
-//	slime.workspace.<m>{...}         "workspace.<m>", id filled in
+//	slime.workspace.<m>{...}         "workspace.<m>", id filled in;
+//	                                 new's attach too (false: detached)
 //	slime.tab.<m>{...}               "tab.<m>", id or workspace filled in
 //	slime.pane.<m>{...}              "pane.<m>", id or pane filled in
 //	slime.layout.pane{...}, horizontal(ratio, a, b, ...), vertical
@@ -89,17 +90,30 @@ func (r *Runner) namespace(group string) *glua.LTable {
 
 // fillContext puts the script's ids into the params a method takes
 // them in, where the script left them out: a workspace method's id,
-// tab.new's workspace, a pane method's id, and the pane a split or move
-// starts from.
+// workspace.new's attach (so the windows on the script's workspace open
+// the new one; attach = false leaves it detached, true asks for the
+// default), tab.new's workspace, a pane method's id, and the pane a
+// split or move starts from.
 func (r *Runner) fillContext(method string, params *glua.LTable) {
 	var field, from string
 	group, name, _ := strings.Cut(method, ".")
 	switch group {
 	case "workspace":
-		if name == "list" || name == "new" {
+		switch name {
+		case "list":
 			return
+		case "new":
+			field, from = "attach", "workspace_id"
+			switch params.RawGetString(field) {
+			case glua.LFalse:
+				params.RawSetString(field, glua.LNil)
+				return
+			case glua.LTrue:
+				params.RawSetString(field, glua.LNil)
+			}
+		default:
+			field, from = "id", "workspace_id"
 		}
-		field, from = "id", "workspace_id"
 	case "tab":
 		if name == "new" {
 			field, from = "workspace", "workspace_id"

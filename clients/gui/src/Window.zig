@@ -143,6 +143,11 @@ connect_field: ?Chrome.TextField = null,
 /// The connection to slime: local sessions are panes of the workspace
 /// it holds for this window. Null if it couldn't be reached.
 daemon: ?*Daemon = null,
+/// Further connections to slime, one per workspace it said to open here
+/// (`workspace.open`: a script run from one of this window's panes
+/// made it). Their tabs sit with the first workspace's; one goes when
+/// its tabs have.
+opened: std.ArrayList(*Daemon) = .empty,
 /// Connections to slime on SSH hosts, bridged through the local daemon:
 /// a host's sessions are panes of the workspace its slime holds for
 /// this window.
@@ -333,6 +338,8 @@ pub fn destroy(self: *Window) void {
     // Hanging up detaches the workspace; slime keeps it for the next
     // window.
     if (self.daemon) |conn| conn.deinit();
+    for (self.opened.items) |conn| conn.deinit();
+    self.opened.deinit(self.alloc);
     for (self.remotes.items) |r| r.conn.deinit();
     self.remotes.deinit(self.alloc);
     for (self.host_states.items) |e| {
@@ -744,8 +751,10 @@ fn newSession(self: *Window) void {
 /// A tab in sidebar group `g`: a local one, or one on a host.
 fn newSessionIn(self: *Window, g: usize) void {
     if (g != 0) return self.openOnHost(g - 1) catch |err| log.err("new session failed: {}", .{err});
-    // The tab comes when its pane does (WM_APP_DAEMON).
-    const conn = self.daemon orelse return self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
+    // The tab comes when its pane does (WM_APP_DAEMON). It goes in the
+    // workspace shown, if a local one; else the window's first.
+    const shown: ?*Daemon = if (self.activeTab().conn) |c| (if (c.host() == null) c else null) else null;
+    const conn = shown orelse self.daemon orelse return self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
     if (conn.isLost()) {
         // Its tabs say how; slime comes back with the next window.
         return self.spawnFailed("lost slime", error.Disconnected) catch |err| log.err("new session failed: {}", .{err});
@@ -835,13 +844,30 @@ fn bridgeHost(self: *Window, e: *HostEntry) !void {
 }
 
 /// Take up what slime connections posted: panes that arrived, what the
-/// daemon said about hosts, and how attaching to hosts' went.
+/// daemon said about hosts, workspaces to open here, and how attaching
+/// to hosts' went.
 fn daemonPosted(self: *Window) void {
     if (self.daemon) |conn| {
         self.daemonChanged(conn);
         self.hostsChanged(conn);
+        self.openWorkspaces(conn);
     }
     var i: usize = 0;
+    while (i < self.opened.items.len) {
+        const conn = self.opened.items[i];
+        self.daemonChanged(conn);
+        self.openWorkspaces(conn);
+        // Its tabs all gone, it has nothing left to show.
+        const shown = for (self.tabs.items) |t| {
+            if (t.conn == conn) break true;
+        } else false;
+        if (shown) {
+            i += 1;
+            continue;
+        }
+        self.opened.orderedRemove(i).deinit();
+    }
+    i = 0;
     while (i < self.remotes.items.len) {
         switch (self.remotes.items[i].conn.attachState()) {
             .connecting => {},
@@ -854,6 +880,35 @@ fn daemonPosted(self: *Window) void {
         i += 1;
     }
     self.pruneRemotes();
+}
+
+/// Open the workspaces `conn` was told to: each on a connection of its
+/// own, whose tabs join the strip, the last of them shown.
+fn openWorkspaces(self: *Window, conn: *Daemon) void {
+    const ids = conn.takeOpens();
+    defer self.alloc.free(ids);
+    for (ids) |id| self.openWorkspace(id) catch |err| log.err("opening workspace {d} failed: {}", .{ id, err });
+}
+
+/// Attach workspace `id` on a connection of its own, make tabs of its
+/// tabs, and show the one slime has active.
+fn openWorkspace(self: *Window, id: u32) !void {
+    try self.opened.ensureUnusedCapacity(self.alloc, 1);
+    const conn = try Daemon.connectWorkspace(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_DAEMON }, self.frameInterval(), self.daemonArea(), self.daemonSize(), self.local_command, id);
+    self.daemonChanged(conn);
+    conn.start() catch |err| {
+        var i: usize = 0;
+        while (i < self.tabs.items.len) {
+            if (self.tabs.items[i].conn == conn) self.dropTab(i) else i += 1;
+        }
+        conn.deinit();
+        return err;
+    };
+    self.opened.appendAssumeCapacity(conn);
+    log.info("opened workspace {d} here", .{id});
+    for (self.tabs.items, 0..) |t, i| {
+        if (t.conn == conn and t.id == conn.active_tab) return self.activate(i);
+    }
 }
 
 /// Take up what host's slime `r` sent. Once its panes have come, they
@@ -2268,6 +2323,7 @@ fn layout(self: *Window) void {
     self.quiet_until = win32.GetTickCount64() + resize_quiet_ms;
     for (self.tabs.items) |t| self.layoutTab(t);
     if (self.daemon) |conn| conn.resizeWorkspace(self.daemonArea());
+    for (self.opened.items) |conn| conn.resizeWorkspace(self.daemonArea());
     for (self.remotes.items) |remote| if (remote.conn.attachState() == .attached) remote.conn.resizeWorkspace(self.daemonArea());
 
     // Render synchronously so live resize doesn't show stale frames.

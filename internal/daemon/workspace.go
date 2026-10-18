@@ -186,7 +186,8 @@ func (s *Server) measureLocked(ws *workspace, a Area, root *Node, extra map[uint
 
 // workspaceNew creates a workspace with the tabs asked for, the caller
 // a viewer of it, and answers with its structure before anything can
-// change it.
+// change it. With attach, the viewers of that workspace are told to
+// open the new one once its tabs are up.
 func (s *Server) workspaceNew(cl *callCtx, p rpc.WorkspaceNewParams) (*rpc.Workspace, error) {
 	if cl.c == nil && len(p.Tabs) == 0 {
 		return nil, rpc.Errorf(rpc.CodeInvalidRequest, "workspace.new needs a connection to attach to, or tabs")
@@ -197,6 +198,13 @@ func (s *Server) workspaceNew(cl *callCtx, p rpc.WorkspaceNewParams) (*rpc.Works
 		}
 	}
 	s.mu.Lock()
+	var beside *workspace
+	if p.Attach != 0 {
+		if beside = s.workspaces[p.Attach]; beside == nil || beside.killed {
+			s.mu.Unlock()
+			return nil, errNoWorkspace
+		}
+	}
 	ws := &workspace{id: s.newIDLocked(), name: p.Name, viewers: map[*conn]*viewer{}}
 	if ws.name == "" {
 		ws.name = "default"
@@ -211,6 +219,7 @@ func (s *Server) workspaceNew(cl *callCtx, p rpc.WorkspaceNewParams) (*rpc.Works
 	s.emitLocked(rpc.EvWorkspaceCreated, rpc.WorkspaceCreatedParams{ID: ws.id, Name: ws.name}, nil, nil)
 	if len(p.Tabs) == 0 {
 		defer s.mu.Unlock()
+		s.openBesideLocked(ws, beside, cl.c)
 		cl.reply(ws.structure())
 		return nil, nil
 	}
@@ -230,8 +239,19 @@ func (s *Server) workspaceNew(cl *callCtx, p rpc.WorkspaceNewParams) (*rpc.Works
 	if len(ws.tabs) > 0 && s.selectTabLocked(ws, ws.tabs[0]) {
 		s.changedLocked(ws, nil)
 	}
+	s.openBesideLocked(ws, beside, cl.c)
 	cl.reply(ws.structure())
 	return nil, nil
+}
+
+// openBesideLocked tells beside's viewers to open ws too, except the
+// caller, which is a viewer already if it has a connection. Nothing
+// happens if beside has gone meanwhile.
+func (s *Server) openBesideLocked(ws, beside *workspace, caller *conn) {
+	if beside == nil || s.workspaces[beside.id] != beside {
+		return
+	}
+	s.emitLocked(rpc.EvWorkspaceOpen, rpc.WorkspaceOpenParams{ID: ws.id, Name: ws.name}, beside, caller)
 }
 
 // workspaceAttach adds the caller to a workspace's viewers: each pane,
@@ -543,7 +563,7 @@ func (s *Server) addTab(cl *callCtx, ws *workspace, name string, l *rpc.Layout, 
 
 	var panes []*started
 	for _, id := range root.Panes() {
-		st, err := s.startPane(id, specs[id], sizes[id])
+		st, err := s.startPane(id, ws.id, specs[id], sizes[id])
 		if err != nil {
 			for _, p := range panes {
 				p.close()
@@ -628,14 +648,16 @@ func (s *Server) addPaneLocked(t *tab, st *started) *Pane {
 }
 
 // paneEnv is what every pane's environment says about itself: the pane
-// it is, and the daemon it belongs to (SLIME_INSTANCE, when the daemon
-// is one).
-func paneEnv(id uint32, spec *rpc.PaneSpec) map[string]string {
-	env := make(map[string]string, len(spec.Env)+2)
+// it is, the workspace it's in, and the daemon it belongs to
+// (SLIME_INSTANCE, when the daemon is one), so the CLI and scripts run
+// in it act on them by default.
+func paneEnv(id, ws uint32, spec *rpc.PaneSpec) map[string]string {
+	env := make(map[string]string, len(spec.Env)+3)
 	for k, v := range spec.Env {
 		env[k] = v
 	}
 	env["SLIME_PANE"] = strconv.FormatUint(uint64(id), 10)
+	env["SLIME_WORKSPACE"] = strconv.FormatUint(uint64(ws), 10)
 	if inst := os.Getenv("SLIME_INSTANCE"); inst != "" {
 		env["SLIME_INSTANCE"] = inst
 	}
@@ -669,7 +691,7 @@ func (s *Server) paneSplit(cl *callCtx, m rpc.PaneSplitParams) (*rpc.Created, er
 	size := s.measureLocked(t.ws, t.ws.area, trial, map[uint32]Size{id: target.cell()})[id]
 	s.mu.Unlock()
 
-	st, err := s.startPane(id, &rpc.PaneSpec{Command: m.Command, Cwd: m.Cwd, Env: m.Env}, size)
+	st, err := s.startPane(id, t.ws.id, &rpc.PaneSpec{Command: m.Command, Cwd: m.Cwd, Env: m.Env}, size)
 	if err != nil {
 		return nil, err
 	}

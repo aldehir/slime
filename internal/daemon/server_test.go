@@ -984,7 +984,7 @@ func TestPaneEnv(t *testing.T) {
 	first := w.newWorkspace()
 	_, created := w.split(first, Right, 5000, "")
 	env := h.spawned(1).Env
-	if env["SLIME_PANE"] != fmt.Sprint(created.Pane) || env["SLIME_INSTANCE"] != "envtest" {
+	if env["SLIME_PANE"] != fmt.Sprint(created.Pane) || env["SLIME_WORKSPACE"] != fmt.Sprint(w.ws.ID) || env["SLIME_INSTANCE"] != "envtest" {
 		t.Errorf("env %v", env)
 	}
 	var made rpc.Created
@@ -992,7 +992,7 @@ func TestPaneEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	env = h.spawned(2).Env
-	if env["FOO"] != "bar" || env["SLIME_PANE"] != fmt.Sprint(made.Pane) {
+	if env["FOO"] != "bar" || env["SLIME_PANE"] != fmt.Sprint(made.Pane) || env["SLIME_WORKSPACE"] != fmt.Sprint(w.ws.ID) {
 		t.Errorf("env %v", env)
 	}
 }

@@ -76,9 +76,15 @@ func doCommand() *cobra.Command {
 	return cmd
 }
 
-// envPane is the pane this console runs in, if it's one of slime's.
-func envPane() uint32 {
-	id, err := strconv.ParseUint(os.Getenv("SLIME_PANE"), 10, 32)
+// envPane is the pane this console runs in, if it's one of slime's,
+// and envWorkspace the workspace that pane is in: every pane's shell
+// has SLIME_PANE and SLIME_WORKSPACE.
+func envPane() uint32 { return envID("SLIME_PANE") }
+
+func envWorkspace() uint32 { return envID("SLIME_WORKSPACE") }
+
+func envID(name string) uint32 {
+	id, err := strconv.ParseUint(os.Getenv(name), 10, 32)
 	if err != nil {
 		return 0
 	}

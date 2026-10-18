@@ -117,6 +117,10 @@ arrivals: std.ArrayList(Arrival) = .empty,
 /// (`takeHosts`).
 host_events: std.ArrayList(HostEvent) = .empty,
 structure: ?*Structure = null,
+/// Workspaces the daemon said to open here (`workspace.open`): a script
+/// run from one of ours made them for this window. Taken by
+/// `takeOpens`.
+opens: std.ArrayList(u32) = .empty,
 /// Ids of our `focus` calls not yet replied to. A structure that comes
 /// meanwhile may predate them, so its focus isn't taken.
 focus_calls: std.ArrayList(u32) = .empty,
@@ -537,6 +541,7 @@ const Json = struct {
     const Status = struct { id: []const u8 = "", state: u8 = 0, progress: i8 = -1 };
     const PaneExited = struct { id: u32, status: u32 = 0 };
     const WorkspaceDetached = struct { id: u32, reason: []const u8 = "" };
+    const WorkspaceOpen = struct { id: u32, name: []const u8 = "" };
     const Host = struct { id: u32, dest: []const u8 = "", state: []const u8 = "", text: []const u8 = "" };
     const HostPrompt = struct {
         host: u32,
@@ -603,6 +608,19 @@ const Pending = struct {
 /// every `frame_interval` µs. The workspace's panes wait in `arrivals`;
 /// `start` the reader after adopting them. UI thread.
 pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16) !*Daemon {
+    return connectTo(alloc, notify, frame_interval, area, size, command, 0);
+}
+
+/// Connect again and attach workspace `ws`, which the daemon said to
+/// open here (`workspace.open`): a connection of its own, whose tabs a
+/// window shows beside its first workspace's. As `connect`, except that
+/// it fails if `ws` is gone, and leaves the hosts' changes to the first
+/// connection. UI thread.
+pub fn connectWorkspace(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16, ws: u32) !*Daemon {
+    return connectTo(alloc, notify, frame_interval, area, size, command, ws);
+}
+
+fn connectTo(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16, want: u32) !*Daemon {
     var pipe: Pipe = try .open(true);
     errdefer pipe.close();
     const buf = try alloc.alloc(u8, max_frame);
@@ -612,7 +630,7 @@ pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area
     errdefer alloc.destroy(self);
     self.* = .{ .alloc = alloc, .pipe = pipe, .notify = notify, .frame_interval = frame_interval };
     errdefer self.freeState();
-    try self.attachFirst(buf, area, size, command);
+    try self.attachFirst(buf, area, size, command, want);
     return self;
 }
 
@@ -647,17 +665,18 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host
 }
 
 /// Say hello, subscribe to the hosts' changes, then attach the
-/// workspace asked for (SLIME_WORKSPACE, for the local daemon), else
-/// the most recently detached, or a new one with a tab running
-/// `command`, reading the replies in line. Before the reader routes
-/// frames.
-fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16) !void {
+/// workspace asked for (`want`, else SLIME_WORKSPACE for the local
+/// daemon), else the most recently detached, or a new one with a tab
+/// running `command`, reading the replies in line. Before the reader
+/// routes frames. With `want`, this is a window's further connection
+/// to its local daemon: the first one has the hosts' changes.
+fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16, want: u32) !void {
     try self.handshake(buf);
 
     // A host's state changes reach every window; a bridged daemon has
     // none to tell of.
-    var ws: u32 = 0;
-    if (self.remote == null) {
+    var ws: u32 = want;
+    if (want == 0 and self.remote == null) {
         var sub = try self.awaitReply(buf, try self.call("subscribe", .{ .events = .{"host.*"} }), struct {});
         sub.deinit();
         ws = requestedWorkspace();
@@ -754,7 +773,7 @@ fn remoteLoop(self: *Daemon) void {
     putStr(self.alloc, &p, r.term) catch return self.fail(error.OutOfMemory);
     self.send(.bridge, r.host, p.items) catch |err| return self.fail(err);
     // The host's own shell: the command is for its slime to run.
-    self.attachFirst(buf, self.area, self.size, &.{}) catch |err| return self.fail(err);
+    self.attachFirst(buf, self.area, self.size, &.{}, 0) catch |err| return self.fail(err);
     log.info("attached workspace {d} on {f}", .{ self.workspace, std.unicode.fmtUtf16Le(self.hostLabel()) });
     self.state.store(.attached, .release);
     self.posting.store(true, .release);
@@ -791,6 +810,7 @@ fn freeState(self: *Daemon) void {
     self.arrivals.deinit(self.alloc);
     self.focus_calls.deinit(self.alloc);
     self.host_lists.deinit(self.alloc);
+    self.opens.deinit(self.alloc);
     if (self.structure) |st| st.destroy(self.alloc);
     for (self.host_events.items) |*e| e.deinit(self.alloc);
     self.host_events.deinit(self.alloc);
@@ -858,6 +878,14 @@ pub fn take(self: *Daemon) Taken {
         .arrivals = self.arrivals.toOwnedSlice(self.alloc) catch &.{},
         .structure = structure,
     };
+}
+
+/// Take the workspaces the daemon said to open here, in order. The
+/// caller owns the slice. UI thread.
+pub fn takeOpens(self: *Daemon) []u32 {
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    return self.opens.toOwnedSlice(self.alloc) catch &.{};
 }
 
 /// Make `sink` the pane's: what came while it waited goes first, then
@@ -1114,7 +1142,7 @@ fn handle(self: *Daemon, f: Frame) !void {
 
 /// Act on a notification. `a` is an arena for the parse.
 fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Value) !void {
-    const Event = enum { @"pane.attached", @"pane.exited", @"workspace.changed", @"workspace.detached", @"host.changed", @"host.prompt" };
+    const Event = enum { @"pane.attached", @"pane.exited", @"workspace.changed", @"workspace.detached", @"workspace.open", @"host.changed", @"host.prompt" };
     const ev = std.meta.stringToEnum(Event, method) orelse return;
     switch (ev) {
         .@"pane.attached" => {
@@ -1162,6 +1190,13 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
                 var buf: [256]u8 = undefined;
                 self.loseAllLocked(std.fmt.bufPrint(&buf, "detached: {s}", .{p.reason}) catch "detached");
             }
+        },
+        .@"workspace.open" => {
+            const p = try std.json.parseFromValueLeaky(Json.WorkspaceOpen, a, params, json_opts);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            try self.opens.append(self.alloc, p.id);
+            if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
         },
         .@"host.changed" => {
             const h = try std.json.parseFromValueLeaky(Json.Host, a, params, json_opts);
@@ -1863,6 +1898,13 @@ test "pane and workspace events parse as the daemon sends them" {
     , json_opts);
     defer det.deinit();
     try std.testing.expectEqualStrings("attached elsewhere", det.value.reason);
+
+    var open = try std.json.parseFromSlice(Json.WorkspaceOpen, alloc,
+        \\{"id":14,"name":"dev"}
+    , json_opts);
+    defer open.deinit();
+    try std.testing.expectEqual(@as(u32, 14), open.value.id);
+    try std.testing.expectEqualStrings("dev", open.value.name);
 
     var created = try std.json.parseFromSlice(Json.Created, alloc,
         \\{"workspace":9,"tab":2,"pane":3}

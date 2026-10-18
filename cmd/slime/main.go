@@ -264,16 +264,20 @@ func layoutString(n *rpc.Node) string {
 }
 
 func wsCommand() *cobra.Command {
+	var attach uint32
 	ws := &cobra.Command{Use: "ws", Short: "Create, rename, kill, and describe workspaces"}
-	ws.AddCommand(&cobra.Command{
+	newWs := &cobra.Command{
 		Use:   "new [name]",
-		Short: "Create a workspace, detached, with a tab running the shell, and print its id",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Create a workspace with a tab running the shell, and print its id",
+		Long: "Creates a workspace with a tab running the shell. Inside a pane, the windows\n" +
+			"on the pane's workspace open it too ($SLIME_WORKSPACE); --attach names another\n" +
+			"workspace's windows, and 0 none, leaving it detached for the next window.",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var w rpc.Workspace
 			// Hanging up detaches it, but an empty workspace would go:
 			// give it a shell.
-			p := rpc.WorkspaceNewParams{Name: strings.Join(args, ""), Tabs: []*rpc.Layout{{Pane: &rpc.PaneSpec{}}}}
+			p := rpc.WorkspaceNewParams{Name: strings.Join(args, ""), Tabs: []*rpc.Layout{{Pane: &rpc.PaneSpec{}}}, Attach: attach}
 			if err := call(rpc.WorkspaceNew, p, &w); err != nil {
 				return err
 			}
@@ -283,7 +287,9 @@ func wsCommand() *cobra.Command {
 			fmt.Println(w.ID)
 			return nil
 		},
-	}, &cobra.Command{
+	}
+	newWs.Flags().Uint32Var(&attach, "attach", envWorkspace(), "open it in the windows on this workspace (default $SLIME_WORKSPACE; 0 for none)")
+	ws.AddCommand(newWs, &cobra.Command{
 		Use:   "focus <workspace> <tab> [pane]",
 		Short: "Show a tab in every window on the workspace, and focus a pane of it",
 		Args:  cobra.RangeArgs(2, 3),
@@ -361,9 +367,10 @@ func tabCommand() *cobra.Command {
 	newTab := &cobra.Command{
 		Use:   "new [command]...",
 		Short: "Start a tab; with several commands, one pane each, side by side or stacked",
-		Long: "Starts a tab in a workspace: the one given, else the most recently detached,\n" +
-			"else a new one. Each command (CreateProcessW syntax; empty for the shell)\n" +
-			"gets a pane, sharing the tab equally along --split.",
+		Long: "Starts a tab in a workspace: the one given, else the pane's own inside a\n" +
+			"pane ($SLIME_WORKSPACE), else the most recently detached, else a new one. Each\n" +
+			"command (CreateProcessW syntax; empty for the shell) gets a pane, sharing the\n" +
+			"tab equally along --split.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var axis rpc.Axis
 			switch split {
@@ -409,7 +416,7 @@ func tabCommand() *cobra.Command {
 			return nil
 		},
 	}
-	newTab.Flags().Uint32VarP(&wsID, "workspace", "w", 0, "workspace to start it in")
+	newTab.Flags().Uint32VarP(&wsID, "workspace", "w", envWorkspace(), "workspace to start it in (default $SLIME_WORKSPACE)")
 	newTab.Flags().StringVarP(&name, "name", "n", "", "name the tab")
 	newTab.Flags().StringVar(&split, "split", "right", "how several commands share the tab: right (side by side) or down (stacked)")
 

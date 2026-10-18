@@ -136,6 +136,74 @@ func TestScriptBuildsWorkspace(t *testing.T) {
 	}
 }
 
+// nextNotification reads c until a notification named name comes, and
+// returns its params.
+func nextNotification(t *testing.T, c *Client, name string) json.RawMessage {
+	t.Helper()
+	for {
+		_, m, err := c.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, params, ok := Notification(m); ok && got == name {
+			return params
+		}
+	}
+}
+
+// TestScriptOpensWorkspaceInWindow: a script run from a pane makes
+// workspaces for the window showing that pane, unless it says
+// otherwise; its tabs and splits land in the pane's own workspace.
+func TestScriptOpensWorkspaceInWindow(t *testing.T) {
+	h := newHarness(t)
+	w := h.window()
+	pane := w.newWorkspace()
+	c := h.connect()
+	_, done := runScript(t, c, rpc.ScriptRunParams{Pane: pane, Source: `
+		local shown = assert(slime.workspace.new{ name = "shown", tabs = { slime.layout.pane{} } })
+		local quiet = assert(slime.workspace.new{ name = "quiet", tabs = { slime.layout.pane{} }, attach = false })
+		local _, err, code = slime.workspace.new{ name = "nowhere", tabs = { slime.layout.pane{} }, attach = 999 }
+		assert(code == 1000, err)
+		local again = assert(slime.workspace.new{ name = "again", tabs = { slime.layout.pane{} } })
+		local tab = assert(slime.tab.new{})
+		local split = assert(slime.pane.split{ direction = "down" })
+		return { shown = shown.id, quiet = quiet.id, again = again.id, tab = tab.workspace, split = split.workspace }
+	`})
+	if !done.OK {
+		t.Fatalf("script failed: %s", done.Error)
+	}
+	var res struct{ Shown, Quiet, Again, Tab, Split uint32 }
+	if err := json.Unmarshal(done.Result, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Tab != w.ws.ID || res.Split != w.ws.ID {
+		t.Errorf("tab in %d, split in %d, want %d", res.Tab, res.Split, w.ws.ID)
+	}
+	// The window is told of the first and third, in order; the second
+	// stays detached, and the script's own connection, no viewer, hears
+	// nothing.
+	for _, want := range []uint32{res.Shown, res.Again} {
+		var open rpc.WorkspaceOpenParams
+		if err := json.Unmarshal(nextNotification(t, w.c, rpc.EvWorkspaceOpen), &open); err != nil {
+			t.Fatal(err)
+		}
+		if open.ID != want {
+			t.Errorf("told to open %d (%s), want %d", open.ID, open.Name, want)
+		}
+	}
+	home := w.ws.ID
+	w.attach(res.Shown, Area{})
+	l := h.list()
+	for _, ws := range l.Workspaces {
+		if ws.Attached != (ws.ID == home || ws.ID == res.Shown) {
+			t.Errorf("workspace %d (%s) attached: %v", ws.ID, ws.Name, ws.Attached)
+		}
+	}
+	if len(l.Workspaces) != 4 {
+		t.Errorf("%d workspaces", len(l.Workspaces))
+	}
+}
+
 func TestScriptErrorsAndLog(t *testing.T) {
 	h := newHarness(t)
 	c := h.connect()

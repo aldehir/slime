@@ -41,7 +41,7 @@ exists for one exists for all.
 
 ```
 slime ls [--json]                                  workspaces, tabs, panes
-slime ws new [name] | rename <ws> <name> | kill <ws> | info <ws>
+slime ws new [name] [--attach ws] | rename <ws> <name> | kill <ws> | info <ws>
 slime ws focus <ws> <tab> [pane]                   show a tab in every window on the workspace
 slime tab new [-w ws] [-n name] [--split right|down] [command]...
 slime tab rename <tab> <name> | close <tab> | info <tab>
@@ -63,6 +63,13 @@ take `CreateProcessW` syntax for a pane's command; an empty command is
 the default shell. `slime tab new` with several commands gives each a
 pane sharing the tab along `--split`.
 
+Every pane's shell has `SLIME_PANE` and `SLIME_WORKSPACE` (and
+`SLIME_INSTANCE` when the daemon is one). Inside a pane, `slime ws new`
+therefore opens the new workspace in the pane's window (`--attach 0`
+leaves it detached, another id names another workspace's windows),
+`slime tab new` adds to the pane's workspace, and `slime do` runs for
+the pane.
+
 ## `slime do`
 
 ```powershell
@@ -79,7 +86,8 @@ slime do --json -e 'return { a = 1 }'    # the result as raw JSON
 - `-p <pane>` sets the pane the script runs for; it defaults to
   `$SLIME_PANE`, which every pane's shell has. From inside a pane,
   `slime do` therefore targets that pane, its tab, and its workspace
-  unless the script says otherwise.
+  unless the script says otherwise, and a workspace it makes opens in
+  that pane's window.
 - What the script `print`s comes to stdout as it runs; `slime.log` goes
   to stderr and the daemon's log. The value the chunk returns prints at
   the end: a string as is, anything else as JSON, nothing for `nil`.
@@ -101,7 +109,7 @@ so a blocking Go call finishes before a cancel lands.
 | `slime.args` | table of the `key=value` arguments (an empty table if none) |
 | `slime.workspace_id`, `slime.tab_id`, `slime.pane_id` | the context, or nil; read at call time, so a script may set them to retarget |
 | `slime.call(method, params)` | any method by wire name; `params` a table or nil |
-| `slime.workspace.<m>{...}` | `workspace.<m>` with `id` filled from `workspace_id` (not for `list`, `new`) |
+| `slime.workspace.<m>{...}` | `workspace.<m>` with `id` filled from `workspace_id` (not for `list`); `new` gets `attach` from it instead, so the windows on the script's workspace open the new one (`attach = false` leaves it detached; another id names another workspace's windows) |
 | `slime.tab.<m>{...}` | `tab.<m>`; `tab.new` gets `workspace`, the rest get `id` from `tab_id` |
 | `slime.pane.<m>{...}` | `pane.<m>`; `split` and `move` get `pane`, the rest get `id` from `pane_id` |
 | `slime.layout.pane{command, cwd, env}` | a leaf for `tabs` in `workspace.new` or `layout` in `tab.new` |
@@ -123,10 +131,12 @@ empty table, and `nil` in a table means the key is absent. Functions
 and cycles can't be encoded.
 
 **Caveats.** `pcall` catches `slime.stop` (it is an error under the
-hood). A script is never a viewer: `slime.workspace.new` needs `tabs`,
-the workspace starts detached, and a script's `split`, `tab.new`, and
-`move` don't take the focus (a window's own do). `subscribe`, hooks,
-`wait`, timers, and `exec` are not available yet.
+hood). A script is never a viewer: `slime.workspace.new` needs `tabs`;
+run from a pane, the windows on that pane's workspace open the new one
+(they get `workspace.open` and attach it beside their tabs), otherwise
+it starts detached. A script's `split`, `tab.new`, and `move` don't
+take the focus (a window's own do). `subscribe`, hooks, `wait`, timers,
+and `exec` are not available yet.
 
 ## Examples
 
@@ -159,9 +169,12 @@ print("workspace", ws.id, "opens on tab", ws.active_tab)
 return ws.id
 ```
 
-A new window attaches the most recently detached workspace, so the next
-`slime-gui` shows it; `SLIME_WORKSPACE=<id>` in the window's environment
-picks one explicitly.
+Run from a pane, the window showing that pane opens the new workspace
+beside its tabs and shows it. From a console outside slime it starts
+detached: a new window attaches the most recently detached workspace,
+so the next `slime-gui` shows it; `SLIME_WORKSPACE=<id>` in the
+window's environment picks one explicitly (every pane's shell has it,
+so a `slime-gui` started from a pane joins that pane's workspace).
 
 From inside a pane (ids default to this pane):
 
@@ -213,7 +226,7 @@ definition; this is the summary.
 | method | params | result |
 |---|---|---|
 | `workspace.list` | none | `{workspaces: [WorkspaceDesc], panes: [PaneDesc]}` |
-| `workspace.new` | `{name?, tabs?: [Layout]}` | `Workspace`; a connection calling it becomes a viewer, a script must give `tabs` |
+| `workspace.new` | `{name?, tabs?: [Layout], attach?: workspace id}` | `Workspace`; a connection calling it becomes a viewer, a script must give `tabs`; the viewers of `attach` get `workspace.open` once the tabs are up |
 | `workspace.attach` | `{id, area?}` | `Workspace`; windows only (frames follow) |
 | `workspace.detach` | `{id}` | `{}` |
 | `workspace.kill` | `{id}` | `{}`; ends every pane in it |
@@ -289,6 +302,7 @@ can't receive events yet.
 | `workspace.created` / `destroyed` | `{id, name}` / `{id}` |
 | `workspace.changed` | `Workspace` (structure and focus) |
 | `workspace.detached` | `{id, reason}` |
+| `workspace.open` | `{id, name}`: to the viewers of the workspace a `workspace.new` named in `attach`, which open it too |
 | `workspace.viewer_joined` / `viewer_left` | `{id, viewers}` |
 | `tab.created` / `closed` / `renamed` / `selected` | `{workspace, id, name?}` |
 | `pane.created` | `{workspace, tab, id}` |

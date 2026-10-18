@@ -108,6 +108,7 @@ const (
 	EvWorkspaceDestroyed    = "workspace.destroyed"
 	EvWorkspaceChanged      = "workspace.changed"
 	EvWorkspaceDetached     = "workspace.detached"
+	EvWorkspaceOpen         = "workspace.open"
 	EvWorkspaceViewerJoined = "workspace.viewer_joined"
 	EvWorkspaceViewerLeft   = "workspace.viewer_left"
 	EvTabCreated            = "tab.created"
@@ -559,10 +560,14 @@ type Created struct {
 // WorkspaceNewParams: the name ("default" if empty) and the tabs to
 // start it with, one layout each; a connection calling it becomes a
 // viewer. With no tabs, a connection that then hangs up loses the
-// empty workspace.
+// empty workspace. Attach names a workspace whose viewers are to open
+// the new one too: once its tabs are up, they get workspace.open, and
+// a window attaches it beside what it shows. A script run from a pane
+// fills it with the pane's workspace.
 type WorkspaceNewParams struct {
-	Name string    `json:"name,omitempty"`
-	Tabs []*Layout `json:"tabs,omitempty"`
+	Name   string    `json:"name,omitempty"`
+	Tabs   []*Layout `json:"tabs,omitempty"`
+	Attach uint32    `json:"attach,omitempty"`
 }
 
 // WorkspaceAttachParams adds the caller to workspace ID's viewers,
@@ -695,6 +700,14 @@ type Empty struct{}
 
 // WorkspaceCreatedParams: workspace.created.
 type WorkspaceCreatedParams struct {
+	ID   uint32 `json:"id"`
+	Name string `json:"name"`
+}
+
+// WorkspaceOpenParams: workspace.open, to the viewers of the workspace
+// a workspace.new named in attach: workspace ID is for them to attach
+// as well.
+type WorkspaceOpenParams struct {
 	ID   uint32 `json:"id"`
 	Name string `json:"name"`
 }
