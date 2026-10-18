@@ -160,7 +160,12 @@ func (p *Pane) attachFramesLocked(c *conn) (*paneViewer, error) {
 			p.autoscrollLocked(v, false)
 		}
 	}
-	c.sendForce(0, notify(rpc.EvPaneAttached, rpc.PaneAttachedParams{ID: p.id, Command: p.command, Status: p.status.records()}))
+	// Every attach runs under the server's lock, which guards p.tab.
+	at := rpc.PaneAttachedParams{ID: p.id, Command: p.command, Status: p.status.records()}
+	if p.tab != nil {
+		at.Workspace, at.Tab = p.tab.ws.id, p.tab.id
+	}
+	c.sendForce(0, notify(rpc.EvPaneAttached, at))
 	// What the client would otherwise only learn when they change.
 	if title, _ := p.term.Title(); title != "" {
 		c.sendForce(p.id, &Notice{Kind: NoticeTitle, Text: title})

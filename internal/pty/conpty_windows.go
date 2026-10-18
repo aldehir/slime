@@ -309,6 +309,9 @@ func coord(cols, rows uint16) uintptr {
 	return uintptr(x) | uintptr(y)<<16
 }
 
+// DefaultCommand is what an empty Options.Command runs: %COMSPEC%.
+func DefaultCommand() string { return defaultShell() }
+
 func defaultShell() string {
 	if s := os.Getenv("COMSPEC"); s != "" {
 		return s

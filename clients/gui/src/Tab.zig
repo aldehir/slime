@@ -19,6 +19,8 @@ const Rect = @import("renderer/Painter.zig").Rect;
 id: u32,
 /// The daemon whose tab it is, or null for a session of its own.
 conn: ?*Daemon = null,
+/// slime's id for the workspace it's in, or 0 for a session of its own.
+ws: u32 = 0,
 root: Node,
 /// The pane that gets the keys.
 focus: *Session,
@@ -53,9 +55,9 @@ pub const Child = struct {
     node: Node,
 };
 
-pub fn create(alloc: Allocator, conn: ?*Daemon, id: u32, root: Node, focus: *Session) !*Tab {
+pub fn create(alloc: Allocator, conn: ?*Daemon, ws: u32, id: u32, root: Node, focus: *Session) !*Tab {
     const self = try alloc.create(Tab);
-    self.* = .{ .id = id, .conn = conn, .root = root, .focus = focus };
+    self.* = .{ .id = id, .conn = conn, .ws = ws, .root = root, .focus = focus };
     return self;
 }
 
@@ -663,7 +665,7 @@ test "placing and removing panes" {
     const row = try alloc.alloc(Child, 2);
     row[0] = .{ .share = 7500, .node = .{ .pane = &a } };
     row[1] = .{ .share = 2500, .node = .{ .split = .{ .axis = .column, .children = column } } };
-    const tab = try create(alloc, null, 1, .{ .split = .{ .axis = .row, .children = row } }, &c);
+    const tab = try create(alloc, null, 0, 1, .{ .split = .{ .axis = .row, .children = row } }, &c);
     defer tab.destroy(alloc);
 
     try tab.place(alloc, .{ .x = 10, .y = 20, .w = 401, .h = 201 }, 1);
@@ -718,7 +720,7 @@ test "navigating, resizing, and equalizing panes" {
     const row = try alloc.alloc(Child, 2);
     row[0] = .{ .share = 5000, .node = .{ .pane = &a } };
     row[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = column } } };
-    const tab = try create(alloc, null, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    const tab = try create(alloc, null, 0, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
     defer tab.destroy(alloc);
     try tab.place(alloc, .{ .w = 401, .h = 201 }, 1);
 
@@ -766,7 +768,7 @@ test "moving panes" {
     row[0] = .{ .share = 3334, .node = .{ .pane = &a } };
     row[1] = .{ .share = 3333, .node = .{ .pane = &b } };
     row[2] = .{ .share = 3333, .node = .{ .pane = &c } };
-    const tab = try create(alloc, null, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    const tab = try create(alloc, null, 0, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
     defer tab.destroy(alloc);
 
     // c along the top: a column of c over the rest.

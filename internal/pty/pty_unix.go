@@ -162,6 +162,10 @@ func childEnv() []string {
 	return append(env, "TERM="+term, "COLORTERM=truecolor")
 }
 
+// DefaultCommand is what an empty Options.Command runs: the user's
+// shell.
+func DefaultCommand() string { return userShell() }
+
 // userShell is $SHELL, else the passwd entry's, else /bin/sh.
 func userShell() string {
 	if s := os.Getenv("SHELL"); s != "" {

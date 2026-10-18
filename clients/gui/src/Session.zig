@@ -115,6 +115,9 @@ ended: bool = false,
 /// was taken by another window, or slime went away). Written by the
 /// connection's reader before it posts WM_APP_CHILD_EXITED.
 daemon_loss: ?DaemonLoss = null,
+/// The daemon pane's program exited, so there's nothing left to kill.
+/// Written as `daemon_loss` is.
+exited: bool = false,
 
 /// Logging in to the SSH host, while there's something to show: a
 /// question, the server working on an answer, or why it failed. Shown
@@ -290,7 +293,7 @@ fn stopTransport(self: *Session) void {
 /// to slime, as closing the window does. A pane already lost to us is
 /// left alone.
 pub fn kill(self: *Session) void {
-    if (self.daemon_loss != null) return;
+    if (self.daemon_loss != null or self.exited) return;
     switch (self.transport orelse return) {
         .daemon => |s| s.conn.kill(s.pane),
         .waiting => {},
@@ -553,6 +556,8 @@ fn daemonEnded(ctx: *anyopaque, why: ?[]const u8) void {
         loss.set("{s}", .{text});
         // Read on the UI thread only after the post, which orders it.
         self.daemon_loss = loss;
+    } else {
+        self.exited = true;
     }
     _ = win32.PostMessageW(self.window.hwnd, Window.WM_APP_CHILD_EXITED, self.id, 0);
 }

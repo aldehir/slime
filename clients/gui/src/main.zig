@@ -5,6 +5,7 @@ const win32 = @import("win32/win32.zig");
 const Window = @import("Window.zig");
 const Config = @import("Config.zig");
 const Hosts = @import("Hosts.zig");
+const Shown = @import("Shown.zig");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
@@ -25,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
     defer config.deinit();
     var hosts: Hosts = try .load(init.gpa, init.io, config_dir);
     defer hosts.deinit();
+    var shown: Shown = try .load(init.gpa, init.io, config_dir);
+    defer shown.deinit();
 
     const command_line = try shellCommand(init.gpa, config.command);
     defer init.gpa.free(command_line);
@@ -35,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         try init.gpa.dupeZ(u16, command_line);
     defer init.gpa.free(local_command);
 
-    const window = try Window.create(init.gpa, init.io, &config, &hosts, command_line, local_command);
+    const window = try Window.create(init.gpa, init.io, &config, &hosts, &shown, command_line, local_command);
     defer window.destroy();
 
     // Handle every pending message (input first) before drawing, so a
@@ -175,6 +178,7 @@ test {
     _ = Window;
     _ = Config;
     _ = @import("Hosts.zig");
+    _ = @import("Shown.zig");
     _ = @import("Screen.zig");
     _ = @import("Session.zig");
     _ = @import("Daemon.zig");

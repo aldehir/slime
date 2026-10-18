@@ -751,6 +751,9 @@ type PaneCreatedParams struct {
 // title and pwd if it has them.
 type PaneAttachedParams struct {
 	ID uint32 `json:"id"`
+	// Workspace and Tab place it, for a viewer of several workspaces.
+	Workspace uint32 `json:"workspace"`
+	Tab       uint32 `json:"tab"`
 	// Command is what the pane runs, for a client that didn't start it.
 	Command string         `json:"command"`
 	Status  []StatusRecord `json:"status,omitempty"`

@@ -538,9 +538,11 @@ func (s *Server) tabNew(cl *callCtx, m rpc.TabNewParams) (*rpc.Created, error) {
 type started struct {
 	id   uint32
 	spec *rpc.PaneSpec
-	size Size
-	pty  pty.Pty
-	term *vt.Terminal
+	// command is what runs: the spec's, or the default shell.
+	command string
+	size    Size
+	pty     pty.Pty
+	term    *vt.Terminal
 }
 
 func (st *started) close() {
@@ -634,11 +636,11 @@ func (s *Server) layoutTreeLocked(l *rpc.Layout) (*Node, map[uint32]*rpc.PaneSpe
 // addPaneLocked makes the pane of a started child in tab t, attaches
 // it to the tab's viewers, and starts it running.
 func (s *Server) addPaneLocked(t *tab, st *started) *Pane {
-	p := newPane(s, st.id, st.spec.Command, st.size, st.pty, st.term)
+	p := newPane(s, st.id, st.command, st.size, st.pty, st.term)
 	p.tab = t
 	s.panes[p.id] = p
 	ws := t.ws
-	s.log.Info("pane started", "workspace", ws.id, "tab", t.id, "pane", p.id, "command", st.spec.Command, "pid", st.pty.PID())
+	s.log.Info("pane started", "workspace", ws.id, "tab", t.id, "pane", p.id, "command", st.command, "pid", st.pty.PID())
 	s.emitLocked(rpc.EvPaneCreated, rpc.PaneCreatedParams{Workspace: ws.id, Tab: t.id, ID: p.id}, nil, nil)
 	for c := range ws.viewers {
 		p.attach(c, Size{})

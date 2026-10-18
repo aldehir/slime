@@ -171,10 +171,11 @@ return ws.id
 
 Run from a pane, the window showing that pane opens the new workspace
 beside its tabs and shows it. From a console outside slime it starts
-detached: a new window attaches the most recently detached workspace,
-so the next `slime-gui` shows it; `SLIME_WORKSPACE=<id>` in the
-window's environment picks one explicitly (every pane's shell has it,
-so a `slime-gui` started from a pane joins that pane's workspace).
+detached: every window lists it in its sidebar, where a click shows it.
+A new window shows the workspaces the last one did (or all of them,
+under a daemon it hasn't seen); `SLIME_WORKSPACE=<id>` in the window's
+environment shows that one alone (every pane's shell has it, so a
+`slime-gui` started from a pane joins that pane's workspace).
 
 From inside a pane (ids default to this pane):
 
@@ -306,7 +307,7 @@ can't receive events yet.
 | `workspace.viewer_joined` / `viewer_left` | `{id, viewers}` |
 | `tab.created` / `closed` / `renamed` / `selected` | `{workspace, id, name?}` |
 | `pane.created` | `{workspace, tab, id}` |
-| `pane.attached` | `{id, command, status?}` (viewers only; frames follow) |
+| `pane.attached` | `{id, workspace, tab, command, status?}` (viewers only; frames follow) |
 | `pane.exited` | `{id, status}` |
 | `script.output` | `{id, stream: stdout\|stderr, data}` |
 | `script.done` | `{id, ok, result?, error?}` |

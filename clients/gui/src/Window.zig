@@ -22,6 +22,7 @@ const Session = @import("Session.zig");
 const Tab = @import("Tab.zig");
 const Daemon = @import("Daemon.zig");
 const Hosts = @import("Hosts.zig");
+const Shown = @import("Shown.zig");
 const Login = @import("Login.zig");
 const Chrome = @import("chrome/Chrome.zig");
 const build_options = @import("build_options");
@@ -86,6 +87,9 @@ config: *const Config,
 local_command: []const u16,
 /// The SSH hosts the sidebar lists. Outlives the window.
 hosts: *Hosts,
+/// The workspaces the last window showed, for this one to show, and
+/// this one's for the next. Outlives the window.
+shown: *Shown,
 hwnd: ?win32.HWND = null,
 /// The last stats report, which the chrome shows.
 stats_text: [max_stats_len]u16 = undefined,
@@ -102,11 +106,12 @@ chrome_layout: Chrome.Layout = undefined,
 /// (WM_SIZE, etc.) arrive before everything else is ready.
 renderer: ?Renderer = null,
 
-/// Never empty once created: closing the last tab closes the window.
-/// Grouped as the sidebar shows them: local tabs first, then each
-/// connection's together.
+/// Grouped as the sidebar shows them: each shown workspace's tabs in
+/// the workspaces' order, then each host's together. Empty while no
+/// workspace is shown (the terminal area says so); the window closes
+/// when nothing is left to show.
 tabs: std.ArrayList(*Tab) = .empty,
-/// The tab shown. Its focused pane gets input.
+/// The tab shown, while there are any. Its focused pane gets input.
 active: usize = 0,
 next_session_id: u32 = 1,
 /// Scratch for `view`, with room for every group.
@@ -116,7 +121,7 @@ view_groups: std.ArrayList(Chrome.View.Group) = .empty,
 view_panes: std.ArrayList(Chrome.View.Pane) = .empty,
 view_dividers: std.ArrayList(Chrome.Rect) = .empty,
 /// The active tab's panes on screen, as `view` lists them.
-shown: std.ArrayList(*Session) = .empty,
+shown_panes: std.ArrayList(*Session) = .empty,
 /// Scratch for `render`.
 frame_panes: std.ArrayList(Renderer.Pane) = .empty,
 
@@ -139,15 +144,25 @@ blink_visible: bool = true,
 /// The host being typed after "Connect" was clicked. Takes the keyboard
 /// while set.
 connect_field: ?Chrome.TextField = null,
+/// A workspace's name being edited in its header. Takes the keyboard
+/// while set.
+rename: ?Rename = null,
+/// Asking before killing a workspace, over the terminal area. Takes the
+/// keyboard while set.
+confirm: ?Confirm = null,
 
-/// The connection to slime: local sessions are panes of the workspace
-/// it holds for this window. Null if it couldn't be reached.
+/// The connection to slime: local sessions are panes of the workspaces
+/// it holds, those shown here. Null if it couldn't be reached.
 daemon: ?*Daemon = null,
-/// Further connections to slime, one per workspace it said to open here
-/// (`workspace.open`: a script run from one of this window's panes
-/// made it). Their tabs sit with the first workspace's; one goes when
-/// its tabs have.
-opened: std.ArrayList(*Daemon) = .empty,
+/// slime's workspaces, as it lists them, in its order. The shown ones
+/// are attached on `daemon`, their tabs in `tabs`; the rest are a header
+/// each in the sidebar.
+workspaces: std.ArrayList(Workspace) = .empty,
+/// A workspace just asked for here (shown from the sidebar, or made):
+/// its active tab is shown when its tabs come. `activate_new` is for one
+/// whose id isn't known yet.
+activate_ws: ?u32 = null,
+activate_new: bool = false,
 /// Connections to slime on SSH hosts, bridged through the local daemon:
 /// a host's sessions are panes of the workspace its slime holds for
 /// this window.
@@ -226,6 +241,34 @@ const Remote = struct {
     host: u32,
 };
 
+/// A workspace of the local daemon, as it last described it.
+const Workspace = struct {
+    id: u32,
+    /// Owned.
+    name: []u16,
+    /// Tabs the daemon has in it, shown here or not.
+    tabs: usize,
+    /// Connections viewing it, this one included.
+    viewers: usize,
+    /// Attached on `daemon`: its tabs are in `tabs`, or about to be.
+    shown: bool,
+};
+
+/// A workspace's name being edited.
+const Rename = struct {
+    ws: u32,
+    field: Chrome.TextField,
+};
+
+/// Asking whether to kill a workspace. The dialog's strings point into
+/// the buffers, so it stays where it is.
+const Confirm = struct {
+    ws: u32,
+    dialog: Chrome.Dialog,
+    title: [Chrome.TextField.max_len + 32]u16 = undefined,
+    text: [96]u16 = undefined,
+};
+
 /// A host as the local daemon knows it.
 const HostEntry = struct {
     id: u32,
@@ -239,11 +282,11 @@ const HostEntry = struct {
     ours: bool = false,
 };
 
-/// Create the window, attaching the workspace slime kept for it, or a
-/// new one running `command_line` (CreateProcessW syntax). An `ssh://`
-/// URL opens that host instead, and is remembered in `hosts`. Local
-/// sessions opened later run `local_command`.
-pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts, command_line: []const u16, local_command: []const u16) !*Window {
+/// Create the window, showing the workspaces the last window did (or
+/// what slime has, or a new one running `command_line`, CreateProcessW
+/// syntax). An `ssh://` URL opens that host too, and is remembered in
+/// `hosts`. Local sessions opened later run `local_command`.
+pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts, shown: *Shown, command_line: []const u16, local_command: []const u16) !*Window {
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
 
@@ -258,6 +301,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
         .config = config,
         .local_command = local_command,
         .hosts = hosts,
+        .shown = shown,
         .output_event = output_event,
         .grid = undefined,
         .chrome = undefined,
@@ -304,7 +348,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
 
     try self.reserveGroups();
     // Hosts are reached through the local daemon too, so a host URL still
-    // attaches the local workspace, and opens the host beside it.
+    // shows the local workspaces, and opens the host beside them.
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     const on_host = std.mem.startsWith(u16, command_line, ssh_scheme);
     try self.connectDaemon(if (on_host) local_command else command_line);
@@ -335,11 +379,11 @@ pub fn destroy(self: *Window) void {
         self.chrome.deinit();
         self.grid.deinit();
     }
-    // Hanging up detaches the workspace; slime keeps it for the next
+    // Hanging up detaches the workspaces; slime keeps them for the next
     // window.
     if (self.daemon) |conn| conn.deinit();
-    for (self.opened.items) |conn| conn.deinit();
-    self.opened.deinit(self.alloc);
+    for (self.workspaces.items) |w| self.alloc.free(w.name);
+    self.workspaces.deinit(self.alloc);
     for (self.remotes.items) |r| r.conn.deinit();
     self.remotes.deinit(self.alloc);
     for (self.host_states.items) |e| {
@@ -352,7 +396,7 @@ pub fn destroy(self: *Window) void {
     self.view_groups.deinit(self.alloc);
     self.view_panes.deinit(self.alloc);
     self.view_dividers.deinit(self.alloc);
-    self.shown.deinit(self.alloc);
+    self.shown_panes.deinit(self.alloc);
     self.frame_panes.deinit(self.alloc);
     _ = win32.CloseHandle(self.output_event);
     self.alloc.destroy(self);
@@ -370,13 +414,26 @@ fn destroyTab(self: *Window, t: *Tab) void {
     t.destroy(self.alloc);
 }
 
+/// The tab shown. Only while there are tabs (`hasTabs`).
 pub fn activeTab(self: *const Window) *Tab {
     return self.tabs.items[self.active];
 }
 
-/// The active tab's focused pane, which gets input.
+/// The active tab's focused pane, which gets input. Only while there
+/// are tabs.
 pub fn activeSession(self: *const Window) *Session {
     return self.activeTab().focus;
+}
+
+/// Whether anything is shown in the terminal area. Without tabs, the
+/// chrome alone takes input.
+pub fn hasTabs(self: *const Window) bool {
+    return self.tabs.items.len > 0;
+}
+
+/// The active tab's focused pane, if there is one.
+fn focusedSession(self: *const Window) ?*Session {
+    return if (self.hasTabs()) self.activeSession() else null;
 }
 
 const Found = struct { tab: usize, s: *Session };
@@ -413,15 +470,16 @@ const Target = union(enum) {
     failed: struct { title: []const u16, why: []const u8 },
 };
 
-/// Connect to slime and attach the workspace detached last (a new one
-/// running `command` if none), making a tab of each of its tabs. If that
-/// fails, a tab says why.
+/// Connect to slime and show the workspaces the last window did (else
+/// what slime has, else a new one running `command`), making a tab of
+/// each of their tabs. If that fails, a tab says why.
 fn connectDaemon(self: *Window, command: []const u16) !void {
-    const conn = Daemon.connect(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_DAEMON }, self.frameInterval(), self.daemonArea(), self.daemonSize(), command) catch |err| {
+    const conn = Daemon.connect(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_DAEMON }, self.frameInterval(), self.daemonArea(), self.daemonSize(), command, self.shown.wanted()) catch |err| {
         log.err("connecting to slime failed: {}", .{err});
         return self.spawnFailed("couldn't start slime", err);
     };
     self.daemon = conn;
+    self.workspacesChanged(conn);
     self.daemonChanged(conn);
     conn.start() catch |err| {
         log.err("starting slime's reader failed: {}", .{err});
@@ -449,9 +507,9 @@ fn frameInterval(self: *const Window) u32 {
 }
 
 /// Take up what `conn` sent: make sessions of the panes that arrived,
-/// and lay out tabs as its workspace has them, focused as slime says: a
-/// pane we asked for (a new tab or split) is shown and focused; a
-/// script's is added without taking focus.
+/// and lay out tabs as their workspaces have them, focused as slime
+/// says: a pane we asked for (a new tab or split) is shown and focused;
+/// a script's is added without taking focus.
 fn daemonChanged(self: *Window, conn: *Daemon) void {
     var taken = conn.take();
     defer taken.deinit(self.alloc);
@@ -469,31 +527,314 @@ fn daemonChanged(self: *Window, conn: *Daemon) void {
             continue;
         };
     }
-    if (taken.structure) |st| self.applyStructure(conn, st, &arrived) catch |err| log.err("laying out slime's tabs failed: {}", .{err});
+    for (taken.structures) |st| {
+        var wanted = false;
+        if (conn == self.daemon) {
+            const was_shown = if (self.workspaceEntry(st.id)) |w| w.shown else false;
+            self.workspaceShown(st);
+            // One the user just showed or made is what they want to see.
+            wanted = self.activate_ws == st.id or (!was_shown and self.activate_new);
+        }
+        self.applyStructure(conn, st, &arrived) catch |err| log.err("laying out slime's tabs failed: {}", .{err});
+        if (!wanted) continue;
+        self.activate_ws = null;
+        self.activate_new = false;
+        for (self.tabs.items, 0..) |t, k| {
+            if (t.conn == conn and t.ws == st.id and (t.id == st.active_tab or st.active_tab == 0)) {
+                self.activate(k);
+                break;
+            }
+        }
+    }
     // Panes no tab holds (which slime doesn't send) aren't shown.
     var left = arrived.valueIterator();
     while (left.next()) |s| s.*.destroy();
 
-    if (self.tabs.items.len == 0) {
-        // Every pane is gone: so is the window.
-        _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
-        return;
-    }
+    self.closeIfNothingLeft();
     self.dirty = true;
 }
 
-/// Lay out `conn`'s tabs as `st` has them, in its order: replace the
-/// trees of tabs we have, add tabs we don't, and drop tabs and panes it
-/// no longer has. Its focus is slime's, shared with every window on the
-/// workspace: each tab's focused and zoomed pane, and the tab shown,
-/// which is followed when one of `conn`'s tabs is the one shown here.
-/// Sessions placed from `arrived` are taken out of it.
+/// Nothing is shown, and nothing is left to show: close the window. A
+/// hidden workspace with tabs keeps it open, empty, to show one from
+/// the sidebar.
+fn closeIfNothingLeft(self: *Window) void {
+    if (self.hasTabs()) return;
+    for (self.workspaces.items) |w| if (w.tabs > 0 or w.shown) return;
+    _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
+}
+
+/// Take up what the local daemon said about its workspaces: keep the
+/// list as it has it, and let go of the tabs of one it took away.
+fn workspacesChanged(self: *Window, conn: *Daemon) void {
+    const events = conn.takeWorkspaces();
+    defer {
+        for (events) |*e| e.deinit(self.alloc);
+        self.alloc.free(events);
+    }
+    if (conn != self.daemon) return;
+    for (events) |e| switch (e) {
+        .list => |list| for (list) |w| self.workspaceInfo(w, true),
+        .created, .changed => |w| self.workspaceInfo(w, false),
+        .viewers => |v| if (self.workspaceEntry(v.id)) |w| {
+            w.viewers = v.count;
+        },
+        .destroyed => |id| self.workspaceGone(id),
+        .attach_failed => |id| if (self.workspaceEntry(id)) |w| {
+            w.shown = false;
+            self.rememberShown();
+        },
+    };
+    _ = self.chrome.setHover(.none);
+    self.dirty = true;
+}
+
+/// Record what the daemon said of workspace `w`, adding it to the list
+/// if it's new. `listed` says the daemon is listing everything it has, so
+/// whether it's attached here is current.
+fn workspaceInfo(self: *Window, w: Daemon.WorkspaceInfo, listed: bool) void {
+    const conn = self.daemon orelse return;
+    const entry = self.workspaceEntry(w.id) orelse entry: {
+        const name = self.alloc.dupe(u16, w.name) catch return;
+        self.workspaces.append(self.alloc, .{ .id = w.id, .name = name, .tabs = 0, .viewers = 0, .shown = false }) catch {
+            self.alloc.free(name);
+            return;
+        };
+        self.reserveGroups() catch {};
+        break :entry &self.workspaces.items[self.workspaces.items.len - 1];
+    };
+    if (!std.mem.eql(u16, entry.name, w.name)) {
+        const name = self.alloc.dupe(u16, w.name) catch return;
+        self.alloc.free(entry.name);
+        entry.name = name;
+    }
+    entry.tabs = w.tabs;
+    if (w.viewers) |n| entry.viewers = n;
+    if (listed) entry.shown = conn.isAttached(w.id);
+}
+
+/// A structure came for workspace `st`: it's shown here, named and
+/// sized as the structure says.
+fn workspaceShown(self: *Window, st: *const Daemon.Structure) void {
+    self.workspaceInfo(.{ .id = st.id, .name = st.name, .tabs = st.tabs.len, .active_tab = st.active_tab, .viewers = null }, false);
+    const entry = self.workspaceEntry(st.id) orelse return;
+    if (!entry.shown) {
+        entry.shown = true;
+        self.rememberShown();
+    }
+}
+
+/// Workspace `id` is gone: so are its tabs here, and its row.
+fn workspaceGone(self: *Window, id: u32) void {
+    self.cancelDrag();
+    var i: usize = 0;
+    while (i < self.tabs.items.len) {
+        const t = self.tabs.items[i];
+        if (t.conn == self.daemon and t.ws == id) self.dropTab(i) else i += 1;
+    }
+    if (self.rename) |r| if (r.ws == id) self.cancelRename();
+    if (self.confirm) |c| if (c.ws == id) self.closeConfirm();
+    for (self.workspaces.items, 0..) |w, k| {
+        if (w.id != id) continue;
+        self.alloc.free(w.name);
+        _ = self.workspaces.orderedRemove(k);
+        break;
+    }
+    self.rememberShown();
+    self.closeIfNothingLeft();
+}
+
+fn workspaceEntry(self: *Window, id: u32) ?*Workspace {
+    for (self.workspaces.items) |*w| {
+        if (w.id == id) return w;
+    }
+    return null;
+}
+
+/// Remember which workspaces are shown, for the next window.
+fn rememberShown(self: *Window) void {
+    const conn = self.daemon orelse return;
+    var ids: [64]u32 = undefined;
+    var n: usize = 0;
+    for (self.workspaces.items) |w| {
+        if (!w.shown or n == ids.len) continue;
+        ids[n] = w.id;
+        n += 1;
+    }
+    self.shown.set(conn.pid, ids[0..n]);
+}
+
+/// Show workspace `id`: attach it, so its tabs come (WM_APP_DAEMON).
+fn showWorkspace(self: *Window, id: u32) void {
+    const conn = self.daemon orelse return;
+    const entry = self.workspaceEntry(id) orelse return;
+    if (entry.shown or conn.isLost()) return;
+    conn.attach(id, self.daemonArea()) catch |err| return log.err("showing workspace {d} failed: {}", .{ id, err });
+    entry.shown = true;
+    self.activate_ws = id;
+    self.rememberShown();
+    self.dirty = true;
+}
+
+/// Hide workspace `id`: let go of its tabs, which slime keeps running.
+fn hideWorkspace(self: *Window, id: u32) void {
+    const conn = self.daemon orelse return;
+    const entry = self.workspaceEntry(id) orelse return;
+    if (!entry.shown) return;
+    self.cancelDrag();
+    var i: usize = 0;
+    while (i < self.tabs.items.len) {
+        const t = self.tabs.items[i];
+        if (t.conn == conn and t.ws == id) self.dropTab(i) else i += 1;
+    }
+    conn.detach(id);
+    entry.shown = false;
+    self.rememberShown();
+    _ = self.chrome.setHover(.none);
+    self.closeIfNothingLeft();
+    self.dirty = true;
+}
+
+/// Make a workspace with a tab running the local command, shown here.
+fn newWorkspace(self: *Window) void {
+    const conn = self.daemon orelse return;
+    if (conn.isLost()) return;
+    conn.newWorkspace(&.{}, self.local_command) catch |err| return log.err("new workspace failed: {}", .{err});
+    self.activate_new = true;
+}
+
+/// Ask before killing workspace `id`, unless it has nothing running.
+fn askKillWorkspace(self: *Window, id: u32) void {
+    const conn = self.daemon orelse return;
+    const entry = self.workspaceEntry(id) orelse return;
+    if (entry.tabs == 0) return conn.killWorkspace(id);
+    self.cancelConnect();
+    self.cancelRename();
+    self.confirm = .{ .ws = id, .dialog = undefined };
+    const c = &self.confirm.?;
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("Kill workspace \u{201c}");
+    const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\u{201d}?");
+    const name = entry.name[0..@min(entry.name.len, c.title.len - prefix.len - suffix.len)];
+    @memcpy(c.title[0..prefix.len], prefix);
+    @memcpy(c.title[prefix.len..][0..name.len], name);
+    @memcpy(c.title[prefix.len + name.len ..][0..suffix.len], suffix);
+    var utf8: [96]u8 = undefined;
+    const text = std.fmt.bufPrint(&utf8, "Its {d} tab{s} and everything running in them will end.", .{ entry.tabs, if (entry.tabs == 1) "" else "s" }) catch "Everything running in it will end.";
+    const text_len = std.unicode.utf8ToUtf16Le(&c.text, text) catch 0;
+    c.dialog = .{
+        .icon = .warning,
+        .danger = true,
+        .title = c.title[0 .. prefix.len + name.len + suffix.len],
+        .text = c.text[0..text_len],
+    };
+    c.dialog.addButton(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Cancel"), .action = .cancel, .style = .primary });
+    c.dialog.addButton(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Kill"), .action = .accept, .style = .danger });
+    c.dialog.focus = .{ .button = 0 };
+    _ = self.chrome.setHover(.none);
+    self.resetBlink();
+    self.dirty = true;
+}
+
+/// Act on the kill dialog's button.
+fn confirmAction(self: *Window, action: Chrome.Dialog.Action) void {
+    const c = self.confirm orelse return;
+    if (action == .accept) if (self.daemon) |conn| conn.killWorkspace(c.ws);
+    self.closeConfirm();
+}
+
+fn closeConfirm(self: *Window) void {
+    if (self.confirm == null) return;
+    self.confirm = null;
+    _ = self.chrome.setHover(.none);
+    self.dirty = true;
+}
+
+/// Edit workspace `id`'s name in its header.
+fn startRename(self: *Window, id: u32) void {
+    const entry = self.workspaceEntry(id) orelse return;
+    self.cancelConnect();
+    self.closeConfirm();
+    self.rename = .{ .ws = id, .field = .{} };
+    const field = &self.rename.?.field;
+    field.insert(entry.name);
+    field.press(.select_all, false, false);
+    _ = self.chrome.setHover(.none);
+    self.resetBlink();
+    self.dirty = true;
+}
+
+fn cancelRename(self: *Window) void {
+    if (self.rename == null) return;
+    self.rename = null;
+    self.dirty = true;
+}
+
+/// Send the name in the field and close it. The name comes back from
+/// slime.
+fn submitRename(self: *Window) void {
+    const r = &(self.rename orelse return);
+    const name = std.mem.trim(u16, r.field.text(), &.{ ' ', '\t' });
+    if (name.len > 0) if (self.daemon) |conn| {
+        conn.renameWorkspace(r.ws, name) catch |err| log.err("renaming workspace {d} failed: {}", .{ r.ws, err });
+    };
+    self.cancelRename();
+}
+
+/// A key down while a workspace's name is being edited. Returns false
+/// for keys it doesn't take.
+fn renameKey(self: *Window, vk: u32) bool {
+    const r = &(self.rename orelse return false);
+    switch (vk) {
+        win32.VK_RETURN => self.submitRename(),
+        win32.VK_ESCAPE => self.cancelRename(),
+        else => if (!self.editKey(&r.field, vk, true)) return false,
+    }
+    self.keyHandled();
+    return true;
+}
+
+/// A key down for the kill dialog. Returns false for keys it doesn't
+/// take.
+fn confirmKey(self: *Window, vk: u32) bool {
+    const c = &(self.confirm orelse return false);
+    const d = &c.dialog;
+    switch (vk) {
+        win32.VK_RETURN => if (d.enterAction()) |action| self.confirmAction(action),
+        win32.VK_SPACE => if (d.focusedButton()) |b| self.confirmAction(b.action) else return false,
+        win32.VK_ESCAPE => self.confirmAction(.cancel),
+        win32.VK_TAB => if (win32.GetKeyState(win32.VK_CONTROL) < 0) return false else d.cycleFocus(win32.GetKeyState(win32.VK_SHIFT) >= 0),
+        else => return false,
+    }
+    self.keyHandled();
+    return true;
+}
+
+/// The sidebar group of local workspace `id`, if it's listed.
+fn workspaceGroup(self: *const Window, id: u32) ?usize {
+    for (self.workspaces.items, 0..) |w, i| {
+        if (w.id == id) return i;
+    }
+    return null;
+}
+
+/// How many groups come before the hosts': one per workspace, or Local
+/// alone while slime lists none.
+fn localGroups(self: *const Window) usize {
+    return @max(1, self.workspaces.items.len);
+}
+
+/// Lay out `conn`'s tabs of workspace `st.id` as `st` has them, in its
+/// order: replace the trees of tabs we have, add tabs we don't, and drop
+/// tabs and panes it no longer has. Its focus is slime's, shared with
+/// every window on the workspace: each tab's focused and zoomed pane,
+/// and the tab shown, which is followed when one of the workspace's tabs
+/// is the one shown here. Sessions placed from `arrived` are taken out
+/// of it.
 fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
     const alloc = self.alloc;
     self.cancelDrag();
     const was_active: ?*Tab = if (self.tabs.items.len > 0) self.activeTab() else null;
     const was_focus: ?*Session = if (was_active) |t| t.focus else null;
-    const shown_conn: ?*Daemon = if (was_active) |t| t.conn else null;
+    const shown_ws = if (was_active) |t| t.conn == conn and t.ws == st.id else false;
 
     const Lookup = struct {
         window: *Window,
@@ -523,24 +864,24 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
     var dropped: std.ArrayList(*Session) = .empty;
     defer dropped.deinit(alloc);
     for (self.tabs.items) |t| {
-        if (t.conn != conn) continue;
+        if (t.conn != conn or t.ws != st.id) continue;
         var it = t.iterator();
         while (it.next()) |s| if (!used.contains(s)) try dropped.append(alloc, s);
     }
 
-    // This daemon's tabs as slime orders them: ours with their new trees,
-    // and new ones. Each takes slime's focus, unless a focus call of ours
-    // is still out, which it may predate.
+    // The workspace's tabs as slime orders them: ours with their new
+    // trees, and new ones. Each takes slime's focus, unless a focus call
+    // of ours is still out, which it may predate.
     var ordered: std.ArrayList(*Tab) = .empty;
     defer ordered.deinit(alloc);
     try ordered.ensureTotalCapacity(alloc, st.tabs.len);
     for (st.tabs, roots) |lt, *root| {
         const node = root.* orelse continue;
         const t = for (self.tabs.items) |t| {
-            if (t.conn != conn or t.id != lt.id) continue;
+            if (t.conn != conn or t.ws != st.id or t.id != lt.id) continue;
             t.setRoot(alloc, node);
             break t;
-        } else try Tab.create(alloc, conn, lt.id, node, Tab.first(node));
+        } else try Tab.create(alloc, conn, st.id, lt.id, node, Tab.first(node));
         root.* = null;
         ordered.appendAssumeCapacity(t);
         if (st.focus_known) {
@@ -549,13 +890,13 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
             t.sent_focus = focusOf(t);
         }
     }
-    // They go where this daemon's tabs were, else at the end of their
+    // They go where the workspace's tabs were, else at the end of their
     // group; the tabs slime no longer has go.
     var at: ?usize = null;
     var i: usize = 0;
     while (i < self.tabs.items.len) {
         const t = self.tabs.items[i];
-        if (t.conn != conn) {
+        if (t.conn != conn or t.ws != st.id) {
             i += 1;
             continue;
         }
@@ -581,17 +922,22 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
     _ = self.chrome.setHover(.none);
     self.middle_pressed = null;
     for (self.tabs.items) |t| self.layoutTab(t);
-    if (self.tabs.items.len == 0) return;
+    if (st.focus_known) conn.setActiveTab(st.id, st.active_tab);
+    if (self.tabs.items.len == 0) {
+        self.active = 0;
+        self.showTitle();
+        self.updateSpinner();
+        return;
+    }
 
     // Where the active tab was, if it's still here; else the one in its
-    // place. slime's active tab is followed while this daemon's tabs are
-    // what's shown: a tab of another daemon (a host's) stays.
+    // place. slime's active tab is followed while this workspace's tabs
+    // are what's shown: a tab of another workspace or daemon stays.
     const still: ?usize = if (was_active) |t| self.tabIndex(t) else null;
     var active = still orelse @min(self.active, self.tabs.items.len - 1);
     if (st.focus_known) {
-        conn.active_tab = st.active_tab;
-        if (still == null or shown_conn == conn) for (self.tabs.items, 0..) |t, k| {
-            if (t.conn == conn and t.id == st.active_tab) active = k;
+        if (still == null or shown_ws) for (self.tabs.items, 0..) |t, k| {
+            if (t.conn == conn and t.ws == st.id and t.id == st.active_tab) active = k;
         };
     }
     self.active = active;
@@ -605,6 +951,7 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
 /// A tab's focus as `workspace.focus` takes it.
 fn focusOf(t: *const Tab) Daemon.Focus {
     return .{
+        .workspace = t.ws,
         .tab = t.id,
         .pane = t.focus.daemonPane() orelse 0,
         .zoomed = if (t.zoom) |z| z.daemonPane() orelse 0 else 0,
@@ -620,8 +967,7 @@ fn syncFocus(self: *Window) void {
     const conn = t.conn orelse return;
     const f = focusOf(t);
     if (f.pane == 0) return;
-    if (conn.active_tab == t.id and t.sent_focus != null and std.meta.eql(t.sent_focus.?, f)) return;
-    conn.active_tab = t.id;
+    if (conn.activeTab(t.ws) == t.id and t.sent_focus != null and std.meta.eql(t.sent_focus.?, f)) return;
     t.sent_focus = f;
     conn.focus(f) catch |err| log.warn("telling slime the focus failed: {}", .{err});
 }
@@ -653,7 +999,7 @@ fn spawnSession(self: *Window, target: Target) !void {
     try self.tabs.ensureUnusedCapacity(self.alloc, 1);
     try self.reserveGroups();
     const s = try self.createSession(target, self.gridSize());
-    const t = Tab.create(self.alloc, null, 0, .{ .pane = s }, s) catch |err| {
+    const t = Tab.create(self.alloc, null, 0, 0, .{ .pane = s }, s) catch |err| {
         s.kill();
         s.destroy();
         return err;
@@ -688,17 +1034,19 @@ fn nextSessionId(self: *Window) u32 {
     return id;
 }
 
-/// Room in `view`'s scratch for Local and every host.
+/// Room in `view`'s scratch for every workspace (or Local) and every
+/// host.
 fn reserveGroups(self: *Window) !void {
-    try self.view_groups.ensureTotalCapacity(self.alloc, 1 + self.hosts.items.items.len);
+    try self.view_groups.ensureTotalCapacity(self.alloc, self.localGroups() + self.hosts.items.items.len);
 }
 
-/// The sidebar group `t` is listed in: 0 for Local, else 1 plus its
-/// host's index. Tabs are kept in group order.
+/// The sidebar group `t` is listed in: its workspace's, for a local tab
+/// (the first group if slime lists none, or no longer lists it), else
+/// its host's after them. Tabs are kept in group order.
 fn groupOf(self: *const Window, t: *const Tab) usize {
-    const dest = t.focus.hostDest() orelse return 0;
+    const dest = t.focus.hostDest() orelse return self.workspaceGroup(t.ws) orelse 0;
     // A host isn't forgotten while sessions use it.
-    return 1 + (self.hosts.indexOf(dest) orelse return 0);
+    return self.localGroups() + (self.hosts.indexOf(dest) orelse return 0);
 }
 
 /// Where a tab in group `g` goes: after the group's last.
@@ -743,23 +1091,27 @@ fn standIn(self: *const Window, dest: []const u16) ?Found {
     return null;
 }
 
-/// A tab in the active tab's group.
+/// A tab in the active tab's group, or the first workspace's with
+/// nothing shown.
 fn newSession(self: *Window) void {
-    self.newSessionIn(self.groupOf(self.activeTab()));
+    self.newSessionIn(if (self.hasTabs()) self.groupOf(self.activeTab()) else 0);
 }
 
-/// A tab in sidebar group `g`: a local one, or one on a host.
+/// A tab in sidebar group `g`: in a local workspace, shown first if it's
+/// hidden, or on a host.
 fn newSessionIn(self: *Window, g: usize) void {
-    if (g != 0) return self.openOnHost(g - 1) catch |err| log.err("new session failed: {}", .{err});
-    // The tab comes when its pane does (WM_APP_DAEMON). It goes in the
-    // workspace shown, if a local one; else the window's first.
-    const shown: ?*Daemon = if (self.activeTab().conn) |c| (if (c.host() == null) c else null) else null;
-    const conn = shown orelse self.daemon orelse return self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
+    const locals = self.localGroups();
+    if (g >= locals) return self.openOnHost(g - locals) catch |err| log.err("new session failed: {}", .{err});
+    // The tab comes when its pane does (WM_APP_DAEMON).
+    const conn = self.daemon orelse return self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
     if (conn.isLost()) {
         // Its tabs say how; slime comes back with the next window.
         return self.spawnFailed("lost slime", error.Disconnected) catch |err| log.err("new session failed: {}", .{err});
     }
-    conn.tabNew(self.local_command, self.daemonSize()) catch |err| log.err("new tab in slime failed: {}", .{err});
+    if (g >= self.workspaces.items.len) return self.newWorkspace();
+    const ws = self.workspaces.items[g].id;
+    if (!self.workspaces.items[g].shown) self.showWorkspace(ws);
+    conn.tabNew(ws, self.local_command, self.daemonSize()) catch |err| log.err("new tab in slime failed: {}", .{err});
 }
 
 /// A session on remembered host `h`: a tab of the workspace the host's
@@ -772,8 +1124,9 @@ fn newSessionIn(self: *Window, g: usize) void {
 fn openOnHost(self: *Window, h: usize) !void {
     const dest = self.hosts.items.items[h];
     if (self.remoteOn(dest)) |r| switch (r.conn.attachState()) {
-        // The tab comes when its pane does (WM_APP_DAEMON).
-        .attached => return r.conn.tabNew(&.{}, self.daemonSize()),
+        // The tab comes when its pane does (WM_APP_DAEMON), in whichever
+        // of the host's workspaces is attached.
+        .attached => return r.conn.tabNew(r.conn.anyAttached() orelse return, &.{}, self.daemonSize()),
         // Still attaching: show where.
         .connecting => {
             if (self.standIn(dest)) |found| self.activate(found.tab);
@@ -844,30 +1197,16 @@ fn bridgeHost(self: *Window, e: *HostEntry) !void {
 }
 
 /// Take up what slime connections posted: panes that arrived, what the
-/// daemon said about hosts, workspaces to open here, and how attaching
-/// to hosts' went.
+/// daemon said about workspaces and hosts, workspaces to show here, and
+/// how attaching to hosts' went.
 fn daemonPosted(self: *Window) void {
     if (self.daemon) |conn| {
+        self.workspacesChanged(conn);
         self.daemonChanged(conn);
         self.hostsChanged(conn);
         self.openWorkspaces(conn);
     }
     var i: usize = 0;
-    while (i < self.opened.items.len) {
-        const conn = self.opened.items[i];
-        self.daemonChanged(conn);
-        self.openWorkspaces(conn);
-        // Its tabs all gone, it has nothing left to show.
-        const shown = for (self.tabs.items) |t| {
-            if (t.conn == conn) break true;
-        } else false;
-        if (shown) {
-            i += 1;
-            continue;
-        }
-        self.opened.orderedRemove(i).deinit();
-    }
-    i = 0;
     while (i < self.remotes.items.len) {
         switch (self.remotes.items[i].conn.attachState()) {
             .connecting => {},
@@ -882,33 +1221,12 @@ fn daemonPosted(self: *Window) void {
     self.pruneRemotes();
 }
 
-/// Open the workspaces `conn` was told to: each on a connection of its
-/// own, whose tabs join the strip, the last of them shown.
+/// Show the workspaces `conn` was told to open here: a script run from
+/// one of this window's panes made them.
 fn openWorkspaces(self: *Window, conn: *Daemon) void {
     const ids = conn.takeOpens();
     defer self.alloc.free(ids);
-    for (ids) |id| self.openWorkspace(id) catch |err| log.err("opening workspace {d} failed: {}", .{ id, err });
-}
-
-/// Attach workspace `id` on a connection of its own, make tabs of its
-/// tabs, and show the one slime has active.
-fn openWorkspace(self: *Window, id: u32) !void {
-    try self.opened.ensureUnusedCapacity(self.alloc, 1);
-    const conn = try Daemon.connectWorkspace(self.alloc, .{ .hwnd = self.hwnd.?, .msg = WM_APP_DAEMON }, self.frameInterval(), self.daemonArea(), self.daemonSize(), self.local_command, id);
-    self.daemonChanged(conn);
-    conn.start() catch |err| {
-        var i: usize = 0;
-        while (i < self.tabs.items.len) {
-            if (self.tabs.items[i].conn == conn) self.dropTab(i) else i += 1;
-        }
-        conn.deinit();
-        return err;
-    };
-    self.opened.appendAssumeCapacity(conn);
-    log.info("opened workspace {d} here", .{id});
-    for (self.tabs.items, 0..) |t, i| {
-        if (t.conn == conn and t.id == conn.active_tab) return self.activate(i);
-    }
+    for (ids) |id| self.showWorkspace(id);
 }
 
 /// Take up what host's slime `r` sent. Once its panes have come, they
@@ -1316,7 +1634,7 @@ fn half(r: Chrome.Rect, side: Daemon.Direction) Chrome.Rect {
 
 /// The active tab's pane `view` listed at `i`.
 fn shownPane(self: *const Window, i: usize) ?*Session {
-    return if (i < self.shown.items.len) self.shown.items[i] else null;
+    return if (i < self.shown_panes.items.len) self.shown_panes.items[i] else null;
 }
 
 /// Show tab `i` and give its pane `j` (in layout order) the keys.
@@ -1341,11 +1659,12 @@ fn focusPane(self: *Window, s: *Session) void {
 
 /// Drop the host behind group `g` from the sidebar, if no tab uses it.
 fn forgetHost(self: *Window, g: usize) void {
-    if (g == 0 or g > self.hosts.items.items.len) return;
+    const locals = self.localGroups();
+    if (g < locals or g - locals >= self.hosts.items.items.len) return;
     for (self.tabs.items) |t| {
         if (self.groupOf(t) == g) return;
     }
-    self.hosts.remove(g - 1);
+    self.hosts.remove(g - locals);
     _ = self.chrome.setHover(.none);
     self.dirty = true;
 }
@@ -1370,19 +1689,9 @@ fn closePane(self: *Window, ti: usize, s: *Session) void {
 }
 
 /// Close tab `i`, killing what runs in its panes. Closing the last one
-/// closes the window.
+/// closes the window, unless a workspace in the sidebar has more.
 fn closeTab(self: *Window, i: usize) void {
     self.cancelDrag();
-    if (self.tabs.items.len <= 1) {
-        // Closing the window only detaches slime's panes.
-        var it = self.tabs.items[i].iterator();
-        while (it.next()) |s| {
-            self.standInClosing(s);
-            s.kill();
-        }
-        _ = win32.PostMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
-        return;
-    }
     var it = self.tabs.items[i].iterator();
     while (it.next()) |s| {
         self.standInClosing(s);
@@ -1390,10 +1699,11 @@ fn closeTab(self: *Window, i: usize) void {
     }
     self.dropTab(i);
     self.pruneRemotes();
+    self.closeIfNothingLeft();
 }
 
 /// Take tab `i` out and free it with its sessions, which lets go of
-/// slime's panes without ending them. Not the last tab.
+/// slime's panes without ending them.
 fn dropTab(self: *Window, i: usize) void {
     const was_active = i == self.active;
     if (was_active) self.deactivate();
@@ -1401,7 +1711,11 @@ fn dropTab(self: *Window, i: usize) void {
     // Rows moved under the mouse.
     _ = self.chrome.setHover(.none);
     self.middle_pressed = null;
-    if (i < self.active) {
+    if (self.tabs.items.len == 0) {
+        self.active = 0;
+        self.showTitle();
+        self.updateSpinner();
+    } else if (i < self.active) {
         self.active -= 1;
     } else if (was_active) {
         self.active = @min(i, self.tabs.items.len - 1);
@@ -1420,7 +1734,7 @@ fn activate(self: *Window, i: usize) void {
 
 /// Let go of the focused pane before switching away from it.
 fn deactivate(self: *Window) void {
-    const s = self.activeSession();
+    const s = self.focusedSession() orelse return;
     if (self.mouse_in_terminal) _ = win32.ReleaseCapture();
     self.mouse_in_terminal = false;
     s.cancelSelection();
@@ -1446,6 +1760,7 @@ fn activated(self: *Window) void {
 /// Show the next or previous tab, wrapping around.
 fn cycle(self: *Window, forward: bool) void {
     const n = self.tabs.items.len;
+    if (n == 0) return;
     self.activate(if (forward) (self.active + 1) % n else (self.active + n - 1) % n);
 }
 
@@ -1518,9 +1833,27 @@ fn keyBinding(self: *Window, msg: u32, wparam: win32.WPARAM) bool {
 
 /// Returns false if the action couldn't run: copy with no selection,
 /// paste with no text on the clipboard, a pane action in a tab slime
-/// doesn't run.
+/// doesn't run, or with nothing shown.
 fn runAction(self: *Window, action: binding.Action) bool {
-    const s = self.activeSession();
+    const s = self.focusedSession() orelse switch (action) {
+        .new_tab => {
+            self.newSession();
+            return true;
+        },
+        .increase_font_size => |pt| {
+            self.setFontSize(self.grid.size_pt + pt);
+            return true;
+        },
+        .decrease_font_size => |pt| {
+            self.setFontSize(self.grid.size_pt - pt);
+            return true;
+        },
+        .reset_font_size => {
+            self.setFontSize(self.config.@"font-size");
+            return true;
+        },
+        else => return false,
+    };
     switch (action) {
         .new_split, .goto_split, .resize_split, .equalize_splits, .toggle_split_zoom => if (self.activeTab().conn == null) return false,
         else => {},
@@ -1572,7 +1905,7 @@ fn setFocus(self: *Window, focused: bool) void {
     } else {
         _ = win32.KillTimer(self.hwnd, blink_timer_id);
     }
-    self.activeSession().reportFocus(focused);
+    if (self.focusedSession()) |s| s.reportFocus(focused);
 }
 
 /// Start the blink over in its on phase. Blinking follows the system's
@@ -1596,9 +1929,11 @@ fn blinkTick(self: *Window) void {
     self.blink_visible = !self.blink_visible;
     // Only redraw if the last frame's cursor blinks. One that starts
     // blinking later picks up the phase from here.
-    const cursor = self.activeSession().screen.cursor;
-    if (cursor.visible and cursor.blinking) self.dirty = true;
-    if (self.connect_field != null) self.dirty = true;
+    if (self.focusedSession()) |s| {
+        const cursor = s.screen.cursor;
+        if (cursor.visible and cursor.blinking) self.dirty = true;
+    }
+    if (self.connect_field != null or self.rename != null) self.dirty = true;
 }
 
 /// Show the host field in place of "Connect".
@@ -1702,10 +2037,17 @@ fn fieldPaste(self: *Window, field: *Chrome.TextField) void {
 }
 
 /// The active session's login dialog, which has the keyboard unless the
-/// host field does.
+/// host field, a rename, or the kill dialog does.
 fn activeLogin(self: *const Window) ?*Login {
-    if (self.connect_field != null) return null;
-    return self.activeSession().login;
+    if (self.connect_field != null or self.rename != null or self.confirm != null) return null;
+    return (self.focusedSession() orelse return null).login;
+}
+
+/// The dialog over the terminal area, if one is up: the kill dialog, or
+/// the active session's login.
+fn activeDialog(self: *Window) ?*Chrome.Dialog {
+    if (self.confirm) |*c| return &c.dialog;
+    return &(self.activeLogin() orelse return null).dialog;
 }
 
 /// A key down for the active session's login dialog. Returns false for
@@ -1733,7 +2075,7 @@ fn loginKey(self: *Window, vk: u32) bool {
 
 /// Act on a login dialog's button for the active session.
 fn loginAction(self: *Window, action: Chrome.Dialog.Action) void {
-    const s = self.activeSession();
+    const s = self.focusedSession() orelse return;
     const login = s.login orelse return;
     const daemon = self.daemon orelse return;
     const e = self.hostEntry(s.hostDest() orelse return) orelse return;
@@ -1765,11 +2107,11 @@ fn closeLogin(self: *Window, s: *Session) void {
     self.dirty = true;
 }
 
-/// Run the spinner's timer while the active session's dialog waits.
 /// Run the spinner's timer while the active session's dialog waits, or a
 /// pane is working.
 fn updateSpinner(self: *Window) void {
-    const waiting = if (self.activeSession().login) |l| l.dialog.state == .waiting else self.anyWorking();
+    const login: ?*Login = if (self.focusedSession()) |s| s.login else null;
+    const waiting = if (login) |l| l.dialog.state == .waiting else self.anyWorking();
     if (waiting == self.spinning) return;
     self.spinning = waiting;
     if (waiting) {
@@ -1800,9 +2142,21 @@ fn view(self: *Window) Chrome.View {
     self.view_groups.clearRetainingCapacity();
     self.view_panes.clearRetainingCapacity();
     self.view_dividers.clearRetainingCapacity();
-    self.shown.clearRetainingCapacity();
-    // Local is always listed, for its button, then every host.
-    self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .tabs = 0, .kind = .local });
+    self.shown_panes.clearRetainingCapacity();
+    // Every workspace, shown or not (Local alone while slime lists none,
+    // for its button), then every host.
+    if (self.workspaces.items.len == 0) {
+        self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .tabs = 0, .kind = .local });
+    } else for (self.workspaces.items) |w| {
+        self.view_groups.appendAssumeCapacity(.{
+            .label = w.name,
+            .tabs = 0,
+            .kind = .workspace,
+            .shown = w.shown,
+            .count = w.tabs,
+            .others = w.viewers -| @intFromBool(w.shown),
+        });
+    }
     for (self.hosts.items.items, 0..) |dest, h| {
         self.view_groups.appendAssumeCapacity(.{
             .label = Hosts.label(dest),
@@ -1837,32 +2191,36 @@ fn view(self: *Window) Chrome.View {
         vt.panes = self.view_tab_panes.items[start..][0..n];
         start += n;
     }
-    const tab = self.activeTab();
-    const several = tab.count() > 1;
-    var it = tab.iterator();
-    while (it.next()) |s| {
-        if (!tab.shows(s)) continue;
-        self.shown.append(self.alloc, s) catch break;
-        self.view_panes.append(self.alloc, .{
-            .frame = s.frame,
-            .rect = s.rect,
-            .title = s.title(),
-            .focused = s == tab.focus,
-            .splittable = s.daemonPane() != null,
-            .zoomable = several,
-            .zoomed = tab.zoom == s,
-            .bg = toColor(s.cells.default_bg),
-        }) catch {
-            _ = self.shown.pop();
-            break;
-        };
+    if (self.hasTabs()) {
+        const tab = self.activeTab();
+        const several = tab.count() > 1;
+        var it = tab.iterator();
+        while (it.next()) |s| {
+            if (!tab.shows(s)) continue;
+            self.shown_panes.append(self.alloc, s) catch break;
+            self.view_panes.append(self.alloc, .{
+                .frame = s.frame,
+                .rect = s.rect,
+                .title = s.title(),
+                .focused = s == tab.focus,
+                .splittable = s.daemonPane() != null,
+                .zoomable = several,
+                .zoomed = tab.zoom == s,
+                .bg = toColor(s.cells.default_bg),
+            }) catch {
+                _ = self.shown_panes.pop();
+                break;
+            };
+        }
+        for (tab.dividers.items) |d| self.view_dividers.append(self.alloc, d.rect) catch break;
     }
-    for (tab.dividers.items) |d| self.view_dividers.append(self.alloc, d.rect) catch break;
     const pane_drag: ?Chrome.View.PaneDrag = if (self.pane_drag) |d| if (d.at) |at| .{
-        .source = std.mem.indexOfScalar(*Session, self.shown.items, d.source),
+        .source = std.mem.indexOfScalar(*Session, self.shown_panes.items, d.source),
         .drop = if (d.drop) |drop| drop.rect else null,
         .mouse = .{ .x = @floatFromInt(at.x), .y = @floatFromInt(at.y) },
     } else null else null;
+    const rename: ?Chrome.View.Rename = if (self.rename) |*r| (if (self.workspaceGroup(r.ws)) |g| .{ .group = g, .field = &r.field } else null) else null;
+    const focus_session = self.focusedSession();
     return .{
         .groups = self.view_groups.items,
         .tabs = self.view_tabs.items,
@@ -1870,13 +2228,14 @@ fn view(self: *Window) Chrome.View {
         .dividers = self.view_dividers.items,
         .pane_drag = pane_drag,
         .connect = if (self.connect_field) |*f| f else null,
+        .rename = rename,
         .caret_visible = self.blink_visible,
-        .dialog = if (self.activeSession().login) |l| &l.dialog else null,
+        .dialog = if (self.confirm) |*c| &c.dialog else if (focus_session) |s| (if (s.login) |l| &l.dialog else null) else null,
         .spinner = self.spinner_step,
         .active = self.active,
         .focused = self.focused,
         .maximized = win32.IsZoomed(self.hwnd.?) != 0,
-        .terminal_bg = toColor(self.activeSession().cells.default_bg),
+        .terminal_bg = if (focus_session) |s| toColor(s.cells.default_bg) else self.chrome.theme.ground,
         .stats = self.stats_text[0..self.stats_len],
         .new_tab_key = new_session_key.slice(),
         .close_tab_key = close_session_key.slice(),
@@ -1934,7 +2293,6 @@ fn setPressed(self: *Window, hit: Chrome.Hit) void {
 /// otherwise. Pressing a button over a pane focuses it.
 fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
     const pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
-    const s = self.activeSession();
     const held = input.heldButton(wparam) != null;
     const press = if (input.mouseButton(msg, wparam)) |b| b[1] else false;
 
@@ -1955,7 +2313,7 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     }
 
     if (self.mouse_in_terminal) {
-        s.mouseInput(msg, wparam, toPane(s, pos));
+        if (self.focusedSession()) |s| s.mouseInput(msg, wparam, toPane(s, pos));
         if (!held) {
             self.mouse_in_terminal = false;
             // After the session's handled the release, so a selection
@@ -1968,8 +2326,9 @@ fn mouseInput(self: *Window, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     const hit = self.hitAt(pos);
     self.setHover(hit);
     if (press) self.hideTip();
-    // Clicking anywhere else closes the host field.
+    // Clicking anywhere else closes the host field, and a rename.
     if (press and hit != .connect) self.cancelConnect();
+    if (press and hit != .rename_field) self.cancelRename();
     if (hit == .terminal) {
         const pane = self.shownPane(hit.terminal) orelse return;
         if (press) {
@@ -2023,15 +2382,24 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
         },
         .new_tab => |g| self.newSessionIn(g),
         .forget_host => |g| self.forgetHost(g),
+        .header => |g| if (g < self.workspaces.items.len) {
+            const w = self.workspaces.items[g];
+            if (w.shown) self.hideWorkspace(w.id) else self.showWorkspace(w.id);
+        },
+        .detach_workspace => |g| if (g < self.workspaces.items.len) self.hideWorkspace(self.workspaces.items[g].id),
+        .kill_workspace => |g| if (g < self.workspaces.items.len) self.askKillWorkspace(self.workspaces.items[g].id),
+        .rename_workspace => |g| if (g < self.workspaces.items.len) self.startRename(self.workspaces.items[g].id),
+        .new_workspace => self.newWorkspace(),
         .connect => self.startConnect(),
         .dialog_button => |i| {
-            const d = &(self.activeSession().login orelse return).dialog;
+            const d = self.activeDialog() orelse return;
             var buf: [Chrome.Dialog.max_buttons]Chrome.Dialog.Button = undefined;
             const buttons = d.buttons(&buf);
-            if (i < buttons.len and !buttons[i].disabled) self.loginAction(buttons[i].action);
+            if (i >= buttons.len or buttons[i].disabled) return;
+            if (self.confirm != null) self.confirmAction(buttons[i].action) else self.loginAction(buttons[i].action);
         },
         .dialog_field => |i| {
-            const d = &(self.activeSession().login orelse return).dialog;
+            const d = self.activeDialog() orelse return;
             d.focus = .{ .field = i };
             self.resetBlink();
             self.dirty = true;
@@ -2179,37 +2547,41 @@ const Ui = struct {
 fn renderFallible(self: *Window, r: *Renderer) !void {
     r.waitForFrame();
     self.dirty = false;
-    const tab = self.activeTab();
     const stats = build_options.stats;
     var t: i64 = if (stats) Stats.now() else 0;
     self.frame_panes.clearRetainingCapacity();
-    var it = tab.iterator();
-    while (it.next()) |s| {
-        if (!tab.shows(s)) continue;
-        s.applyFrames();
-        if (stats) t = self.stats.lap(.update, t);
-        // Panes without focus show a hollow cursor, as an unfocused
-        // window's does.
-        const focus = s == tab.focus;
-        try s.cells.build(self.alloc, &s.screen, &self.grid, .{
-            // The host field or a login dialog has the keyboard while open.
-            .focused = focus and self.focused and self.connect_field == null and s.login == null,
-            .blink_visible = self.blink_visible,
-        }, .{
-            .cursor_color = self.config.@"cursor-color",
-            .cursor_text = self.config.@"cursor-text",
-            .selection_background = self.config.@"selection-background",
-            .selection_foreground = self.config.@"selection-foreground",
-        });
-        if (stats) t = self.stats.lap(.build, t);
-        try self.frame_panes.append(self.alloc, .{
-            .cells = &s.cells,
-            .images = &s.images,
-            .textures = &s.textures,
-            .frame = s.frame,
-            .viewport = s.rect,
-            .grid_offset = .{ @floatFromInt(s.pad.left), @floatFromInt(s.pad.top) },
-        });
+    // With nothing shown, the chrome alone is drawn.
+    const tab: ?*Tab = if (self.hasTabs()) self.activeTab() else null;
+    if (tab) |tb| {
+        var it = tb.iterator();
+        while (it.next()) |s| {
+            if (!tb.shows(s)) continue;
+            s.applyFrames();
+            if (stats) t = self.stats.lap(.update, t);
+            // Panes without focus show a hollow cursor, as an unfocused
+            // window's does.
+            const focus = s == tb.focus;
+            try s.cells.build(self.alloc, &s.screen, &self.grid, .{
+                // The host field, a rename, or a dialog has the keyboard
+                // while open.
+                .focused = focus and self.focused and self.connect_field == null and self.rename == null and self.confirm == null and s.login == null,
+                .blink_visible = self.blink_visible,
+            }, .{
+                .cursor_color = self.config.@"cursor-color",
+                .cursor_text = self.config.@"cursor-text",
+                .selection_background = self.config.@"selection-background",
+                .selection_foreground = self.config.@"selection-foreground",
+            });
+            if (stats) t = self.stats.lap(.build, t);
+            try self.frame_panes.append(self.alloc, .{
+                .cells = &s.cells,
+                .images = &s.images,
+                .textures = &s.textures,
+                .frame = s.frame,
+                .viewport = s.rect,
+                .grid_offset = .{ @floatFromInt(s.pad.left), @floatFromInt(s.pad.top) },
+            });
+        }
     }
     var shadows: [2]Renderer.BoxStyle.Shadow = undefined;
     try r.draw(self.alloc, .{
@@ -2223,8 +2595,10 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         .box = self.paneBox(&shadows),
     }, Ui{ .window = self, .view = self.view() });
     // More frames may come for what's drawn.
-    it = tab.iterator();
-    while (it.next()) |s| if (tab.shows(s)) s.drawn();
+    if (tab) |tb| {
+        var it = tb.iterator();
+        while (it.next()) |s| if (tb.shows(s)) s.drawn();
+    }
     if (stats) {
         _ = self.stats.lap(.draw, t);
         self.stats.frames += 1;
@@ -2260,10 +2634,10 @@ fn showStats(self: *Window) void {
 }
 
 /// Set the window text, which the taskbar shows: the active session's
-/// title.
+/// title, or the app's with nothing shown.
 fn showTitle(self: *Window) void {
     var text: [Session.max_title_len + 1]u16 = undefined;
-    const title = self.activeSession().title();
+    const title: []const u16 = if (self.focusedSession()) |s| s.title() else class_name;
     const len = @min(title.len, Session.max_title_len);
     @memcpy(text[0..len], title[0..len]);
     text[len] = 0;
@@ -2322,9 +2696,8 @@ fn layout(self: *Window) void {
 
     self.quiet_until = win32.GetTickCount64() + resize_quiet_ms;
     for (self.tabs.items) |t| self.layoutTab(t);
-    if (self.daemon) |conn| conn.resizeWorkspace(self.daemonArea());
-    for (self.opened.items) |conn| conn.resizeWorkspace(self.daemonArea());
-    for (self.remotes.items) |remote| if (remote.conn.attachState() == .attached) remote.conn.resizeWorkspace(self.daemonArea());
+    if (self.daemon) |conn| conn.resizeWorkspaces(self.daemonArea());
+    for (self.remotes.items) |remote| if (remote.conn.attachState() == .attached) remote.conn.resizeWorkspaces(self.daemonArea());
 
     // Render synchronously so live resize doesn't show stale frames.
     self.render();
@@ -2380,8 +2753,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
     if (ptr == 0) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     const self: *Window = @ptrFromInt(@as(usize, @bitCast(ptr)));
 
-    // Only the frame is ours to handle until the first session runs.
-    if (self.tabs.items.len == 0 and msg != win32.WM_NCCALCSIZE)
+    // Only the frame is ours to handle until the renderer is up.
+    if (self.renderer == null and msg != win32.WM_NCCALCSIZE)
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
@@ -2540,14 +2913,19 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 self.cancelDrag();
                 return 0;
             }
-            if (self.connect_field != null or self.activeLogin() != null) {
-                if (msg == win32.WM_KEYDOWN and (self.connectKey(@truncate(wparam)) or self.loginKey(@truncate(wparam)))) return 0;
+            if (self.connect_field != null or self.rename != null or self.confirm != null or self.activeLogin() != null) {
+                if (msg == win32.WM_KEYDOWN and (self.connectKey(@truncate(wparam)) or self.renameKey(@truncate(wparam)) or self.confirmKey(@truncate(wparam)) or self.loginKey(@truncate(wparam)))) return 0;
                 if (self.keyBinding(msg, wparam)) return 0;
                 // Keep alt+F4; the session gets nothing.
                 if (msg == win32.WM_SYSKEYDOWN and wparam == win32.VK_F4) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 return 0;
             }
             if (self.keyBinding(msg, wparam)) return 0;
+            // Nothing shown: the keys have nowhere to go but alt+F4.
+            if (!self.hasTabs()) {
+                if (msg == win32.WM_SYSKEYDOWN and wparam == win32.VK_F4) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                return 0;
+            }
             if (self.activeSession().ended) {
                 if ((msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) and !input.isModifier(wparam, lparam)) {
                     // Drop the key's text, which would otherwise go to
@@ -2573,8 +2951,8 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         win32.WM_CHAR, win32.WM_SYSCHAR => {
-            const field: ?*Chrome.TextField = if (self.connect_field) |*f| f else if (self.activeLogin()) |l| l.dialog.focused() else null;
-            if (field != null or self.activeLogin() != null) {
+            const field: ?*Chrome.TextField = if (self.connect_field) |*f| f else if (self.rename) |*r| &r.field else if (self.activeLogin()) |l| l.dialog.focused() else null;
+            if (field != null or self.confirm != null or self.activeLogin() != null) {
                 if (msg == win32.WM_CHAR) if (field) |f| {
                     f.insert(&.{@truncate(wparam)});
                     self.resetBlink();
@@ -2582,7 +2960,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 };
                 return 0;
             }
-            self.activeSession().charInput(@truncate(wparam));
+            if (self.focusedSession()) |s| s.charInput(@truncate(wparam));
             return 0;
         },
 
@@ -2620,7 +2998,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
                 self.cancelDrag();
                 if (self.mouse_in_terminal) {
                     self.mouse_in_terminal = false;
-                    self.activeSession().cancelSelection();
+                    if (self.focusedSession()) |s| s.cancelSelection();
                 }
                 self.setPressed(.none);
             }
@@ -2632,7 +3010,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             // coordinates.
             var pos: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
             _ = win32.ScreenToClient(hwnd, &pos);
-            const pane = if (self.mouse_in_terminal) self.activeSession() else switch (self.hitAt(pos)) {
+            const pane = if (self.mouse_in_terminal) (self.focusedSession() orelse return 0) else switch (self.hitAt(pos)) {
                 .terminal => |i| self.shownPane(i) orelse return 0,
                 else => return 0,
             };
@@ -2650,14 +3028,15 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             const hit = self.hitAt(pos);
             if (hit == .dialog_field) cursor = win32.IDC_IBEAM;
             const divider: ?Tab.Divider = if (self.drag) |d| d.divider else switch (hit) {
-                .divider => |i| if (i < self.activeTab().dividers.items.len) self.activeTab().dividers.items[i] else null,
+                .divider => |i| if (self.hasTabs() and i < self.activeTab().dividers.items.len) self.activeTab().dividers.items[i] else null,
                 else => null,
             };
             if (divider) |d| cursor = if (d.axis() == .row) win32.IDC_SIZEWE else win32.IDC_SIZENS;
             if (self.pane_drag) |d| if (d.at != null) {
                 cursor = win32.IDC_SIZEALL;
             };
-            const pane = if (self.mouse_in_terminal) self.activeSession() else switch (hit) {
+            if (hit == .rename_field) cursor = win32.IDC_IBEAM;
+            const pane = if (self.mouse_in_terminal) self.focusedSession() else switch (hit) {
                 .terminal => |i| self.shownPane(i),
                 else => null,
             };

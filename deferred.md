@@ -230,22 +230,32 @@ reconnects, reattaches, and replaces them.
   font grid, and Ctrl+= resizes every pane.
 - **A zoomed pane's pty takes the whole tab's size** while it's zoomed,
   so the others reflow when it's unzoomed.
-- **Workspaces have no UI**: no list to attach or detach one, create or
-  rename one, or see which windows have it. A window takes the most
-  recently detached at startup (or `SLIME_WORKSPACE`) and can't change
-  it, and nothing shows that another window is on the same workspace.
-  The one way in is `workspace.new` with `attach` (what a script or
-  `slime ws new` run from a pane does): the window opens that workspace
-  on a connection of its own, beside its first, and lets it go when its
-  tabs have.
+- **A host's workspaces aren't listed.** The sidebar lists the local
+  daemon's workspaces; a host's slime attaches every workspace it has
+  (or makes one) and shows their tabs flat under the host, with no
+  headers to show, hide, make, or kill them. The bridged connection has
+  the same list and events; the sidebar needs a level for it.
 - **`workspace.open` from a host's slime isn't followed.** A script run
   in a pane on a host that makes a workspace tells the bridged
-  connection to open it, and the window only logs it: opening one there
-  takes a second bridge to the host, and the stand-in bookkeeping is
-  per host.
+  connection to open it, and the window only logs it, since it has no
+  list for the host's workspaces to show it in.
 - **`SLIME_WORKSPACE` is in every pane's shell**, so a `slime-gui`
-  started from a pane attaches that pane's workspace, as the variable
-  has always meant, rather than the most recently detached one.
+  started from a pane shows that pane's workspace alone, as the
+  variable has always meant, rather than what the last window showed.
+- **A new workspace is named `default`**, as the daemon names one made
+  without a name, so two made from the sidebar look alike until
+  renamed. The daemon could number them.
+- **Hidden workspaces say nothing but a tab count.** Their tabs' titles
+  and activity aren't shown (the window isn't attached, so it has no
+  panes), and nothing says which window has one shown beyond an eye.
+- **A tab can't move to another workspace**; `pane.move` stays within
+  one, and there is no `tab.move`.
+- **The window's workspace actions have no keys**: showing, hiding,
+  making, renaming, and killing are the sidebar's buttons only, and a
+  hidden workspace can't be switched to from the keyboard.
+- **An empty shown workspace goes when the window hides it** or closes:
+  the daemon drops a workspace with no tabs once no window views it, so
+  one emptied by closing its tabs lives only while shown.
 - **Daemon copies pile up.** slime-gui runs slime from a copy in
   `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
   doesn't block the next install, and never deletes old ones.
@@ -284,7 +294,8 @@ reconnects, reattaches, and replaces them.
   Per-window colors would be a remap when the frame is cut.
 - **Windows sharing a workspace share its tab.** Both show the active
   tab; per-window views (tmux's grouped sessions) are the model if
-  that's wanted.
+  that's wanted. A window showing several workspaces has its own
+  current tab among them, so this only bites windows on the same one.
 
 ## Scripting
 

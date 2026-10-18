@@ -61,13 +61,23 @@ pub const Hit = union(enum) {
     maximize,
     close,
     toggle_mode,
-    /// Group `i`'s header, away from its buttons.
+    /// Group `i`'s header, away from its buttons. A workspace's shows or
+    /// hides its tabs.
     header: usize,
     /// The button that opens a tab in group `i`, connecting first if
-    /// it's a host that isn't connected.
+    /// it's a host that isn't connected, or showing a workspace first.
     new_tab: usize,
     /// The button that removes host group `i` from the list.
     forget_host: usize,
+    /// Workspace group `i`'s buttons: let go of it (the daemon keeps
+    /// it), end it and everything in it, and edit its name.
+    detach_workspace: usize,
+    kill_workspace: usize,
+    rename_workspace: usize,
+    /// The field a workspace's name is edited in, in its header.
+    rename_field: usize,
+    /// The row that makes a workspace, after the last one.
+    new_workspace,
     /// The button that connects to a host, or its field.
     connect,
     tab: usize,
@@ -112,6 +122,8 @@ pub const View = struct {
     pane_drag: ?PaneDrag = null,
     /// The host being typed after "Connect" was clicked, if it was.
     connect: ?*const TextField = null,
+    /// A workspace's name being edited, in group `group`'s header.
+    rename: ?Rename = null,
     /// The on phase of the caret's blink, while focused.
     caret_visible: bool = false,
     /// The active pane's dialog, over the terminal area.
@@ -142,14 +154,30 @@ pub const View = struct {
         /// How many of `tabs` are in it.
         tabs: usize,
         kind: Kind,
+        /// A workspace's tabs are shown: it's attached, so its tabs are
+        /// in `tabs` (or about to be). Hidden, it's a header alone.
+        shown: bool = true,
+        /// How many tabs the daemon has in a workspace, shown or not.
+        count: usize = 0,
+        /// Other windows on a workspace.
+        others: usize = 0,
 
         pub const Kind = enum {
+            /// Where local tabs go while the daemon lists no workspaces
+            /// (it couldn't be reached).
             local,
+            /// A workspace of the local daemon.
+            workspace,
             /// A host with a live connection, which new tabs join.
             connected,
             /// A remembered host that new tabs connect to.
             disconnected,
         };
+    };
+
+    pub const Rename = struct {
+        group: usize,
+        field: *const TextField,
     };
 
     pub const Tab = struct {
@@ -347,7 +375,7 @@ pub fn setHover(self: *Chrome, hit: Hit) bool {
 /// Buttons that are only an icon, which tooltips name.
 pub fn hasTip(hit: Hit) bool {
     return switch (hit) {
-        .toggle_mode, .new_tab, .forget_host, .close_tab, .split_right, .split_down, .zoom => true,
+        .toggle_mode, .new_tab, .forget_host, .detach_workspace, .kill_workspace, .rename_workspace, .close_tab, .split_right, .split_down, .zoom => true,
         else => false,
     };
 }
@@ -389,6 +417,7 @@ pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const Vi
     }
     p.pushClip(l.terminal);
     panes.paint(self, p, l, view);
+    if (view.panes.len == 0 and view.tabs.len == 0) self.paintEmpty(p, l);
     p.popClip();
     if (view.dialog) |d| modal.paint(self, p, l.terminal, d, .{
         .focused = view.focused,
@@ -400,6 +429,17 @@ pub fn paint(self: *const Chrome, p: *Painter, l: *const Layout, view: *const Vi
     self.paintToggle(p, l, view);
     self.paintCaptionButtons(p, l, view);
     self.paintTip(p, l, view);
+}
+
+/// Nothing is shown: say what the sidebar is for.
+fn paintEmpty(self: *const Chrome, p: *Painter, l: *const Layout) void {
+    const t = l.terminal;
+    const h = self.px(20);
+    const line: Rect = .{ .x = t.x, .y = t.y + @round((t.h - h) / 2), .w = t.w, .h = h };
+    p.text(switch (self.mode) {
+        .sidebar => L("Show a workspace from the list, or make one."),
+        .tabs => L("No tabs. Show the sidebar to pick a workspace."),
+    }, self.fonts.title, line, self.theme.text_inactive);
 }
 
 /// The part of the frame `paintDrag` wants a copy of, if any.
@@ -427,6 +467,9 @@ fn tipText(self: *const Chrome, view: *const View, hit: Hit) struct { []const u1
         else
             .{ L("New tab"), if (g == view.activeGroup()) view.new_tab_key else none },
         .forget_host => .{ L("Forget host"), none },
+        .detach_workspace => .{ L("Hide workspace (it keeps running)"), none },
+        .kill_workspace => .{ L("Kill workspace"), none },
+        .rename_workspace => .{ L("Rename workspace"), none },
         .split_right => |i| .{ L("Split right"), if (focusedPane(view, i)) view.split_right_key else none },
         .split_down => |i| .{ L("Split down"), if (focusedPane(view, i)) view.split_down_key else none },
         .zoom => |i| .{ if (i < view.panes.len and view.panes[i].zoomed) L("Unzoom") else L("Zoom"), if (focusedPane(view, i)) view.zoom_key else none },

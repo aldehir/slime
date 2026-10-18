@@ -1,8 +1,12 @@
 //! Tabs in a sidebar under the title bar, grouped by where they run:
-//! Local, then each remembered SSH host. A group's header has a button
-//! that opens another tab there, connecting first if the host isn't
-//! connected; a host with no tabs can be forgotten. A "Connect" button at
-//! the bottom turns into a field for a host to connect to.
+//! the local daemon's workspaces, then each remembered SSH host. A
+//! workspace's header folds its tabs away (the window lets go of it; the
+//! daemon keeps it running) and back, and has buttons to open a tab in
+//! it, rename it, hide it, and kill it; a row after the last makes a new
+//! one. A host's header has a button that opens another tab there,
+//! connecting first if the host isn't connected; a host with no tabs can
+//! be forgotten. A "Connect" button at the bottom turns into a field for
+//! a host to connect to.
 //!
 //! Each tab's row folds open to its panes, each a row of its own with
 //! what its programs report doing (OSC 7501): working, waiting on the
@@ -29,10 +33,14 @@ const row_gap = 2;
 const pane_height = 28;
 /// How far pane rows are indented: past the tab's fold arrow.
 const pane_indent = 26;
-/// The fold arrow's column at a tab row's left.
+/// The fold arrow's column at a tab row's left, and a workspace
+/// header's.
 const fold_width = 18;
-/// Rows' close buttons and headers' new tab buttons, in one column.
+/// Rows' close buttons and headers' buttons, in columns from the right.
 const button_size = 20;
+const button_gap = 2;
+/// The "New workspace" row.
+const new_workspace_height = 26;
 const connect_height = 32;
 const pad_bottom = 12;
 
@@ -53,14 +61,21 @@ pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.Vi
     while (walk.next()) |item| {
         if (item.rect.y >= rows.bottom()) break;
         if (!item.rect.contains(x, y)) continue;
-        const on_button = rowButton(c, item.rect).contains(x, y);
+        const on_button = rowButton(c, item.rect, 0).contains(x, y);
         return switch (item.part) {
-            .header => |g| if (on_button)
-                .{ .new_tab = g }
-            else if (forgettable(view.groups[g]) and forgetButton(c, item.rect).contains(x, y))
-                .{ .forget_host = g }
-            else
-                .{ .header = g },
+            .header => |g| header: {
+                const group = view.groups[g];
+                if (renaming(view, g)) break :header .{ .rename_field = g };
+                if (on_button) break :header .{ .new_tab = g };
+                if (group.kind == .workspace) {
+                    if (rowButton(c, item.rect, 1).contains(x, y)) break :header .{ .kill_workspace = g };
+                    if (rowButton(c, item.rect, 2).contains(x, y)) break :header .{ .rename_workspace = g };
+                    if (group.shown and rowButton(c, item.rect, 3).contains(x, y)) break :header .{ .detach_workspace = g };
+                } else if (forgettable(group) and rowButton(c, item.rect, 1).contains(x, y)) {
+                    break :header .{ .forget_host = g };
+                }
+                break :header .{ .header = g };
+            },
             .tab => |i| if (on_button)
                 .{ .close_tab = i }
             else if (x < item.rect.x + c.px(fold_width))
@@ -68,6 +83,7 @@ pub fn hitTest(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome.Vi
             else
                 .{ .tab = i },
             .pane => |pn| .{ .tab_pane = .{ .tab = pn.tab, .pane = pn.pane } },
+            .new_workspace => .new_workspace,
         };
     }
     return .none;
@@ -81,12 +97,14 @@ pub fn buttonRect(c: *const Chrome, l: *const Chrome.Layout, view: *const Chrome
         if (item.rect.bottom() > rows.bottom()) break;
         switch (item.part) {
             .header => |g| switch (hit) {
-                .new_tab => |h| if (h == g) return rowButton(c, item.rect),
-                .forget_host => |h| if (h == g) return forgetButton(c, item.rect),
+                .new_tab => |h| if (h == g) return rowButton(c, item.rect, 0),
+                .forget_host, .kill_workspace => |h| if (h == g) return rowButton(c, item.rect, 1),
+                .rename_workspace => |h| if (h == g) return rowButton(c, item.rect, 2),
+                .detach_workspace => |h| if (h == g) return rowButton(c, item.rect, 3),
                 else => {},
             },
-            .tab => |i| if (hit == .close_tab and hit.close_tab == i) return rowButton(c, item.rect),
-            .pane => {},
+            .tab => |i| if (hit == .close_tab and hit.close_tab == i) return rowButton(c, item.rect, 0),
+            .pane, .new_workspace => {},
         }
     }
     return null;
@@ -104,20 +122,26 @@ pub fn paint(c: *const Chrome, p: *Painter, l: *const Chrome.Layout, view: *cons
     while (walk.next()) |item| {
         if (item.rect.y >= rows.bottom()) break;
         switch (item.part) {
-            .header => |g| paintHeader(c, p, item.rect, g, view.groups[g]),
+            .header => |g| paintHeader(c, p, item.rect, g, view),
             .tab => |i| paintTab(c, p, item.rect, i, view.tabs[i], i == view.active, view.spinner),
             .pane => |pn| paintPane(c, p, item.rect, pn.tab, pn.pane, view),
+            .new_workspace => paintNewWorkspace(c, p, item.rect),
         }
     }
     p.popClip();
 
     const connect = connectRect(c, l);
     if (view.connect) |field| {
-        paintField(c, p, connect, field, view.focused and view.caret_visible);
+        paintField(c, p, connect, field, L("user@host:port"), view.focused and view.caret_visible);
     } else {
         paintConnect(c, p, connect);
     }
     paintStats(c, p, l, connect.y, view.stats);
+}
+
+/// Whether group `g`'s name is being edited.
+fn renaming(view: *const Chrome.View, g: usize) bool {
+    return if (view.rename) |r| r.group == g else false;
 }
 
 /// "Connect", at the bottom of the list.
@@ -165,23 +189,59 @@ fn paintConnect(c: *const Chrome, p: *Painter, r: Rect) void {
     p.text(L("Connect…"), c.fonts.body, .{ .x = label_x, .y = r.y, .w = @max(0, r.right() - c.px(8) - label_x), .h = r.h }, c.theme.text);
 }
 
-/// The host field "Connect" turns into: its text scrolled to keep the
-/// caret in view, with the selection behind it.
-fn paintField(c: *const Chrome, p: *Painter, r: Rect, field: *const Chrome.TextField, caret: bool) void {
+/// The row that makes a workspace, after the last one's tabs: faint
+/// until the mouse is over it.
+fn paintNewWorkspace(c: *const Chrome, p: *Painter, r: Rect) void {
+    const hovered = c.hover.eql(.new_workspace);
+    if (hovered) p.fillRounded(r, c.px(6), switch (c.buttonState(.new_workspace)) {
+        .pressed => c.theme.button_pressed,
+        else => c.theme.row_hover,
+    });
+    const color = if (hovered) c.theme.text_strong else c.theme.text_inactive;
+    const icon = c.px(17);
+    c.drawIcon(p, .plus, (Rect{ .x = r.x, .y = r.y, .w = c.px(fold_width + 24), .h = r.h }).center(icon, icon), color);
+    const text_x = r.x + c.px(fold_width + 24);
+    p.text(L("New workspace"), c.fonts.body, .{ .x = text_x, .y = r.y, .w = @max(0, r.right() - c.px(8) - text_x), .h = r.h }, color);
+}
+
+/// A text field in `r`: its text scrolled to keep the caret in view, with
+/// the selection behind it, and `placeholder` while empty.
+fn paintField(c: *const Chrome, p: *Painter, r: Rect, field: *const Chrome.TextField, placeholder: []const u16, caret: bool) void {
     const radius = c.px(6);
     c.fillBordered(p, r, radius, c.theme.surface, c.theme.accent);
 
     const inner = r.inset(c.px(10), 0);
-    if (field.len == 0) p.text(L("user@host:port"), c.fonts.body, inner, c.theme.text_inactive);
+    if (field.len == 0) p.text(placeholder, c.fonts.body, inner, c.theme.text_inactive);
     c.paintEditText(p, inner, field, .{ .caret = caret });
 }
 
-fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.View.Group) void {
-    const button = rowButton(c, r);
+/// Group `g`'s header: its name in capitals, with a fold arrow for a
+/// workspace (its tabs are listed while shown), and buttons at the
+/// right: one to open a tab in it always; a host with no tabs gets one
+/// to forget it, and a workspace its kill, rename, and (while shown)
+/// hide buttons, while the mouse is over the header. A workspace hidden
+/// shows how many tabs it has instead, and one other windows show, an
+/// eye.
+fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, view: *const Chrome.View) void {
+    const group = view.groups[g];
+    const is_ws = group.kind == .workspace;
+    const label_left = if (is_ws) r.x + c.px(fold_width) else r.x + c.px(2);
+    if (view.rename) |rename| if (rename.group == g) {
+        if (is_ws) paintFold(c, p, .{ .x = r.x, .y = r.y, .w = c.px(fold_width), .h = r.h }, !group.shown, c.theme.text_muted);
+        paintField(c, p, .{ .x = label_left, .y = r.y, .w = @max(0, r.right() - label_left), .h = r.h }, rename.field, L("Workspace name"), view.focused and view.caret_visible);
+        return;
+    };
+
+    const hovered = switch (c.hover) {
+        .header, .new_tab, .forget_host, .kill_workspace, .rename_workspace, .detach_workspace => |h| h == g,
+        else => false,
+    };
+    if (is_ws and c.hover.eql(.{ .header = g })) p.fillRounded(r, c.px(6), c.theme.row_hover);
+
+    const button = rowButton(c, r, 0);
     const hit: Hit = .{ .new_tab = g };
-    const hovered = c.hover.eql(hit);
     paintIconButton(c, p, button, hit);
-    const color = if (hovered) c.theme.text_strong else c.theme.text_muted;
+    const color = if (c.hover.eql(hit)) c.theme.text_strong else c.theme.text_muted;
     if (group.kind == .disconnected) {
         paintPlug(c, p, button, color);
     } else {
@@ -192,12 +252,8 @@ fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.V
     }
 
     var label_right = button.x - c.px(4);
-    const show_forget = forgettable(group) and switch (c.hover) {
-        .header, .new_tab, .forget_host => |h| h == g,
-        else => false,
-    };
-    if (show_forget) {
-        const forget = forgetButton(c, r);
+    if (hovered and forgettable(group)) {
+        const forget = rowButton(c, r, 1);
         const forget_hit: Hit = .{ .forget_host = g };
         paintIconButton(c, p, forget, forget_hit);
         // Lucide's x spans 12 of its 24 units: 8 DIPs in this box.
@@ -205,14 +261,54 @@ fn paintHeader(c: *const Chrome, p: *Painter, r: Rect, g: usize, group: Chrome.V
         c.drawIcon(p, .x, forget.center(icon, icon), if (c.hover.eql(forget_hit)) c.theme.text_strong else c.theme.text_muted);
         label_right = forget.x - c.px(4);
     }
+    if (is_ws) {
+        paintFold(c, p, .{ .x = r.x, .y = r.y, .w = c.px(fold_width), .h = r.h }, !group.shown, if (hovered) c.theme.text_strong else c.theme.text_muted);
+        if (hovered) {
+            // Kill, rename, and hide, from the right. Each icon spans 16
+            // to 18 of its 24 units: about 11 DIPs in these boxes.
+            const kill = rowButton(c, r, 1);
+            const kill_hit: Hit = .{ .kill_workspace = g };
+            paintIconButton(c, p, kill, kill_hit);
+            c.drawIcon(p, .trash, kill.center(c.px(16), c.px(16)), if (c.hover.eql(kill_hit)) c.theme.danger else c.theme.text_muted);
+            const rename = rowButton(c, r, 2);
+            const rename_hit: Hit = .{ .rename_workspace = g };
+            paintIconButton(c, p, rename, rename_hit);
+            c.drawIcon(p, .pencil, rename.center(c.px(16), c.px(16)), if (c.hover.eql(rename_hit)) c.theme.text_strong else c.theme.text_muted);
+            label_right = rename.x - c.px(4);
+            if (group.shown) {
+                const hide = rowButton(c, r, 3);
+                const hide_hit: Hit = .{ .detach_workspace = g };
+                paintIconButton(c, p, hide, hide_hit);
+                c.drawIcon(p, .eye_off, hide.center(c.px(17), c.px(17)), if (c.hover.eql(hide_hit)) c.theme.text_strong else c.theme.text_muted);
+                label_right = hide.x - c.px(4);
+            }
+        } else {
+            // At rest: how many tabs a hidden workspace has, and whether
+            // another window shows it.
+            var slot = rowButton(c, r, 1);
+            if (group.others > 0) {
+                c.drawIcon(p, .eye, slot.center(c.px(17), c.px(17)), c.theme.text_muted);
+                label_right = slot.x - c.px(4);
+                slot = rowButton(c, r, 2);
+            }
+            if (!group.shown and group.count > 0) {
+                var buf: [12]u8 = undefined;
+                var units: [12]u16 = undefined;
+                const digits = std.fmt.bufPrint(&buf, "{d}", .{group.count}) catch "";
+                for (digits, units[0..digits.len]) |d, *u| u.* = d;
+                const w = @ceil(c.fonts.measure(units[0..digits.len], c.fonts.body)) + c.px(4);
+                const count: Rect = .{ .x = slot.right() - w, .y = r.y, .w = w, .h = r.h };
+                p.text(units[0..digits.len], c.fonts.body, count, c.theme.text_inactive);
+                label_right = count.x - c.px(4);
+            }
+        }
+    }
 
-    const label_x = r.x + c.px(2);
-    const label: Rect = .{ .x = label_x, .y = r.y, .w = @max(0, label_right - label_x), .h = r.h };
+    const label: Rect = .{ .x = label_left, .y = r.y, .w = @max(0, label_right - label_left), .h = r.h };
     var buf: [256]u16 = undefined;
-    p.text(upper(&buf, group.label), c.fonts.section, label, c.theme.text_muted);
+    p.text(upper(&buf, group.label), c.fonts.section, label, if (is_ws and group.shown) c.theme.text_muted else if (is_ws) c.theme.text_inactive else c.theme.text_muted);
 }
 
-/// A small button's background under the mouse.
 /// Lucide's plug, centered in `area`. It spans 16 of its 24 units: 11
 /// DIPs in this box, about the plus's size. Its prongs land on pixel edges
 /// at this size, so a half pixel moves them onto centers.
@@ -223,6 +319,7 @@ fn paintPlug(c: *const Chrome, p: *Painter, area: Rect, color: Chrome.Color) voi
     c.drawIcon(p, .plug, box, color);
 }
 
+/// A small button's background under the mouse.
 fn paintIconButton(c: *const Chrome, p: *Painter, r: Rect, hit: Hit) void {
     if (!c.hover.eql(hit)) return;
     p.fillRounded(r, c.px(4), switch (c.buttonState(hit)) {
@@ -233,14 +330,7 @@ fn paintIconButton(c: *const Chrome, p: *Painter, r: Rect, hit: Hit) void {
 
 /// A host with no tabs, which can be dropped from the list.
 fn forgettable(group: Chrome.View.Group) bool {
-    return group.kind != .local and group.tabs == 0;
-}
-
-/// The button left of a header's new tab button.
-fn forgetButton(c: *const Chrome, header: Rect) Rect {
-    var r = rowButton(c, header);
-    r.x -= r.w + c.px(2);
-    return r;
+    return (group.kind == .connected or group.kind == .disconnected) and group.tabs == 0;
 }
 
 /// `text` in capitals, as section headers are, cut to fit `buf`. Only
@@ -266,7 +356,7 @@ fn paintTab(c: *const Chrome, p: *Painter, r: Rect, i: usize, tab: Chrome.View.T
     const icon_color = if (active) c.theme.text_strong else c.theme.text_muted;
     c.drawIcon(p, .panels_top_left, .{ .x = r.x + c.px(fold_width), .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, icon_color);
 
-    const close = rowButton(c, r);
+    const close = rowButton(c, r, 0);
     const text_x = r.x + c.px(fold_width + 24);
     // Folded, its panes' most pressing status stands in for theirs.
     const folded_status: ?Chrome.View.TabPane = if (tab.folded) mostPressing(tab.panes) else null;
@@ -348,7 +438,7 @@ fn paintPane(c: *const Chrome, p: *Painter, r: Rect, i: usize, j: usize, view: *
     const icon = c.px(14);
     const x = r.x + c.px(pane_indent);
     c.drawIcon(p, .terminal, .{ .x = x, .y = r.y + @round((r.h - icon) / 2), .w = icon, .h = icon }, if (focused) c.theme.accent else c.theme.text_muted);
-    const slot = rowButton(c, r);
+    const slot = rowButton(c, r, 0);
     const text_x = x + c.px(22);
     const text_rect: Rect = .{ .x = text_x, .y = r.y, .w = @max(0, slot.x - c.px(4) - text_x), .h = r.h };
     p.text(pane.title, c.fonts.body, text_rect, if (focused) c.theme.text_strong else c.theme.text_muted);
@@ -383,11 +473,12 @@ fn paintStatus(c: *const Chrome, p: *Painter, slot: Rect, pane: Chrome.View.TabP
     }
 }
 
-/// The button at the right of a row or header.
-fn rowButton(c: *const Chrome, row: Rect) Rect {
+/// Button `n` of a row or header, counted from the right: 0 is at the
+/// right edge, each further one a button's width left.
+fn rowButton(c: *const Chrome, row: Rect, n: usize) Rect {
     const size = c.px(button_size);
     return .{
-        .x = row.right() - c.px(5) - size,
+        .x = row.right() - c.px(5) - size - @as(f32, @floatFromInt(n)) * (size + c.px(button_gap)),
         .y = row.y + @round((row.h - size) / 2),
         .w = size,
         .h = size,
@@ -395,7 +486,8 @@ fn rowButton(c: *const Chrome, row: Rect) Rect {
 }
 
 /// The list's parts from the top: each group's header, then its tabs'
-/// rows, each followed by its panes' unless folded.
+/// rows, each followed by its panes' unless folded; after the last
+/// workspace, the row that makes one.
 const Walk = struct {
     groups: []const Chrome.View.Group,
     tabs: []const Chrome.View.Tab,
@@ -406,6 +498,7 @@ const Walk = struct {
     header_h: f32,
     row_h: f32,
     pane_h: f32,
+    new_ws_h: f32,
     row_gap: f32,
     section_gap: f32,
     group: usize = 0,
@@ -415,12 +508,15 @@ const Walk = struct {
     tab: usize = 0,
     /// The next pane of the last tab given out, while it's open.
     pane: ?usize = null,
+    /// The new workspace row was given out.
+    new_ws_done: bool = false,
 
     const Item = struct {
         part: union(enum) {
             header: usize,
             tab: usize,
             pane: struct { tab: usize, pane: usize },
+            new_workspace,
         },
         rect: Rect,
     };
@@ -435,6 +531,7 @@ const Walk = struct {
             .header_h = c.px(header_height),
             .row_h = c.px(row_height),
             .pane_h = c.px(pane_height),
+            .new_ws_h = c.px(new_workspace_height),
             .row_gap = c.px(row_gap),
             .section_gap = c.px(section_gap),
         };
@@ -453,6 +550,11 @@ const Walk = struct {
             self.y += self.row_gap;
         }
         while (self.group < self.groups.len) {
+            // After the last workspace's tabs, before the hosts.
+            if (!self.new_ws_done and self.group > 0 and self.groups[self.group - 1].kind == .workspace and self.groups[self.group].kind != .workspace) {
+                self.new_ws_done = true;
+                return .{ .part = .new_workspace, .rect = self.take(self.new_ws_h, self.section_gap) };
+            }
             if (!self.header_done) {
                 self.header_done = true;
                 return .{ .part = .{ .header = self.group }, .rect = self.take(self.header_h, 0) };
@@ -470,6 +572,10 @@ const Walk = struct {
             self.header_done = false;
             self.y += self.section_gap;
         }
+        if (!self.new_ws_done and self.groups.len > 0 and self.groups[self.groups.len - 1].kind == .workspace) {
+            self.new_ws_done = true;
+            return .{ .part = .new_workspace, .rect = self.take(self.new_ws_h, 0) };
+        }
         return null;
     }
 
@@ -485,8 +591,8 @@ test "groups, rows, and their buttons" {
     const c: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
     const view: Chrome.View = .{
         .groups = &.{
-            .{ .label = &.{}, .tabs = 0, .kind = .local },
-            .{ .label = &.{}, .tabs = 2, .kind = .connected },
+            .{ .label = &.{}, .tabs = 0, .kind = .workspace, .shown = false, .count = 3 },
+            .{ .label = &.{}, .tabs = 2, .kind = .workspace },
             .{ .label = &.{}, .tabs = 0, .kind = .disconnected },
         },
         .tabs = &.{
@@ -500,11 +606,11 @@ test "groups, rows, and their buttons" {
     };
     const l = c.layout(1000, 600);
     var walk: Walk = .init(&c, &l, &view);
-    const local = walk.next().?;
-    try std.testing.expectEqual(@as(usize, 0), local.part.header);
-    const remote = walk.next().?;
-    try std.testing.expectEqual(@as(usize, 1), remote.part.header);
-    try std.testing.expect(remote.rect.y > local.rect.bottom());
+    const hidden = walk.next().?;
+    try std.testing.expectEqual(@as(usize, 0), hidden.part.header);
+    const shown = walk.next().?;
+    try std.testing.expectEqual(@as(usize, 1), shown.part.header);
+    try std.testing.expect(shown.rect.y > hidden.rect.bottom());
     // The first tab is folded; the second lists its two panes.
     try std.testing.expectEqual(@as(usize, 0), walk.next().?.part.tab);
     const second = walk.next().?.rect;
@@ -513,26 +619,57 @@ test "groups, rows, and their buttons" {
     try std.testing.expectEqual(@as(usize, 0), pane.part.pane.pane);
     try std.testing.expectEqual(second.bottom() + row_gap, pane.rect.y);
     try std.testing.expectEqual(@as(usize, 1), walk.next().?.part.pane.pane);
+    // Then the row that makes a workspace, then the host.
+    const new_ws = walk.next().?;
+    try std.testing.expect(new_ws.part == .new_workspace);
     const forgotten = walk.next().?;
     try std.testing.expectEqual(@as(usize, 2), forgotten.part.header);
+    try std.testing.expect(forgotten.rect.y > new_ws.rect.bottom());
     try std.testing.expect(walk.next() == null);
     const connect = connectRect(&c, &l);
     try std.testing.expectEqual(l.list.bottom() - pad_bottom, connect.bottom());
     try std.testing.expectEqual(Hit.connect, c.hitTest(&l, &view, connect.x + 1, connect.y + 1));
+    try std.testing.expectEqual(Hit.new_workspace, c.hitTest(&l, &view, new_ws.rect.x + 10, new_ws.rect.y + 2));
 
     try std.testing.expectEqual(Hit{ .fold = 1 }, c.hitTest(&l, &view, second.x + 2, second.y + 2));
     try std.testing.expectEqual(Hit{ .tab = 1 }, c.hitTest(&l, &view, second.x + fold_width + 10, second.y + 2));
     try std.testing.expectEqual(Hit{ .tab_pane = .{ .tab = 1, .pane = 0 } }, c.hitTest(&l, &view, pane.rect.x + 40, pane.rect.y + 2));
-    const close = rowButton(&c, second);
+    const close = rowButton(&c, second, 0);
     try std.testing.expectEqual(Hit{ .close_tab = 1 }, c.hitTest(&l, &view, close.x + 1, close.y + 1));
-    const plus = rowButton(&c, remote.rect);
-    try std.testing.expectEqual(Hit{ .new_tab = 1 }, c.hitTest(&l, &view, plus.x + 1, plus.y + 1));
-    try std.testing.expectEqual(Hit{ .header = 1 }, c.hitTest(&l, &view, remote.rect.x + 2, remote.rect.y + 2));
+    const plus = rowButton(&c, forgotten.rect, 0);
+    try std.testing.expectEqual(Hit{ .new_tab = 2 }, c.hitTest(&l, &view, plus.x + 1, plus.y + 1));
+    try std.testing.expectEqual(Hit{ .header = 2 }, c.hitTest(&l, &view, forgotten.rect.x + 2, forgotten.rect.y + 2));
     // Only a host with no tabs can be forgotten.
-    const keep = forgetButton(&c, remote.rect);
-    try std.testing.expectEqual(Hit{ .header = 1 }, c.hitTest(&l, &view, keep.x + 1, keep.y + 1));
-    const forget = forgetButton(&c, forgotten.rect);
+    const forget = rowButton(&c, forgotten.rect, 1);
     try std.testing.expectEqual(Hit{ .forget_host = 2 }, c.hitTest(&l, &view, forget.x + 1, forget.y + 1));
+    // A workspace's header has its buttons; a hidden one has no hide
+    // button.
+    try std.testing.expectEqual(Hit{ .header = 1 }, c.hitTest(&l, &view, shown.rect.x + 2, shown.rect.y + 2));
+    try std.testing.expectEqual(Hit{ .new_tab = 1 }, c.hitTest(&l, &view, rowButton(&c, shown.rect, 0).x + 1, shown.rect.y + 5));
+    try std.testing.expectEqual(Hit{ .kill_workspace = 1 }, c.hitTest(&l, &view, rowButton(&c, shown.rect, 1).x + 1, shown.rect.y + 5));
+    try std.testing.expectEqual(Hit{ .rename_workspace = 1 }, c.hitTest(&l, &view, rowButton(&c, shown.rect, 2).x + 1, shown.rect.y + 5));
+    try std.testing.expectEqual(Hit{ .detach_workspace = 1 }, c.hitTest(&l, &view, rowButton(&c, shown.rect, 3).x + 1, shown.rect.y + 5));
+    try std.testing.expectEqual(Hit{ .header = 0 }, c.hitTest(&l, &view, rowButton(&c, hidden.rect, 3).x + 1, hidden.rect.y + 5));
     // Between groups.
     try std.testing.expectEqual(Hit.none, c.hitTest(&l, &view, second.x + 2, forgotten.rect.y - 5));
+}
+
+test "a workspace being renamed is all field" {
+    const c: Chrome = .{ .scale = 1, .fonts = undefined, .theme = undefined };
+    const field: Chrome.TextField = .{};
+    const view: Chrome.View = .{
+        .groups = &.{.{ .label = &.{}, .tabs = 0, .kind = .workspace }},
+        .tabs = &.{},
+        .active = 0,
+        .rename = .{ .group = 0, .field = &field },
+        .focused = true,
+        .maximized = false,
+        .terminal_bg = .{ 0, 0, 0, 1 },
+    };
+    const l = c.layout(1000, 600);
+    var walk: Walk = .init(&c, &l, &view);
+    const header = walk.next().?.rect;
+    try std.testing.expect(walk.next().?.part == .new_workspace);
+    try std.testing.expectEqual(Hit{ .rename_field = 0 }, c.hitTest(&l, &view, header.x + 2, header.y + 2));
+    try std.testing.expectEqual(Hit{ .rename_field = 0 }, c.hitTest(&l, &view, rowButton(&c, header, 0).x + 1, header.y + 5));
 }

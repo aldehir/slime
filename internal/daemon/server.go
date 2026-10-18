@@ -271,6 +271,10 @@ func (s *Server) newIDLocked() uint32 {
 // registers it (addPaneLocked), or closes it if what it was for is gone
 // by then.
 func (s *Server) startPane(id, ws uint32, spec *rpc.PaneSpec, size Size) (*started, error) {
+	command := spec.Command
+	if command == "" {
+		command = pty.DefaultCommand()
+	}
 	if size.Cols == 0 || size.Rows == 0 {
 		size.Cols, size.Rows = defaultSize.Cols, defaultSize.Rows
 	}
@@ -295,7 +299,7 @@ func (s *Server) startPane(id, ws uint32, spec *rpc.PaneSpec, size Size) (*start
 		term.Close()
 		return nil, err
 	}
-	return &started{id: id, spec: spec, size: size, pty: p, term: term}, nil
+	return &started{id: id, spec: spec, command: command, size: size, pty: p, term: term}, nil
 }
 
 func (s *Server) list() *rpc.WorkspaceListResult {
