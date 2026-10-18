@@ -191,7 +191,7 @@ func lsCommand() *cobra.Command {
 			if jsonOut {
 				return printJSON(l)
 			}
-			panes := map[uint32]rpc.PaneDesc{}
+			panes := map[rpc.PaneID]rpc.PaneDesc{}
 			for _, p := range l.Panes {
 				panes[p.ID] = p
 			}
@@ -199,14 +199,14 @@ func lsCommand() *cobra.Command {
 			for _, ws := range l.Workspaces {
 				fmt.Fprintf(w, "workspace %d\t%s\t%s\n", ws.ID, ws.Name, workspaceState(ws))
 				for _, t := range ws.Tabs {
-					fmt.Fprintf(w, "  tab %d%s\t%s\t%s\n", t.ID, mark(t.ID == ws.ActiveTab), t.Name, layoutString(t.Tree))
+					fmt.Fprintf(w, "  tab %s%s\t%s\t%s\n", t.ID, mark(t.ID == ws.ActiveTab), t.Name, layoutString(t.Tree))
 					for _, id := range t.Tree.Panes() {
 						p := panes[id]
 						title := p.Title
 						if title == "" {
 							title = p.Command
 						}
-						fmt.Fprintf(w, "    pane %d%s\t%dx%d\tpid %d\t%s\n", id, mark(id == t.Focus), p.Cols, p.Rows, p.PID, title)
+						fmt.Fprintf(w, "    pane %s%s\t%dx%d\tpid %d\t%s\n", id, mark(id == t.Focus), p.Cols, p.Rows, p.PID, title)
 					}
 				}
 			}
@@ -239,13 +239,14 @@ func mark(on bool) string {
 	return ""
 }
 
-// layoutString shows a tree compactly: row(60% 3, 40% col(50% 4, 50% 5)).
+// layoutString shows a tree compactly: row(60% 1.1.3, 40% col(50% 1.1.4,
+// 50% 1.1.5)).
 func layoutString(n *rpc.Node) string {
 	if n == nil {
 		return ""
 	}
 	if n.IsLeaf() {
-		return strconv.FormatUint(uint64(n.Pane), 10)
+		return n.Pane.String()
 	}
 	var b strings.Builder
 	if n.Axis == rpc.Row {
@@ -290,23 +291,23 @@ func wsCommand() *cobra.Command {
 	}
 	newWs.Flags().Uint32Var(&attach, "attach", envWorkspace(), "open it in the windows on this workspace (default $SLIME_WORKSPACE; 0 for none)")
 	ws.AddCommand(newWs, &cobra.Command{
-		Use:   "focus <workspace> <tab> [pane]",
-		Short: "Show a tab in every window on the workspace, and focus a pane of it",
-		Args:  cobra.RangeArgs(2, 3),
+		Use:   "focus <tab|pane>",
+		Short: "Show a tab in every window on its workspace, or a pane's tab with the pane focused",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ws, err := parseID(args[0])
-			if err != nil {
-				return err
-			}
-			tab, err := parseID(args[1])
-			if err != nil {
-				return err
-			}
-			p := rpc.WorkspaceFocusParams{ID: ws, Tab: tab}
-			if len(args) == 3 {
-				if p.Pane, err = parseID(args[2]); err != nil {
+			var p rpc.WorkspaceFocusParams
+			if strings.Count(args[0], ".") == 1 {
+				tab, err := rpc.ParseTabID(args[0])
+				if err != nil {
 					return err
 				}
+				p.Tab = tab
+			} else {
+				pane, err := rpc.ParsePaneID(args[0])
+				if err != nil {
+					return err
+				}
+				p.Pane = pane
 			}
 			return call(rpc.WorkspaceFocus, p, nil)
 		},
@@ -350,7 +351,7 @@ func wsCommand() *cobra.Command {
 			}
 			fmt.Printf("workspace %d\t%s\t%s\n", d.ID, d.Name, workspaceState(d))
 			for _, t := range d.Tabs {
-				fmt.Printf("  tab %d%s\t%s\t%s\n", t.ID, mark(t.ID == d.ActiveTab), t.Name, layoutString(t.Tree))
+				fmt.Printf("  tab %s%s\t%s\t%s\n", t.ID, mark(t.ID == d.ActiveTab), t.Name, layoutString(t.Tree))
 			}
 			return nil
 		},
@@ -412,7 +413,7 @@ func tabCommand() *cobra.Command {
 			if jsonOut {
 				return printJSON(created)
 			}
-			fmt.Println(created.Tab)
+			fmt.Println(created.Pane.TabID())
 			return nil
 		},
 	}
@@ -426,7 +427,7 @@ func tabCommand() *cobra.Command {
 		Short: "Rename a tab",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := parseID(args[0])
+			id, err := rpc.ParseTabID(args[0])
 			if err != nil {
 				return err
 			}
@@ -437,7 +438,7 @@ func tabCommand() *cobra.Command {
 		Short: "End a tab's panes",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := parseID(args[0])
+			id, err := rpc.ParseTabID(args[0])
 			if err != nil {
 				return err
 			}
@@ -445,21 +446,21 @@ func tabCommand() *cobra.Command {
 		},
 	}, &cobra.Command{
 		Use:   "info <tab>",
-		Short: "Describe a tab: its workspace and layout",
+		Short: "Describe a tab: its layout and focus",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := parseID(args[0])
+			id, err := rpc.ParseTabID(args[0])
 			if err != nil {
 				return err
 			}
-			var t rpc.TabInfoResult
+			var t rpc.Tab
 			if err := call(rpc.TabInfo, rpc.TabParams{ID: id}, &t); err != nil {
 				return err
 			}
 			if jsonOut {
 				return printJSON(t)
 			}
-			fmt.Printf("tab %d\tworkspace %d\t%s\t%s\n", t.ID, t.Workspace, t.Name, layoutString(t.Tree))
+			fmt.Printf("tab %s\t%s\t%s\n", t.ID, t.Name, layoutString(t.Tree))
 			return nil
 		},
 	})
@@ -476,7 +477,7 @@ func paneCommand() *cobra.Command {
 		Short: "Start a pane beside another, and print its id",
 		Args:  cobra.RangeArgs(2, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := parseID(args[0])
+			pane, err := rpc.ParsePaneID(args[0])
 			if err != nil {
 				return err
 			}
@@ -505,16 +506,16 @@ func paneCommand() *cobra.Command {
 	split.Flags().Float64VarP(&percent, "percent", "p", 50, "how much of the pane's space the new one takes")
 	move := &cobra.Command{
 		Use:   "move <pane> <tab|new> [right|down|left|up]",
-		Short: "Move a pane along a side of another tab, or into a new tab of its own",
+		Short: "Move a pane along a side of another tab, or into a new tab of its own, and print its new id",
 		Args:  cobra.RangeArgs(2, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := parseID(args[0])
+			pane, err := rpc.ParsePaneID(args[0])
 			if err != nil {
 				return err
 			}
 			p := rpc.PaneMoveParams{Pane: pane}
 			if args[1] != "new" {
-				if p.Tab, err = parseID(args[1]); err != nil {
+				if p.Tab, err = rpc.ParseTabID(args[1]); err != nil {
 					return err
 				}
 			}
@@ -530,7 +531,7 @@ func paneCommand() *cobra.Command {
 			if jsonOut {
 				return printJSON(moved)
 			}
-			fmt.Println(moved.Tab)
+			fmt.Println(moved.Pane)
 			return nil
 		},
 	}
@@ -540,30 +541,21 @@ func paneCommand() *cobra.Command {
 		Short: "Give a pane the input in every window on its workspace, showing its tab",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := parseID(args[0])
+			pane, err := rpc.ParsePaneID(args[0])
 			if err != nil {
 				return err
 			}
 			if zoom && unzoom {
 				return fmt.Errorf("--zoom and --unzoom are one or the other")
 			}
-			c, err := connect(false)
-			if err != nil {
-				return err
-			}
-			defer c.Close()
-			var d rpc.PaneDesc
-			if err := c.Call(rpc.PaneInfo, rpc.PaneParams{ID: pane}, &d); err != nil {
-				return err
-			}
-			p := rpc.WorkspaceFocusParams{ID: d.Workspace, Pane: pane}
+			p := rpc.WorkspaceFocusParams{Pane: pane}
 			if zoom {
 				p.Zoomed = &pane
 			}
 			if unzoom {
-				p.Zoomed = new(uint32)
+				p.Zoomed = new(rpc.PaneID)
 			}
-			return c.Call(rpc.WorkspaceFocus, p, nil)
+			return call(rpc.WorkspaceFocus, p, nil)
 		},
 	}
 	focus.Flags().BoolVar(&zoom, "zoom", false, "zoom it to fill its tab too")
@@ -573,7 +565,7 @@ func paneCommand() *cobra.Command {
 		Short: "Print a pane's screen and scrollback, without taking it",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := parseID(args[0])
+			pane, err := rpc.ParsePaneID(args[0])
 			if err != nil {
 				return err
 			}
@@ -606,7 +598,7 @@ func paneCommand() *cobra.Command {
 			}
 			defer c.Close()
 			for _, arg := range args {
-				id, err := parseID(arg)
+				id, err := rpc.ParsePaneID(arg)
 				if err != nil {
 					return err
 				}
@@ -621,7 +613,7 @@ func paneCommand() *cobra.Command {
 		Short: "Send text to a pane's program as if typed (no newline is added)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := parseID(args[0])
+			id, err := rpc.ParsePaneID(args[0])
 			if err != nil {
 				return err
 			}
@@ -629,10 +621,12 @@ func paneCommand() *cobra.Command {
 		},
 	}, &cobra.Command{
 		Use:   "info <pane>",
-		Short: "Describe a pane: its tab, command, title, size, and program status",
-		Args:  cobra.ExactArgs(1),
+		Short: "Describe a pane: its command, title, size, and program status",
+		Long: "Describes a pane. A pane that moved tabs is found under the id it had too,\n" +
+			"and described under the id it has now.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := parseID(args[0])
+			id, err := rpc.ParsePaneID(args[0])
 			if err != nil {
 				return err
 			}
@@ -644,8 +638,8 @@ func paneCommand() *cobra.Command {
 				return printJSON(d)
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintf(w, "pane\t%d\nworkspace\t%d\ntab\t%d\ncommand\t%s\ntitle\t%s\npwd\t%s\nsize\t%dx%d\npid\t%d\ncreated\t%s\n",
-				d.ID, d.Workspace, d.Tab, d.Command, d.Title, d.Pwd, d.Cols, d.Rows, d.PID, time.UnixMilli(d.Created).Format(time.RFC3339))
+			fmt.Fprintf(w, "pane\t%s\ncommand\t%s\ntitle\t%s\npwd\t%s\nsize\t%dx%d\npid\t%d\ncreated\t%s\n",
+				d.ID, d.Command, d.Title, d.Pwd, d.Cols, d.Rows, d.PID, time.UnixMilli(d.Created).Format(time.RFC3339))
 			for _, r := range d.Status {
 				fmt.Fprintf(w, "status\t%q state %d progress %d\n", r.ID, r.State, r.Progress)
 			}
@@ -717,6 +711,8 @@ func layoutOf(commands []string, axis rpc.Axis) *rpc.Layout {
 	return l
 }
 
+// parseID reads a workspace or script id: one number. Tab and pane
+// ids are paths (rpc.ParseTabID, rpc.ParsePaneID).
 func parseID(s string) (uint32, error) {
 	id, err := strconv.ParseUint(s, 10, 32)
 	if err != nil || id == 0 {

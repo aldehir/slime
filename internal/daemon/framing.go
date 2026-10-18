@@ -135,8 +135,9 @@ func (p *Pane) changedLocked() {
 }
 
 // attachFramesLocked starts c's frames of the pane with a full one,
-// adding it to the viewers if it isn't one.
-func (p *Pane) attachFramesLocked(c *conn) (*paneViewer, error) {
+// adding it to the viewers if it isn't one. from is the pane's old id
+// if it just moved tabs.
+func (p *Pane) attachFramesLocked(c *conn, from PaneID) (*paneViewer, error) {
 	v := p.fr.viewers[c]
 	if v == nil {
 		if p.fr.source == nil {
@@ -160,12 +161,8 @@ func (p *Pane) attachFramesLocked(c *conn) (*paneViewer, error) {
 			p.autoscrollLocked(v, false)
 		}
 	}
-	// Every attach runs under the server's lock, which guards p.tab.
-	at := rpc.PaneAttachedParams{ID: p.id, Command: p.command, Status: p.status.records()}
-	if p.tab != nil {
-		at.Workspace, at.Tab = p.tab.ws.id, p.tab.id
-	}
-	c.sendForce(0, notify(rpc.EvPaneAttached, at))
+	at := rpc.PaneAttachedParams{ID: p.id, MovedFrom: from, Command: p.command, Status: p.status.records()}
+	c.sendForce(NoPane, notify(rpc.EvPaneAttached, at))
 	// What the client would otherwise only learn when they change.
 	if title, _ := p.term.Title(); title != "" {
 		c.sendForce(p.id, &Notice{Kind: NoticeTitle, Text: title})

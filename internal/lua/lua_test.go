@@ -108,15 +108,15 @@ func TestCancel(t *testing.T) {
 
 func TestContextAndNamespaces(t *testing.T) {
 	h := &fakeHost{answers: map[string]string{
-		"pane.split": `{"workspace":1,"tab":2,"pane":9}`,
+		"pane.split": `{"pane":"1.2.9"}`,
 		"pane.text":  `{"text":"hello"}`,
 	}}
-	ctx := Context{Workspace: 1, Tab: 2, Pane: 3, Args: json.RawMessage(`{"file":"app.log","n":2}`)}
+	ctx := Context{Pane: rpc.PaneID{WS: 1, Tab: 2, N: 3}, Args: json.RawMessage(`{"file":"app.log","n":2}`)}
 	res, err := run(t, h, ctx, `
-		assert(slime.workspace_id == 1 and slime.tab_id == 2 and slime.pane_id == 3)
+		assert(slime.workspace_id == 1 and slime.tab_id == "1.2" and slime.pane_id == "1.2.3")
 		assert(slime.args.file == "app.log" and slime.args.n == 2)
 		local p = slime.pane.split{ direction = "down", ratio = 0.3, command = "htop" }
-		assert(p.pane == 9)
+		assert(p.pane == "1.2.9")
 		local t = slime.pane.text{ id = p.pane }
 		slime.pane.kill{}
 		slime.tab.new{ name = "x" }
@@ -127,7 +127,9 @@ func TestContextAndNamespaces(t *testing.T) {
 		slime.workspace.new{ name = "d", attach = false }
 		slime.workspace.new{ name = "t", attach = true }
 		slime.workspace.new{ name = "e", attach = 5 }
-		slime.pane_id = 7
+		slime.workspace.focus{}
+		slime.workspace.focus{ tab = "1.4" }
+		slime.pane_id = "1.2.7"
 		slime.pane.info()
 		slime.call("host.list")
 		slime.call("workspace.focus", { tab = 2 })
@@ -140,18 +142,20 @@ func TestContextAndNamespaces(t *testing.T) {
 		t.Errorf("result %s", res)
 	}
 	want := []call{
-		{"pane.split", `{"command":"htop","direction":"down","pane":3,"ratio":0.3}`},
-		{"pane.text", `{"id":9}`},
-		{"pane.kill", `{"id":3}`},
+		{"pane.split", `{"command":"htop","direction":"down","pane":"1.2.3","ratio":0.3}`},
+		{"pane.text", `{"id":"1.2.9"}`},
+		{"pane.kill", `{"id":"1.2.3"}`},
 		{"tab.new", `{"name":"x","workspace":1}`},
-		{"tab.rename", `{"id":2,"name":"y"}`},
+		{"tab.rename", `{"id":"1.2","name":"y"}`},
 		{"workspace.info", `{"id":1}`},
 		{"workspace.list", `{}`},
 		{"workspace.new", `{"attach":1,"name":"z"}`},
 		{"workspace.new", `{"name":"d"}`},
 		{"workspace.new", `{"attach":1,"name":"t"}`},
 		{"workspace.new", `{"attach":5,"name":"e"}`},
-		{"pane.info", `{"id":7}`},
+		{"workspace.focus", `{"pane":"1.2.3"}`},
+		{"workspace.focus", `{"tab":"1.4"}`},
+		{"pane.info", `{"id":"1.2.7"}`},
 		{"host.list", ``},
 		{"workspace.focus", `{"tab":2}`},
 	}
@@ -162,6 +166,35 @@ func TestContextAndNamespaces(t *testing.T) {
 		if h.calls[i] != c {
 			t.Errorf("call %d: %v, want %v", i, h.calls[i], c)
 		}
+	}
+}
+
+// Ids come apart with slime.id.parse and together with slime.id.tab
+// and slime.id.pane.
+func TestIDs(t *testing.T) {
+	res, err := run(t, &fakeHost{}, Context{}, `
+		assert(slime.pane_id == nil and slime.tab_id == nil and slime.workspace_id == nil)
+		local p = slime.id.parse("1.2.3")
+		assert(p.workspace == 1 and p.tab == 2 and p.pane == 3)
+		local t = slime.id.parse("4.5")
+		assert(t.workspace == 4 and t.tab == 5 and t.pane == nil)
+		local w = slime.id.parse(6)
+		assert(w.workspace == 6 and w.tab == nil)
+		assert(slime.id.tab(1, 2) == "1.2" and slime.id.pane(1, 2, 3) == "1.2.3")
+		assert(slime.id.pane(p.workspace, p.tab, p.pane) == "1.2.3")
+		for _, bad in ipairs({ "", "0.1.1", "1.2.3.4", "a.b", "1..2", true }) do
+			local v, err = slime.id.parse(bad)
+			assert(v == nil and err, tostring(bad))
+		end
+		assert(not pcall(slime.id.pane, 0, 1, 1))
+		assert(not pcall(slime.id.tab, 1.5, 1))
+		return slime.id.tab(p.workspace, p.tab)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res) != `"1.2"` {
+		t.Errorf("result %s", res)
 	}
 }
 

@@ -63,7 +63,7 @@ func TestConPTY(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { c.Close() })
-		return &window{t: t, h: h, c: c, screens: map[uint32]*vt.Screen{}}
+		return &window{t: t, h: h, c: c, screens: map[PaneID]*vt.Screen{}}
 	}
 
 	os.Setenv("SLIME_HELPER_SHELL", "1")

@@ -38,8 +38,9 @@ type HostOptions struct {
 
 // hostTable is the hosts by id. Guarded by the server's lock.
 type hostTable struct {
-	opts HostOptions
-	byID map[uint32]*host
+	opts   HostOptions
+	byID   map[uint32]*host
+	nextID uint32
 }
 
 func newHostTable(opts HostOptions) hostTable {
@@ -107,7 +108,8 @@ func (s *Server) hostConnect(cl *callCtx, m rpc.HostConnectParams) (*rpc.Host, e
 		}
 	}
 	if h == nil {
-		h = &host{id: s.newIDLocked(), dest: m.Dest}
+		s.hosts.nextID++
+		h = &host{id: s.hosts.nextID, dest: m.Dest}
 		s.hosts.byID[h.id] = h
 	}
 	if h.state == HostConnecting || h.state == HostConnected {
@@ -291,11 +293,11 @@ func (s *Server) hostList(_ *callCtx, _ rpc.Empty) (*rpc.HostListResult, error) 
 }
 
 // bridge splices a connection whose first frame was Bridge to `slime
-// connect` on host id, until either end hangs up. What the client
+// connect` on its host, until either end hangs up. What the client
 // sends next (its Hello) is in r's buffer, and goes through.
-func (s *Server) bridge(rw io.ReadWriteCloser, r *Reader, id uint32, m *Bridge) {
+func (s *Server) bridge(rw io.ReadWriteCloser, r *Reader, m *Bridge) {
 	s.mu.Lock()
-	h := s.hosts.byID[id]
+	h := s.hosts.byID[m.Host]
 	var conn *sshbridge.Conn
 	if h != nil && h.state == HostConnected {
 		conn = h.conn
@@ -303,7 +305,7 @@ func (s *Server) bridge(rw io.ReadWriteCloser, r *Reader, id uint32, m *Bridge) 
 	s.mu.Unlock()
 	switch {
 	case h == nil:
-		writeError(rw, fmt.Sprintf("no host %d", id))
+		writeError(rw, fmt.Sprintf("no host %d", m.Host))
 		return
 	case conn == nil:
 		writeError(rw, fmt.Sprintf("%s isn't connected (%s: %s)", h.dest, h.state, h.text))
@@ -362,7 +364,7 @@ func (a *hostAsker) Ask(q *sshbridge.Query) (sshbridge.Answer, error) {
 	for _, pq := range q.Questions {
 		p.Questions = append(p.Questions, rpc.Question{Label: pq.Label, Echo: pq.Echo})
 	}
-	client.sendForce(0, notify(rpc.EvHostPrompt, p))
+	client.sendForce(NoPane, notify(rpc.EvHostPrompt, p))
 	select {
 	case ans := <-answers:
 		return sshbridge.PadAnswers(sshbridge.Answer{Choice: choices[ans.Choice], Answers: ans.Answers}, len(q.Questions)), nil

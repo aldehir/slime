@@ -50,7 +50,7 @@ func TestUnixSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { c.Close() })
-		return &window{t: t, h: h, c: c, screens: map[uint32]*vt.Screen{}}
+		return &window{t: t, h: h, c: c, screens: map[PaneID]*vt.Screen{}}
 	}
 	command := `printf 'ready>'; while read l; do [ "$l" = exit ] && exit 3; printf 'got %s\r\nready>' "$l"; done`
 

@@ -18,6 +18,8 @@ import (
 	"strings"
 
 	glua "github.com/yuin/gopher-lua"
+
+	"github.com/aldehir/slime/internal/rpc"
 )
 
 // Host is the daemon a script runs in.
@@ -40,14 +42,12 @@ const (
 	Stderr Stream = "stderr"
 )
 
-// Context is what a script runs for: its arguments, and the pane, tab,
-// and workspace it was started from (zero for none), which fill the
-// ids its calls leave out.
+// Context is what a script runs for: its arguments, and the pane it
+// was started from (zero for none), which names its tab and workspace
+// too; they fill the ids its calls leave out.
 type Context struct {
-	Args      json.RawMessage
-	Workspace uint32
-	Tab       uint32
-	Pane      uint32
+	Args json.RawMessage
+	Pane rpc.PaneID
 }
 
 // ErrCancelled ends a run that was cancelled.

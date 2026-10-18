@@ -35,7 +35,7 @@ func (cl *callCtx) reply(result any) {
 	}
 	cl.replied = true
 	if cl.c != nil {
-		cl.c.sendForce(0, reply(cl.id, result, nil))
+		cl.c.sendForce(NoPane, reply(cl.id, result, nil))
 	} else {
 		cl.result = result
 	}
@@ -108,7 +108,7 @@ func (s *Server) call(c *conn, req rpc.Request) {
 	if cl.replied {
 		return
 	}
-	c.sendForce(0, reply(req.ID, result, rerr))
+	c.sendForce(NoPane, reply(req.ID, result, rerr))
 }
 
 // Call runs a method for a connection (nil for a caller in process)
@@ -202,7 +202,7 @@ func (s *Server) emitLocked(name string, params any, ws *workspace, skip ...*con
 	if ws != nil {
 		for c := range ws.viewers {
 			if !skipped(c) {
-				c.sendForce(0, n)
+				c.sendForce(NoPane, n)
 			}
 		}
 	}
@@ -210,7 +210,7 @@ func (s *Server) emitLocked(name string, params any, ws *workspace, skip ...*con
 		if skipped(c) || (ws != nil && ws.viewers[c] != nil) || !c.subscribedLocked(name) {
 			continue
 		}
-		c.sendForce(0, n)
+		c.sendForce(NoPane, n)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	glua "github.com/yuin/gopher-lua"
@@ -15,12 +16,14 @@ import (
 // The slime table. Its shape is Rex's with the nouns renamed:
 //
 //	slime.args                       the script's arguments
-//	slime.workspace_id, tab_id, pane_id   what it runs for, or nil
+//	slime.workspace_id, tab_id, pane_id   what it runs for, or nil:
+//	                                 a number, "w.t", and "w.t.p"
 //	slime.call(method, params)       any method, by its wire name
 //	slime.workspace.<m>{...}         "workspace.<m>", id filled in;
 //	                                 new's attach too (false: detached)
 //	slime.tab.<m>{...}               "tab.<m>", id or workspace filled in
 //	slime.pane.<m>{...}              "pane.<m>", id or pane filled in
+//	slime.id.parse(id), tab(w, t), pane(w, t, p)   ids apart and together
 //	slime.layout.pane{...}, horizontal(ratio, a, b, ...), vertical
 //	slime.json.encode(v), decode(s)
 //	slime.log(...)                   to the daemon's log
@@ -41,15 +44,18 @@ func (r *Runner) install(ctx Context) {
 		}
 	}
 	slime.RawSetString("args", args)
-	for name, id := range map[string]uint32{"workspace_id": ctx.Workspace, "tab_id": ctx.Tab, "pane_id": ctx.Pane} {
-		if id != 0 {
-			slime.RawSetString(name, glua.LNumber(id))
-		}
+	if !ctx.Pane.IsZero() {
+		slime.RawSetString("workspace_id", glua.LNumber(ctx.Pane.WS))
+		slime.RawSetString("tab_id", glua.LString(ctx.Pane.TabID().String()))
+		slime.RawSetString("pane_id", glua.LString(ctx.Pane.String()))
 	}
 	slime.RawSetString("call", L.NewFunction(r.luaCall))
 	for _, group := range []string{"workspace", "tab", "pane"} {
 		slime.RawSetString(group, r.namespace(group))
 	}
+	ids := L.NewTable()
+	L.SetFuncs(ids, map[string]glua.LGFunction{"parse": idParse, "tab": idTab, "pane": idPane})
+	slime.RawSetString("id", ids)
 	layout := L.NewTable()
 	L.SetFuncs(layout, map[string]glua.LGFunction{
 		"pane":       layoutPane,
@@ -92,8 +98,9 @@ func (r *Runner) namespace(group string) *glua.LTable {
 // them in, where the script left them out: a workspace method's id,
 // workspace.new's attach (so the windows on the script's workspace open
 // the new one; attach = false leaves it detached, true asks for the
-// default), tab.new's workspace, a pane method's id, and the pane a
-// split or move starts from.
+// default), workspace.focus's pane (or tab, with no pane to fill),
+// tab.new's workspace, a pane method's id, and the pane a split or move
+// starts from.
 func (r *Runner) fillContext(method string, params *glua.LTable) {
 	var field, from string
 	group, name, _ := strings.Cut(method, ".")
@@ -110,6 +117,14 @@ func (r *Runner) fillContext(method string, params *glua.LTable) {
 				return
 			case glua.LTrue:
 				params.RawSetString(field, glua.LNil)
+			}
+		case "focus":
+			if params.RawGetString("tab") != glua.LNil || params.RawGetString("pane") != glua.LNil {
+				return
+			}
+			field, from = "pane", "pane_id"
+			if r.slime.RawGetString(from) == glua.LNil {
+				field, from = "tab", "tab_id"
 			}
 		default:
 			field, from = "id", "workspace_id"
@@ -212,6 +227,61 @@ func (r *Runner) luaStop(L *glua.LState) int {
 	}
 	L.Error(r.stop, 0)
 	return 0
+}
+
+// idParse is slime.id.parse(id): the parts of a workspace, tab, or
+// pane id as {workspace, tab, pane}, the ones it has; or nil and why
+// not.
+func idParse(L *glua.LState) int {
+	var text string
+	switch v := L.Get(1).(type) {
+	case glua.LNumber:
+		text = numberString(float64(v))
+	case glua.LString:
+		text = string(v)
+	default:
+		return pushError(L, "an id is a number or a string", 0)
+	}
+	parts := strings.Split(text, ".")
+	if len(parts) > 3 {
+		return pushError(L, fmt.Sprintf("%q isn't an id", text), 0)
+	}
+	out := L.NewTable()
+	for i, name := range []string{"workspace", "tab", "pane"} {
+		if i >= len(parts) {
+			break
+		}
+		n, err := strconv.ParseUint(parts[i], 10, 32)
+		if err != nil || n == 0 {
+			return pushError(L, fmt.Sprintf("%q isn't an id", text), 0)
+		}
+		out.RawSetString(name, glua.LNumber(n))
+	}
+	L.Push(out)
+	return 1
+}
+
+// idTab is slime.id.tab(workspace, tab): "w.t".
+func idTab(L *glua.LState) int {
+	id := rpc.TabID{WS: idPart(L, 1), N: idPart(L, 2)}
+	L.Push(glua.LString(id.String()))
+	return 1
+}
+
+// idPane is slime.id.pane(workspace, tab, pane): "w.t.p".
+func idPane(L *glua.LState) int {
+	id := rpc.PaneID{WS: idPart(L, 1), Tab: idPart(L, 2), N: idPart(L, 3)}
+	L.Push(glua.LString(id.String()))
+	return 1
+}
+
+// idPart is argument i of an id: a positive integer.
+func idPart(L *glua.LState, i int) uint32 {
+	n := L.CheckNumber(i)
+	if n <= 0 || n != glua.LNumber(uint32(n)) {
+		L.ArgError(i, "an id's parts are positive integers")
+	}
+	return uint32(n)
 }
 
 // layoutPane is slime.layout.pane{command, cwd, env}: a leaf of a

@@ -194,10 +194,10 @@ func newHostHarness(t *testing.T, sshOpts sshtest.Options, idle time.Duration) *
 }
 
 // recv reads the next message within the timeout.
-func recv(t *testing.T, c *Client) (uint32, Message) {
+func recv(t *testing.T, c *Client) (PaneID, Message) {
 	t.Helper()
 	type got struct {
-		id uint32
+		id PaneID
 		m  Message
 	}
 	ch := make(chan got, 1)
@@ -218,7 +218,7 @@ func recv(t *testing.T, c *Client) (uint32, Message) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for a message")
 	}
-	return 0, nil
+	return NoPane, nil
 }
 
 // subscribeHosts has c hear every host's changes.
@@ -334,12 +334,12 @@ func (h *hostHarness) login(c *Client, dest string) uint32 {
 func (h *hostHarness) bridge(id uint32, term string) (*Client, error) {
 	h.t.Helper()
 	b := h.dial()
-	frame, _ := Encode(id, &Bridge{Term: term})
+	frame, _ := Encode(NoPane, &Bridge{Host: id, Term: term})
 	if _, err := b.Write(frame); err != nil {
 		return nil, err
 	}
 	c := &Client{rw: b, r: NewReader(b)}
-	if err := c.Send(0, &Hello{Version: Version}); err != nil {
+	if err := c.Send(NoPane, &Hello{Version: Version}); err != nil {
 		return nil, err
 	}
 	_, m, err := c.Recv()

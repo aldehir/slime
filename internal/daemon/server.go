@@ -38,16 +38,25 @@ type Server struct {
 	log   *slog.Logger
 	idle  time.Duration
 
-	mu         sync.Mutex
-	nextID     uint32 // shared by workspaces, tabs, panes, and scripts
+	mu sync.Mutex
+	// Ids are paths (rpc.TabID, rpc.PaneID): the daemon numbers
+	// workspaces and scripts, a workspace its tabs, a tab its panes,
+	// each from a counter that never reuses a number while its owner
+	// lives.
+	nextWS     uint32
+	nextScript uint32
 	workspaces map[uint32]*workspace
-	tabs       map[uint32]*tab
-	panes      map[uint32]*Pane
-	conns      map[*conn]struct{}
-	scripts    map[uint32]*script
-	hosts      hostTable
-	idleT      *time.Timer
-	idleC      chan struct{} // closed when the idle timer fires
+	tabs       map[TabID]*tab
+	panes      map[PaneID]*Pane
+	// moved forwards the id a pane had before it moved tabs to its
+	// current one, for as long as it lives: a shell's SLIME_PANE still
+	// finds it. One hop: a pane that moves again rewrites its entries.
+	moved   map[PaneID]PaneID
+	conns   map[*conn]struct{}
+	scripts map[uint32]*script
+	hosts   hostTable
+	idleT   *time.Timer
+	idleC   chan struct{} // closed when the idle timer fires
 }
 
 // Options configure a Server.
@@ -78,8 +87,9 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		log:        opts.Log,
 		idle:       opts.Idle,
 		workspaces: map[uint32]*workspace{},
-		tabs:       map[uint32]*tab{},
-		panes:      map[uint32]*Pane{},
+		tabs:       map[TabID]*tab{},
+		panes:      map[PaneID]*Pane{},
+		moved:      map[PaneID]PaneID{},
 		conns:      map[*conn]struct{}{},
 		scripts:    map[uint32]*script{},
 		hosts:      newHostTable(opts.Hosts),
@@ -151,7 +161,7 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 	}
 	m, err := Decode(f)
 	if b, ok := m.(*Bridge); ok && err == nil {
-		s.bridge(rw, r, f.ID, b)
+		s.bridge(rw, r, b)
 		return
 	}
 	c := newConn(rw, s.log)
@@ -200,16 +210,16 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 func (s *Server) handshake(c *conn, m Message, err error) bool {
 	hello, ok := m.(*Hello)
 	if err != nil || !ok {
-		c.sendForce(0, &Error{Message: "expected hello"})
+		c.sendForce(NoPane, &Error{Message: "expected hello"})
 		return false
 	}
-	c.sendForce(0, &HelloReply{
+	c.sendForce(NoPane, &HelloReply{
 		Version:     Version,
 		PID:         uint32(os.Getpid()),
 		FrameLayout: vt.FrameLayout(),
 	})
 	if hello.Version != Version {
-		c.sendForce(0, &Error{Message: fmt.Sprintf("slime speaks version %d, not %d", Version, hello.Version)})
+		c.sendForce(NoPane, &Error{Message: fmt.Sprintf("slime speaks version %d, not %d", Version, hello.Version)})
 		return false
 	}
 	c.interval = defaultFrameInterval
@@ -219,7 +229,7 @@ func (s *Server) handshake(c *conn, m Message, err error) bool {
 	return true
 }
 
-func (s *Server) dispatch(c *conn, id uint32, m Message) {
+func (s *Server) dispatch(c *conn, id PaneID, m Message) {
 	switch m := m.(type) {
 	case *Call:
 		s.call(c, m.Request)
@@ -245,7 +255,7 @@ func (s *Server) dispatch(c *conn, id uint32, m Message) {
 // passed: closing with its Hello unread would reset a TCP connection
 // and lose the Error.
 func writeError(rw io.ReadWriteCloser, msg string) {
-	if b, err := Encode(0, &Error{Message: msg}); err == nil {
+	if b, err := Encode(NoPane, &Error{Message: msg}); err == nil {
 		rw.Write(b)
 	}
 	if c, ok := rw.(net.Conn); ok {
@@ -255,22 +265,28 @@ func writeError(rw io.ReadWriteCloser, msg string) {
 	rw.Close()
 }
 
-func (s *Server) pane(id uint32) *Pane {
+func (s *Server) pane(id PaneID) *Pane {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.panes[id]
+	return s.paneLocked(id)
 }
 
-func (s *Server) newIDLocked() uint32 {
-	s.nextID++
-	return s.nextID
+// paneLocked finds a pane by its id, or by one it had before moving
+// tabs.
+func (s *Server) paneLocked(id PaneID) *Pane {
+	if p := s.panes[id]; p != nil {
+		return p
+	}
+	if now, ok := s.moved[id]; ok {
+		return s.panes[now]
+	}
+	return nil
 }
 
-// startPane starts a child and its terminal for pane id of workspace
-// ws, outside the server's lock: spawning takes a while. The caller
-// registers it (addPaneLocked), or closes it if what it was for is gone
-// by then.
-func (s *Server) startPane(id, ws uint32, spec *rpc.PaneSpec, size Size) (*started, error) {
+// startPane starts a child and its terminal for pane id, outside the
+// server's lock: spawning takes a while. The caller registers it
+// (addPaneLocked), or closes it if what it was for is gone by then.
+func (s *Server) startPane(id PaneID, spec *rpc.PaneSpec, size Size) (*started, error) {
 	command := spec.Command
 	if command == "" {
 		command = pty.DefaultCommand()
@@ -289,7 +305,7 @@ func (s *Server) startPane(id, ws uint32, spec *rpc.PaneSpec, size Size) (*start
 	p, err := s.spawn(pty.Options{
 		Command: spec.Command,
 		Dir:     spec.Cwd,
-		Env:     paneEnv(id, ws, spec),
+		Env:     paneEnv(id, spec),
 		Cols:    size.Cols,
 		Rows:    size.Rows,
 		Width:   uint32(size.Cols) * size.CellW,
@@ -311,7 +327,7 @@ func (s *Server) list() *rpc.WorkspaceListResult {
 		for _, t := range ws.tabs {
 			for _, id := range t.root.Panes() {
 				if p := s.panes[id]; p != nil {
-					out.Panes = append(out.Panes, p.desc(t))
+					out.Panes = append(out.Panes, p.desc())
 				}
 			}
 		}

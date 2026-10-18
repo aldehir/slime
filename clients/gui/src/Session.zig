@@ -155,7 +155,7 @@ const Transport = union(enum) {
     waiting: []const u16,
 };
 
-const Pane = struct { conn: *Daemon, pane: u32 };
+const Pane = struct { conn: *Daemon, pane: Daemon.PaneRef };
 
 /// What a new session shows.
 pub const Launch = union(enum) {
@@ -569,7 +569,7 @@ pub fn daemonLoss(self: *const Session) ?*const DaemonLoss {
 }
 
 /// The daemon pane the session shows, if it's one.
-pub fn daemonPane(self: *const Session) ?u32 {
+pub fn daemonPane(self: *const Session) ?Daemon.PaneRef {
     return switch (self.transport orelse return null) {
         .daemon => |s| s.pane,
         .waiting => null,

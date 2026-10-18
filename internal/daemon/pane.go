@@ -15,7 +15,9 @@ import (
 // its workspace's, set by the server as workspaces are attached and
 // detached; each gets its own frames of the one terminal.
 type Pane struct {
-	id      uint32
+	// Its id, which changes when it moves tabs. Guarded by the server's
+	// lock and the pane's: written under both, read under either.
+	id      PaneID
 	srv     *Server
 	command string
 	created time.Time
@@ -38,7 +40,7 @@ type Pane struct {
 	replies []byte
 }
 
-func newPane(srv *Server, id uint32, command string, size Size, p pty.Pty, term *vt.Terminal) *Pane {
+func newPane(srv *Server, id PaneID, command string, size Size, p pty.Pty, term *vt.Terminal) *Pane {
 	pn := &Pane{
 		id:      id,
 		srv:     srv,
@@ -160,19 +162,18 @@ func (p *Pane) run() {
 		}
 	}
 	status, err := p.pty.Wait()
+	p.mu.Lock()
 	if err != nil {
 		p.srv.log.Error("waiting for child", "pane", p.id, "err", err)
 	}
 	p.srv.log.Info("pane ended", "pane", p.id, "status", status)
-
-	p.mu.Lock()
 	p.done = true
 	// The viewers hear in order with the pane's frames; the subscribers
 	// from paneExited.
 	var told []*conn
 	exited := notify(rpc.EvPaneExited, rpc.PaneExitedParams{ID: p.id, Status: status})
 	for c := range p.fr.viewers {
-		c.sendForce(0, exited)
+		c.sendForce(NoPane, exited)
 		told = append(told, c)
 	}
 	p.stopFramingLocked()
@@ -196,10 +197,11 @@ func (p *Pane) write(b []byte) error {
 }
 
 // attach adds c to the pane's viewers, asking for size if that's set,
-// and starts its frames.
-func (p *Pane) attach(c *conn, size Size) error {
+// and starts its frames. from is the id the pane had if it just moved
+// tabs (zero otherwise), for the viewer to let go of.
+func (p *Pane) attach(c *conn, size Size, from PaneID) error {
 	p.mu.Lock()
-	err := p.attachLocked(c, size)
+	err := p.attachLocked(c, size, from)
 	// A resize can answer a program's size query (mode 2048).
 	replies := p.takeRepliesLocked()
 	p.mu.Unlock()
@@ -207,11 +209,11 @@ func (p *Pane) attach(c *conn, size Size) error {
 	return err
 }
 
-func (p *Pane) attachLocked(c *conn, size Size) error {
+func (p *Pane) attachLocked(c *conn, size Size, from PaneID) error {
 	if p.done {
 		return nil
 	}
-	v, err := p.attachFramesLocked(c)
+	v, err := p.attachFramesLocked(c, from)
 	if err != nil {
 		return err
 	}
@@ -343,9 +345,16 @@ func (p *Pane) cell() Size {
 // kill ends the child; run reports the exit and cleans up.
 func (p *Pane) kill() { go p.pty.Close() }
 
-// desc describes the pane as workspace.list and pane.info do. t is its
-// tab, if it's still in one.
-func (p *Pane) desc(t *tab) rpc.PaneDesc {
+// renameLocked gives the pane the id it has in its new tab. Under the
+// server's lock.
+func (p *Pane) renameLocked(id PaneID) {
+	p.mu.Lock()
+	p.id = id
+	p.mu.Unlock()
+}
+
+// desc describes the pane as workspace.list and pane.info do.
+func (p *Pane) desc() rpc.PaneDesc {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	d := rpc.PaneDesc{
@@ -356,9 +365,6 @@ func (p *Pane) desc(t *tab) rpc.PaneDesc {
 		Created: p.created.UnixMilli(),
 		PID:     p.pty.PID(),
 		Status:  p.status.records(),
-	}
-	if t != nil {
-		d.Tab, d.Workspace = t.id, t.ws.id
 	}
 	if !p.done {
 		d.Title, _ = p.term.Title()

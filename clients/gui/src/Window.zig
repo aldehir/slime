@@ -449,7 +449,7 @@ fn findSession(self: *const Window, id: u32) ?Found {
 }
 
 /// The session showing `conn`'s pane `id`.
-fn daemonSession(self: *const Window, conn: *Daemon, id: u32) ?*Session {
+fn daemonSession(self: *const Window, conn: *Daemon, id: Daemon.PaneRef) ?*Session {
     for (self.tabs.items) |t| {
         if (t.conn != conn) continue;
         if (t.findPane(id)) |s| return s;
@@ -516,11 +516,11 @@ fn daemonChanged(self: *Window, conn: *Daemon) void {
     var taken = conn.take();
     defer taken.deinit(self.alloc);
 
-    var arrived: std.AutoHashMapUnmanaged(u32, *Session) = .empty;
+    var arrived: std.AutoHashMapUnmanaged(Daemon.PaneRef, *Session) = .empty;
     defer arrived.deinit(self.alloc);
     for (taken.arrivals) |*a| {
         const s = self.createSession(.{ .daemon = .{ .conn = conn, .arrival = a } }, self.gridSize()) catch |err| {
-            log.err("showing daemon pane {d} failed: {}", .{ a.pane, err });
+            log.err("showing daemon pane {f} failed: {}", .{ a.pane, err });
             conn.release(a.pane);
             continue;
         };
@@ -542,7 +542,7 @@ fn daemonChanged(self: *Window, conn: *Daemon) void {
         self.activate_ws = null;
         self.activate_new = false;
         for (self.tabs.items, 0..) |t, k| {
-            if (t.conn == conn and t.ws == st.id and (t.id == st.active_tab or st.active_tab == 0)) {
+            if (t.conn == conn and t.ws == st.id and (t.id.eql(st.active_tab) or st.active_tab.isNone())) {
                 self.activate(k);
                 break;
             }
@@ -830,7 +830,7 @@ fn localGroups(self: *const Window) usize {
 /// and the tab shown, which is followed when one of the workspace's tabs
 /// is the one shown here. Sessions placed from `arrived` are taken out
 /// of it.
-fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arrived: *std.AutoHashMapUnmanaged(u32, *Session)) !void {
+fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arrived: *std.AutoHashMapUnmanaged(Daemon.PaneRef, *Session)) !void {
     const alloc = self.alloc;
     self.cancelDrag();
     const was_active: ?*Tab = if (self.tabs.items.len > 0) self.activeTab() else null;
@@ -840,8 +840,8 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
     const Lookup = struct {
         window: *Window,
         conn: *Daemon,
-        arrived: *std.AutoHashMapUnmanaged(u32, *Session),
-        pub fn session(l: @This(), id: u32) ?*Session {
+        arrived: *std.AutoHashMapUnmanaged(Daemon.PaneRef, *Session),
+        pub fn session(l: @This(), id: Daemon.PaneRef) ?*Session {
             return l.arrived.get(id) orelse l.window.daemonSession(l.conn, id);
         }
     };
@@ -855,7 +855,7 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
     for (st.tabs, roots) |lt, *root| {
         root.* = try Tab.fromLayout(alloc, lt.root, lookup);
         const node = root.* orelse continue;
-        var walk: Tab = .{ .id = 0, .root = node, .focus = Tab.first(node) };
+        var walk: Tab = .{ .id = .none, .root = node, .focus = Tab.first(node) };
         var it = walk.iterator();
         while (it.next()) |s| try used.put(alloc, s, {});
     }
@@ -879,7 +879,7 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
     for (st.tabs, roots) |lt, *root| {
         const node = root.* orelse continue;
         const t = for (self.tabs.items) |t| {
-            if (t.conn != conn or t.ws != st.id or t.id != lt.id) continue;
+            if (t.conn != conn or t.ws != st.id or !t.id.eql(lt.id)) continue;
             t.setRoot(alloc, node);
             break t;
         } else try Tab.create(alloc, conn, st.id, lt.id, node, Tab.first(node));
@@ -887,7 +887,7 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
         ordered.appendAssumeCapacity(t);
         if (st.focus_known) {
             if (t.findPane(lt.focus)) |s| t.focus = s;
-            t.zoom = if (lt.zoomed != 0) t.findPane(lt.zoomed) else null;
+            t.zoom = if (!lt.zoomed.isNone()) t.findPane(lt.zoomed) else null;
             t.sent_focus = focusOf(t);
         }
     }
@@ -938,7 +938,7 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
     var active = still orelse @min(self.active, self.tabs.items.len - 1);
     if (st.focus_known) {
         if (still == null or shown_ws) for (self.tabs.items, 0..) |t, k| {
-            if (t.conn == conn and t.ws == st.id and t.id == st.active_tab) active = k;
+            if (t.conn == conn and t.ws == st.id and t.id.eql(st.active_tab)) active = k;
         };
     }
     self.active = active;
@@ -952,10 +952,9 @@ fn applyStructure(self: *Window, conn: *Daemon, st: *const Daemon.Structure, arr
 /// A tab's focus as `workspace.focus` takes it.
 fn focusOf(t: *const Tab) Daemon.Focus {
     return .{
-        .workspace = t.ws,
         .tab = t.id,
-        .pane = t.focus.daemonPane() orelse 0,
-        .zoomed = if (t.zoom) |z| z.daemonPane() orelse 0 else 0,
+        .pane = t.focus.daemonPane() orelse .none,
+        .zoomed = if (t.zoom) |z| z.daemonPane() orelse .none else .none,
     };
 }
 
@@ -967,8 +966,8 @@ fn syncFocus(self: *Window) void {
     const t = self.activeTab();
     const conn = t.conn orelse return;
     const f = focusOf(t);
-    if (f.pane == 0) return;
-    if (conn.activeTab(t.ws) == t.id and t.sent_focus != null and std.meta.eql(t.sent_focus.?, f)) return;
+    if (f.pane.isNone()) return;
+    if (conn.activeTab(t.ws).eql(t.id) and t.sent_focus != null and std.meta.eql(t.sent_focus.?, f)) return;
     t.sent_focus = f;
     conn.focus(f) catch |err| log.warn("telling slime the focus failed: {}", .{err});
 }
@@ -1000,7 +999,7 @@ fn spawnSession(self: *Window, target: Target) !void {
     try self.tabs.ensureUnusedCapacity(self.alloc, 1);
     try self.reserveGroups();
     const s = try self.createSession(target, self.gridSize());
-    const t = Tab.create(self.alloc, null, 0, 0, .{ .pane = s }, s) catch |err| {
+    const t = Tab.create(self.alloc, null, 0, .none, .{ .pane = s }, s) catch |err| {
         s.kill();
         s.destroy();
         return err;

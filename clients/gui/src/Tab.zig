@@ -15,8 +15,8 @@ const Session = @import("Session.zig");
 const Daemon = @import("Daemon.zig");
 const Rect = @import("renderer/Painter.zig").Rect;
 
-/// slime's id for the tab, or 0 for a session of its own.
-id: u32,
+/// slime's id for the tab, or none for a session of its own.
+id: Daemon.TabRef,
 /// The daemon whose tab it is, or null for a session of its own.
 conn: ?*Daemon = null,
 /// slime's id for the workspace it's in, or 0 for a session of its own.
@@ -55,7 +55,7 @@ pub const Child = struct {
     node: Node,
 };
 
-pub fn create(alloc: Allocator, conn: ?*Daemon, ws: u32, id: u32, root: Node, focus: *Session) !*Tab {
+pub fn create(alloc: Allocator, conn: ?*Daemon, ws: u32, id: Daemon.TabRef, root: Node, focus: *Session) !*Tab {
     const self = try alloc.create(Tab);
     self.* = .{ .id = id, .conn = conn, .ws = ws, .root = root, .focus = focus };
     return self;
@@ -135,9 +135,9 @@ pub const Iterator = struct {
 };
 
 /// The pane showing slime's pane `id`.
-pub fn findPane(self: *const Tab, id: u32) ?*Session {
+pub fn findPane(self: *const Tab, id: Daemon.PaneRef) ?*Session {
     var it = self.iterator();
-    while (it.next()) |s| if (s.daemonPane() == id) return s;
+    while (it.next()) |s| if (s.daemonPane()) |p| if (p.eql(id)) return s;
     return null;
 }
 
@@ -665,7 +665,7 @@ test "placing and removing panes" {
     const row = try alloc.alloc(Child, 2);
     row[0] = .{ .share = 7500, .node = .{ .pane = &a } };
     row[1] = .{ .share = 2500, .node = .{ .split = .{ .axis = .column, .children = column } } };
-    const tab = try create(alloc, null, 0, 1, .{ .split = .{ .axis = .row, .children = row } }, &c);
+    const tab = try create(alloc, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &c);
     defer tab.destroy(alloc);
 
     try tab.place(alloc, .{ .x = 10, .y = 20, .w = 401, .h = 201 }, 1);
@@ -720,7 +720,7 @@ test "navigating, resizing, and equalizing panes" {
     const row = try alloc.alloc(Child, 2);
     row[0] = .{ .share = 5000, .node = .{ .pane = &a } };
     row[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = column } } };
-    const tab = try create(alloc, null, 0, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    const tab = try create(alloc, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
     defer tab.destroy(alloc);
     try tab.place(alloc, .{ .w = 401, .h = 201 }, 1);
 
@@ -768,7 +768,7 @@ test "moving panes" {
     row[0] = .{ .share = 3334, .node = .{ .pane = &a } };
     row[1] = .{ .share = 3333, .node = .{ .pane = &b } };
     row[2] = .{ .share = 3333, .node = .{ .pane = &c } };
-    const tab = try create(alloc, null, 0, 1, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    const tab = try create(alloc, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
     defer tab.destroy(alloc);
 
     // c along the top: a column of c over the rest.
@@ -806,16 +806,21 @@ test fromLayout {
     const Ctx = struct {
         a: *Session,
         b: *Session,
-        pub fn session(self: @This(), id: u32) ?*Session {
-            return switch (id) {
+        pub fn session(self: @This(), id: Daemon.PaneRef) ?*Session {
+            return switch (id.n) {
                 1 => self.a,
                 2 => self.b,
                 else => null,
             };
         }
     };
-    var inner = [_]Daemon.Child{ .{ .share = 5000, .node = .{ .pane = 2 } }, .{ .share = 5000, .node = .{ .pane = 3 } } };
-    var outer = [_]Daemon.Child{ .{ .share = 5000, .node = .{ .pane = 1 } }, .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = &inner } } } };
+    const p = struct {
+        fn p(n: u32) Daemon.PaneRef {
+            return .{ .ws = 1, .tab = 1, .n = n };
+        }
+    }.p;
+    var inner = [_]Daemon.Child{ .{ .share = 5000, .node = .{ .pane = p(2) } }, .{ .share = 5000, .node = .{ .pane = p(3) } } };
+    var outer = [_]Daemon.Child{ .{ .share = 5000, .node = .{ .pane = p(1) } }, .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = &inner } } } };
     // Pane 3 has no session, so the column gives way to b.
     const root = (try fromLayout(alloc, .{ .split = .{ .axis = .row, .children = &outer } }, Ctx{ .a = &a, .b = &b })).?;
     defer freeNode(alloc, root);

@@ -49,13 +49,13 @@ func newConn(rw io.ReadWriteCloser, log *slog.Logger) *conn {
 
 // send queues m. It returns false, queueing nothing, if the client is
 // MaxQueued behind or gone.
-func (c *conn) send(id uint32, m Message) bool { return c.enqueue(id, m, false) }
+func (c *conn) send(id PaneID, m Message) bool { return c.enqueue(id, m, false) }
 
 // sendForce queues m whatever the backlog: frames, images, and the
 // messages that start or end an attachment.
-func (c *conn) sendForce(id uint32, m Message) { c.enqueue(id, m, true) }
+func (c *conn) sendForce(id PaneID, m Message) { c.enqueue(id, m, true) }
 
-func (c *conn) enqueue(id uint32, m Message, force bool) bool {
+func (c *conn) enqueue(id PaneID, m Message, force bool) bool {
 	b, err := Encode(id, m)
 	if err != nil {
 		c.log.Error("encoding", "type", m.Type(), "err", err)

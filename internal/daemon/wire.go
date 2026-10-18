@@ -12,8 +12,9 @@ import (
 )
 
 // The wire protocol between a client and the daemon. A frame is a
-// little-endian u32 length of what follows, a u8 type, a u32 pane id
-// (0 when the message isn't about one pane), and a payload.
+// little-endian u32 length of what follows, a u8 type, a pane id as
+// three u32s (workspace, tab, pane; all 0 when the message isn't about
+// one pane), and a payload.
 //
 // Hello and HelloReply are binary, so a client learns the version
 // before it parses anything else, and so is the per-pane path, whose
@@ -40,7 +41,7 @@ const (
 	ImageChunk = 1 << 20
 )
 
-const headerLen = 1 + 4
+const headerLen = 1 + 12
 
 type Type uint8
 
@@ -77,7 +78,7 @@ var (
 // Frame is one undecoded message.
 type Frame struct {
 	Type    Type
-	ID      uint32
+	ID      PaneID
 	Payload []byte
 }
 
@@ -92,6 +93,8 @@ type Message interface {
 type (
 	Size         = rpc.Size
 	Area         = rpc.Area
+	TabID        = rpc.TabID
+	PaneID       = rpc.PaneID
 	Node         = rpc.Node
 	Child        = rpc.Child
 	Axis         = rpc.Axis
@@ -151,14 +154,16 @@ type Reply struct{ Response rpc.Response }
 type Notify struct{ Notification rpc.Notification }
 
 // Bridge, as a connection's first frame instead of Hello, splices the
-// connection to `slime connect` on the host in the frame's id: every
-// frame after it goes to the host's daemon, and its replies come back.
-// Term is the TERM for panes it starts (xterm-ghostty falls back where
-// the host lacks it). A bridge that can't be served gets Error and the
-// connection closes; one that is gets nothing from the local daemon, so
-// the client sends Hello right after Bridge and reads the host daemon's
-// HelloReply.
-type Bridge struct{ Term string }
+// connection to `slime connect` on host Host: every frame after it goes
+// to the host's daemon, and its replies come back. Term is the TERM for
+// panes it starts (xterm-ghostty falls back where the host lacks it). A
+// bridge that can't be served gets Error and the connection closes; one
+// that is gets nothing from the local daemon, so the client sends Hello
+// right after Bridge and reads the host daemon's HelloReply.
+type Bridge struct {
+	Host uint32
+	Term string
+}
 
 // Resize is what a viewer wants the pane in the frame's id sized to;
 // the pane takes the smallest its viewers ask for.
@@ -275,8 +280,15 @@ func (m *Reply) decode(d *decoder)  { d.json(&m.Response) }
 func (m *Notify) encode(e *encoder) { e.json(m.Notification) }
 func (m *Notify) decode(d *decoder) { d.json(&m.Notification) }
 
-func (m *Bridge) encode(e *encoder) { e.str(m.Term) }
-func (m *Bridge) decode(d *decoder) { m.Term = d.str() }
+func (m *Bridge) encode(e *encoder) {
+	e.u32(m.Host)
+	e.str(m.Term)
+}
+
+func (m *Bridge) decode(d *decoder) {
+	m.Host = d.u32()
+	m.Term = d.str()
+}
 
 func (m *Resize) encode(e *encoder) { e.size(m.Size) }
 func (m *Resize) decode(d *decoder) { m.Size = d.size() }
@@ -388,8 +400,9 @@ func newMessage(t Type) Message {
 	return nil
 }
 
-// Encode returns m as a frame for pane id (0 for none), ready to write.
-func Encode(id uint32, m Message) ([]byte, error) {
+// Encode returns m as a frame for pane id (zero for none), ready to
+// write.
+func Encode(id PaneID, m Message) ([]byte, error) {
 	e := encoder{buf: make([]byte, 4+headerLen, 64)}
 	m.encode(&e)
 	if e.err != nil {
@@ -400,9 +413,14 @@ func Encode(id uint32, m Message) ([]byte, error) {
 	}
 	binary.LittleEndian.PutUint32(e.buf[0:4], uint32(len(e.buf)-4))
 	e.buf[4] = byte(m.Type())
-	binary.LittleEndian.PutUint32(e.buf[5:9], id)
+	binary.LittleEndian.PutUint32(e.buf[5:9], id.WS)
+	binary.LittleEndian.PutUint32(e.buf[9:13], id.Tab)
+	binary.LittleEndian.PutUint32(e.buf[13:17], id.N)
 	return e.buf, nil
 }
+
+// NoPane is the id of a frame that isn't about one pane.
+var NoPane PaneID
 
 // Reader reads frames.
 type Reader struct{ r *bufio.Reader }
@@ -435,8 +453,12 @@ func (r *Reader) Read() (Frame, error) {
 		return Frame{}, err
 	}
 	return Frame{
-		Type:    Type(buf[0]),
-		ID:      binary.LittleEndian.Uint32(buf[1:5]),
+		Type: Type(buf[0]),
+		ID: PaneID{
+			WS:  binary.LittleEndian.Uint32(buf[1:5]),
+			Tab: binary.LittleEndian.Uint32(buf[5:9]),
+			N:   binary.LittleEndian.Uint32(buf[9:13]),
+		},
 		Payload: buf[headerLen:],
 	}, nil
 }

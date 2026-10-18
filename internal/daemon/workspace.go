@@ -18,6 +18,7 @@ type workspace struct {
 	id      uint32
 	name    string
 	tabs    []*tab
+	nextTab uint32 // the last tab number given out
 	viewers map[*conn]*viewer
 	// The tab shown; nil while there are none.
 	active *tab
@@ -42,14 +43,15 @@ type viewer struct {
 
 // tab is a layout tree of panes, one of them focused.
 type tab struct {
-	id   uint32
-	ws   *workspace
-	name string
-	root *Node
-	// The pane that gets input, and the one filling the tab (0 for
+	id       TabID
+	ws       *workspace
+	name     string
+	root     *Node
+	nextPane uint32 // the last pane number given out
+	// The pane that gets input, and the one filling the tab (zero for
 	// none).
-	focus uint32
-	zoom  uint32
+	focus PaneID
+	zoom  PaneID
 }
 
 var (
@@ -61,11 +63,23 @@ var (
 
 func (ws *workspace) attached() bool { return len(ws.viewers) > 0 }
 
-func (ws *workspace) activeID() uint32 {
+func (ws *workspace) activeID() TabID {
 	if ws.active == nil {
-		return 0
+		return TabID{}
 	}
 	return ws.active.id
+}
+
+// newTabLocked numbers a tab of ws, not yet in it.
+func (ws *workspace) newTabLocked(name string) *tab {
+	ws.nextTab++
+	return &tab{id: TabID{WS: ws.id, N: ws.nextTab}, ws: ws, name: name}
+}
+
+// newPaneID numbers a pane of t.
+func (t *tab) newPaneID() PaneID {
+	t.nextPane++
+	return PaneID{WS: t.id.WS, Tab: t.id.N, N: t.nextPane}
 }
 
 func (t *tab) info() rpc.Tab {
@@ -146,8 +160,8 @@ func (s *Server) retileLocked(t *tab) {
 // that hasn't reported a cell size uses the area's; extra gives cells
 // for panes not made yet. With no pixel area (no window has given one),
 // the shares divide the workspace's grid in cells.
-func (s *Server) measureLocked(ws *workspace, a Area, root *Node, extra map[uint32]Size) map[uint32]Size {
-	cellOf := func(id uint32) Size {
+func (s *Server) measureLocked(ws *workspace, a Area, root *Node, extra map[PaneID]Size) map[PaneID]Size {
+	cellOf := func(id PaneID) Size {
 		if c, ok := extra[id]; ok {
 			return c
 		}
@@ -156,9 +170,9 @@ func (s *Server) measureLocked(ws *workspace, a Area, root *Node, extra map[uint
 		}
 		return Size{}
 	}
-	out := map[uint32]Size{}
+	out := map[PaneID]Size{}
 	if validArea(a) {
-		grids := Measure(root, a.Width, a.Height, func(id uint32) (uint32, uint32) {
+		grids := Measure(root, a.Width, a.Height, func(id PaneID) (uint32, uint32) {
 			if c := cellOf(id); c.CellW != 0 && c.CellH != 0 {
 				return c.CellW, c.CellH
 			}
@@ -177,7 +191,7 @@ func (s *Server) measureLocked(ws *workspace, a Area, root *Node, extra map[uint
 	if grid.Cols == 0 || grid.Rows == 0 {
 		grid = defaultSize
 	}
-	for id, g := range Measure(root, uint32(grid.Cols), uint32(grid.Rows), func(uint32) (uint32, uint32) { return 1, 1 }) {
+	for id, g := range Measure(root, uint32(grid.Cols), uint32(grid.Rows), func(PaneID) (uint32, uint32) { return 1, 1 }) {
 		c := cellOf(id)
 		out[id] = Size{Cols: g[0], Rows: g[1], CellW: c.CellW, CellH: c.CellH}
 	}
@@ -205,7 +219,8 @@ func (s *Server) workspaceNew(cl *callCtx, p rpc.WorkspaceNewParams) (*rpc.Works
 			return nil, errNoWorkspace
 		}
 	}
-	ws := &workspace{id: s.newIDLocked(), name: p.Name, viewers: map[*conn]*viewer{}}
+	s.nextWS++
+	ws := &workspace{id: s.nextWS, name: p.Name, viewers: map[*conn]*viewer{}}
 	if ws.name == "" {
 		ws.name = "default"
 	}
@@ -277,7 +292,7 @@ func (s *Server) workspaceAttach(cl *callCtx, p rpc.WorkspaceAttachParams) (*rpc
 	c.viewing[ws.id] = ws
 	ws.areaLocked()
 	for _, t := range ws.tabs {
-		var sizes map[uint32]Size
+		var sizes map[PaneID]Size
 		if validArea(v.area) {
 			sizes = s.measureLocked(ws, v.area, t.root, nil)
 		}
@@ -287,7 +302,7 @@ func (s *Server) workspaceAttach(cl *callCtx, p rpc.WorkspaceAttachParams) (*rpc
 				continue
 			}
 			// Without an area, as they are.
-			if err := pn.attach(c, sizes[id]); err != nil {
+			if err := pn.attach(c, sizes[id], NoPane); err != nil {
 				s.log.Error("attaching pane", "pane", id, "err", err)
 			}
 		}
@@ -327,7 +342,7 @@ func (s *Server) releaseLocked(ws *workspace, c *conn, reason string) {
 		}
 	}
 	if reason != "" {
-		c.sendForce(0, notify(rpc.EvWorkspaceDetached, rpc.WorkspaceDetachedParams{ID: ws.id, Reason: reason}))
+		c.sendForce(NoPane, notify(rpc.EvWorkspaceDetached, rpc.WorkspaceDetachedParams{ID: ws.id, Reason: reason}))
 	}
 	delete(ws.viewers, c)
 	delete(c.viewing, ws.id)
@@ -421,50 +436,52 @@ func (s *Server) workspaceResize(cl *callCtx, p rpc.WorkspaceResizeParams) (rpc.
 	return rpc.Empty{}, nil
 }
 
-// workspaceFocus moves the workspace's focus for every viewer: the
-// active tab, a tab's focused pane, and what's zoomed in it.
+// workspaceFocus moves a workspace's focus for every viewer: the
+// active tab, a tab's focused pane, and what's zoomed in it. The tab
+// and pane name the workspace.
 func (s *Server) workspaceFocus(cl *callCtx, p rpc.WorkspaceFocusParams) (rpc.Empty, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ws := s.workspaces[p.ID]
-	if ws == nil {
-		return rpc.Empty{}, errNoWorkspace
-	}
 	var t *tab
-	if p.Tab != 0 {
-		t = s.tabs[p.Tab]
-		if t == nil || t.ws != ws {
+	if !p.Tab.IsZero() {
+		if t = s.tabs[p.Tab]; t == nil {
 			return rpc.Empty{}, errNoTab
 		}
 	}
-	if p.Pane != 0 {
-		pn := s.panes[p.Pane]
-		if pn == nil || pn.tab == nil || pn.tab.ws != ws {
+	var pn *Pane
+	if !p.Pane.IsZero() {
+		pn = s.paneLocked(p.Pane)
+		if pn == nil || pn.tab == nil {
 			return rpc.Empty{}, errNoPane
 		}
 		if t == nil {
 			t = pn.tab
 		} else if pn.tab != t {
-			return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "pane %d isn't in tab %d", p.Pane, p.Tab)
+			return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "pane %s isn't in tab %s", pn.id, p.Tab)
 		}
 	}
 	if t == nil {
 		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "workspace.focus needs a tab or a pane")
 	}
+	ws := t.ws
 	changed := s.selectTabLocked(ws, t)
-	if p.Pane != 0 && t.focus != p.Pane {
-		t.focus = p.Pane
+	if pn != nil && t.focus != pn.id {
+		t.focus = pn.id
 		changed = true
 	}
-	if p.Zoomed != nil && t.zoom != *p.Zoomed {
-		if z := *p.Zoomed; z != 0 {
-			pn := s.panes[z]
-			if pn == nil || pn.tab != t {
-				return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "pane %d isn't in tab %d", z, t.id)
+	if p.Zoomed != nil {
+		var zoom PaneID
+		if !p.Zoomed.IsZero() {
+			zp := s.paneLocked(*p.Zoomed)
+			if zp == nil || zp.tab != t {
+				return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "pane %s isn't in tab %s", *p.Zoomed, t.id)
 			}
+			zoom = zp.id
 		}
-		t.zoom = *p.Zoomed
-		changed = true
+		if t.zoom != zoom {
+			t.zoom = zoom
+			changed = true
+		}
 	}
 	if changed {
 		s.changedLocked(ws, cl.c)
@@ -480,7 +497,7 @@ func (s *Server) selectTabLocked(ws *workspace, t *tab) bool {
 	}
 	ws.active = t
 	if t != nil {
-		s.emitLocked(rpc.EvTabSelected, rpc.TabEventParams{Workspace: ws.id, ID: t.id}, nil, nil)
+		s.emitLocked(rpc.EvTabSelected, rpc.TabEventParams{ID: t.id}, nil, nil)
 	}
 	return true
 }
@@ -488,13 +505,13 @@ func (s *Server) selectTabLocked(ws *workspace, t *tab) bool {
 // focusNewLocked gives a pane a viewer just made the focus: its tab is
 // shown, unzoomed, with the pane focused. A script's pane takes no
 // focus from the user.
-func (s *Server) focusNewLocked(cl *callCtx, t *tab, pane uint32) {
+func (s *Server) focusNewLocked(cl *callCtx, t *tab, pane PaneID) {
 	if cl.c == nil || t.ws.viewers[cl.c] == nil {
 		return
 	}
 	s.selectTabLocked(t.ws, t)
 	t.focus = pane
-	t.zoom = 0
+	t.zoom = PaneID{}
 }
 
 func (s *Server) workspaceInfo(_ *callCtx, p rpc.WorkspaceParams) (*rpc.WorkspaceDesc, error) {
@@ -536,7 +553,7 @@ func (s *Server) tabNew(cl *callCtx, m rpc.TabNewParams) (*rpc.Created, error) {
 // started is a pane's child and terminal, running before the pane is
 // made, in case what it was for is gone by then.
 type started struct {
-	id   uint32
+	id   PaneID
 	spec *rpc.PaneSpec
 	// command is what runs: the spec's, or the default shell.
 	command string
@@ -552,11 +569,17 @@ func (st *started) close() {
 
 // addTab starts l's panes, outside the lock, and adds them to ws as a
 // tab. size, if given, is a single pane's; else the panes are measured
-// in the workspace's tab area.
+// in the workspace's tab area. The tab is numbered first, so its panes'
+// ids (their environment names them) are the tab's; a tab whose panes
+// don't start keeps its number.
 func (s *Server) addTab(cl *callCtx, ws *workspace, name string, l *rpc.Layout, size Size) (*rpc.Created, error) {
 	s.mu.Lock()
-	// Ids first: a pane's environment names it.
-	root, specs := s.layoutTreeLocked(l)
+	if s.workspaces[ws.id] != ws || ws.killed {
+		s.mu.Unlock()
+		return nil, errNoWorkspace
+	}
+	t := ws.newTabLocked(name)
+	root, specs := layoutTree(t, l)
 	sizes := s.measureLocked(ws, ws.area, root, nil)
 	if l.IsLeaf() && size.Cols != 0 && size.Rows != 0 {
 		sizes[root.Pane] = size
@@ -565,7 +588,7 @@ func (s *Server) addTab(cl *callCtx, ws *workspace, name string, l *rpc.Layout, 
 
 	var panes []*started
 	for _, id := range root.Panes() {
-		st, err := s.startPane(id, ws.id, specs[id], sizes[id])
+		st, err := s.startPane(id, specs[id], sizes[id])
 		if err != nil {
 			for _, p := range panes {
 				p.close()
@@ -596,13 +619,14 @@ func (s *Server) addTab(cl *callCtx, ws *workspace, name string, l *rpc.Layout, 
 			ws.grid = size
 		}
 	}
-	t := &tab{id: s.newIDLocked(), ws: ws, name: name, root: root, focus: root.Panes()[0]}
+	t.root = root
+	t.focus = root.Panes()[0]
 	s.tabs[t.id] = t
 	ws.tabs = append(ws.tabs, t)
 	if ws.active == nil {
 		ws.active = t
 	}
-	s.emitLocked(rpc.EvTabCreated, rpc.TabEventParams{Workspace: ws.id, ID: t.id, Name: t.name}, nil, nil)
+	s.emitLocked(rpc.EvTabCreated, rpc.TabEventParams{ID: t.id, Name: t.name}, nil, nil)
 	for _, st := range panes {
 		s.addPaneLocked(t, st)
 	}
@@ -610,17 +634,17 @@ func (s *Server) addTab(cl *callCtx, ws *workspace, name string, l *rpc.Layout, 
 	s.log.Info("tab started", "workspace", ws.id, "tab", t.id, "panes", root.Panes())
 	s.focusNewLocked(cl, t, t.focus)
 	s.changedLocked(ws, nil)
-	return &rpc.Created{Workspace: ws.id, Tab: t.id, Pane: t.focus}, nil
+	return &rpc.Created{Pane: t.focus}, nil
 }
 
-// layoutTreeLocked gives each of l's leaves a pane id, returning the
+// layoutTree numbers each of l's leaves as a pane of t, returning the
 // tree of ids and what each runs.
-func (s *Server) layoutTreeLocked(l *rpc.Layout) (*Node, map[uint32]*rpc.PaneSpec) {
-	specs := map[uint32]*rpc.PaneSpec{}
+func layoutTree(t *tab, l *rpc.Layout) (*Node, map[PaneID]*rpc.PaneSpec) {
+	specs := map[PaneID]*rpc.PaneSpec{}
 	var build func(l *rpc.Layout) *Node
 	build = func(l *rpc.Layout) *Node {
 		if l.IsLeaf() {
-			id := s.newIDLocked()
+			id := t.newPaneID()
 			specs[id] = l.Pane
 			return leaf(id)
 		}
@@ -640,26 +664,27 @@ func (s *Server) addPaneLocked(t *tab, st *started) *Pane {
 	p.tab = t
 	s.panes[p.id] = p
 	ws := t.ws
-	s.log.Info("pane started", "workspace", ws.id, "tab", t.id, "pane", p.id, "command", st.command, "pid", st.pty.PID())
-	s.emitLocked(rpc.EvPaneCreated, rpc.PaneCreatedParams{Workspace: ws.id, Tab: t.id, ID: p.id}, nil, nil)
+	s.log.Info("pane started", "pane", p.id, "command", st.command, "pid", st.pty.PID())
+	s.emitLocked(rpc.EvPaneCreated, rpc.PaneCreatedParams{ID: p.id}, nil, nil)
 	for c := range ws.viewers {
-		p.attach(c, Size{})
+		p.attach(c, Size{}, NoPane)
 	}
 	go p.run()
 	return p
 }
 
 // paneEnv is what every pane's environment says about itself: the pane
-// it is, the workspace it's in, and the daemon it belongs to
+// it is (which names its tab and workspace), the workspace again for
+// a window started from it, and the daemon it belongs to
 // (SLIME_INSTANCE, when the daemon is one), so the CLI and scripts run
 // in it act on them by default.
-func paneEnv(id, ws uint32, spec *rpc.PaneSpec) map[string]string {
+func paneEnv(id PaneID, spec *rpc.PaneSpec) map[string]string {
 	env := make(map[string]string, len(spec.Env)+3)
 	for k, v := range spec.Env {
 		env[k] = v
 	}
-	env["SLIME_PANE"] = strconv.FormatUint(uint64(id), 10)
-	env["SLIME_WORKSPACE"] = strconv.FormatUint(uint64(ws), 10)
+	env["SLIME_PANE"] = id.String()
+	env["SLIME_WORKSPACE"] = strconv.FormatUint(uint64(id.WS), 10)
 	if inst := os.Getenv("SLIME_INSTANCE"); inst != "" {
 		env["SLIME_INSTANCE"] = inst
 	}
@@ -676,51 +701,55 @@ func (s *Server) paneSplit(cl *callCtx, m rpc.PaneSplitParams) (*rpc.Created, er
 	}
 	// Estimate the new pane's size from the tree as it would be.
 	s.mu.Lock()
-	target := s.panes[m.Pane]
+	target := s.paneLocked(m.Pane)
 	if target == nil || target.tab == nil {
 		s.mu.Unlock()
 		return nil, errNoPane
 	}
 	t := target.tab
-	id := s.newIDLocked()
-	trial, err := splitNode(t.root.Clone(), m.Pane, id, m.Direction, m.Share)
+	beside := target.id
+	id := t.newPaneID()
+	trial, err := splitNode(t.root.Clone(), beside, id, m.Direction, m.Share)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
 	}
 	// The new pane takes its neighbour's cell size, as a split takes its
 	// font.
-	size := s.measureLocked(t.ws, t.ws.area, trial, map[uint32]Size{id: target.cell()})[id]
+	size := s.measureLocked(t.ws, t.ws.area, trial, map[PaneID]Size{id: target.cell()})[id]
 	s.mu.Unlock()
 
-	st, err := s.startPane(id, t.ws.id, &rpc.PaneSpec{Command: m.Command, Cwd: m.Cwd, Env: m.Env}, size)
+	st, err := s.startPane(id, &rpc.PaneSpec{Command: m.Command, Cwd: m.Cwd, Env: m.Env}, size)
 	if err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// The tree may have changed while the child started.
-	if s.panes[m.Pane] != target || target.tab != t || s.tabs[t.id] != t {
+	if s.panes[beside] != target || target.tab != t || s.tabs[t.id] != t {
 		st.close()
 		return nil, errNoPane
 	}
-	root, err := splitNode(t.root, m.Pane, id, m.Direction, m.Share)
+	root, err := splitNode(t.root, beside, id, m.Direction, m.Share)
 	if err != nil {
 		st.close()
 		return nil, err
 	}
 	t.root = root
 	s.addPaneLocked(t, st)
-	s.log.Info("pane split", "tab", t.id, "pane", id, "beside", m.Pane)
+	s.log.Info("pane split", "pane", id, "beside", beside)
 	ws := t.ws
 	s.focusNewLocked(cl, t, id)
 	s.retileLocked(t)
 	s.changedLocked(ws, nil)
-	return &rpc.Created{Workspace: ws.id, Tab: t.id, Pane: id}, nil
+	return &rpc.Created{Pane: id}, nil
 }
 
 // paneMove takes a pane out of its tab and puts it along a side of
-// another, or of a new tab after its own.
+// another, or of a new tab after its own. In another tab it's that
+// tab's next pane: its viewers let go of it under the old id and take
+// it up under the new, and the old id forwards to the new while the
+// pane lives.
 func (s *Server) paneMove(cl *callCtx, m rpc.PaneMoveParams) (*rpc.Created, error) {
 	if m.Side == 0 {
 		m.Side = Right
@@ -730,31 +759,28 @@ func (s *Server) paneMove(cl *callCtx, m rpc.PaneMoveParams) (*rpc.Created, erro
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pn := s.panes[m.Pane]
+	pn := s.paneLocked(m.Pane)
 	if pn == nil || pn.tab == nil {
 		return nil, errNoPane
 	}
 	src := pn.tab
 	ws := src.ws
 	var dst *tab
-	if m.Tab != 0 {
+	if !m.Tab.IsZero() {
 		dst = s.tabs[m.Tab]
 		if dst == nil {
 			return nil, errNoTab
 		}
 		if dst.ws != ws {
-			return nil, rpc.Errorf(rpc.CodeInvalidParams, "tab %d is in another workspace", m.Tab)
+			return nil, rpc.Errorf(rpc.CodeInvalidParams, "tab %s is in another workspace", m.Tab)
 		}
 	}
-	if dst == src && src.root.IsLeaf() {
+	if src.root.IsLeaf() && (dst == src || dst == nil) {
 		// Alone in its tab already.
-		return &rpc.Created{Workspace: ws.id, Tab: src.id, Pane: pn.id}, nil
+		return &rpc.Created{Pane: pn.id}, nil
 	}
 	if dst == nil {
-		if src.root.IsLeaf() {
-			return &rpc.Created{Workspace: ws.id, Tab: src.id, Pane: pn.id}, nil
-		}
-		dst = &tab{id: s.newIDLocked(), ws: ws}
+		dst = ws.newTabLocked("")
 		s.tabs[dst.id] = dst
 		at := len(ws.tabs)
 		for i, t := range ws.tabs {
@@ -764,39 +790,68 @@ func (s *Server) paneMove(cl *callCtx, m rpc.PaneMoveParams) (*rpc.Created, erro
 			}
 		}
 		ws.tabs = append(ws.tabs[:at], append([]*tab{dst}, ws.tabs[at:]...)...)
-		s.emitLocked(rpc.EvTabCreated, rpc.TabEventParams{Workspace: ws.id, ID: dst.id}, nil, nil)
+		s.emitLocked(rpc.EvTabCreated, rpc.TabEventParams{ID: dst.id}, nil, nil)
 	}
 
-	s.takePaneLocked(src, pn.id)
+	old := pn.id
+	s.takePaneLocked(src, old)
+	id := old
+	if dst != src {
+		id = dst.newPaneID()
+		for c := range ws.viewers {
+			pn.detach(c)
+		}
+		delete(s.panes, old)
+		for from, to := range s.moved {
+			if to == old {
+				s.moved[from] = id
+			}
+		}
+		s.moved[old] = id
+		pn.renameLocked(id)
+		s.panes[id] = pn
+	}
 	if dst.root == nil {
-		dst.root = leaf(pn.id)
+		dst.root = leaf(id)
 	} else {
-		dst.root = joinEdge(dst.root, pn.id, m.Side)
+		dst.root = joinEdge(dst.root, id, m.Side)
 	}
 	pn.tab = dst
-	if dst.focus == 0 {
-		dst.focus = pn.id
+	if dst.focus.IsZero() {
+		dst.focus = id
 	}
-	s.log.Info("pane moved", "pane", pn.id, "from", src.id, "to", dst.id)
+	s.log.Info("pane moved", "pane", id, "from", old)
+	if dst != src {
+		s.emitLocked(rpc.EvPaneMoved, rpc.PaneMovedParams{ID: id, From: old}, nil, nil)
+		for c, v := range ws.viewers {
+			var size Size
+			if validArea(v.area) {
+				size = s.measureLocked(ws, v.area, dst.root, nil)[id]
+			}
+			if err := pn.attach(c, size, old); err != nil {
+				s.log.Error("attaching pane", "pane", id, "err", err)
+			}
+		}
+	}
 	if src.root == nil {
 		s.removeTabLocked(src)
 	} else {
 		s.retileLocked(src)
 	}
-	s.focusNewLocked(cl, dst, pn.id)
+	s.focusNewLocked(cl, dst, id)
 	s.retileLocked(dst)
 	s.changedLocked(ws, nil)
-	return &rpc.Created{Workspace: ws.id, Tab: dst.id, Pane: pn.id}, nil
+	return &rpc.Created{Pane: id}, nil
 }
 
 // takePaneLocked removes pane from t's tree, moving the tab's focus
 // and zoom off it: to the pane before it in layout order, or the one
 // after. The tree is nil once its last pane goes.
-func (s *Server) takePaneLocked(t *tab, pane uint32) {
+func (s *Server) takePaneLocked(t *tab, pane PaneID) {
 	panes := t.root.Panes()
 	t.root = removeNode(t.root, pane)
 	if t.zoom == pane {
-		t.zoom = 0
+		t.zoom = PaneID{}
 	}
 	if t.focus != pane || t.root == nil {
 		return
@@ -860,19 +915,20 @@ func (s *Server) tabRename(_ *callCtx, p rpc.TabRenameParams) (rpc.Empty, error)
 		return rpc.Empty{}, errNoTab
 	}
 	t.name = p.Name
-	s.emitLocked(rpc.EvTabRenamed, rpc.TabEventParams{Workspace: t.ws.id, ID: t.id, Name: t.name}, nil, nil)
+	s.emitLocked(rpc.EvTabRenamed, rpc.TabEventParams{ID: t.id, Name: t.name}, nil, nil)
 	s.changedLocked(t.ws, nil)
 	return rpc.Empty{}, nil
 }
 
-func (s *Server) tabInfo(_ *callCtx, p rpc.TabParams) (*rpc.TabInfoResult, error) {
+func (s *Server) tabInfo(_ *callCtx, p rpc.TabParams) (*rpc.Tab, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := s.tabs[p.ID]
 	if t == nil {
 		return nil, errNoTab
 	}
-	return &rpc.TabInfoResult{Workspace: t.ws.id, Tab: t.info()}, nil
+	info := t.info()
+	return &info, nil
 }
 
 // removeTabLocked takes a tab out of its workspace, moving the active
@@ -895,7 +951,7 @@ func (s *Server) removeTabLocked(t *tab) bool {
 			break
 		}
 	}
-	s.emitLocked(rpc.EvTabClosed, rpc.TabEventParams{Workspace: ws.id, ID: t.id}, nil, nil)
+	s.emitLocked(rpc.EvTabClosed, rpc.TabEventParams{ID: t.id}, nil, nil)
 	switch {
 	case len(ws.tabs) > 0:
 		return true
@@ -912,11 +968,17 @@ func (s *Server) removeTabLocked(t *tab) bool {
 
 // paneExited takes a pane whose child is gone out of its tab: the tree
 // closes over it, an empty tab goes, and the viewers hear. told are
-// the viewers the pane told itself; the subscribers hear here.
+// the viewers the pane told itself; the subscribers hear here. The ids
+// it had before moving forward nowhere now.
 func (s *Server) paneExited(p *Pane, status uint32, told []*conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.panes, p.id)
+	for from, to := range s.moved {
+		if to == p.id {
+			delete(s.moved, from)
+		}
+	}
 	defer s.checkIdleLocked()
 	s.emitLocked(rpc.EvPaneExited, rpc.PaneExitedParams{ID: p.id, Status: status}, nil, told...)
 	t := p.tab
@@ -963,17 +1025,12 @@ func (s *Server) paneText(_ *callCtx, p rpc.PaneTextParams) (*rpc.PaneTextResult
 	return &rpc.PaneTextResult{Text: text}, nil
 }
 
+// paneInfo describes a pane, under the id it has now if it moved.
 func (s *Server) paneInfo(_ *callCtx, p rpc.PaneParams) (*rpc.PaneDesc, error) {
-	s.mu.Lock()
-	pn := s.panes[p.ID]
-	var t *tab
-	if pn != nil {
-		t = pn.tab
-	}
-	s.mu.Unlock()
+	pn := s.pane(p.ID)
 	if pn == nil {
 		return nil, errNoPane
 	}
-	d := pn.desc(t)
+	d := pn.desc()
 	return &d, nil
 }

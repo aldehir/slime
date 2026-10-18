@@ -201,11 +201,11 @@ type window struct {
 	h       *harness
 	c       *Client
 	ws      *rpc.Workspace
-	screens map[uint32]*vt.Screen
+	screens map[PaneID]*vt.Screen
 }
 
 func (h *harness) window() *window {
-	return &window{t: h.t, h: h, c: h.connect(), screens: map[uint32]*vt.Screen{}}
+	return &window{t: h.t, h: h, c: h.connect(), screens: map[PaneID]*vt.Screen{}}
 }
 
 // PaneState is a pane as attaching delivered it, with the frames and
@@ -220,7 +220,7 @@ type PaneState struct {
 // an attached workspace) delivered before its reply.
 type Attachment struct {
 	Workspace *rpc.Workspace
-	Panes     map[uint32]*PaneState
+	Panes     map[PaneID]*PaneState
 }
 
 // collect takes what c set aside before the last reply: the panes that
@@ -234,7 +234,7 @@ func collect(c *Client) *Attachment {
 // peekBacklog reads what c set aside as collect does, leaving it for
 // Recv: a reply can follow the first frames of the pane it made.
 func peekBacklog(c *Client) *Attachment {
-	a := &Attachment{Panes: map[uint32]*PaneState{}}
+	a := &Attachment{Panes: map[PaneID]*PaneState{}}
 	for _, p := range c.backlog {
 		switch m := p.m.(type) {
 		case *Draw:
@@ -287,7 +287,7 @@ func (w *window) absorb(a *Attachment) {
 }
 
 // draw applies a pane's frame to its screen and acks it.
-func (w *window) draw(id uint32, d *Draw) {
+func (w *window) draw(id PaneID, d *Draw) {
 	w.t.Helper()
 	if s := w.screens[id]; s != nil {
 		if err := s.Apply(d.Data); err != nil {
@@ -298,7 +298,7 @@ func (w *window) draw(id uint32, d *Draw) {
 }
 
 // newWorkspace creates a workspace with one tab, and returns its pane.
-func (w *window) newWorkspace() uint32 {
+func (w *window) newWorkspace() PaneID {
 	w.t.Helper()
 	var ws rpc.Workspace
 	if _, err := w.call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Name: "test"}, &ws); err != nil {
@@ -308,7 +308,7 @@ func (w *window) newWorkspace() uint32 {
 	return w.newTab()
 }
 
-func (w *window) newTab() uint32 {
+func (w *window) newTab() PaneID {
 	w.t.Helper()
 	var created rpc.Created
 	a, err := w.call(rpc.TabNew, rpc.TabNewParams{Workspace: w.ws.ID, Size: Size{Cols: 40, Rows: 10}}, &created)
@@ -320,7 +320,7 @@ func (w *window) newTab() uint32 {
 }
 
 // split starts a pane beside pane and returns what came with it.
-func (w *window) split(pane uint32, dir Direction, share uint16, command string) (*Attachment, rpc.Created) {
+func (w *window) split(pane PaneID, dir Direction, share uint16, command string) (*Attachment, rpc.Created) {
 	w.t.Helper()
 	var created rpc.Created
 	a, err := w.call(rpc.PaneSplit, rpc.PaneSplitParams{Pane: pane, Direction: dir, Share: share, Command: command}, &created)
@@ -350,7 +350,7 @@ func (w *window) detach() {
 
 // until applies frames to the window's screens until pane's shows want,
 // and returns the other messages it read on the way.
-func (w *window) until(pane uint32, want string) []Message {
+func (w *window) until(pane PaneID, want string) []Message {
 	w.t.Helper()
 	var others []Message
 	deadline := time.Now().Add(10 * time.Second)
@@ -359,7 +359,7 @@ func (w *window) until(pane uint32, want string) []Message {
 			return others
 		}
 		if time.Now().After(deadline) {
-			w.t.Fatalf("pane %d never showed %q; text %q", pane, want, w.text(pane))
+			w.t.Fatalf("pane %s never showed %q; text %q", pane, want, w.text(pane))
 		}
 		id, m, err := w.c.Recv()
 		if err != nil {
@@ -410,7 +410,7 @@ func nextEvent[P any](w *window, name string) P {
 
 // text is the pane's screen as the window has drawn it: the viewport,
 // not the scrollback.
-func (w *window) text(pane uint32) string {
+func (w *window) text(pane PaneID) string {
 	if w.screens[pane] == nil {
 		return ""
 	}
@@ -419,7 +419,7 @@ func (w *window) text(pane uint32) string {
 }
 
 // serverText is the daemon's own copy of a pane's screen.
-func (h *harness) serverText(id uint32) string {
+func (h *harness) serverText(id PaneID) string {
 	p := h.srv.pane(id)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -468,20 +468,21 @@ func TestWireRoundTrip(t *testing.T) {
 		&Ack{Seq: 4},
 		&Event{Data: []byte{1, 2, 3}},
 		&Resize{Size: Size{1, 2, 3, 4}},
-		&Bridge{Term: "xterm-ghostty"},
+		&Bridge{Host: 3, Term: "xterm-ghostty"},
 		&HelloReply{Version: 1, PID: 99, FrameLayout: 1 << 63},
-		&Reply{Response: rpc.Response{JSONRPC: "2.0", ID: 7, Result: json.RawMessage(`{"workspace":9,"tab":2,"pane":3}`)}},
+		&Reply{Response: rpc.Response{JSONRPC: "2.0", ID: 7, Result: json.RawMessage(`{"pane":"9.2.3"}`)}},
 		&Reply{Response: rpc.Response{JSONRPC: "2.0", ID: 8, Error: &rpc.Error{Code: rpc.CodeNotFound, Message: "no such pane"}}},
-		&Notify{Notification: rpc.Notification{JSONRPC: "2.0", Method: "pane.exited", Params: json.RawMessage(`{"id":3,"status":3221225786}`)}},
+		&Notify{Notification: rpc.Notification{JSONRPC: "2.0", Method: "pane.exited", Params: json.RawMessage(`{"id":"9.2.3","status":3221225786}`)}},
 		&Error{Message: "no such host"},
 		&Draw{Seq: 4, Data: []byte{1, 2, 3}},
 		&Image{ID: 7, Generation: 1 << 40, Width: 2, Height: 3, Total: 10, Offset: 4, Data: []byte{9, 8, 7}},
 		&Copied{Tag: 5, Text: "sel"},
 		&Notice{Kind: NoticeStatus, Text: "", Status: []StatusRecord{{"", 1, 40}, {"deploy/eu", 3, -1}}},
 	}
+	ids := func(i int) PaneID { return PaneID{WS: uint32(i), Tab: uint32(i) * 2, N: uint32(i) * 3} }
 	var stream bytes.Buffer
 	for i, m := range msgs {
-		b, err := Encode(uint32(i), m)
+		b, err := Encode(ids(i), m)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -497,7 +498,7 @@ func TestWireRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if f.ID != uint32(i) || !reflect.DeepEqual(got, want) {
+		if f.ID != ids(i) || !reflect.DeepEqual(got, want) {
 			t.Errorf("frame %d: %#v, want %#v", i, got, want)
 		}
 	}
@@ -515,11 +516,11 @@ func TestWireBadFrames(t *testing.T) {
 	if _, err := NewReader(bytes.NewReader(short)).Read(); err != ErrShortFrame {
 		t.Errorf("short: %v", err)
 	}
-	b, _ := Encode(1, &Error{Message: "gone"})
+	b, _ := Encode(PaneID{WS: 1, Tab: 1, N: 1}, &Error{Message: "gone"})
 	if _, err := NewReader(bytes.NewReader(b[:len(b)-2])).Read(); err != io.ErrUnexpectedEOF {
 		t.Errorf("cut off: %v", err)
 	}
-	f := Frame{Type: TypeBridge, Payload: []byte{0xff, 0, 0, 0, 'x'}}
+	f := Frame{Type: TypeBridge, Payload: []byte{1, 0, 0, 0, 0xff, 0, 0, 0, 'x'}}
 	if _, err := Decode(f); err == nil {
 		t.Error("truncated string decoded")
 	}
@@ -534,7 +535,7 @@ func TestWireBadFrames(t *testing.T) {
 func TestBadCalls(t *testing.T) {
 	h := newHarness(t)
 	c := h.connect()
-	c.Send(0, &Call{Request: rpc.Request{JSONRPC: "2.0", ID: 1, Method: "no.such"}})
+	c.Send(NoPane, &Call{Request: rpc.Request{JSONRPC: "2.0", ID: 1, Method: "no.such"}})
 	_, m, err := c.Recv()
 	if err != nil {
 		t.Fatal(err)
@@ -542,13 +543,13 @@ func TestBadCalls(t *testing.T) {
 	if r, ok := m.(*Reply); !ok || r.Response.ID != 1 || r.Response.Error == nil || r.Response.Error.Code != rpc.CodeMethodNotFound {
 		t.Errorf("unknown method got %#v", m)
 	}
-	c.Send(0, &Call{Request: rpc.Request{JSONRPC: "2.0", ID: 2, Method: rpc.TabNew, Params: json.RawMessage(`{"workspace":"nine"}`)}})
+	c.Send(NoPane, &Call{Request: rpc.Request{JSONRPC: "2.0", ID: 2, Method: rpc.TabNew, Params: json.RawMessage(`{"workspace":"nine"}`)}})
 	_, m, _ = c.Recv()
 	if r, ok := m.(*Reply); !ok || r.Response.Error == nil || r.Response.Error.Code != rpc.CodeInvalidParams {
 		t.Errorf("bad params got %#v", m)
 	}
 	// Unparseable JSON is dropped; the next call still works.
-	b, _ := Encode(0, &Bridge{Term: `{"jsonrpc":`})
+	b, _ := Encode(NoPane, &Bridge{Term: `{"jsonrpc":`})
 	b[4] = byte(TypeCall)
 	c.rw.Write(b)
 	if err := c.Call(rpc.WorkspaceList, nil, nil); err != nil {
@@ -561,7 +562,7 @@ func TestVersionMismatch(t *testing.T) {
 	a, b := net.Pipe()
 	go h.srv.handle(a)
 	c := &Client{rw: b, r: NewReader(b)}
-	c.Send(0, &Hello{Version: Version + 1})
+	c.Send(NoPane, &Hello{Version: Version + 1})
 	_, m, err := c.Recv()
 	if _, ok := m.(*HelloReply); err != nil || !ok {
 		t.Fatalf("got %#v, %v", m, err)
@@ -597,7 +598,7 @@ func TestDetachReattach(t *testing.T) {
 	if len(l.Workspaces) != 1 || l.Workspaces[0].Attached || l.Workspaces[0].DetachedAt == 0 {
 		t.Fatalf("list %+v", l.Workspaces)
 	}
-	if len(l.Panes) != 1 || l.Panes[0].ID != pane || l.Panes[0].PID != 4242 || l.Panes[0].Workspace != ws {
+	if len(l.Panes) != 1 || l.Panes[0].ID != pane || l.Panes[0].PID != 4242 || l.Panes[0].ID.WS != ws {
 		t.Fatalf("panes %+v", l.Panes)
 	}
 	w2 := h.window()
@@ -775,7 +776,7 @@ func TestFocus(t *testing.T) {
 	w1.absorb(a)
 	second := created.Pane
 	if w1.ws.Tabs[0].Focus != second {
-		t.Errorf("focus after a split: %d, want %d", w1.ws.Tabs[0].Focus, second)
+		t.Errorf("focus after a split: %s, want %s", w1.ws.Tabs[0].Focus, second)
 	}
 	// A script's doesn't.
 	script := h.connect()
@@ -785,20 +786,20 @@ func TestFocus(t *testing.T) {
 	}
 	nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
 	if w1.ws.ActiveTab != tab1 || len(w1.ws.Tabs) != 2 {
-		t.Errorf("after a script's tab: active %d, tabs %d", w1.ws.ActiveTab, len(w1.ws.Tabs))
+		t.Errorf("after a script's tab: active %s, tabs %d", w1.ws.ActiveTab, len(w1.ws.Tabs))
 	}
 
 	w2 := h.window()
 	w2.attach(w1.ws.ID, Area{})
 	nextEvent[rpc.WorkspaceViewerParams](w1, rpc.EvWorkspaceViewerJoined)
 	if w2.ws.ActiveTab != tab1 || w2.ws.Tabs[0].Focus != second {
-		t.Errorf("the second viewer sees active %d focus %d", w2.ws.ActiveTab, w2.ws.Tabs[0].Focus)
+		t.Errorf("the second viewer sees active %s focus %s", w2.ws.ActiveTab, w2.ws.Tabs[0].Focus)
 	}
 
 	// The second focuses the first pane and zooms it: the first viewer
 	// hears, the second doesn't hear its own change.
 	zoom := first
-	if _, err := w2.call(rpc.WorkspaceFocus, rpc.WorkspaceFocusParams{ID: w2.ws.ID, Pane: first, Zoomed: &zoom}, nil); err != nil {
+	if _, err := w2.call(rpc.WorkspaceFocus, rpc.WorkspaceFocusParams{Pane: first, Zoomed: &zoom}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(w2.c.backlog) != 0 {
@@ -809,34 +810,35 @@ func TestFocus(t *testing.T) {
 		t.Errorf("after focusing: %+v", ws.Tabs[0])
 	}
 	// Selecting the other tab.
-	if _, err := w2.call(rpc.WorkspaceFocus, rpc.WorkspaceFocusParams{ID: w2.ws.ID, Tab: scripted.Tab}, nil); err != nil {
+	if _, err := w2.call(rpc.WorkspaceFocus, rpc.WorkspaceFocusParams{Tab: scripted.Pane.TabID()}, nil); err != nil {
 		t.Fatal(err)
 	}
 	ws = nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
-	if ws.ActiveTab != scripted.Tab {
-		t.Errorf("active tab %d, want %d", ws.ActiveTab, scripted.Tab)
+	if ws.ActiveTab != scripted.Pane.TabID() {
+		t.Errorf("active tab %s, want %s", ws.ActiveTab, scripted.Pane.TabID())
 	}
 	// Closing the active tab moves to the one before it. The zoomed pane
 	// exiting unzooms, and the focus moves to its neighbour.
-	if _, err := w2.call(rpc.TabClose, rpc.TabParams{ID: scripted.Tab}, nil); err != nil {
+	if _, err := w2.call(rpc.TabClose, rpc.TabParams{ID: scripted.Pane.TabID()}, nil); err != nil {
 		t.Fatal(err)
 	}
 	ws = nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
 	if ws.ActiveTab != tab1 {
-		t.Errorf("active tab after a close %d, want %d", ws.ActiveTab, tab1)
+		t.Errorf("active tab after a close %s, want %s", ws.ActiveTab, tab1)
 	}
 	h.pty(0).exit(0)
 	nextEvent[rpc.PaneExitedParams](w1, rpc.EvPaneExited)
 	ws = nextEvent[rpc.Workspace](w1, rpc.EvWorkspaceChanged)
-	if ws.Tabs[0].Focus != second || ws.Tabs[0].Zoomed != 0 {
+	if ws.Tabs[0].Focus != second || !ws.Tabs[0].Zoomed.IsZero() {
 		t.Errorf("after the zoomed pane exited: %+v", ws.Tabs[0])
 	}
 
 	// Bad asks.
 	for _, p := range []rpc.WorkspaceFocusParams{
-		{ID: w2.ws.ID},
-		{ID: w2.ws.ID, Tab: 999},
-		{ID: w2.ws.ID, Pane: 999},
+		{},
+		{Tab: TabID{WS: w2.ws.ID, N: 999}},
+		{Pane: PaneID{WS: w2.ws.ID, Tab: 1, N: 999}},
+		{Tab: tab1, Pane: PaneID{WS: w2.ws.ID, Tab: 999, N: 1}},
 	} {
 		var rerr *rpc.Error
 		if err := w2.c.Call(rpc.WorkspaceFocus, p, nil); !errors.As(err, &rerr) {
@@ -869,8 +871,8 @@ func TestTabNewLayout(t *testing.T) {
 		t.Fatalf("%d panes attached", len(a.Panes))
 	}
 	tab := w.ws.Tabs[1]
-	if tab.ID != created.Tab || tab.Name != "dev" || tab.Focus != created.Pane || w.ws.ActiveTab != tab.ID {
-		t.Errorf("tab %+v, created %+v, active %d", tab, created, w.ws.ActiveTab)
+	if tab.ID != created.Pane.TabID() || tab.Name != "dev" || tab.Focus != created.Pane || w.ws.ActiveTab != tab.ID {
+		t.Errorf("tab %+v, created %+v, active %s", tab, created, w.ws.ActiveTab)
 	}
 	panes := tab.Tree.Panes()
 	if len(panes) != 3 || panes[0] != created.Pane || tab.Tree.Children[0].Share != 7000 || tab.Tree.Children[1].Node.Children[0].Share != 5000 {
@@ -911,7 +913,10 @@ func TestTabNewLayout(t *testing.T) {
 }
 
 // TestPaneMove moves a pane into a new tab, then beside another tab's
-// panes; the tab it leaves empty closes.
+// panes; the tab it leaves empty closes. In another tab the pane is
+// that tab's next pane: the viewer lets go of it under the old id and
+// takes it up under the new, and the old id still finds it while it
+// lives.
 func TestPaneMove(t *testing.T) {
 	h := newHarness(t)
 	w := h.window()
@@ -920,6 +925,8 @@ func TestPaneMove(t *testing.T) {
 	w.absorb(a)
 	second := created.Pane
 	tab1 := w.ws.Tabs[0].ID
+	h.pty(1).emit("in the second")
+	w.until(second, "in the second")
 
 	var moved rpc.Created
 	a, err := w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: second}, &moved)
@@ -927,40 +934,68 @@ func TestPaneMove(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.absorb(a)
-	if len(w.ws.Tabs) != 2 || moved.Tab != w.ws.Tabs[1].ID || moved.Pane != second {
+	// The workspace's second tab, and its first pane.
+	inTab2 := PaneID{WS: w.ws.ID, Tab: 2, N: 1}
+	if len(w.ws.Tabs) != 2 || moved.Pane != inTab2 || w.ws.Tabs[1].ID != inTab2.TabID() {
 		t.Fatalf("after moving out: %+v, tabs %+v", moved, w.ws.Tabs)
 	}
+	// It came anew under the new id, saying which it was, with its
+	// screen.
+	if ps := a.Panes[moved.Pane]; ps == nil || ps.Attached.MovedFrom != second {
+		t.Fatalf("attached as %+v", a.Panes)
+	}
+	w.until(moved.Pane, "in the second")
 	if tree := w.ws.Tabs[0].Tree; !tree.IsLeaf() || tree.Pane != first {
 		t.Errorf("the tab it left: %s", show(tree))
 	}
-	if w.ws.ActiveTab != moved.Tab || w.ws.Tabs[1].Focus != second {
-		t.Errorf("focus didn't follow: active %d, focus %d", w.ws.ActiveTab, w.ws.Tabs[1].Focus)
+	if w.ws.ActiveTab != inTab2.TabID() || w.ws.Tabs[1].Focus != moved.Pane {
+		t.Errorf("focus didn't follow: active %s, focus %s", w.ws.ActiveTab, w.ws.Tabs[1].Focus)
+	}
+	// The old id still names it, and it answers under the new.
+	var d rpc.PaneDesc
+	if err := h.connect().Call(rpc.PaneInfo, rpc.PaneParams{ID: second}, &d); err != nil || d.ID != moved.Pane {
+		t.Errorf("by its old id: %+v, %v", d, err)
+	}
+	if l := h.list(); len(l.Panes) != 2 || l.Panes[1].ID != moved.Pane {
+		t.Errorf("listed as %+v", l.Panes)
 	}
 
-	// Back, below the first: its own tab goes.
-	a, err = w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: second, Tab: tab1, Side: Down}, &moved)
+	// Back, below the first: its own tab goes, and it's the first tab's
+	// third pane.
+	a, err = w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: moved.Pane, Tab: tab1, Side: Down}, &moved)
 	if err != nil {
 		t.Fatal(err)
 	}
 	w.absorb(a)
-	if len(w.ws.Tabs) != 1 || moved.Tab != tab1 {
+	third := PaneID{WS: w.ws.ID, Tab: 1, N: 3}
+	if len(w.ws.Tabs) != 1 || moved.Pane != third {
 		t.Fatalf("after moving back: %+v, tabs %+v", moved, w.ws.Tabs)
 	}
 	tree := w.ws.Tabs[0].Tree
-	if tree.Axis != Column || fmt.Sprint(tree.Panes()) != fmt.Sprint([]uint32{first, second}) {
+	if tree.Axis != Column || fmt.Sprint(tree.Panes()) != fmt.Sprint([]PaneID{first, third}) {
 		t.Errorf("tree %s", show(tree))
 	}
-	// Along the same axis, it joins the split.
-	a, created = w.split(second, Down, 5000, "")
+	// Both ids it had forward to it, in one hop.
+	for _, old := range []PaneID{second, inTab2} {
+		if err := h.connect().Call(rpc.PaneInfo, rpc.PaneParams{ID: old}, &d); err != nil || d.ID != third {
+			t.Errorf("by %s: %+v, %v", old, d, err)
+		}
+	}
+	// Along the same axis, it joins the split; within its own tab a pane
+	// keeps its id.
+	a, created = w.split(third, Down, 5000, "")
 	w.absorb(a)
-	third := created.Pane
+	fourth := created.Pane
 	a, err = w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: first, Tab: tab1, Side: Up}, &moved)
 	if err != nil {
 		t.Fatal(err)
 	}
 	w.absorb(a)
+	if moved.Pane != first {
+		t.Errorf("moved within its tab, %s became %s", first, moved.Pane)
+	}
 	tree = w.ws.Tabs[0].Tree
-	if len(tree.Children) != 3 || fmt.Sprint(tree.Panes()) != fmt.Sprint([]uint32{first, second, third}) {
+	if len(tree.Children) != 3 || fmt.Sprint(tree.Panes()) != fmt.Sprint([]PaneID{first, third, fourth}) {
 		t.Errorf("tree %s", show(tree))
 	}
 	var sum int
@@ -970,8 +1005,14 @@ func TestPaneMove(t *testing.T) {
 	if sum != Whole {
 		t.Errorf("shares sum to %d", sum)
 	}
-	if err := w.c.Call(rpc.PaneMove, rpc.PaneMoveParams{Pane: first, Tab: 999}, nil); err == nil {
+	if err := w.c.Call(rpc.PaneMove, rpc.PaneMoveParams{Pane: first, Tab: TabID{WS: w.ws.ID, N: 999}}, nil); err == nil {
 		t.Error("moved to a tab that isn't")
+	}
+	// Its old ids go with it.
+	h.pty(1).exit(0)
+	nextEvent[rpc.PaneExitedParams](w, rpc.EvPaneExited)
+	if err := h.connect().Call(rpc.PaneInfo, rpc.PaneParams{ID: second}, nil); err == nil {
+		t.Error("a gone pane's old id still answers")
 	}
 }
 
@@ -1048,7 +1089,7 @@ func TestSplitByViewer(t *testing.T) {
 		t.Fatal("no workspace.changed before the reply")
 	}
 	tree := w.ws.Tabs[0].Tree
-	if tree.Axis != Column || fmt.Sprint(tree.Panes()) != fmt.Sprint([]uint32{first, second}) || tree.Children[1].Share != 3000 {
+	if tree.Axis != Column || fmt.Sprint(tree.Panes()) != fmt.Sprint([]PaneID{first, second}) || tree.Children[1].Share != 3000 {
 		t.Errorf("layout %s", show(tree))
 	}
 	h.pty(1).emit("in the second")
@@ -1089,7 +1130,7 @@ func TestSplitByScript(t *testing.T) {
 			}
 			var ws rpc.Workspace
 			json.Unmarshal(params, &ws)
-			if got := fmt.Sprint(ws.Tabs[0].Tree.Panes()); got != fmt.Sprint([]uint32{created.Pane, first}) {
+			if got := fmt.Sprint(ws.Tabs[0].Tree.Panes()); got != fmt.Sprint([]PaneID{created.Pane, first}) {
 				t.Errorf("panes %s", got)
 			}
 			return
@@ -1178,7 +1219,7 @@ func TestPaneExit(t *testing.T) {
 	h.pty(1).exit(7)
 	e := nextEvent[rpc.PaneExitedParams](w, rpc.EvPaneExited)
 	if e.ID != second || e.Status != 7 {
-		t.Errorf("exit %d on %d", e.Status, e.ID)
+		t.Errorf("exit %d on %s", e.Status, e.ID)
 	}
 	nextEvent[rpc.Workspace](w, rpc.EvWorkspaceChanged)
 	if tree := w.ws.Tabs[0].Tree; !tree.IsLeaf() || tree.Pane != first {
@@ -1219,7 +1260,7 @@ func TestLayout(t *testing.T) {
 	}
 
 	bad := tree.Clone()
-	bad.Children[1].Node.Pane = 999
+	bad.Children[1].Node.Pane = PaneID{WS: w.ws.ID, Tab: 1, N: 999}
 	err := w.c.Call(rpc.TabLayout, rpc.TabLayoutParams{ID: tab.ID, Tree: bad}, nil)
 	var rerr *rpc.Error
 	if !errors.As(err, &rerr) || rerr.Code != rpc.CodeInvalidParams || !strings.Contains(rerr.Message, "match") {
@@ -1308,7 +1349,7 @@ func TestPaneInfoAndWrite(t *testing.T) {
 	if err := h.connect().Call(rpc.PaneInfo, rpc.PaneParams{ID: pane}, &d); err != nil {
 		t.Fatal(err)
 	}
-	if d.ID != pane || d.Workspace != w.ws.ID || d.Tab != w.ws.Tabs[0].ID || d.Cols != 40 || d.Rows != 10 || d.PID != 4242 {
+	if d.ID != pane || d.ID.WS != w.ws.ID || d.ID.TabID() != w.ws.Tabs[0].ID || d.Cols != 40 || d.Rows != 10 || d.PID != 4242 {
 		t.Errorf("info %+v", d)
 	}
 	if len(d.Status) != 1 || d.Status[0].Progress != 40 {
@@ -1318,8 +1359,8 @@ func TestPaneInfoAndWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, "input", func() bool { return h.pty(0).inputString() == "typed\r" })
-	var ti rpc.TabInfoResult
-	if err := h.connect().Call(rpc.TabInfo, rpc.TabParams{ID: d.Tab}, &ti); err != nil || ti.Workspace != w.ws.ID || ti.Tree.Pane != pane {
+	var ti rpc.Tab
+	if err := h.connect().Call(rpc.TabInfo, rpc.TabParams{ID: d.ID.TabID()}, &ti); err != nil || ti.ID != d.ID.TabID() || ti.Tree.Pane != pane {
 		t.Errorf("tab.info %+v, %v", ti, err)
 	}
 }
@@ -1353,7 +1394,7 @@ func TestSubscribe(t *testing.T) {
 		case rpc.EvTabCreated:
 			var p rpc.TabEventParams
 			json.Unmarshal(params, &p)
-			if p.Workspace != w.ws.ID || p.ID != tab {
+			if p.ID != tab {
 				t.Errorf("tab.created %+v", p)
 			}
 		case rpc.EvPaneExited:
@@ -1410,9 +1451,9 @@ func TestErrors(t *testing.T) {
 	}{
 		{rpc.WorkspaceAttach, rpc.WorkspaceAttachParams{ID: 99}},
 		{rpc.TabNew, rpc.TabNewParams{Workspace: 99}},
-		{rpc.PaneSplit, rpc.PaneSplitParams{Pane: 99, Direction: Right}},
-		{rpc.PaneText, rpc.PaneTextParams{ID: 99}},
-		{rpc.TabInfo, rpc.TabParams{ID: 99}},
+		{rpc.PaneSplit, rpc.PaneSplitParams{Pane: PaneID{WS: 99, Tab: 1, N: 1}, Direction: Right}},
+		{rpc.PaneText, rpc.PaneTextParams{ID: PaneID{WS: 99, Tab: 1, N: 1}}},
+		{rpc.TabInfo, rpc.TabParams{ID: TabID{WS: 99, N: 1}}},
 	} {
 		err := c.Call(call.method, call.params, nil)
 		var rerr *rpc.Error

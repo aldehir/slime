@@ -116,6 +116,7 @@ const (
 	EvTabRenamed            = "tab.renamed"
 	EvTabSelected           = "tab.selected"
 	EvPaneCreated           = "pane.created"
+	EvPaneMoved             = "pane.moved"
 	EvPaneAttached          = "pane.attached"
 	EvPaneExited            = "pane.exited"
 	EvHostChanged           = "host.changed"
@@ -225,13 +226,13 @@ func (d Direction) Axis() Axis {
 	return Column
 }
 
-// Node is a tab's layout tree: a pane (Pane != 0) or a split whose
+// Node is a tab's layout tree: a pane (Pane set) or a split whose
 // children each have a share of it in basis points, summing to Whole.
-// On the wire a pane is {"pane": id} and a split {"split": {"axis":
-// "row", "children": [{"share": 5000, "node": ...}, ...]}}: the shape
-// a tagged union takes in Zig's std.json.
+// On the wire a pane is {"pane": "1.2.3"} and a split {"split":
+// {"axis": "row", "children": [{"share": 5000, "node": ...}, ...]}}:
+// the shape a tagged union takes in Zig's std.json.
 type Node struct {
-	Pane     uint32
+	Pane     PaneID
 	Axis     Axis
 	Children []Child
 }
@@ -246,17 +247,17 @@ const MaxDepth = 32
 
 var ErrTooDeep = errors.New("rpc: layout nested too deep")
 
-func (n *Node) IsLeaf() bool { return n.Pane != 0 }
+func (n *Node) IsLeaf() bool { return !n.Pane.IsZero() }
 
 // Panes lists the tree's panes in order: left to right, top to bottom.
-func (n *Node) Panes() []uint32 {
+func (n *Node) Panes() []PaneID {
 	if n == nil {
 		return nil
 	}
 	if n.IsLeaf() {
-		return []uint32{n.Pane}
+		return []PaneID{n.Pane}
 	}
-	var ids []uint32
+	var ids []PaneID
 	for _, c := range n.Children {
 		ids = append(ids, c.Node.Panes()...)
 	}
@@ -281,7 +282,7 @@ type splitJSON struct {
 }
 
 type nodeJSON struct {
-	Pane  *uint32    `json:"pane,omitempty"`
+	Pane  *PaneID    `json:"pane,omitempty"`
 	Split *splitJSON `json:"split,omitempty"`
 }
 
@@ -301,7 +302,7 @@ func (n *Node) unmarshal(b []byte, depth int) error {
 		return ErrTooDeep
 	}
 	var raw struct {
-		Pane  *uint32 `json:"pane"`
+		Pane  *PaneID `json:"pane"`
 		Split *struct {
 			Axis     Axis `json:"axis"`
 			Children []struct {
@@ -314,7 +315,7 @@ func (n *Node) unmarshal(b []byte, depth int) error {
 		return err
 	}
 	switch {
-	case raw.Pane != nil && raw.Split == nil:
+	case raw.Pane != nil && raw.Split == nil && !raw.Pane.IsZero():
 		*n = Node{Pane: *raw.Pane}
 	case raw.Split != nil && raw.Pane == nil:
 		*n = Node{Axis: raw.Split.Axis}
@@ -338,19 +339,19 @@ func (n *Node) unmarshal(b []byte, depth int) error {
 type Workspace struct {
 	ID        uint32 `json:"id"`
 	Name      string `json:"name"`
-	ActiveTab uint32 `json:"active_tab,omitempty"`
+	ActiveTab TabID  `json:"active_tab,omitzero"`
 	Tabs      []Tab  `json:"tabs"`
 }
 
 // Tab is one tab's layout and focus.
 type Tab struct {
-	ID   uint32 `json:"id"`
+	ID   TabID  `json:"id"`
 	Name string `json:"name,omitempty"` // empty unless renamed
 	Tree *Node  `json:"tree"`
 	// Focus is the pane that gets input; Zoomed the pane filling the
-	// tab, or zero.
-	Focus  uint32 `json:"focus,omitempty"`
-	Zoomed uint32 `json:"zoomed,omitempty"`
+	// tab, or none.
+	Focus  PaneID `json:"focus,omitzero"`
+	Zoomed PaneID `json:"zoomed,omitzero"`
 }
 
 // Layout is a tab to build: a tree whose leaves say what to run,
@@ -512,23 +513,22 @@ type WorkspaceDesc struct {
 	Viewers  int  `json:"viewers,omitempty"`
 	// DetachedAt is when its last viewer left, in unix milliseconds;
 	// zero while attached or if it never was.
-	DetachedAt int64  `json:"detached_at,omitempty"`
-	ActiveTab  uint32 `json:"active_tab,omitempty"`
-	Tabs       []Tab  `json:"tabs"`
+	DetachedAt int64 `json:"detached_at,omitempty"`
+	ActiveTab  TabID `json:"active_tab,omitzero"`
+	Tabs       []Tab `json:"tabs"`
 }
 
-// PaneDesc is a pane as workspace.list and pane.info describe it.
+// PaneDesc is a pane as workspace.list and pane.info describe it. ID
+// names its tab and workspace too.
 type PaneDesc struct {
-	ID        uint32 `json:"id"`
-	Tab       uint32 `json:"tab"`
-	Workspace uint32 `json:"workspace"`
-	Command   string `json:"command"`
-	Title     string `json:"title,omitempty"`
-	Pwd       string `json:"pwd,omitempty"`
-	Cols      uint16 `json:"cols"`
-	Rows      uint16 `json:"rows"`
-	Created   int64  `json:"created"` // unix milliseconds
-	PID       uint32 `json:"pid"`
+	ID      PaneID `json:"id"`
+	Command string `json:"command"`
+	Title   string `json:"title,omitempty"`
+	Pwd     string `json:"pwd,omitempty"`
+	Cols    uint16 `json:"cols"`
+	Rows    uint16 `json:"rows"`
+	Created int64  `json:"created"` // unix milliseconds
+	PID     uint32 `json:"pid"`
 	// Status is what the pane's programs report doing (OSC 7501),
 	// oldest update first.
 	Status []StatusRecord `json:"status,omitempty"`
@@ -543,18 +543,11 @@ type StatusRecord struct {
 	Progress int8   `json:"progress"`
 }
 
-// TabInfoResult answers tab.info.
-type TabInfoResult struct {
-	Workspace uint32 `json:"workspace"`
-	Tab
-}
-
-// Created answers tab.new, pane.split, and pane.move with what they
-// made or moved: Pane is the tab's first pane for a tab.new of several.
+// Created answers tab.new, pane.split, and pane.move with the pane it
+// made or moved, which names its tab: the tab's first pane for a
+// tab.new of several, and a moved pane's new id.
 type Created struct {
-	Workspace uint32 `json:"workspace"`
-	Tab       uint32 `json:"tab"`
-	Pane      uint32 `json:"pane"`
+	Pane PaneID `json:"pane"`
 }
 
 // WorkspaceNewParams: the name ("default" if empty) and the tabs to
@@ -582,16 +575,15 @@ type WorkspaceAttachParams struct {
 	Area Area   `json:"area,omitempty"`
 }
 
-// WorkspaceFocusParams moves the workspace's focus, for every viewer:
+// WorkspaceFocusParams moves a workspace's focus, for every viewer:
 // Tab becomes the active tab, Pane the focus of its tab (which is Tab
-// if that's zero), and Zoomed, if given, the pane zoomed in that tab
-// (zero for none). The other viewers get workspace.changed; the caller
-// doesn't, having made the change.
+// if that's given, else the pane's own), and Zoomed, if given, the
+// pane zoomed in that tab ("" for none). The other viewers get
+// workspace.changed; the caller doesn't, having made the change.
 type WorkspaceFocusParams struct {
-	ID     uint32  `json:"id"`
-	Tab    uint32  `json:"tab,omitempty"`
-	Pane   uint32  `json:"pane,omitempty"`
-	Zoomed *uint32 `json:"zoomed,omitempty"`
+	Tab    TabID   `json:"tab,omitzero"`
+	Pane   PaneID  `json:"pane,omitzero"`
+	Zoomed *PaneID `json:"zoomed,omitempty"`
 }
 
 // WorkspaceParams names a workspace: detach, kill, info.
@@ -629,26 +621,26 @@ type TabNewParams struct {
 
 // TabParams names a tab: close, info.
 type TabParams struct {
-	ID uint32 `json:"id"`
+	ID TabID `json:"id"`
 }
 
 type TabRenameParams struct {
-	ID   uint32 `json:"id"`
+	ID   TabID  `json:"id"`
 	Name string `json:"name"`
 }
 
 // TabLayoutParams replaces a tab's tree, which must hold the same panes:
 // a divider was dragged. The viewer gets workspace.changed back.
 type TabLayoutParams struct {
-	ID   uint32 `json:"id"`
-	Tree *Node  `json:"tree"`
+	ID   TabID `json:"id"`
+	Tree *Node `json:"tree"`
 }
 
 // PaneSplitParams starts a pane beside Pane, on side Direction, taking
 // Share basis points of its space (half if zero). Replies as tab.new
 // does; a viewer's own call focuses the new pane.
 type PaneSplitParams struct {
-	Pane      uint32            `json:"pane"`
+	Pane      PaneID            `json:"pane"`
 	Direction Direction         `json:"direction"`
 	Share     uint16            `json:"share,omitempty"`
 	Command   string            `json:"command,omitempty"`
@@ -657,30 +649,34 @@ type PaneSplitParams struct {
 }
 
 // PaneMoveParams moves Pane to tab Tab of its workspace, along its
-// whole Side (right if zero), taking half of it; with Tab zero, into a
-// new tab after its own. A tab left empty closes. Replies with Created
-// naming the tab it's in now; a viewer's own call focuses the pane.
+// whole Side (right if zero), taking half of it; with no Tab, into a
+// new tab after its own. A tab left empty closes. The pane takes its
+// new tab's next number: Created names it, and the old id forwards to
+// it for as long as the pane lives, so a shell's SLIME_PANE still
+// finds it. The viewers see the old id detach and the new attach
+// (pane.attached with moved_from); a viewer's own call focuses the
+// pane.
 type PaneMoveParams struct {
-	Pane uint32    `json:"pane"`
-	Tab  uint32    `json:"tab,omitempty"`
+	Pane PaneID    `json:"pane"`
+	Tab  TabID     `json:"tab,omitzero"`
 	Side Direction `json:"side,omitempty"`
 }
 
 // PaneParams names a pane: kill, info.
 type PaneParams struct {
-	ID uint32 `json:"id"`
+	ID PaneID `json:"id"`
 }
 
 // PaneWriteParams writes Text to the pane's child as typed.
 type PaneWriteParams struct {
-	ID   uint32 `json:"id"`
+	ID   PaneID `json:"id"`
 	Text string `json:"text"`
 }
 
 // PaneTextParams asks for the text of a pane's screen and scrollback
 // without taking it: plain, or with VT the sequences that redraw it.
 type PaneTextParams struct {
-	ID uint32 `json:"id"`
+	ID PaneID `json:"id"`
 	VT bool   `json:"vt,omitempty"`
 }
 
@@ -734,26 +730,29 @@ type WorkspaceViewerParams struct {
 // TabEventParams: tab.created, tab.closed, tab.renamed, and
 // tab.selected (the workspace's active tab changed).
 type TabEventParams struct {
-	Workspace uint32 `json:"workspace"`
-	ID        uint32 `json:"id"`
-	Name      string `json:"name,omitempty"`
+	ID   TabID  `json:"id"`
+	Name string `json:"name,omitempty"`
 }
 
 // PaneCreatedParams: pane.created.
 type PaneCreatedParams struct {
-	Workspace uint32 `json:"workspace"`
-	Tab       uint32 `json:"tab"`
-	ID        uint32 `json:"id"`
+	ID PaneID `json:"id"`
+}
+
+// PaneMovedParams: pane.moved, to another tab, under a new id.
+type PaneMovedParams struct {
+	ID   PaneID `json:"id"`
+	From PaneID `json:"from"`
 }
 
 // PaneAttachedParams starts a pane's attachment to the viewer it goes
 // to: its frames follow, the first a full one, with a Notice for its
-// title and pwd if it has them.
+// title and pwd if it has them. ID places it, for a viewer of several
+// workspaces. MovedFrom is the id it had, if it just moved tabs: the
+// viewer's attachment under that id is over.
 type PaneAttachedParams struct {
-	ID uint32 `json:"id"`
-	// Workspace and Tab place it, for a viewer of several workspaces.
-	Workspace uint32 `json:"workspace"`
-	Tab       uint32 `json:"tab"`
+	ID        PaneID `json:"id"`
+	MovedFrom PaneID `json:"moved_from,omitzero"`
 	// Command is what the pane runs, for a client that didn't start it.
 	Command string         `json:"command"`
 	Status  []StatusRecord `json:"status,omitempty"`
@@ -762,7 +761,7 @@ type PaneAttachedParams struct {
 // PaneExitedParams says the pane's child exited. The viewer gets
 // workspace.changed after, with the pane gone from its tab.
 type PaneExitedParams struct {
-	ID     uint32 `json:"id"`
+	ID     PaneID `json:"id"`
 	Status uint32 `json:"status"`
 }
 
@@ -877,7 +876,7 @@ type Question struct {
 // ScriptRunParams starts a script: Source, compiled as chunk Name (a
 // file name, for error messages), with Args as slime.args (a JSON
 // object). Pane is the pane it runs for, filled into slime.pane_id and,
-// through it, tab_id and workspace_id; zero for none. The caller gets
+// through it, tab_id and workspace_id; none for none. The caller gets
 // script.output and script.done for it without subscribing, and a
 // caller that hangs up before it's done cancels it unless Detach is set.
 // The reply comes as soon as it's started; the result comes with
@@ -886,7 +885,7 @@ type ScriptRunParams struct {
 	Source string          `json:"source"`
 	Name   string          `json:"name,omitempty"`
 	Args   json.RawMessage `json:"args,omitempty"`
-	Pane   uint32          `json:"pane,omitempty"`
+	Pane   PaneID          `json:"pane,omitzero"`
 	Detach bool            `json:"detach,omitempty"`
 }
 
@@ -909,7 +908,7 @@ type ScriptListResult struct {
 type ScriptDesc struct {
 	ID      uint32 `json:"id"`
 	Name    string `json:"name,omitempty"`
-	Pane    uint32 `json:"pane,omitempty"`
+	Pane    PaneID `json:"pane,omitzero"`
 	Started int64  `json:"started"` // unix milliseconds
 	// Detached: it outlives the connection that started it.
 	Detached bool `json:"detached,omitempty"`

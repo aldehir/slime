@@ -42,6 +42,6 @@ func (s *Server) hostList(*callCtx, rpc.Empty) (*rpc.HostListResult, error) {
 	return &rpc.HostListResult{Hosts: []rpc.Host{}}, nil
 }
 
-func (s *Server) bridge(rw io.ReadWriteCloser, _ *Reader, _ uint32, _ *Bridge) {
+func (s *Server) bridge(rw io.ReadWriteCloser, _ *Reader, _ *Bridge) {
 	writeError(rw, noHosts)
 }

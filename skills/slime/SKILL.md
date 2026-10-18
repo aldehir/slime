@@ -34,19 +34,26 @@ exists for one exists for all.
 - Build the CLI with `go build -o <dir>\slime.exe ./cmd/slime` after
   `. .\scripts\setup-msvc.ps1` (cgo needs `zig cc`). `zig build` puts
   it in `zig-out\bin\`. See `AGENTS.md`.
-- Pane ids, tab ids, workspace ids, and script ids share one counter,
-  so they are unique across kinds.
+- **Ids are paths.** A workspace is a number (`1`), a tab is its
+  workspace's number and its own (`1.2`), a pane its tab's and its own
+  (`1.2.3`): each level is numbered by its parent from a counter that
+  never reuses a number, so a path is never reissued while the daemon
+  lives and reordering changes no id. A method given a pane id knows
+  its tab and workspace. A pane moved to another tab takes that tab's
+  next number; its old ids keep finding it while it lives, and every
+  answer names it by its current id. Script and host ids are plain
+  numbers of their own.
 
 ## The CLI
 
 ```
 slime ls [--json]                                  workspaces, tabs, panes
 slime ws new [name] [--attach ws] | rename <ws> <name> | kill <ws> | info <ws>
-slime ws focus <ws> <tab> [pane]                   show a tab in every window on the workspace
+slime ws focus <tab|pane>                          show a tab in every window on its workspace, or a pane's tab with it focused
 slime tab new [-w ws] [-n name] [--split right|down] [command]...
 slime tab rename <tab> <name> | close <tab> | info <tab>
 slime pane split <pane> right|down|left|up [-p percent] [command]
-slime pane move <pane> <tab|new> [right|down|left|up]
+slime pane move <pane> <tab|new> [right|down|left|up]   prints the pane's new id
 slime pane focus <pane> [--zoom|--unzoom]
 slime pane write <pane> <text>                     typed as is; "\r" presses enter
 slime pane text <pane> [--vt]                      screen and scrollback
@@ -63,12 +70,12 @@ take `CreateProcessW` syntax for a pane's command; an empty command is
 the default shell. `slime tab new` with several commands gives each a
 pane sharing the tab along `--split`.
 
-Every pane's shell has `SLIME_PANE` and `SLIME_WORKSPACE` (and
-`SLIME_INSTANCE` when the daemon is one). Inside a pane, `slime ws new`
-therefore opens the new workspace in the pane's window (`--attach 0`
-leaves it detached, another id names another workspace's windows),
-`slime tab new` adds to the pane's workspace, and `slime do` runs for
-the pane.
+Every pane's shell has `SLIME_PANE` (`1.2.3`) and `SLIME_WORKSPACE`
+(`1`), and `SLIME_INSTANCE` when the daemon is one. Inside a pane,
+`slime ws new` therefore opens the new workspace in the pane's window
+(`--attach 0` leaves it detached, another id names another workspace's
+windows), `slime tab new` adds to the pane's workspace, and `slime do`
+runs for the pane, even after the pane moved tabs.
 
 ## `slime do`
 
@@ -107,11 +114,13 @@ so a blocking Go call finishes before a cancel lands.
 | name | what |
 |---|---|
 | `slime.args` | table of the `key=value` arguments (an empty table if none) |
-| `slime.workspace_id`, `slime.tab_id`, `slime.pane_id` | the context, or nil; read at call time, so a script may set them to retarget |
+| `slime.workspace_id`, `slime.tab_id`, `slime.pane_id` | the context, or nil: a number, `"1.2"`, and `"1.2.3"`; read at call time, so a script may set them to retarget |
 | `slime.call(method, params)` | any method by wire name; `params` a table or nil |
-| `slime.workspace.<m>{...}` | `workspace.<m>` with `id` filled from `workspace_id` (not for `list`); `new` gets `attach` from it instead, so the windows on the script's workspace open the new one (`attach = false` leaves it detached; another id names another workspace's windows) |
+| `slime.workspace.<m>{...}` | `workspace.<m>` with `id` filled from `workspace_id` (not for `list`); `new` gets `attach` from it instead, so the windows on the script's workspace open the new one (`attach = false` leaves it detached; another id names another workspace's windows); `focus` with neither `tab` nor `pane` gets `pane` from `pane_id` |
 | `slime.tab.<m>{...}` | `tab.<m>`; `tab.new` gets `workspace`, the rest get `id` from `tab_id` |
 | `slime.pane.<m>{...}` | `pane.<m>`; `split` and `move` get `pane`, the rest get `id` from `pane_id` |
+| `slime.id.parse(id)` | `{workspace, tab, pane}` from `1`, `"1.2"`, or `"1.2.3"` (the parts it has); `nil, err` for anything else |
+| `slime.id.tab(w, t)`, `slime.id.pane(w, t, p)` | `"w.t"` and `"w.t.p"` from numbers |
 | `slime.layout.pane{command, cwd, env}` | a leaf for `tabs` in `workspace.new` or `layout` in `tab.new` |
 | `slime.layout.horizontal([ratio,] a, b, ...)` | side by side; `ratio` is `a`'s share (0 to 1), the rest share what's left equally; no ratio divides equally |
 | `slime.layout.vertical([ratio,] a, b, ...)` | stacked; same rule |
@@ -124,7 +133,8 @@ is the error code below. Wrap in `assert(...)` when failure should end
 the script. The namespaces are metatables: any method the daemon has
 works, including ones added later, without a Lua-side list.
 
-**Values cross as JSON.** Numbers are doubles (ids fit). A table whose
+**Values cross as JSON.** Numbers are doubles; workspace ids are
+numbers, tab and pane ids strings, compared with `==`. A table whose
 keys are exactly 1..n is an array; any other table, including an empty
 one, is an object. So a method that takes a list can't be given an
 empty table, and `nil` in a table means the key is absent. Functions
@@ -183,7 +193,7 @@ From inside a pane (ids default to this pane):
 local me = assert(slime.pane.info{})
 local below = assert(slime.pane.split{ direction = "down", share = 3000, command = "pwsh" })
 assert(slime.pane.write{ id = below.pane, text = "cd " .. me.pwd .. "\r" })
-assert(slime.workspace.focus{ tab = slime.tab_id, pane = below.pane })
+assert(slime.workspace.focus{ pane = below.pane })   -- its tab comes with it
 ```
 
 Walk a tab's tree:
@@ -203,7 +213,7 @@ end
 Error handling and stopping early:
 
 ```lua
-local p, err, code = slime.pane.info{ id = 999 }
+local p, err, code = slime.pane.info{ id = "1.1.999" }
 if not p then slime.log("no pane:", err, code) end          -- 1000 is not found
 if #assert(slime.workspace.list{}).workspaces > 0 then slime.stop("already set up") end
 ```
@@ -212,15 +222,17 @@ Raw access, with and without Lua:
 
 ```powershell
 slime do -e 'return slime.call("host.list")'
-slime call pane.text '{"id": 3}'
-slime call workspace.focus '{"id": 2, "tab": 6, "pane": 3, "zoomed": 3}'
+slime call pane.text '{"id": "1.1.3"}'
+slime call workspace.focus '{"pane": "2.6.3", "zoomed": "2.6.3"}'
 ```
 
 ## Method reference
 
 Params and results are JSON objects; the Lua tables mirror them
-field for field. Ids are integers. `internal/rpc/rpc.go` is the
-definition; this is the summary.
+field for field. A workspace id is an integer; a tab id is the string
+`"w.t"` and a pane id `"w.t.p"` (`internal/rpc/id.go`), and `""` is
+none where one is optional. `internal/rpc/rpc.go` is the definition;
+this is the summary.
 
 ### workspace
 
@@ -233,29 +245,29 @@ definition; this is the summary.
 | `workspace.kill` | `{id}` | `{}`; ends every pane in it |
 | `workspace.rename` | `{id, name}` | `{}` |
 | `workspace.resize` | `{id, area}` | `{}`; a viewer's tab area in pixels |
-| `workspace.focus` | `{id, tab?, pane?, zoomed?}` | `{}`; `tab` becomes active, `pane` its focus, `zoomed` the zoomed pane (0 unzooms) |
+| `workspace.focus` | `{tab?, pane?, zoomed?}` | `{}`; `tab` becomes active, `pane` its focus (and names the tab if `tab` is left out), `zoomed` the zoomed pane (`""` unzooms) |
 | `workspace.info` | `{id}` | `WorkspaceDesc` |
 
 ### tab
 
 | method | params | result |
 |---|---|---|
-| `tab.new` | `{workspace, name?, layout?: Layout, command?, cwd?, env?, size?}` | `Created` (`pane` is the first pane) |
+| `tab.new` | `{workspace, name?, layout?: Layout, command?, cwd?, env?, size?}` | `Created` (`pane` is the first pane, which names the tab) |
 | `tab.close` | `{id}` | `{}` |
 | `tab.rename` | `{id, name}` | `{}` |
 | `tab.layout` | `{id, tree: Node}` | `{}`; same panes, new shares (a divider drag) |
-| `tab.info` | `{id}` | `{workspace, id, name, tree, focus, zoomed}` |
+| `tab.info` | `{id}` | `Tab` |
 
 ### pane
 
 | method | params | result |
 |---|---|---|
 | `pane.split` | `{pane, direction: right\|down\|left\|up, share?: 1..9999 (basis points, 5000 default), command?, cwd?, env?}` | `Created` |
-| `pane.move` | `{pane, tab?: 0 for a new tab, side?}` | `Created` naming the tab it's in now |
+| `pane.move` | `{pane, tab?: leave out for a new tab, side?}` | `Created` naming the pane's new id: in another tab it's that tab's next pane, and its old ids keep finding it |
 | `pane.kill` | `{id}` | `{}` |
 | `pane.write` | `{id, text}` | `{}`; as typed, no newline added |
 | `pane.text` | `{id, vt?: bool}` | `{text}`: plain, or the VT that redraws it |
-| `pane.info` | `{id}` | `PaneDesc` |
+| `pane.info` | `{id}` | `PaneDesc`, under the id the pane has now |
 
 ### script
 
@@ -280,12 +292,12 @@ definition; this is the summary.
 ```
 Layout     {pane: {command?, cwd?, env?}} | {split: {axis: row|column, children: [{share?, node: Layout}]}}
            shares in basis points summing to 10000, or all absent for equal parts
-Node       {pane: id} | {split: {axis, children: [{share, node: Node}]}}      (a built tab's tree)
-Workspace  {id, name, active_tab, tabs: [Tab]}
-Tab        {id, name?, tree: Node, focus?, zoomed?}
+Node       {pane: "w.t.p"} | {split: {axis, children: [{share, node: Node}]}}      (a built tab's tree)
+Workspace  {id, name, active_tab: "w.t", tabs: [Tab]}
+Tab        {id: "w.t", name?, tree: Node, focus?: "w.t.p", zoomed?: "w.t.p"}
 WorkspaceDesc  Workspace plus {attached, viewers?, detached_at?}
-PaneDesc   {id, tab, workspace, command, title?, pwd?, cols, rows, created, pid, status?: [{id, state, progress}]}
-Created    {workspace, tab, pane}
+PaneDesc   {id: "w.t.p", command, title?, pwd?, cols, rows, created, pid, status?: [{id, state, progress}]}
+Created    {pane: "w.t.p"}
 Host       {id, dest, state: connecting|connected|failed|lost|gone, text?}
 ```
 
@@ -305,9 +317,10 @@ can't receive events yet.
 | `workspace.detached` | `{id, reason}` |
 | `workspace.open` | `{id, name}`: to the viewers of the workspace a `workspace.new` named in `attach`, which open it too |
 | `workspace.viewer_joined` / `viewer_left` | `{id, viewers}` |
-| `tab.created` / `closed` / `renamed` / `selected` | `{workspace, id, name?}` |
-| `pane.created` | `{workspace, tab, id}` |
-| `pane.attached` | `{id, workspace, tab, command, status?}` (viewers only; frames follow) |
+| `tab.created` / `closed` / `renamed` / `selected` | `{id, name?}` |
+| `pane.created` | `{id}` |
+| `pane.moved` | `{id, from}`: to another tab, under a new id |
+| `pane.attached` | `{id, moved_from?, command, status?}` (viewers only; frames follow; `moved_from` is the id a viewer held it under until now) |
 | `pane.exited` | `{id, status}` |
 | `script.output` | `{id, stream: stdout\|stderr, data}` |
 | `script.done` | `{id, ok, result?, error?}` |
@@ -333,6 +346,10 @@ The CLI prints `message (code N)` and exits 1; Lua gets `nil, message, code`.
 - **`no such pane` right after a split**: the command exited at once
   (`cmd /c dir`); the pane is gone with it. Use a shell.
 - **`hello nil`**: `slime.pane_id` is nil outside a pane; pass `-p`.
+- **`bad id: a pane id is workspace.tab.pane, not "4"`**: a bare
+  number is a workspace id; tabs and panes are paths. A shell from a
+  slime before paths has a numeric `SLIME_PANE`, which `slime do`
+  ignores.
 - **Script hangs on Ctrl+C**: it is inside a Go call; wait, or press
   Ctrl+C again to leave it running and `slime scripts kill` it.
 - **Which daemon?** A daemon the CLI started logs to

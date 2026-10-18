@@ -24,7 +24,7 @@ type drawer struct {
 	t    *testing.T
 	c    *Client
 	conn net.Conn
-	pane uint32
+	pane PaneID
 	// The image pieces that came before the frames read.
 	images []*Image
 }
@@ -469,7 +469,7 @@ func TestFramesReplyOutsideLock(t *testing.T) {
 	pane := h.srv.pane(d.pane)
 	done := make(chan struct{})
 	go func() {
-		pane.desc(nil)
+		pane.desc()
 		close(done)
 	}()
 	select {
@@ -489,7 +489,7 @@ func evMotion(x, y float32) []byte {
 
 // attachDrawer connects a second client and attaches ws, beside any
 // client attached before.
-func attachDrawer(t *testing.T, h *harness, ws, pane uint32) *drawer {
+func attachDrawer(t *testing.T, h *harness, ws uint32, pane PaneID) *drawer {
 	t.Helper()
 	a, b := net.Pipe()
 	go h.srv.handle(a)

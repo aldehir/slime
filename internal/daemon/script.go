@@ -23,7 +23,7 @@ import (
 type script struct {
 	id      uint32
 	name    string
-	pane    uint32
+	pane    PaneID
 	started time.Time
 	// owner started it and gets its output; nil once it has hung up.
 	// Unless detached, the owner hanging up cancels the script.
@@ -55,20 +55,21 @@ func (s *Server) scriptRun(cl *callCtx, p rpc.ScriptRunParams) (*rpc.ScriptRunRe
 		name = "script"
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	lctx := lua.Context{Args: p.Args, Pane: p.Pane}
+	lctx := lua.Context{Args: p.Args}
 
 	s.mu.Lock()
-	if p.Pane != 0 {
-		pane := s.panes[p.Pane]
+	if !p.Pane.IsZero() {
+		// The pane as it's named now, if it moved.
+		pane := s.paneLocked(p.Pane)
 		if pane == nil || pane.tab == nil {
 			s.mu.Unlock()
 			cancel()
 			return nil, errNoPane
 		}
-		lctx.Tab = pane.tab.id
-		lctx.Workspace = pane.tab.ws.id
+		lctx.Pane = pane.id
 	}
-	sc := &script{id: s.newIDLocked(), name: name, pane: p.Pane, started: time.Now(), owner: cl.c, detached: p.Detach || cl.c == nil, cancel: cancel}
+	s.nextScript++
+	sc := &script{id: s.nextScript, name: name, pane: lctx.Pane, started: time.Now(), owner: cl.c, detached: p.Detach || cl.c == nil, cancel: cancel}
 	s.scripts[sc.id] = sc
 	s.checkIdleLocked()
 	s.mu.Unlock()
@@ -106,7 +107,7 @@ func (s *Server) scriptEmit(sc *script, name string, params any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if sc.owner != nil {
-		sc.owner.sendForce(0, notify(name, params))
+		sc.owner.sendForce(NoPane, notify(name, params))
 	}
 	s.emitLocked(name, params, nil, sc.owner)
 }

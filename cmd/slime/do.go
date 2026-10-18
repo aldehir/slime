@@ -29,7 +29,7 @@ var errScriptFailed = errors.New("script failed")
 func doCommand() *cobra.Command {
 	var (
 		code   string
-		pane   uint32
+		pane   string
 		detach bool
 	)
 	cmd := &cobra.Command{
@@ -47,7 +47,14 @@ func doCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			params := rpc.ScriptRunParams{Source: source, Name: name, Pane: pane, Detach: detach}
+			params := rpc.ScriptRunParams{Source: source, Name: name, Detach: detach}
+			if pane != "" {
+				if params.Pane, err = rpc.ParsePaneID(pane); err != nil {
+					return err
+				}
+			} else {
+				params.Pane = envPane()
+			}
 			if params.Args, err = scriptArgs(rest); err != nil {
 				return err
 			}
@@ -71,20 +78,25 @@ func doCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&code, "eval", "e", "", "run this code instead of a file")
-	cmd.Flags().Uint32VarP(&pane, "pane", "p", envPane(), "the pane the script runs for (default $SLIME_PANE)")
+	cmd.Flags().StringVarP(&pane, "pane", "p", "", "the pane the script runs for (default $SLIME_PANE)")
 	cmd.Flags().BoolVar(&detach, "detach", false, "leave the script running in the daemon and print its id")
 	return cmd
 }
 
-// envPane is the pane this console runs in, if it's one of slime's,
-// and envWorkspace the workspace that pane is in: every pane's shell
-// has SLIME_PANE and SLIME_WORKSPACE.
-func envPane() uint32 { return envID("SLIME_PANE") }
+// envPane is the pane this console runs in, if it's one of slime's, and
+// envWorkspace the workspace that pane is in: every pane's shell has
+// SLIME_PANE and SLIME_WORKSPACE. One that doesn't parse (a shell from
+// an older slime) counts as none.
+func envPane() rpc.PaneID {
+	id, err := rpc.ParsePaneID(os.Getenv("SLIME_PANE"))
+	if err != nil {
+		return rpc.PaneID{}
+	}
+	return id
+}
 
-func envWorkspace() uint32 { return envID("SLIME_WORKSPACE") }
-
-func envID(name string) uint32 {
-	id, err := strconv.ParseUint(os.Getenv(name), 10, 32)
+func envWorkspace() uint32 {
+	id, err := strconv.ParseUint(os.Getenv("SLIME_WORKSPACE"), 10, 32)
 	if err != nil {
 		return 0
 	}
@@ -146,7 +158,7 @@ func followScript(c *daemon.Client, id uint32) error {
 		<-interrupt
 		req := rpc.Request{JSONRPC: "2.0", ID: c.NextID(), Method: rpc.ScriptCancel}
 		req.Params, _ = json.Marshal(rpc.ScriptParams{ID: id})
-		c.Send(0, &daemon.Call{Request: req})
+		c.Send(daemon.NoPane, &daemon.Call{Request: req})
 		// A second one gives up on the script.
 		<-interrupt
 		os.Exit(130)
@@ -226,8 +238,8 @@ func scriptsCommand() *cobra.Command {
 					state = "detached"
 				}
 				pane := ""
-				if sc.Pane != 0 {
-					pane = fmt.Sprintf("pane %d", sc.Pane)
+				if !sc.Pane.IsZero() {
+					pane = "pane " + sc.Pane.String()
 				}
 				fmt.Fprintf(w, "script %d\t%s\t%s\t%s\t%s\n", sc.ID, sc.Name, state, pane, time.UnixMilli(sc.Started).Format("Jan 2 15:04:05"))
 			}

@@ -94,15 +94,18 @@ func TestScriptBuildsWorkspace(t *testing.T) {
 		assert(slime.pane.write{ id = p.pane, text = "q" })
 		print("made", p.pane)
 		local info = assert(slime.pane.info{ id = p.pane })
-		return { workspace = ws.id, pane = p.pane, command = info.command, tab = info.tab == ws.tabs[1].id }
+		local id = slime.id.parse(info.id)
+		return { workspace = ws.id, pane = p.pane, command = info.command,
+			tab = slime.id.tab(id.workspace, id.tab) == ws.tabs[1].id and id.workspace == ws.id }
 	`})
 	if !done.OK {
 		t.Fatalf("script failed: %s", done.Error)
 	}
 	var res struct {
-		Workspace, Pane uint32
-		Command         string
-		Tab             bool
+		Workspace uint32
+		Pane      string
+		Command   string
+		Tab       bool
 	}
 	if err := json.Unmarshal(done.Result, &res); err != nil {
 		t.Fatal(err)
@@ -122,7 +125,7 @@ func TestScriptBuildsWorkspace(t *testing.T) {
 	if got := h.pty(3).inputString(); got != "q" {
 		t.Errorf("htop pane got %q", got)
 	}
-	if len(out) != 1 || out[0].Stream != "stdout" || out[0].Data != fmt.Sprintf("made\t%d\n", res.Pane) {
+	if len(out) != 1 || out[0].Stream != "stdout" || out[0].Data != fmt.Sprintf("made\t%s\n", res.Pane) {
 		t.Errorf("output %+v", out)
 	}
 	// The script wasn't a viewer: the workspace is detached, with its
@@ -167,7 +170,8 @@ func TestScriptOpensWorkspaceInWindow(t *testing.T) {
 		local again = assert(slime.workspace.new{ name = "again", tabs = { slime.layout.pane{} } })
 		local tab = assert(slime.tab.new{})
 		local split = assert(slime.pane.split{ direction = "down" })
-		return { shown = shown.id, quiet = quiet.id, again = again.id, tab = tab.workspace, split = split.workspace }
+		return { shown = shown.id, quiet = quiet.id, again = again.id,
+			tab = slime.id.parse(tab.pane).workspace, split = slime.id.parse(split.pane).workspace }
 	`})
 	if !done.OK {
 		t.Fatalf("script failed: %s", done.Error)
@@ -207,7 +211,7 @@ func TestScriptOpensWorkspaceInWindow(t *testing.T) {
 func TestScriptErrorsAndLog(t *testing.T) {
 	h := newHarness(t)
 	c := h.connect()
-	out, done := runScript(t, c, rpc.ScriptRunParams{Name: "bad.lua", Source: "slime.log('about to fail')\nlocal r, err, code = slime.pane.kill{ id = 99 }\nerror(err .. ' ' .. code)"})
+	out, done := runScript(t, c, rpc.ScriptRunParams{Name: "bad.lua", Source: "slime.log('about to fail')\nlocal r, err, code = slime.pane.kill{ id = \"99.1.1\" }\nerror(err .. ' ' .. code)"})
 	if done.OK {
 		t.Fatal("ok?")
 	}
@@ -223,7 +227,7 @@ func TestScriptErrorsAndLog(t *testing.T) {
 	if err := c.Call(rpc.ScriptRun, rpc.ScriptRunParams{Source: "x", Args: json.RawMessage(`[1]`)}, nil); err == nil {
 		t.Error("array args: no error")
 	}
-	if err := c.Call(rpc.ScriptRun, rpc.ScriptRunParams{Source: "x", Pane: 42}, nil); err == nil {
+	if err := c.Call(rpc.ScriptRun, rpc.ScriptRunParams{Source: "x", Pane: PaneID{WS: 42, Tab: 1, N: 1}}, nil); err == nil {
 		t.Error("no such pane: no error")
 	}
 }
@@ -293,7 +297,8 @@ func TestScriptPaneContext(t *testing.T) {
 	c := h.connect()
 	_, done := runScript(t, c, rpc.ScriptRunParams{Pane: pane, Source: `
 		local info = assert(slime.pane.info{})
-		assert(info.id == slime.pane_id and info.tab == slime.tab_id and info.workspace == slime.workspace_id)
+		local id = slime.id.parse(info.id)
+		assert(info.id == slime.pane_id and slime.id.tab(id.workspace, id.tab) == slime.tab_id and id.workspace == slime.workspace_id)
 		local p = assert(slime.pane.split{ direction = "down" })
 		local tab = assert(slime.tab.info{})
 		assert(tab.id == slime.tab_id)
@@ -303,12 +308,28 @@ func TestScriptPaneContext(t *testing.T) {
 	if !done.OK {
 		t.Fatalf("script failed: %s", done.Error)
 	}
-	var res struct{ Split, Focus, Ws uint32 }
+	var res struct {
+		Split, Focus string
+		Ws           uint32
+	}
 	if err := json.Unmarshal(done.Result, &res); err != nil {
 		t.Fatal(err)
 	}
 	// A script's split doesn't take the focus; a viewer's would.
-	if res.Split == 0 || res.Focus != pane || res.Ws != w.ws.ID {
-		t.Errorf("result %s (pane %d)", done.Result, pane)
+	if res.Split == "" || res.Focus != pane.String() || res.Ws != w.ws.ID {
+		t.Errorf("result %s (pane %s)", done.Result, pane)
+	}
+
+	// Run for a pane that moved tabs, by the id it had, the script's
+	// context is the pane as it's named now.
+	var moved rpc.Created
+	a, err := w.call(rpc.PaneMove, rpc.PaneMoveParams{Pane: pane}, &moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.absorb(a)
+	_, done = runScript(t, c, rpc.ScriptRunParams{Pane: pane, Source: `return slime.pane_id`})
+	if !done.OK || string(done.Result) != `"`+moved.Pane.String()+`"` {
+		t.Errorf("context after a move: %s, %s", done.Result, done.Error)
 	}
 }

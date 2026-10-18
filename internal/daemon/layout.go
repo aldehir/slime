@@ -16,18 +16,18 @@ import (
 // The types (Node, Child, Axis, Direction, Whole) are internal/rpc's,
 // shared with the control plane; the algorithms are here.
 
-func leaf(pane uint32) *Node { return &Node{Pane: pane} }
+func leaf(pane PaneID) *Node { return &Node{Pane: pane} }
 
 // splitNode puts pane beside target, on side dir, taking share basis points
 // of target's space. It returns the new root. A split along the same
 // axis as target's parent joins that split rather than nesting another.
-func splitNode(root *Node, target, pane uint32, dir Direction, share uint16) (*Node, error) {
+func splitNode(root *Node, target, pane PaneID, dir Direction, share uint16) (*Node, error) {
 	if share == 0 || share >= Whole {
 		return nil, fmt.Errorf("daemon: split share %d out of range", share)
 	}
 	parent, i := find(root, nil, target)
 	if i < 0 {
-		return nil, fmt.Errorf("daemon: no pane %d in the layout", target)
+		return nil, fmt.Errorf("daemon: no pane %s in the layout", target)
 	}
 	axis := dir.Axis()
 	before := dir == Left || dir == Up
@@ -71,7 +71,7 @@ func splitNode(root *Node, target, pane uint32, dir Direction, share uint16) (*N
 // joinEdge puts pane along side dir of the whole tree, taking an equal
 // share of a root split that runs the same way, else half of a new
 // split over the root. It returns the new root.
-func joinEdge(root *Node, pane uint32, dir Direction) *Node {
+func joinEdge(root *Node, pane PaneID, dir Direction) *Node {
 	axis := dir.Axis()
 	before := dir == Left || dir == Up
 	added := leaf(pane)
@@ -100,7 +100,7 @@ func joinEdge(root *Node, pane uint32, dir Direction) *Node {
 // removeNode takes pane out of the tree and returns the new root: nil if it
 // was the last. Its siblings grow in proportion to fill its space, and a
 // split left with one child is replaced by that child.
-func removeNode(root *Node, pane uint32) *Node {
+func removeNode(root *Node, pane PaneID) *Node {
 	if root == nil {
 		return nil
 	}
@@ -160,7 +160,7 @@ func rebalance(n *Node) {
 
 // find returns pane's parent and its index there; the parent is nil
 // when pane is the root. The index is -1 if pane isn't in the tree.
-func find(n, parent *Node, pane uint32) (*Node, int) {
+func find(n, parent *Node, pane PaneID) (*Node, int) {
 	if n.IsLeaf() {
 		if n.Pane == pane {
 			return parent, 0
@@ -184,11 +184,11 @@ func find(n, parent *Node, pane uint32) (*Node, int) {
 // Validate checks a tree a client sent: every split has at least two
 // children of known axis whose shares sum to Whole, and its panes are
 // exactly want's, each once.
-func Validate(n *Node, want []uint32) error {
+func Validate(n *Node, want []PaneID) error {
 	if n == nil {
 		return errors.New("daemon: empty layout")
 	}
-	seen := map[uint32]bool{}
+	seen := map[PaneID]bool{}
 	if err := validate(n, seen); err != nil {
 		return err
 	}
@@ -203,13 +203,13 @@ func Validate(n *Node, want []uint32) error {
 	return nil
 }
 
-func validate(n *Node, seen map[uint32]bool) error {
+func validate(n *Node, seen map[PaneID]bool) error {
 	if n.IsLeaf() {
 		if len(n.Children) != 0 {
 			return errors.New("daemon: a pane with children")
 		}
 		if seen[n.Pane] {
-			return fmt.Errorf("daemon: pane %d twice in the layout", n.Pane)
+			return fmt.Errorf("daemon: pane %s twice in the layout", n.Pane)
 		}
 		seen[n.Pane] = true
 		return nil
@@ -242,13 +242,13 @@ func validate(n *Node, seen map[uint32]bool) error {
 // share space in proportion but get different grids. Dividers are
 // ignored; the client accounts for them when it corrects the sizes. A
 // split's last child takes the rounding; every pane gets at least 1x1.
-func Measure(n *Node, width, height uint32, cell func(pane uint32) (w, h uint32)) map[uint32][2]uint16 {
-	out := map[uint32][2]uint16{}
+func Measure(n *Node, width, height uint32, cell func(pane PaneID) (w, h uint32)) map[PaneID][2]uint16 {
+	out := map[PaneID][2]uint16{}
 	measure(n, max(width, 1), max(height, 1), cell, out)
 	return out
 }
 
-func measure(n *Node, width, height uint32, cell func(uint32) (uint32, uint32), out map[uint32][2]uint16) {
+func measure(n *Node, width, height uint32, cell func(PaneID) (uint32, uint32), out map[PaneID][2]uint16) {
 	if n == nil {
 		return
 	}

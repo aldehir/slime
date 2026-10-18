@@ -24,7 +24,7 @@ type Client struct {
 }
 
 type pending struct {
-	id uint32
+	id PaneID
 	m  Message
 }
 
@@ -38,7 +38,7 @@ func NewClient(rw io.ReadWriteCloser) (*Client, error) {
 func NewClientWith(rw io.ReadWriteCloser, hello Hello) (*Client, error) {
 	c := &Client{rw: rw, r: NewReader(rw)}
 	hello.Version = Version
-	if err := c.Send(0, &hello); err != nil {
+	if err := c.Send(NoPane, &hello); err != nil {
 		return nil, err
 	}
 	_, m, err := c.Recv()
@@ -59,7 +59,7 @@ func NewClientWith(rw io.ReadWriteCloser, hello Hello) (*Client, error) {
 	return c, nil
 }
 
-func (c *Client) Send(id uint32, m Message) error {
+func (c *Client) Send(id PaneID, m Message) error {
 	b, err := Encode(id, m)
 	if err != nil {
 		return err
@@ -72,7 +72,7 @@ func (c *Client) Send(id uint32, m Message) error {
 
 // Recv reads the next message and the pane it's for: what a Call set
 // aside first, then the connection.
-func (c *Client) Recv() (uint32, Message, error) {
+func (c *Client) Recv() (PaneID, Message, error) {
 	if len(c.backlog) > 0 {
 		p := c.backlog[0]
 		c.backlog = c.backlog[1:]
@@ -81,10 +81,10 @@ func (c *Client) Recv() (uint32, Message, error) {
 	return c.read()
 }
 
-func (c *Client) read() (uint32, Message, error) {
+func (c *Client) read() (PaneID, Message, error) {
 	f, err := c.r.Read()
 	if err != nil {
-		return 0, nil, err
+		return NoPane, nil, err
 	}
 	m, err := Decode(f)
 	return f.ID, m, err
@@ -112,7 +112,7 @@ func (c *Client) Call(method string, params, result any) error {
 		}
 		req.Params = b
 	}
-	if err := c.Send(0, &Call{Request: req}); err != nil {
+	if err := c.Send(NoPane, &Call{Request: req}); err != nil {
 		return err
 	}
 	for {
