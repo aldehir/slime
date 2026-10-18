@@ -170,6 +170,33 @@ pub fn arc(self: *Painter, cx: f32, cy: f32, r: f32, start: f32, sweep: f32, wid
     self.ctx.drawGeometry(geometry.?, self.color(c), width);
 }
 
+/// Stroke an elbow `width` thick: down from (`x`, `y0`) to `y1`, turning
+/// right through a quarter round of radius `r` into a line that ends at
+/// (`x1`, `y1`). One figure, so the turn has no seam where separate
+/// strokes would meet.
+pub fn elbow(self: *Painter, x: f32, y0: f32, y1: f32, r: f32, x1: f32, width: f32, c: Color) void {
+    var geometry: ?*d2d1.IPathGeometry = null;
+    com.check(self.factory.createPathGeometry(&geometry), "ID2D1Factory::CreatePathGeometry") catch return;
+    defer com.releaseOpt(&geometry);
+    var sink: ?*d2d1.IGeometrySink = null;
+    com.check(geometry.?.open(&sink), "ID2D1PathGeometry::Open") catch return;
+    defer com.releaseOpt(&sink);
+
+    sink.?.beginFigure(.{ .x = x, .y = y0 }, d2d1.FIGURE_BEGIN_HOLLOW);
+    sink.?.addLine(.{ .x = x, .y = y1 - r });
+    // From the round's left to its bottom: counterclockwise on screen.
+    sink.?.addArc(&.{
+        .point = .{ .x = x + r, .y = y1 },
+        .size = .{ .width = r, .height = r },
+        .sweepDirection = d2d1.SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+        .arcSize = d2d1.ARC_SIZE_SMALL,
+    });
+    sink.?.addLine(.{ .x = x1, .y = y1 });
+    sink.?.endFigure(d2d1.FIGURE_END_OPEN);
+    com.check(sink.?.close(), "ID2D1GeometrySink::Close") catch return;
+    self.ctx.drawGeometry(geometry.?, self.color(c), width);
+}
+
 /// Draw text laid out by `format` (alignment, trimming) in `r`, clipped
 /// to it.
 pub fn text(self: *Painter, str: []const u16, format: *dwrite.ITextFormat, r: Rect, c: Color) void {

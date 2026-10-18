@@ -118,6 +118,7 @@ next_session_id: u32 = 1,
 view_tabs: std.ArrayList(Chrome.View.Tab) = .empty,
 view_tab_panes: std.ArrayList(Chrome.View.TabPane) = .empty,
 view_groups: std.ArrayList(Chrome.View.Group) = .empty,
+view_workspaces: std.ArrayList(Chrome.View.Workspace) = .empty,
 view_panes: std.ArrayList(Chrome.View.Pane) = .empty,
 view_dividers: std.ArrayList(Chrome.Rect) = .empty,
 /// The active tab's panes on screen, as `view` lists them.
@@ -394,6 +395,7 @@ pub fn destroy(self: *Window) void {
     self.view_tabs.deinit(self.alloc);
     self.view_tab_panes.deinit(self.alloc);
     self.view_groups.deinit(self.alloc);
+    self.view_workspaces.deinit(self.alloc);
     self.view_panes.deinit(self.alloc);
     self.view_dividers.deinit(self.alloc);
     self.shown_panes.deinit(self.alloc);
@@ -696,8 +698,7 @@ fn hideWorkspace(self: *Window, id: u32) void {
 
 /// Make a workspace with a tab running the local command, shown here.
 fn newWorkspace(self: *Window) void {
-    const conn = self.daemon orelse return;
-    if (conn.isLost()) return;
+    const conn = self.localDaemon() orelse return;
     conn.newWorkspace(&.{}, self.local_command) catch |err| return log.err("new workspace failed: {}", .{err});
     self.activate_new = true;
 }
@@ -816,10 +817,10 @@ fn workspaceGroup(self: *const Window, id: u32) ?usize {
     return null;
 }
 
-/// How many groups come before the hosts': one per workspace, or Local
-/// alone while slime lists none.
+/// How many places in the sidebar's order come before the hosts': one
+/// per workspace, and one for local tabs in none.
 fn localGroups(self: *const Window) usize {
-    return @max(1, self.workspaces.items.len);
+    return self.workspaces.items.len + 1;
 }
 
 /// Lay out `conn`'s tabs of workspace `st.id` as `st` has them, in its
@@ -1037,16 +1038,23 @@ fn nextSessionId(self: *Window) u32 {
 /// Room in `view`'s scratch for every workspace (or Local) and every
 /// host.
 fn reserveGroups(self: *Window) !void {
-    try self.view_groups.ensureTotalCapacity(self.alloc, self.localGroups() + self.hosts.items.items.len);
+    try self.view_groups.ensureTotalCapacity(self.alloc, 1 + self.hosts.items.items.len);
+    try self.view_workspaces.ensureTotalCapacity(self.alloc, self.workspaces.items.len);
 }
 
-/// The sidebar group `t` is listed in: its workspace's, for a local tab
-/// (the first group if slime lists none, or no longer lists it), else
-/// its host's after them. Tabs are kept in group order.
+/// Where `t` is listed, as the sidebar orders tabs: its workspace's
+/// place, for a local tab in one; after every workspace for a local tab
+/// in none (there while slime couldn't be reached, or no longer lists
+/// it); then each host's. Tabs are kept in this order.
 fn groupOf(self: *const Window, t: *const Tab) usize {
-    const dest = t.focus.hostDest() orelse return self.workspaceGroup(t.ws) orelse 0;
+    const dest = t.focus.hostDest() orelse return self.workspaceGroup(t.ws) orelse self.workspaces.items.len;
     // A host isn't forgotten while sessions use it.
-    return self.localGroups() + (self.hosts.indexOf(dest) orelse return 0);
+    return self.localGroups() + (self.hosts.indexOf(dest) orelse return self.workspaces.items.len);
+}
+
+/// The place of host `h`'s tabs in the sidebar's order (`groupOf`).
+fn hostGroup(self: *const Window, h: usize) usize {
+    return self.localGroups() + h;
 }
 
 /// Where a tab in group `g` goes: after the group's last.
@@ -1091,26 +1099,46 @@ fn standIn(self: *const Window, dest: []const u16) ?Found {
     return null;
 }
 
-/// A tab in the active tab's group, or the first workspace's with
-/// nothing shown.
+/// A tab where the active tab is: its workspace, or its host. With
+/// nothing shown, or an active tab in neither, the first shown
+/// workspace's, else a new workspace.
 fn newSession(self: *Window) void {
-    self.newSessionIn(if (self.hasTabs()) self.groupOf(self.activeTab()) else 0);
+    if (self.hasTabs()) {
+        const t = self.activeTab();
+        if (t.focus.hostDest()) |dest| {
+            if (self.hosts.indexOf(dest)) |h| return self.openOnHost(h) catch |err| log.err("new session failed: {}", .{err});
+        } else if (self.workspaceGroup(t.ws)) |w| {
+            return self.newTabInWorkspace(w);
+        }
+    }
+    for (self.workspaces.items, 0..) |w, i| {
+        if (w.shown) return self.newTabInWorkspace(i);
+    }
+    self.newWorkspace();
 }
 
-/// A tab in sidebar group `g`: in a local workspace, shown first if it's
-/// hidden, or on a host.
-fn newSessionIn(self: *Window, g: usize) void {
-    const locals = self.localGroups();
-    if (g >= locals) return self.openOnHost(g - locals) catch |err| log.err("new session failed: {}", .{err});
-    // The tab comes when its pane does (WM_APP_DAEMON).
-    const conn = self.daemon orelse return self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
+/// The local daemon, for a new tab or workspace: a tab says why not if
+/// it can't be had.
+fn localDaemon(self: *Window) ?*Daemon {
+    const conn = self.daemon orelse {
+        self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
+        return null;
+    };
     if (conn.isLost()) {
         // Its tabs say how; slime comes back with the next window.
-        return self.spawnFailed("lost slime", error.Disconnected) catch |err| log.err("new session failed: {}", .{err});
+        self.spawnFailed("lost slime", error.Disconnected) catch |err| log.err("new session failed: {}", .{err});
+        return null;
     }
-    if (g >= self.workspaces.items.len) return self.newWorkspace();
-    const ws = self.workspaces.items[g].id;
-    if (!self.workspaces.items[g].shown) self.showWorkspace(ws);
+    return conn;
+}
+
+/// A tab in workspace `w`, shown first if it's hidden. The tab comes
+/// when its pane does (WM_APP_DAEMON).
+fn newTabInWorkspace(self: *Window, w: usize) void {
+    const conn = self.localDaemon() orelse return;
+    if (w >= self.workspaces.items.len) return;
+    const ws = self.workspaces.items[w].id;
+    if (!self.workspaces.items[w].shown) self.showWorkspace(ws);
     conn.tabNew(ws, self.local_command, self.daemonSize()) catch |err| log.err("new tab in slime failed: {}", .{err});
 }
 
@@ -1659,12 +1687,12 @@ fn focusPane(self: *Window, s: *Session) void {
 
 /// Drop the host behind group `g` from the sidebar, if no tab uses it.
 fn forgetHost(self: *Window, g: usize) void {
-    const locals = self.localGroups();
-    if (g < locals or g - locals >= self.hosts.items.items.len) return;
+    if (g == 0 or g - 1 >= self.hosts.items.items.len) return;
+    const h = g - 1;
     for (self.tabs.items) |t| {
-        if (self.groupOf(t) == g) return;
+        if (self.groupOf(t) == self.hostGroup(h)) return;
     }
-    self.hosts.remove(g - locals);
+    self.hosts.remove(h);
     _ = self.chrome.setHover(.none);
     self.dirty = true;
 }
@@ -2143,19 +2171,17 @@ fn view(self: *Window) Chrome.View {
     self.view_panes.clearRetainingCapacity();
     self.view_dividers.clearRetainingCapacity();
     self.shown_panes.clearRetainingCapacity();
-    // Every workspace, shown or not (Local alone while slime lists none,
-    // for its button), then every host.
-    if (self.workspaces.items.len == 0) {
-        self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .tabs = 0, .kind = .local });
-    } else for (self.workspaces.items) |w| {
-        self.view_groups.appendAssumeCapacity(.{
+    // Local with its workspaces, shown or not, then every host.
+    self.view_workspaces.clearRetainingCapacity();
+    self.view_groups.appendAssumeCapacity(.{ .label = std.unicode.utf8ToUtf16LeStringLiteral("Local"), .tabs = 0, .kind = .local });
+    for (self.workspaces.items) |w| {
+        self.view_workspaces.append(self.alloc, .{
             .label = w.name,
             .tabs = 0,
-            .kind = .workspace,
             .shown = w.shown,
             .count = w.tabs,
             .others = w.viewers -| @intFromBool(w.shown),
-        });
+        }) catch break;
     }
     for (self.hosts.items.items, 0..) |dest, h| {
         self.view_groups.appendAssumeCapacity(.{
@@ -2182,7 +2208,14 @@ fn view(self: *Window) Chrome.View {
             .folded = t.folded,
             .focus = focus,
         }) catch break;
-        self.view_groups.items[self.groupOf(t)].tabs += 1;
+        const place = self.groupOf(t);
+        if (place < self.workspaces.items.len) {
+            if (place < self.view_workspaces.items.len) self.view_workspaces.items[place].tabs += 1;
+        } else if (place == self.workspaces.items.len) {
+            self.view_groups.items[0].tabs += 1;
+        } else {
+            self.view_groups.items[1 + place - self.localGroups()].tabs += 1;
+        }
     }
     // Each tab's panes, now that growing the list can't move them.
     var start: usize = 0;
@@ -2219,10 +2252,11 @@ fn view(self: *Window) Chrome.View {
         .drop = if (d.drop) |drop| drop.rect else null,
         .mouse = .{ .x = @floatFromInt(at.x), .y = @floatFromInt(at.y) },
     } else null else null;
-    const rename: ?Chrome.View.Rename = if (self.rename) |*r| (if (self.workspaceGroup(r.ws)) |g| .{ .group = g, .field = &r.field } else null) else null;
+    const rename: ?Chrome.View.Rename = if (self.rename) |*r| (if (self.workspaceGroup(r.ws)) |w| .{ .workspace = w, .field = &r.field } else null) else null;
     const focus_session = self.focusedSession();
     return .{
         .groups = self.view_groups.items,
+        .workspaces = self.view_workspaces.items,
         .tabs = self.view_tabs.items,
         .panes = self.view_panes.items,
         .dividers = self.view_dividers.items,
@@ -2380,16 +2414,20 @@ fn chromeClick(self: *Window, hit: Chrome.Hit) void {
             self.chrome.toggleMode();
             self.layout();
         },
-        .new_tab => |g| self.newSessionIn(g),
+        // Local's header makes a workspace; a host's, a tab there. With
+        // no daemon to list workspaces, Local's makes a tab.
+        .new_tab => |g| if (g == 0) {
+            if (self.workspaces.items.len == 0) self.newSession() else self.newWorkspace();
+        } else self.openOnHost(g - 1) catch |err| log.err("new session failed: {}", .{err}),
         .forget_host => |g| self.forgetHost(g),
-        .header => |g| if (g < self.workspaces.items.len) {
-            const w = self.workspaces.items[g];
-            if (w.shown) self.hideWorkspace(w.id) else self.showWorkspace(w.id);
+        .workspace => |w| if (w < self.workspaces.items.len) {
+            const ws = self.workspaces.items[w];
+            if (ws.shown) self.hideWorkspace(ws.id) else self.showWorkspace(ws.id);
         },
-        .detach_workspace => |g| if (g < self.workspaces.items.len) self.hideWorkspace(self.workspaces.items[g].id),
-        .kill_workspace => |g| if (g < self.workspaces.items.len) self.askKillWorkspace(self.workspaces.items[g].id),
-        .rename_workspace => |g| if (g < self.workspaces.items.len) self.startRename(self.workspaces.items[g].id),
-        .new_workspace => self.newWorkspace(),
+        .workspace_tab => |w| self.newTabInWorkspace(w),
+        .detach_workspace => |w| if (w < self.workspaces.items.len) self.hideWorkspace(self.workspaces.items[w].id),
+        .kill_workspace => |w| if (w < self.workspaces.items.len) self.askKillWorkspace(self.workspaces.items[w].id),
+        .rename_workspace => |w| if (w < self.workspaces.items.len) self.startRename(self.workspaces.items[w].id),
         .connect => self.startConnect(),
         .dialog_button => |i| {
             const d = self.activeDialog() orelse return;

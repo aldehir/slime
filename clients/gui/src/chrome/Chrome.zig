@@ -61,23 +61,25 @@ pub const Hit = union(enum) {
     maximize,
     close,
     toggle_mode,
-    /// Group `i`'s header, away from its buttons. A workspace's shows or
-    /// hides its tabs.
+    /// Group `i`'s header, away from its buttons.
     header: usize,
-    /// The button that opens a tab in group `i`, connecting first if
-    /// it's a host that isn't connected, or showing a workspace first.
+    /// The button on group `i`'s header: a new workspace under Local, a
+    /// tab on a host, connecting first if it isn't connected.
     new_tab: usize,
     /// The button that removes host group `i` from the list.
     forget_host: usize,
-    /// Workspace group `i`'s buttons: let go of it (the daemon keeps
+    /// Workspace `i`'s row, away from its buttons, which shows or hides
+    /// its tabs.
+    workspace: usize,
+    /// The button that opens a tab in workspace `i`, showing it first.
+    workspace_tab: usize,
+    /// Workspace `i`'s other buttons: let go of it (the daemon keeps
     /// it), end it and everything in it, and edit its name.
     detach_workspace: usize,
     kill_workspace: usize,
     rename_workspace: usize,
-    /// The field a workspace's name is edited in, in its header.
+    /// The field workspace `i`'s name is edited in, in its row.
     rename_field: usize,
-    /// The row that makes a workspace, after the last one.
-    new_workspace,
     /// The button that connects to a host, or its field.
     connect,
     tab: usize,
@@ -108,9 +110,12 @@ pub const Hit = union(enum) {
 
 /// The window's state, as the chrome shows it.
 pub const View = struct {
-    /// Where tabs run, in the order listed. Their tabs come one group
-    /// after another.
+    /// Where tabs run, in the order listed: Local first, then each host.
+    /// `tabs` come in order: each of Local's workspaces' tabs, then
+    /// Local's tabs in no workspace, then each host's.
     groups: []const Group,
+    /// Local's workspaces, in the order listed.
+    workspaces: []const Workspace = &.{},
     tabs: []const Tab,
     active: usize,
     /// The active tab's panes on screen, which tile `paneArea` but for
@@ -122,7 +127,7 @@ pub const View = struct {
     pane_drag: ?PaneDrag = null,
     /// The host being typed after "Connect" was clicked, if it was.
     connect: ?*const TextField = null,
-    /// A workspace's name being edited, in group `group`'s header.
+    /// A workspace's name being edited, in its row.
     rename: ?Rename = null,
     /// The on phase of the caret's blink, while focused.
     caret_visible: bool = false,
@@ -151,23 +156,13 @@ pub const View = struct {
 
     pub const Group = struct {
         label: []const u16,
-        /// How many of `tabs` are in it.
+        /// How many of `tabs` are its own: for Local, those in no
+        /// workspace (there while the daemon couldn't be reached).
         tabs: usize,
         kind: Kind,
-        /// A workspace's tabs are shown: it's attached, so its tabs are
-        /// in `tabs` (or about to be). Hidden, it's a header alone.
-        shown: bool = true,
-        /// How many tabs the daemon has in a workspace, shown or not.
-        count: usize = 0,
-        /// Other windows on a workspace.
-        others: usize = 0,
 
         pub const Kind = enum {
-            /// Where local tabs go while the daemon lists no workspaces
-            /// (it couldn't be reached).
             local,
-            /// A workspace of the local daemon.
-            workspace,
             /// A host with a live connection, which new tabs join.
             connected,
             /// A remembered host that new tabs connect to.
@@ -175,8 +170,22 @@ pub const View = struct {
         };
     };
 
+    /// A workspace of the local daemon, under Local.
+    pub const Workspace = struct {
+        label: []const u16,
+        /// How many of `tabs` are in it.
+        tabs: usize,
+        /// Its tabs are shown: it's attached, so its tabs are in `tabs`
+        /// (or about to be). Hidden, it's a row alone.
+        shown: bool,
+        /// How many tabs the daemon has in it, shown or not.
+        count: usize = 0,
+        /// Other windows on it.
+        others: usize = 0,
+    };
+
     pub const Rename = struct {
-        group: usize,
+        workspace: usize,
         field: *const TextField,
     };
 
@@ -229,9 +238,27 @@ pub const View = struct {
         return if (self.active < self.tabs.len) self.tabs[self.active].title else &.{};
     }
 
+    /// How many of `tabs` are in workspaces: the first ones.
+    fn workspaceTabs(self: *const View) usize {
+        var n: usize = 0;
+        for (self.workspaces) |w| n += w.tabs;
+        return n;
+    }
+
+    /// The workspace the active tab is in, if it's in one.
+    pub fn activeWorkspace(self: *const View) ?usize {
+        var end: usize = 0;
+        for (self.workspaces, 0..) |w, i| {
+            end += w.tabs;
+            if (self.active < end) return i;
+        }
+        return null;
+    }
+
     /// The group the active tab is in.
     pub fn activeGroup(self: *const View) usize {
-        var end: usize = 0;
+        var end: usize = self.workspaceTabs();
+        if (self.active < end) return 0;
         for (self.groups, 0..) |g, i| {
             end += g.tabs;
             if (self.active < end) return i;
@@ -375,7 +402,7 @@ pub fn setHover(self: *Chrome, hit: Hit) bool {
 /// Buttons that are only an icon, which tooltips name.
 pub fn hasTip(hit: Hit) bool {
     return switch (hit) {
-        .toggle_mode, .new_tab, .forget_host, .detach_workspace, .kill_workspace, .rename_workspace, .close_tab, .split_right, .split_down, .zoom => true,
+        .toggle_mode, .new_tab, .workspace_tab, .forget_host, .detach_workspace, .kill_workspace, .rename_workspace, .close_tab, .split_right, .split_down, .zoom => true,
         else => false,
     };
 }
@@ -464,8 +491,11 @@ fn tipText(self: *const Chrome, view: *const View, hit: Hit) struct { []const u1
         }, none },
         .new_tab => |g| if (g < view.groups.len and view.groups[g].kind == .disconnected)
             .{ L("Connect"), none }
+        else if (g < view.groups.len and view.groups[g].kind == .local and view.workspaces.len > 0)
+            .{ L("New workspace"), none }
         else
             .{ L("New tab"), if (g == view.activeGroup()) view.new_tab_key else none },
+        .workspace_tab => |w| .{ L("New tab"), if (w == view.activeWorkspace()) view.new_tab_key else none },
         .forget_host => .{ L("Forget host"), none },
         .detach_workspace => .{ L("Hide workspace (it keeps running)"), none },
         .kill_workspace => .{ L("Kill workspace"), none },
