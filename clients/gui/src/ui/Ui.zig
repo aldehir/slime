@@ -344,10 +344,10 @@ pub fn buttonState(self: *const Ui, id: Id) ButtonState {
     return if (self.pressed.eql(id)) .pressed else .hover;
 }
 
-/// A soft shadow around the rounded rect `r`: `rings` rings `step` DIPs
-/// apart, each faint, so they add up to a fade outward.
-pub fn paintShadow(self: *const Ui, p: *Painter, r: Rect, radius: f32, rings: f32, step: f32) void {
-    paintRings(p, r, radius, rings, self.px(step), .{ 0, 0, 0, 0.06 });
+/// A soft shadow around the rounded rect `r`, the same under every raised
+/// widget: three faint rings a DIP apart, so they add up to a fade outward.
+pub fn paintShadow(self: *const Ui, p: *Painter, r: Rect, radius: f32) void {
+    paintRings(p, r, radius, 3, self.px(1), .{ 0, 0, 0, 0.06 });
 }
 
 /// A glow around `r` in `color`, for what has the keyboard, drawn before

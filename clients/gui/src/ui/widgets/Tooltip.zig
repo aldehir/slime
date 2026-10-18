@@ -38,7 +38,7 @@ pub fn paint(ui: *const Ui, p: *Painter, tree: *const Tree) void {
     if (r.bottom() > window.h - margin) r.y = anchor.y - offset - h;
 
     const radius = ui.px(6);
-    ui.paintShadow(p, r, radius, 3, 1);
+    ui.paintShadow(p, r, radius);
     ui.fillBordered(p, r, radius, ui.theme.dialog, ui.theme.dialog_outline);
     p.text(label, font, .{ .x = r.x + pad, .y = r.y, .w = label_w, .h = h }, ui.theme.text_strong);
     if (key.len > 0) p.text(key, font, .{ .x = r.right() - pad - key_w, .y = r.y, .w = key_w, .h = h }, ui.theme.text_muted);

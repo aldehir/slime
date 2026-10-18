@@ -136,7 +136,7 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
     const t = &ui.theme;
     const f = &ui.fonts;
     const r = node.rect;
-    ui.paintShadow(p, r, ui.px(radius), 4, 1.5);
+    ui.paintShadow(p, r, ui.px(radius));
     ui.fillBordered(p, r, ui.px(radius), t.dialog, t.dialog_outline);
 
     const mouse_on_menu = ui.hover.target == .menu;

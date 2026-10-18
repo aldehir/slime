@@ -167,7 +167,7 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
     const l = layoutIn(ui, node.rect, d);
     const r = l.box;
 
-    ui.paintShadow(p, r, ui.px(radius), 4, 1.5);
+    ui.paintShadow(p, r, ui.px(radius));
     const edge = if (d.danger) mix(t.dialog_outline, t.danger, 0.35) else t.dialog_outline;
     ui.fillBordered(p, r, ui.px(radius), t.dialog, edge);
 

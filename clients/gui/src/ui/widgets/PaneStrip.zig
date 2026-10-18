@@ -136,7 +136,7 @@ pub fn paintDrag(ui: *const Ui, p: *Painter, tree: *const Tree, thumb: ?Painter.
     r.x = @min(r.x, @max(0, f.window.w - w));
     r.y = @min(r.y, @max(0, f.window.h - h));
     const radius = @round(f.corner * scale) + ui.px(2);
-    ui.paintShadow(p, r, radius, 4, 1.5);
+    ui.paintShadow(p, r, radius);
     p.image(img, r, radius, thumb_opacity);
     p.strokeRounded(r, radius, ui.stroke(), ui.theme.dialog_outline);
 }
