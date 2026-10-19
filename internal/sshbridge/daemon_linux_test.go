@@ -95,7 +95,7 @@ func TestDaemonOnLinux(t *testing.T) {
 	c := dialDaemon(t, srv, kh)
 	t.Cleanup(func() { syscall.Kill(int(c.Hello.PID), syscall.SIGKILL) })
 	build, _ := testRemote().For("linux", "amd64")
-	if _, err := os.Stat(filepath.Join(home, ".cache", "slime", "bin", "slime-"+build.ID)); err != nil {
+	if _, err := os.Stat(filepath.Join(home, ".cache", "slime", "bin", build.ID, "slime")); err != nil {
 		t.Fatalf("not installed: %v", err)
 	}
 

@@ -52,14 +52,17 @@ func newCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "slime",
 		Short:         "Keep terminals alive between attaches",
+		Long:          rootDoc,
 		Version:       fmt.Sprintf("protocol %d", daemon.Version),
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
 	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "print results as JSON, as the daemon replies")
 	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
-		paneCommand(), doCommand(), scriptsCommand(), callCommand())
+		paneCommand(), doCommand(), scriptsCommand(), callCommand(), skillCommand())
 	root.AddCommand(hostCommands()...)
+	root.AddCommand(topicCommands()...)
+	root.SetHelpCommand(helpCommand(root))
 	return root
 }
 
@@ -473,24 +476,30 @@ func paneCommand() *cobra.Command {
 		asVT    bool
 	)
 	split := &cobra.Command{
-		Use:   "split <pane> right|down|left|up [command]",
-		Short: "Start a pane beside another, and print its id",
-		Args:  cobra.RangeArgs(2, 3),
+		Use:   "split [pane] right|down|left|up [command]",
+		Short: "Start a pane beside another (this one, by default), and print its id",
+		Long: "Starts a pane on a side of another, running command (empty for the shell),\n" +
+			"taking --percent of its space. Without a pane, beside the one this console\n" +
+			"runs in ($SLIME_PANE).",
+		Args: cobra.RangeArgs(1, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := rpc.ParsePaneID(args[0])
+			pane, args, err := paneArg(args)
 			if err != nil {
 				return err
 			}
+			if len(args) == 0 || len(args) > 2 {
+				return fmt.Errorf("a direction, then at most a command: %s", cmd.UseLine())
+			}
 			var dir rpc.Direction
-			if err := dir.UnmarshalText([]byte(args[1])); err != nil {
+			if err := dir.UnmarshalText([]byte(args[0])); err != nil {
 				return err
 			}
 			if percent <= 0 || percent >= 100 {
 				return fmt.Errorf("--percent must be between 0 and 100")
 			}
 			p := rpc.PaneSplitParams{Pane: pane, Direction: dir, Share: uint16(percent * 100)}
-			if len(args) == 3 {
-				p.Command = args[2]
+			if len(args) == 2 {
+				p.Command = args[1]
 			}
 			var created rpc.Created
 			if err := call(rpc.PaneSplit, p, &created); err != nil {
@@ -505,22 +514,28 @@ func paneCommand() *cobra.Command {
 	}
 	split.Flags().Float64VarP(&percent, "percent", "p", 50, "how much of the pane's space the new one takes")
 	move := &cobra.Command{
-		Use:   "move <pane> <tab|new> [right|down|left|up]",
+		Use:   "move [pane] <tab|new> [right|down|left|up]",
 		Short: "Move a pane along a side of another tab, or into a new tab of its own, and print its new id",
-		Args:  cobra.RangeArgs(2, 3),
+		Long: "Moves a pane (this console's, without one) into tab along the side given,\n" +
+			"or into a new tab of its own. The pane gets a new id there, printed; its old\n" +
+			"ids keep finding it.",
+		Args: cobra.RangeArgs(1, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := rpc.ParsePaneID(args[0])
+			pane, args, err := paneArg(args)
 			if err != nil {
 				return err
 			}
+			if len(args) == 0 || len(args) > 2 {
+				return fmt.Errorf("a tab or new, then at most a side: %s", cmd.UseLine())
+			}
 			p := rpc.PaneMoveParams{Pane: pane}
-			if args[1] != "new" {
-				if p.Tab, err = rpc.ParseTabID(args[1]); err != nil {
+			if args[0] != "new" {
+				if p.Tab, err = rpc.ParseTabID(args[0]); err != nil {
 					return err
 				}
 			}
-			if len(args) == 3 {
-				if err := p.Side.UnmarshalText([]byte(args[2])); err != nil {
+			if len(args) == 2 {
+				if err := p.Side.UnmarshalText([]byte(args[1])); err != nil {
 					return err
 				}
 			}
@@ -537,11 +552,11 @@ func paneCommand() *cobra.Command {
 	}
 	var zoom, unzoom bool
 	focus := &cobra.Command{
-		Use:   "focus <pane>",
-		Short: "Give a pane the input in every window on its workspace, showing its tab",
-		Args:  cobra.ExactArgs(1),
+		Use:   "focus [pane]",
+		Short: "Give a pane (this one, by default) the input in every window on its workspace, showing its tab",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := rpc.ParsePaneID(args[0])
+			pane, err := paneOnly(args)
 			if err != nil {
 				return err
 			}
@@ -561,11 +576,11 @@ func paneCommand() *cobra.Command {
 	focus.Flags().BoolVar(&zoom, "zoom", false, "zoom it to fill its tab too")
 	focus.Flags().BoolVar(&unzoom, "unzoom", false, "show every pane of its tab again")
 	text := &cobra.Command{
-		Use:   "text <pane>",
-		Short: "Print a pane's screen and scrollback, without taking it",
-		Args:  cobra.ExactArgs(1),
+		Use:   "text [pane]",
+		Short: "Print a pane's screen and scrollback (this pane's, by default), without taking it",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pane, err := rpc.ParsePaneID(args[0])
+			pane, err := paneOnly(args)
 			if err != nil {
 				return err
 			}
@@ -588,10 +603,17 @@ func paneCommand() *cobra.Command {
 
 	pane := &cobra.Command{Use: "pane", Short: "Split, move, focus, kill, write to, and read panes"}
 	pane.AddCommand(split, move, focus, text, &cobra.Command{
-		Use:   "kill <pane>...",
-		Short: "End panes",
-		Args:  cobra.MinimumNArgs(1),
+		Use:   "kill [pane]...",
+		Short: "End panes (this one, with none given)",
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				self, err := paneOnly(nil)
+				if err != nil {
+					return err
+				}
+				args = []string{self.String()}
+			}
 			c, err := connect(false)
 			if err != nil {
 				return err
@@ -609,24 +631,34 @@ func paneCommand() *cobra.Command {
 			return nil
 		},
 	}, &cobra.Command{
-		Use:   "write <pane> <text>",
-		Short: "Send text to a pane's program as if typed (no newline is added)",
-		Args:  cobra.ExactArgs(2),
+		Use:   "write [pane] <text>",
+		Short: "Send text to a pane's program (this one's, by default) as if typed",
+		Long: "Sends text to the pane's program as typed: no newline is added, and a\n" +
+			"carriage return presses enter (\"\\r\" in most shells' double quotes, `r in\n" +
+			"PowerShell's). Without a pane, the one this console runs in.",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := rpc.ParsePaneID(args[0])
-			if err != nil {
-				return err
+			id := envPane()
+			if len(args) == 2 {
+				var err error
+				if id, err = rpc.ParsePaneID(args[0]); err != nil {
+					return err
+				}
+				args = args[1:]
+			} else if id.IsZero() {
+				return errNoPane
 			}
-			return call(rpc.PaneWrite, rpc.PaneWriteParams{ID: id, Text: args[1]}, nil)
+			return call(rpc.PaneWrite, rpc.PaneWriteParams{ID: id, Text: args[0]}, nil)
 		},
 	}, &cobra.Command{
-		Use:   "info <pane>",
-		Short: "Describe a pane: its command, title, size, and program status",
+		Use:   "info [pane]",
+		Short: "Describe a pane (this one, by default): its command, title, size, and program status",
 		Long: "Describes a pane. A pane that moved tabs is found under the id it had too,\n" +
-			"and described under the id it has now.",
-		Args: cobra.ExactArgs(1),
+			"and described under the id it has now. Without a pane, the one this console\n" +
+			"runs in ($SLIME_PANE).",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := rpc.ParsePaneID(args[0])
+			id, err := paneOnly(args)
 			if err != nil {
 				return err
 			}
@@ -653,8 +685,8 @@ func callCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "call <method> [params-json]",
 		Short: "Call any method on the daemon and print the raw reply",
-		Long: "Calls a method of the control plane (internal/rpc) with params given as JSON,\n" +
-			"and prints the result. Errors print their code and message.",
+		Long: "Calls a method of the control plane with params given as JSON, and prints the\n" +
+			"result; slime help methods lists them. Errors print their code and message.",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var params json.RawMessage
@@ -719,6 +751,36 @@ func parseID(s string) (uint32, error) {
 		return 0, fmt.Errorf("bad id %q", s)
 	}
 	return uint32(id), nil
+}
+
+// errNoPane: a pane command run outside a pane, without a pane.
+var errNoPane = errors.New("which pane? none given, and this console isn't in a slime pane (no SLIME_PANE)")
+
+// paneArg is the pane a pane command names first, when it does, and the
+// arguments after it: a pane id is w.t.p, which none of the others look
+// like. Without one, the pane is this console's ($SLIME_PANE), or
+// errNoPane.
+func paneArg(args []string) (rpc.PaneID, []string, error) {
+	if len(args) > 0 && strings.Count(args[0], ".") == 2 {
+		id, err := rpc.ParsePaneID(args[0])
+		return id, args[1:], err
+	}
+	id := envPane()
+	if id.IsZero() {
+		return id, nil, errNoPane
+	}
+	return id, args, nil
+}
+
+// paneOnly is paneArg for a command that takes a pane and nothing else,
+// so that an argument that isn't a pane id is an error rather than
+// ignored.
+func paneOnly(args []string) (rpc.PaneID, error) {
+	id, rest, err := paneArg(args)
+	if err == nil && len(rest) > 0 {
+		return id, fmt.Errorf("bad id: a pane id is workspace.tab.pane, not %q", rest[0])
+	}
+	return id, err
 }
 
 // connect dials the daemon and says hello. If start is set and none is

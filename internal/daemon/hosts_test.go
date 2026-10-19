@@ -60,7 +60,7 @@ func (f *fakeHost) exec(command string, stdin io.Reader, stdout, stderr io.Write
 			return 1
 		}
 		f.mu.Lock()
-		f.installed = append(f.installed, filepath.Base(args[0]))
+		f.installed = append(f.installed, filepath.Base(filepath.Dir(args[0])))
 		f.mu.Unlock()
 		return 0
 	case strings.Contains(command, " connect --term "):
@@ -119,6 +119,8 @@ type hostHarness struct {
 	*harness
 	ssh  *sshtest.Server
 	host *fakeHost
+	// builds is what the local daemon has to install on hosts.
+	builds *remote.Manifest
 	// remote is the host's daemon.
 	remote *harness
 	// ln accepts connections to the local daemon over TCP, which has
@@ -191,7 +193,7 @@ func newHostHarness(t *testing.T, sshOpts sshtest.Options, idle time.Duration) *
 			go local.handle(c)
 		}
 	}()
-	return &hostHarness{harness: h, ssh: srv, host: host, remote: remoteH, ln: ln}
+	return &hostHarness{harness: h, ssh: srv, host: host, builds: builds, remote: remoteH, ln: ln}
 }
 
 // recv reads the next message within the timeout.
@@ -414,7 +416,8 @@ func TestHostConnectPrompts(t *testing.T) {
 	h.host.mu.Lock()
 	installed := h.host.installed
 	h.host.mu.Unlock()
-	if len(installed) != 1 || !strings.HasPrefix(installed[0], "slime-") {
+	build, _ := h.builds.For("linux", "amd64")
+	if len(installed) != 1 || installed[0] != build.ID {
 		t.Errorf("installed %q", installed)
 	}
 

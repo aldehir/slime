@@ -154,7 +154,7 @@ func (f *fakeHost) exec(command string, stdin io.Reader, stdout, stderr io.Write
 		f.probes++
 		fmt.Fprintf(stdout, "%s\n/home/alde/.cache/slime/bin\n", f.uname)
 		for name := range f.installed {
-			fmt.Fprintf(stdout, "%s\n", strings.TrimPrefix(name, "/home/alde/.cache/slime/bin/"))
+			fmt.Fprintf(stdout, "%s\n", strings.TrimSuffix(strings.TrimPrefix(name, "/home/alde/.cache/slime/bin/"), "/slime"))
 		}
 		return 0
 	case strings.Contains(command, "gzip -dc"):

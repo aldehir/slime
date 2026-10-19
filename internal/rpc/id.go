@@ -17,6 +17,19 @@ import (
 // specific id has the rest. Moving a pane to another tab gives it that
 // tab's next number; the old path forwards to it (see pane.move).
 
+// IDsDoc is `slime help ids`: the paragraph above, for users.
+const IDsDoc = `Ids are paths. A workspace is a number (1), a tab its workspace's number
+and its own (1.2), a pane its tab's and its own (1.2.3): each level is
+numbered by its parent from a counter that never reuses a number, so a
+path is never reissued while the daemon lives, and reordering changes no
+id. A command given a pane id knows its tab and workspace.
+
+A pane moved to another tab takes that tab's next number. Its old ids
+keep finding it while it lives (so a shell's SLIME_PANE stays good), and
+every answer names it by its current id.
+
+Script and host ids are plain numbers of their own.`
+
 // TabID names tab N of workspace WS: "WS.N" on the wire.
 type TabID struct {
 	WS uint32

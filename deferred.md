@@ -221,7 +221,7 @@ attached or not. If slime can't be started, a tab says why.
 
 On SSH hosts it's the same daemon, built for Linux on x86-64 and
 carried in `remote/` beside the exe. The local slime installs it as
-`~/.cache/slime/bin/slime-<build>` and splices a second connection from
+`~/.cache/slime/bin/<build>/slime` and splices a second connection from
 each window to `slime connect` there (its socket is
 `/tmp/slime-<uid>/sock`), which lists the host's workspaces as the
 first lists the local ones. While a user waits for a pane there, a
@@ -279,21 +279,23 @@ so; the host's button reconnects, reattaches, and replaces them.
   the daemon drops a workspace with no tabs once no window views it, so
   one emptied by closing its tabs lives only while shown.
 - **Daemon copies pile up.** slime-gui runs slime from a copy in
-  `%LOCALAPPDATA%\slime\bin` named for the build, so a running daemon
+  `%LOCALAPPDATA%\slime\bin\<build>\slime.exe`, so a running daemon
   doesn't block the next install, and never deletes old ones.
 
 - **New panes take slime's environment**, from whichever slime-gui started
-  it, not the window's (`SLIME_PANE` and `SLIME_INSTANCE` added, and
+  it, not the window's (`SLIME_PANE`, `SLIME_WORKSPACE`, `SLIME_EXE`,
+  `SLIME_INSTANCE`, and the daemon's directory leading `PATH` added, and
   whatever `env` a `tab.new` or `pane.split` carries; the window sends
-  none).
+  none). A shell profile that resets `PATH` loses `slime`; `SLIME_EXE`
+  still names it.
 - **Only Linux hosts on x86-64.** Others get a tab saying slime can't
   run there: slime would need libghostty-vt built for them with Zig,
   and `remote/` carries none.
 - **Nothing shows while a host's slime starts.** The stand-in is blank
   between logging in and the panes coming, which on a first install
   includes sending about 3 MiB.
-- **Builds pile up on hosts**, one `slime-<build>` per slime-gui build in
-  `~/.cache/slime/bin`, never removed.
+- **Builds pile up on hosts**, one `~/.cache/slime/bin/<build>/slime` per
+  slime-gui build, never removed.
 - **A host's daemon from an older build keeps serving.** A slime-gui whose
   protocol or frame layout differs can't attach there until that daemon
   exits, which is when its panes have all ended.

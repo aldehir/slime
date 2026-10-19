@@ -32,9 +32,9 @@ func Name(goos, goarch string) string {
 type Build struct {
 	OS, Arch string
 	// ID names this build: the first 16 hex digits of the gzipped
-	// file's SHA-256. A host keeps it under a name with the ID, so a
-	// different build is installed beside it rather than over a
-	// running one.
+	// file's SHA-256. A host keeps it as `slime` in a directory named
+	// for the ID, so a different build is installed beside it rather
+	// than over a running one.
 	ID string
 	// Size is the gzipped file's, in bytes.
 	Size int64

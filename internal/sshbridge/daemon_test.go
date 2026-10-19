@@ -84,7 +84,7 @@ func TestDaemonInstallsThenBridges(t *testing.T) {
 	}
 	b.echo(t, "hello slime")
 	build, _ := testRemote().For("linux", "amd64")
-	exe := "/home/alde/.cache/slime/bin/slime-" + build.ID
+	exe := "/home/alde/.cache/slime/bin/" + build.ID + "/slime"
 	host.mu.Lock()
 	got, ok := host.installed[exe]
 	connects := host.connects
@@ -125,7 +125,7 @@ func TestDaemonInstallsThenBridges(t *testing.T) {
 func TestDaemonFoundNotInstalled(t *testing.T) {
 	needPayload(t)
 	build, _ := testRemote().For("linux", "amd64")
-	exe := "/home/alde/.cache/slime/bin/slime-" + build.ID
+	exe := "/home/alde/.cache/slime/bin/" + build.ID + "/slime"
 	host := &fakeHost{uname: "Linux x86_64", installed: map[string][]byte{exe: nil}}
 	conn := dialHost(t, host)
 	if got, err := conn.EnsureDaemon(nil); err != nil || got != exe {

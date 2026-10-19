@@ -3,7 +3,11 @@ package daemon
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	goruntime "runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aldehir/slime/internal/pty"
@@ -673,13 +677,37 @@ func (s *Server) addPaneLocked(t *tab, st *started) *Pane {
 	return p
 }
 
+// EnvDoc is `slime help env`: the variables every pane's environment
+// carries, which paneEnv sets.
+const EnvDoc = `Every pane slime starts has these in its environment, so the CLI and
+scripts run in it act on it by default:
+
+  SLIME_PANE       the pane's id (w.t.p), which names its tab and workspace
+                   too. Pane commands without a pane act on it; slime do
+                   runs for it. It keeps finding the pane after a move.
+  SLIME_WORKSPACE  the pane's workspace (w): slime tab new adds to it,
+                   slime ws new opens the new workspace in its windows, and
+                   a slime-gui started from the pane shows it alone.
+  SLIME_EXE        the daemon's own executable, and its directory leads
+                   PATH, so "slime" is the build the daemon runs. Use it
+                   rather than another slime on the machine: the two
+                   speak the same protocol. A shell without it isn't in a
+                   slime pane.
+  SLIME_INSTANCE   set only under a daemon of its own (one started with it
+                   set), so that the CLI reaches that daemon and not the
+                   user's.
+
+The variables are set when the pane starts; a shell keeps them if the
+pane moves, and the ids stay valid.`
+
 // paneEnv is what every pane's environment says about itself: the pane
 // it is (which names its tab and workspace), the workspace again for
-// a window started from it, and the daemon it belongs to
-// (SLIME_INSTANCE, when the daemon is one), so the CLI and scripts run
-// in it act on them by default.
+// a window started from it, and the daemon it belongs to: SLIME_INSTANCE
+// when the daemon is one, and SLIME_EXE, whose directory leads PATH so
+// that `slime` in the pane is the daemon's own build. The CLI and scripts
+// run in it act on them by default.
 func paneEnv(id PaneID, spec *rpc.PaneSpec) map[string]string {
-	env := make(map[string]string, len(spec.Env)+3)
+	env := make(map[string]string, len(spec.Env)+5)
 	for k, v := range spec.Env {
 		env[k] = v
 	}
@@ -688,7 +716,45 @@ func paneEnv(id PaneID, spec *rpc.PaneSpec) map[string]string {
 	if inst := os.Getenv("SLIME_INSTANCE"); inst != "" {
 		env["SLIME_INSTANCE"] = inst
 	}
+	if exe := exePath(); exe != "" {
+		env["SLIME_EXE"] = exe
+		key, base := pathVar(spec.Env)
+		env[key] = leadPath(filepath.Dir(exe), base)
+	}
 	return env
+}
+
+// exePath is the daemon's executable, found once; "" if it can't be.
+var exePath = sync.OnceValue(func() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
+})
+
+// pathVar is the name PATH goes by in spec's env, and its value there,
+// else the daemon's own: Windows spells it any way (Path), and a pane
+// given one of its own keeps it.
+func pathVar(spec map[string]string) (key, value string) {
+	for k, v := range spec {
+		if k == "PATH" || (goruntime.GOOS == "windows" && strings.EqualFold(k, "PATH")) {
+			return k, v
+		}
+	}
+	return "PATH", os.Getenv("PATH")
+}
+
+// leadPath is path with dir first, unless it already is.
+func leadPath(dir, path string) string {
+	sep := string(filepath.ListSeparator)
+	if path == "" {
+		return dir
+	}
+	if first, _, _ := strings.Cut(path, sep); filepath.Clean(first) == filepath.Clean(dir) {
+		return path
+	}
+	return dir + sep + path
 }
 
 // paneSplit starts a pane beside another. Replies as tabNew does.

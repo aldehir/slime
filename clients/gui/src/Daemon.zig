@@ -1983,10 +1983,13 @@ fn checkServer(pipe: win32.HANDLE) !void {
 
 /// Run slime so it outlives us: detached, and out of any job we're in.
 ///
-/// It runs from a copy in %LOCALAPPDATA%\slime\bin, named for the size
-/// and time of the slime.exe next to us: a running exe can't be
-/// replaced, and the daemon runs as long as its sessions, so running ours
-/// in place would stop the next build from installing over it. It loads
+/// It runs from a copy in %LOCALAPPDATA%\slime\bin\<build>\slime.exe, the
+/// directory named for the size and time of the slime.exe next to us: a
+/// running exe can't be replaced, and the daemon runs as long as its
+/// sessions, so running ours in place would stop the next build from
+/// installing over it; and the copy keeps its name, so the daemon can
+/// put its directory on its panes' PATH (`slime` there is the daemon's
+/// own build). It loads
 /// the ConPTY next to us (which doesn't change between builds), and the
 /// builds of slime for hosts from `remote/` next to us. Its log
 /// goes to %LOCALAPPDATA%\slime\slime.log (slime-<instance>.log with
@@ -2028,9 +2031,12 @@ fn startDaemon() !void {
 
         var name_buf: [64]u8 = undefined;
         const size = @as(u64, attrs.nFileSizeHigh) << 32 | attrs.nFileSizeLow;
-        const name = std.fmt.bufPrint(&name_buf, "\\slime-{x}-{x}.exe", .{ size, attrs.ftLastWriteTime }) catch unreachable;
+        const name = std.fmt.bufPrint(&name_buf, "\\{x}-{x}", .{ size, attrs.ftLastWriteTime }) catch unreachable;
+        try base.putAscii(name);
+        try makeDir(&base);
         try exe.put(base.slice());
-        try exe.putAscii(name);
+        try exe.put(L("\\"));
+        try exe.put(daemon_name);
         if (win32.CopyFileW(try src.z(), try exe.z(), win32.TRUE) == 0 and win32.GetLastError() != win32.ERROR_FILE_EXISTS)
             return win32.lastError("CopyFileW(slime.exe)");
     }

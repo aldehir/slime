@@ -13,24 +13,119 @@ import (
 	"github.com/aldehir/slime/internal/rpc"
 )
 
-// The slime table. Its shape is Rex's with the nouns renamed:
-//
-//	slime.args                       the script's arguments
-//	slime.workspace_id, tab_id, pane_id   what it runs for, or nil:
-//	                                 a number, "w.t", and "w.t.p"
-//	slime.call(method, params)       any method, by its wire name
-//	slime.workspace.<m>{...}         "workspace.<m>", id filled in;
-//	                                 new's attach too (false: detached)
-//	slime.tab.<m>{...}               "tab.<m>", id or workspace filled in
-//	slime.pane.<m>{...}              "pane.<m>", id or pane filled in
-//	slime.id.parse(id), tab(w, t), pane(w, t, p)   ids apart and together
-//	slime.layout.pane{...}, horizontal(ratio, a, b, ...), vertical
-//	slime.json.encode(v), decode(s)
-//	slime.log(...)                   to the daemon's log
-//	slime.stop([result])             ends the run, successfully
-//
-// A call returns its result, or nil, the error's message, and its
-// code, as Rex's do. An uncaught error ends the run with status 1.
+// The slime table, as Doc says; its shape is Rex's with the nouns
+// renamed. Doc is `slime help lua`, kept here with what it describes.
+const Doc = `Scripts run in the daemon (slime do) with gopher-lua, a Lua 5.1. The
+libraries are base, package, table, string, math, coroutine, debug, and
+os without exit; there is no io, and print goes to the console that ran
+the script. One state per run, cancelled between instructions, so a
+blocking call finishes before a cancel lands.
+
+THE SLIME TABLE
+
+  slime.args                 table of the key=value arguments (empty if none)
+  slime.workspace_id         what the script runs for, or nil: a number,
+  slime.tab_id, slime.pane_id    "w.t", and "w.t.p"; read at call time, so a
+                             script may set them to retarget
+  slime.call(method, params) any method by wire name; params a table or nil
+  slime.workspace.<m>{...}   workspace.<m> with id filled from workspace_id
+                             (not for list); new gets attach from it instead,
+                             so the windows on the script's workspace open the
+                             new one (attach = false leaves it detached; another
+                             id names another workspace's windows); focus with
+                             neither tab nor pane gets pane from pane_id
+  slime.tab.<m>{...}         tab.<m>; tab.new gets workspace, the rest id
+                             from tab_id
+  slime.pane.<m>{...}        pane.<m>; split and move get pane, the rest id
+                             from pane_id
+  slime.id.parse(id)         {workspace, tab, pane} from 1, "1.2", or "1.2.3"
+                             (the parts it has); nil, err for anything else
+  slime.id.tab(w, t)         "w.t" and "w.t.p" from numbers
+  slime.id.pane(w, t, p)
+  slime.layout.pane{command, cwd, env}
+                             a leaf for tabs in workspace.new or layout in tab.new
+  slime.layout.horizontal([ratio,] a, b, ...)
+                             side by side (a row split); ratio is a's share (0 to
+                             1), the rest share what's left equally; no ratio
+                             divides equally
+  slime.layout.vertical([ratio,] a, b, ...)
+                             stacked (a column split); same rule
+  slime.json.encode(v)       JSON; return nil, err on failure
+  slime.json.decode(s)
+  slime.log(...)             a line to the daemon's log and the script's stderr;
+                             arguments joined by tabs like print
+  slime.stop([result])       ends the run successfully, with result as its
+                             return value
+
+Calls return the result table, or nil, message, code (see slime help
+methods for the codes). Wrap in assert(...) when failure should end the
+script. The namespaces are metatables: any method the daemon has works,
+including ones added later, without a Lua-side list.
+
+Values cross as JSON. Numbers are doubles; workspace ids are numbers,
+tab and pane ids strings, compared with ==. A table whose keys are
+exactly 1..n is an array; any other table, including an empty one, is
+an object. So a method that takes a list can't be given an empty table,
+and nil in a table means the key is absent. Functions and cycles can't
+be encoded.
+
+Caveats: pcall catches slime.stop (it is an error under the hood). A
+script is never a viewer: slime.workspace.new needs tabs; run from a
+pane, the windows on that pane's workspace open the new one, otherwise
+it starts detached. A script's split, tab.new, and move don't take the
+focus (a window's own do). subscribe, hooks, wait, timers, and exec are
+not available yet.
+
+EXAMPLES
+
+Inspect (slime do -e '...'):
+
+  local l = assert(slime.workspace.list{})
+  for _, ws in ipairs(l.workspaces) do
+    print(ws.id, ws.name, ws.attached and "attached" or "detached", #ws.tabs .. " tabs")
+  end
+  for _, p in ipairs(l.panes) do print("pane", p.id, p.command, p.title) end
+
+Build a workspace from a layout (slime do dev.lua file=app.log):
+
+  local ws = assert(slime.workspace.new{
+    name = "dev",
+    tabs = {
+      slime.layout.horizontal(0.7,
+        slime.layout.pane{ command = "nvim" },
+        slime.layout.vertical(0.5,
+          slime.layout.pane{ command = "tail -f " .. slime.args.file },
+          slime.layout.pane{})),
+      slime.layout.pane{ command = "bash", cwd = "/src", env = { EDITOR = "nvim" } },
+    },
+  })
+  print("workspace", ws.id, "opens on tab", ws.active_tab)
+  return ws.id
+
+From inside a pane (ids default to this pane):
+
+  local me = assert(slime.pane.info{})
+  local below = assert(slime.pane.split{ direction = "down", share = 3000 })
+  assert(slime.pane.write{ id = below.pane, text = "cd " .. me.pwd .. "\r" })
+  assert(slime.workspace.focus{ pane = below.pane })   -- its tab comes with it
+
+Walk a tab's tree:
+
+  local function leaves(node, out)
+    if node.pane then out[#out + 1] = node.pane
+    else for _, c in ipairs(node.split.children) do leaves(c.node, out) end end
+    return out
+  end
+  local t = assert(slime.tab.info{ id = slime.tab_id })
+  for _, id in ipairs(leaves(t.tree, {})) do
+    print(id, assert(slime.pane.text{ id = id }).text:match("[^\n]*$"))  -- last line of each
+  end
+
+Errors and stopping early:
+
+  local p, err, code = slime.pane.info{ id = "1.1.999" }
+  if not p then slime.log("no pane:", err, code) end          -- 1000 is not found
+  if #assert(slime.workspace.list{}).workspaces > 0 then slime.stop("already set up") end`
 
 // install sets the script's globals: the slime table, and print.
 func (r *Runner) install(ctx Context) {

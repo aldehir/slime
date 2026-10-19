@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -1028,6 +1030,11 @@ func TestPaneEnv(t *testing.T) {
 	if env["SLIME_PANE"] != fmt.Sprint(created.Pane) || env["SLIME_WORKSPACE"] != fmt.Sprint(w.ws.ID) || env["SLIME_INSTANCE"] != "envtest" {
 		t.Errorf("env %v", env)
 	}
+	// The daemon's own executable, and its directory first on PATH.
+	exe, _ := os.Executable()
+	if env["SLIME_EXE"] != exe || !strings.HasPrefix(env["PATH"], filepath.Dir(exe)+string(filepath.ListSeparator)) {
+		t.Errorf("SLIME_EXE %q PATH %q, want %q first", env["SLIME_EXE"], env["PATH"], exe)
+	}
 	var made rpc.Created
 	if err := w.c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: w.ws.ID, Env: map[string]string{"FOO": "bar"}}, &made); err != nil {
 		t.Fatal(err)
@@ -1035,6 +1042,14 @@ func TestPaneEnv(t *testing.T) {
 	env = h.spawned(2).Env
 	if env["FOO"] != "bar" || env["SLIME_PANE"] != fmt.Sprint(made.Pane) || env["SLIME_WORKSPACE"] != fmt.Sprint(w.ws.ID) {
 		t.Errorf("env %v", env)
+	}
+	// A PATH of the caller's own is kept, led by the daemon's directory.
+	if err := w.c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: w.ws.ID, Env: map[string]string{"PATH": "mine"}}, &made); err != nil {
+		t.Fatal(err)
+	}
+	env = h.spawned(3).Env
+	if want := filepath.Dir(exe) + string(filepath.ListSeparator) + "mine"; env["PATH"] != want {
+		t.Errorf("PATH %q, want %q", env["PATH"], want)
 	}
 }
 

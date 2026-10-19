@@ -1,359 +1,64 @@
 ---
 name: slime
 description: >-
-  Drive slime, the terminal daemon in this repo, from the command line and
-  from Lua: list, create, split, write to, read, focus, and kill workspaces,
-  tabs, and panes with `slime ls|ws|tab|pane|call`; run Lua in the daemon with
-  `slime do` (files, -e code, stdin, key=value args, --detach, slime scripts);
-  build layouts with slime.layout; call any control-plane method. Use when the
-  user wants to script or inspect slime's workspaces, write a slime Lua script,
-  automate a layout, or look up the slime Lua API, the method table, its
-  params and results, events, or error codes. Covers SLIME_INSTANCE,
-  SLIME_PANE, SLIME_WORKSPACE, and the rules for test daemons.
+  Drive slime, the terminal daemon this shell runs in, from the command
+  line: split panes, open tabs and workspaces, type into panes, read their
+  screens, move and focus them, run Lua in the daemon. Use when asked to
+  arrange, read, or control the terminal, open something beside the current
+  pane, watch another pane's output, or script slime. Applies when the
+  environment has SLIME_PANE or SLIME_EXE.
 ---
 
 # Driving slime
 
-slime (`slime.exe`, `cmd/slime`) is a daemon that owns terminals: each
-pane is a pty plus its terminal state, panes sit in tabs (a layout tree),
-tabs in workspaces. Windows (`slime-gui.exe`) attach a workspace and draw
-it; any number may view one workspace. Everything that manages the model
-is a JSON-RPC method on one table (`internal/rpc` names it,
-`internal/daemon/rpc.go` serves it). The CLI calls that table over the
-pipe, and Lua run by `slime do` calls it in process. A method that
-exists for one exists for all.
+slime is a daemon that owns terminals. Each pane is a program on a pty
+with its terminal state; panes sit in tabs (a layout tree), tabs in
+workspaces; windows draw them, locally or over SSH, and panes outlive
+their windows. The `slime` command controls all of it, and every control
+is also a JSON-RPC method (`slime call`) and a Lua function (`slime do`).
 
-## Before running anything
+## Find the CLI
 
-- Alde may be dogfooding slime. Every CLI command talks to the daemon
-  on the per-user pipe `\\.\pipe\slime-<sid>` and starts one if none is
-  running. **To stay off the dogfood daemon, set `SLIME_INSTANCE=<name>`**
-  in the shell: the pipe becomes `slime-<sid>-<name>` and `slime do`
-  starts a daemon of its own. Stop that one by PID when done; never kill
-  processes you didn't start.
-- Build the CLI with `go build -o <dir>\slime.exe ./cmd/slime` after
-  `. .\scripts\setup-msvc.ps1` (cgo needs `zig cc`). `zig build` puts
-  it in `zig-out\bin\`. See `AGENTS.md`.
-- **Ids are paths.** A workspace is a number (`1`), a tab is its
-  workspace's number and its own (`1.2`), a pane its tab's and its own
-  (`1.2.3`): each level is numbered by its parent from a counter that
-  never reuses a number, so a path is never reissued while the daemon
-  lives and reordering changes no id. A method given a pane id knows
-  its tab and workspace. A pane moved to another tab takes that tab's
-  next number; its old ids keep finding it while it lives, and every
-  answer names it by its current id. Script and host ids are plain
-  numbers of their own.
+A shell in a slime pane has `SLIME_EXE`, the daemon's own executable, and
+its directory is first on `PATH`, so `slime` runs it. If `slime` isn't
+found (a shell profile reset `PATH`), run `"$SLIME_EXE"` (`& $env:SLIME_EXE`
+in PowerShell), or put `$(dirname "$SLIME_EXE")` back on `PATH`. Use that
+executable and not another slime on the machine: it is the build the
+daemon runs, so its commands and its manual match the daemon.
 
-## The CLI
+No `SLIME_EXE` means this shell isn't in a slime pane. Then slime can't
+be driven from here unless a `slime` on `PATH` reaches a daemon.
 
-```
-slime ls [--json]                                  workspaces, tabs, panes
-slime ws new [name] [--attach ws] | rename <ws> <name> | kill <ws> | info <ws>
-slime ws focus <tab|pane>                          show a tab in every window on its workspace, or a pane's tab with it focused
-slime tab new [-w ws] [-n name] [--split right|down] [command]...
-slime tab rename <tab> <name> | close <tab> | info <tab>
-slime pane split <pane> right|down|left|up [-p percent] [command]
-slime pane move <pane> <tab|new> [right|down|left|up]   prints the pane's new id
-slime pane focus <pane> [--zoom|--unzoom]
-slime pane write <pane> <text>                     typed as is; "\r" presses enter
-slime pane text <pane> [--vt]                      screen and scrollback
-slime pane info <pane> | kill <pane>...
-slime do <file.lua | -> [key=value...] [-e code] [-p pane] [--detach]
-slime scripts [ls] | scripts kill <id>...
-slime call <method> [params-json]                  any method, raw reply
-slime host connect <dest> | ls | disconnect <id|dest>   (Windows daemon)
-slime serve [--idle 10s] [--log file] [-v]         run the daemon in the foreground
-```
+## Learn it from the CLI
 
-`--json` on any command prints the daemon's reply as it came. Commands
-take `CreateProcessW` syntax for a pane's command; an empty command is
-the default shell. `slime tab new` with several commands gives each a
-pane sharing the tab along `--split`.
+The CLI is its own manual, for the exact build you're talking to. Run
+`slime help` once and read it all: every command with its flags, then the
+topics. Afterwards, `slime help <command>` (`slime help pane split`) or
+`slime help <topic>`:
 
-Every pane's shell has `SLIME_PANE` (`1.2.3`) and `SLIME_WORKSPACE`
-(`1`), and `SLIME_INSTANCE` when the daemon is one. Inside a pane,
-`slime ws new` therefore opens the new workspace in the pane's window
-(`--attach 0` leaves it detached, another id names another workspace's
-windows), `slime tab new` adds to the pane's workspace, and `slime do`
-runs for the pane, even after the pane moved tabs.
+- `env`: `SLIME_PANE`, `SLIME_WORKSPACE`, `SLIME_EXE`, `SLIME_INSTANCE`
+- `ids`: workspaces, tabs, and panes are paths (`1`, `1.2`, `1.2.3`)
+- `lua`: the `slime` table scripts get, with examples
+- `methods`, `events`: the control plane, for `slime call` and scripts
 
-## `slime do`
+Don't guess flags, methods, or fields: read them from `slime help`.
 
-```powershell
-slime do dev.lua file=app.log            # a file, with slime.args.file = "app.log"
-slime do -e 'return slime.workspace.list{}'
-'print("hi")' | slime do -               # stdin
-slime do --detach -e 'while true do end' # prints the script id, returns at once
-slime do --json -e 'return { a = 1 }'    # the result as raw JSON
-```
+## The shape of it
 
-- Arguments after the script are `key=value`, strings in `slime.args`.
-  A bare word that isn't a file is an error (named actions come with
-  the config stage).
-- `-p <pane>` sets the pane the script runs for; it defaults to
-  `$SLIME_PANE`, which every pane's shell has. From inside a pane,
-  `slime do` therefore targets that pane, its tab, and its workspace
-  unless the script says otherwise, and a workspace it makes opens in
-  that pane's window.
-- What the script `print`s comes to stdout as it runs; `slime.log` goes
-  to stderr and the daemon's log. The value the chunk returns prints at
-  the end: a string as is, anything else as JSON, nothing for `nil`.
-- An uncaught error prints the message and stack trace and exits 1.
-- Ctrl+C sends `script.cancel`; a second Ctrl+C gives up waiting.
-- Without `--detach`, closing the console cancels the script. With it,
-  the script runs on; `slime scripts` lists it and `slime scripts kill`
-  ends it.
+- `slime ls` lists every workspace, tab, and pane, with ids; `--json` on
+  any command gives the daemon's reply as data.
+- Pane commands (`split`, `write`, `text`, `focus`, `move`, `info`,
+  `kill`) act on this pane when given none; `slime tab new` adds to this
+  workspace; `slime do` runs its script for this pane.
+- `slime pane split right <command>` opens a pane beside this one and
+  prints its id; `slime pane text <id>` reads its screen and scrollback
+  without disturbing it; `slime pane write <id> <text>` types into it,
+  where a carriage return presses enter.
+- A pane's program ending ends the pane. To keep a result on screen,
+  run a shell and write the command to it.
 
-## Lua API: the `slime` table
+## Manners
 
-The runtime is gopher-lua (Lua 5.1). Libraries: base, package, table,
-string, math, coroutine, debug, and os without `exit`. There is no `io`;
-`print` is stdout. One state per run, cancelled between instructions,
-so a blocking Go call finishes before a cancel lands.
-
-| name | what |
-|---|---|
-| `slime.args` | table of the `key=value` arguments (an empty table if none) |
-| `slime.workspace_id`, `slime.tab_id`, `slime.pane_id` | the context, or nil: a number, `"1.2"`, and `"1.2.3"`; read at call time, so a script may set them to retarget |
-| `slime.call(method, params)` | any method by wire name; `params` a table or nil |
-| `slime.workspace.<m>{...}` | `workspace.<m>` with `id` filled from `workspace_id` (not for `list`); `new` gets `attach` from it instead, so the windows on the script's workspace open the new one (`attach = false` leaves it detached; another id names another workspace's windows); `focus` with neither `tab` nor `pane` gets `pane` from `pane_id` |
-| `slime.tab.<m>{...}` | `tab.<m>`; `tab.new` gets `workspace`, the rest get `id` from `tab_id` |
-| `slime.pane.<m>{...}` | `pane.<m>`; `split` and `move` get `pane`, the rest get `id` from `pane_id` |
-| `slime.id.parse(id)` | `{workspace, tab, pane}` from `1`, `"1.2"`, or `"1.2.3"` (the parts it has); `nil, err` for anything else |
-| `slime.id.tab(w, t)`, `slime.id.pane(w, t, p)` | `"w.t"` and `"w.t.p"` from numbers |
-| `slime.layout.pane{command, cwd, env}` | a leaf for `tabs` in `workspace.new` or `layout` in `tab.new` |
-| `slime.layout.horizontal([ratio,] a, b, ...)` | side by side; `ratio` is `a`'s share (0 to 1), the rest share what's left equally; no ratio divides equally |
-| `slime.layout.vertical([ratio,] a, b, ...)` | stacked; same rule |
-| `slime.json.encode(v)`, `slime.json.decode(s)` | JSON; return `nil, err` on failure |
-| `slime.log(...)` | a line to the daemon's log and the script's stderr; arguments joined by tabs like `print` |
-| `slime.stop([result])` | ends the run successfully, with `result` as its return value |
-
-**Calls return the result table, or `nil, message, code`** where code
-is the error code below. Wrap in `assert(...)` when failure should end
-the script. The namespaces are metatables: any method the daemon has
-works, including ones added later, without a Lua-side list.
-
-**Values cross as JSON.** Numbers are doubles; workspace ids are
-numbers, tab and pane ids strings, compared with `==`. A table whose
-keys are exactly 1..n is an array; any other table, including an empty
-one, is an object. So a method that takes a list can't be given an
-empty table, and `nil` in a table means the key is absent. Functions
-and cycles can't be encoded.
-
-**Caveats.** `pcall` catches `slime.stop` (it is an error under the
-hood). A script is never a viewer: `slime.workspace.new` needs `tabs`;
-run from a pane, the windows on that pane's workspace open the new one
-(they get `workspace.open` and attach it beside their tabs), otherwise
-it starts detached. A script's `split`, `tab.new`, and `move` don't
-take the focus (a window's own do). `subscribe`, hooks, `wait`, timers,
-and `exec` are not available yet.
-
-## Examples
-
-Inspect, from a console:
-
-```lua
--- slime do -e '...'
-local l = assert(slime.workspace.list{})
-for _, ws in ipairs(l.workspaces) do
-  print(ws.id, ws.name, ws.attached and "attached" or "detached", #ws.tabs .. " tabs")
-end
-for _, p in ipairs(l.panes) do print("pane", p.id, p.command, p.title) end
-```
-
-Build a workspace from a layout (`slime do dev.lua file=app.log`):
-
-```lua
-local ws = assert(slime.workspace.new{
-  name = "dev",
-  tabs = {
-    slime.layout.horizontal(0.7,
-      slime.layout.pane{ command = "nvim" },
-      slime.layout.vertical(0.5,
-        slime.layout.pane{ command = "pwsh -c Get-Content -Wait " .. slime.args.file },
-        slime.layout.pane{})),
-    slime.layout.pane{ command = "pwsh", cwd = "E:\\Development", env = { EDITOR = "nvim" } },
-  },
-})
-print("workspace", ws.id, "opens on tab", ws.active_tab)
-return ws.id
-```
-
-Run from a pane, the window showing that pane opens the new workspace
-beside its tabs and shows it. From a console outside slime it starts
-detached: every window lists it in its sidebar, where a click shows it.
-A new window shows the workspaces the last one did (or all of them,
-under a daemon it hasn't seen); `SLIME_WORKSPACE=<id>` in the window's
-environment shows that one alone (every pane's shell has it, so a
-`slime-gui` started from a pane joins that pane's workspace).
-
-From inside a pane (ids default to this pane):
-
-```lua
-local me = assert(slime.pane.info{})
-local below = assert(slime.pane.split{ direction = "down", share = 3000, command = "pwsh" })
-assert(slime.pane.write{ id = below.pane, text = "cd " .. me.pwd .. "\r" })
-assert(slime.workspace.focus{ pane = below.pane })   -- its tab comes with it
-```
-
-Walk a tab's tree:
-
-```lua
-local function leaves(node, out)
-  if node.pane then out[#out + 1] = node.pane
-  else for _, c in ipairs(node.split.children) do leaves(c.node, out) end end
-  return out
-end
-local t = assert(slime.tab.info{ id = slime.tab_id })
-for _, id in ipairs(leaves(t.tree, {})) do
-  print(id, assert(slime.pane.text{ id = id }).text:match("[^\n]*$"))  -- last line of each
-end
-```
-
-Error handling and stopping early:
-
-```lua
-local p, err, code = slime.pane.info{ id = "1.1.999" }
-if not p then slime.log("no pane:", err, code) end          -- 1000 is not found
-if #assert(slime.workspace.list{}).workspaces > 0 then slime.stop("already set up") end
-```
-
-Raw access, with and without Lua:
-
-```powershell
-slime do -e 'return slime.call("host.list")'
-slime call pane.text '{"id": "1.1.3"}'
-slime call workspace.focus '{"pane": "2.6.3", "zoomed": "2.6.3"}'
-```
-
-## Method reference
-
-Params and results are JSON objects; the Lua tables mirror them
-field for field. A workspace id is an integer; a tab id is the string
-`"w.t"` and a pane id `"w.t.p"` (`internal/rpc/id.go`), and `""` is
-none where one is optional. `internal/rpc/rpc.go` is the definition;
-this is the summary.
-
-### workspace
-
-| method | params | result |
-|---|---|---|
-| `workspace.list` | none | `{workspaces: [WorkspaceDesc], panes: [PaneDesc]}` |
-| `workspace.new` | `{name?, tabs?: [Layout], attach?: workspace id}` | `Workspace`; a connection calling it becomes a viewer, a script must give `tabs`; the viewers of `attach` get `workspace.open` once the tabs are up |
-| `workspace.attach` | `{id, area?}` | `Workspace`; windows only (frames follow) |
-| `workspace.detach` | `{id}` | `{}` |
-| `workspace.kill` | `{id}` | `{}`; ends every pane in it |
-| `workspace.rename` | `{id, name}` | `{}` |
-| `workspace.resize` | `{id, area}` | `{}`; a viewer's tab area in pixels |
-| `workspace.focus` | `{tab?, pane?, zoomed?}` | `{}`; `tab` becomes active, `pane` its focus (and names the tab if `tab` is left out), `zoomed` the zoomed pane (`""` unzooms) |
-| `workspace.info` | `{id}` | `WorkspaceDesc` |
-
-### tab
-
-| method | params | result |
-|---|---|---|
-| `tab.new` | `{workspace, name?, layout?: Layout, command?, cwd?, env?, size?}` | `Created` (`pane` is the first pane, which names the tab) |
-| `tab.close` | `{id}` | `{}` |
-| `tab.rename` | `{id, name}` | `{}` |
-| `tab.layout` | `{id, tree: Node}` | `{}`; same panes, new shares (a divider drag) |
-| `tab.info` | `{id}` | `Tab` |
-
-### pane
-
-| method | params | result |
-|---|---|---|
-| `pane.split` | `{pane, direction: right\|down\|left\|up, share?: 1..9999 (basis points, 5000 default), command?, cwd?, env?}` | `Created` |
-| `pane.move` | `{pane, tab?: leave out for a new tab, side?}` | `Created` naming the pane's new id: in another tab it's that tab's next pane, and its old ids keep finding it |
-| `pane.kill` | `{id}` | `{}` |
-| `pane.write` | `{id, text}` | `{}`; as typed, no newline added |
-| `pane.text` | `{id, vt?: bool}` | `{text}`: plain, or the VT that redraws it |
-| `pane.info` | `{id}` | `PaneDesc`, under the id the pane has now |
-
-### script
-
-| method | params | result |
-|---|---|---|
-| `script.run` | `{source, name?, args?: object, pane?, detach?}` | `{id}` at once; output and the end arrive as events |
-| `script.cancel` | `{id}` | `{}` |
-| `script.list` | none | `{scripts: [{id, name, pane, started, detached}]}` |
-
-### other
-
-| method | params | result |
-|---|---|---|
-| `subscribe` | `{events: ["pane.exited", "host.*", "*"]}` | `{}`; needs a connection (not from Lua) |
-| `host.connect` | `{dest}` | `Host`; prompts arrive as `host.prompt`, answered with `host.answer` |
-| `host.answer` | `{host, choice: accept\|cancel\|skip, answers?}` | `{}` |
-| `host.disconnect` | `{host}` | `{}` |
-| `host.list` | none | `{hosts: [Host]}` |
-
-### Shapes
-
-```
-Layout     {pane: {command?, cwd?, env?}} | {split: {axis: row|column, children: [{share?, node: Layout}]}}
-           shares in basis points summing to 10000, or all absent for equal parts
-Node       {pane: "w.t.p"} | {split: {axis, children: [{share, node: Node}]}}      (a built tab's tree)
-Workspace  {id, name, active_tab: "w.t", tabs: [Tab]}
-Tab        {id: "w.t", name?, tree: Node, focus?: "w.t.p", zoomed?: "w.t.p"}
-WorkspaceDesc  Workspace plus {attached, viewers?, detached_at?}
-PaneDesc   {id: "w.t.p", command, title?, pwd?, cols, rows, created, pid, status?: [{id, state, progress}]}
-Created    {pane: "w.t.p"}
-Host       {id, dest, state: connecting|connected|failed|lost|gone, text?}
-```
-
-`slime.layout.horizontal` builds a `row` split, `vertical` a `column`.
-Times are unix milliseconds.
-
-### Events
-
-A window gets its workspaces' events without subscribing; a script's
-owner gets `script.*` for its scripts; anyone else subscribes. Scripts
-can't receive events yet.
-
-| event | params |
-|---|---|
-| `workspace.created` / `destroyed` | `{id, name}` / `{id}` |
-| `workspace.changed` | `Workspace` (structure and focus) |
-| `workspace.detached` | `{id, reason}` |
-| `workspace.open` | `{id, name}`: to the viewers of the workspace a `workspace.new` named in `attach`, which open it too |
-| `workspace.viewer_joined` / `viewer_left` | `{id, viewers}` |
-| `tab.created` / `closed` / `renamed` / `selected` | `{id, name?}` |
-| `pane.created` | `{id}` |
-| `pane.moved` | `{id, from}`: to another tab, under a new id |
-| `pane.attached` | `{id, moved_from?, command, status?}` (viewers only; frames follow; `moved_from` is the id a viewer held it under until now) |
-| `pane.exited` | `{id, status}` |
-| `script.output` | `{id, stream: stdout\|stderr, data}` |
-| `script.done` | `{id, ok, result?, error?}` |
-| `host.changed` / `host.prompt` | `Host` / `{host, kind, title?, text?, detail?, error?, questions?}` |
-
-### Error codes
-
-| code | meaning |
-|---|---|
-| -32601 | no such method |
-| -32602 | bad params |
-| 1000 | no such workspace, tab, pane, host, or script |
-| 1001 | unsupported on this daemon (hosts on Linux) |
-| 1002 | the op ran and failed (a child didn't start) |
-
-The CLI prints `message (code N)` and exits 1; Lua gets `nil, message, code`.
-
-## Troubleshooting
-
-- **`slime isn't running`**: only commands that create things start the
-  daemon (`do`, `tab new`, `host connect`). Run one of those, or
-  `slime serve` in another console.
-- **`no such pane` right after a split**: the command exited at once
-  (`cmd /c dir`); the pane is gone with it. Use a shell.
-- **`hello nil`**: `slime.pane_id` is nil outside a pane; pass `-p`.
-- **`bad id: a pane id is workspace.tab.pane, not "4"`**: a bare
-  number is a workspace id; tabs and panes are paths. A shell from a
-  slime before paths has a numeric `SLIME_PANE`, which `slime do`
-  ignores.
-- **Script hangs on Ctrl+C**: it is inside a Go call; wait, or press
-  Ctrl+C again to leave it running and `slime scripts kill` it.
-- **Which daemon?** A daemon the CLI started logs to
-  `%LOCALAPPDATA%\slime\slime.log` (one the window started logs to
-  `slime-<instance>.log` beside it); its first line is
-  `serving pipe=\\.\pipe\slime-<sid>[-<instance>] pid=<pid>`, which is
-  the PID to stop when you're done with a test instance.
+The user is working in these panes. Don't kill, move, or type into
+panes you didn't make unless asked; read them freely. Prefer a new pane
+or tab for your own work, and clean up what you opened when done.

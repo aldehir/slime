@@ -20,8 +20,9 @@ import (
 // None has a single quote or a !, which csh expands even in quotes.
 const (
 	// daemonProbe prints `uname -sm`, the directory builds are kept in,
-	// and the builds there.
-	daemonProbe = `uname -sm; d="${XDG_CACHE_HOME:-$HOME/.cache}/slime/bin"; echo "$d"; for f in "$d"/slime-*; do [ -x "$f" ] && echo "${f##*/}"; done; true`
+	// and the builds there: each is a directory named for the build,
+	// holding `slime`, so a pane's PATH can name its daemon's build.
+	daemonProbe = `uname -sm; d="${XDG_CACHE_HOME:-$HOME/.cache}/slime/bin"; echo "$d"; for f in "$d"/*/slime; do [ -x "$f" ] && b="${f%/slime}" && echo "${b##*/}"; done; true`
 	// daemonInstall unpacks a build from stdin to $0, beside which
 	// nothing half-written is left.
 	daemonInstall = `set -e; umask 077; mkdir -p "${0%/*}"; t="$0.$$"; trap "rm -f \"$t\"" EXIT; gzip -dc >"$t"; chmod 700 "$t"; mv -f "$t" "$0"; trap - EXIT`
@@ -70,11 +71,10 @@ func (c *Conn) EnsureDaemon(status func(string)) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("no build of slime for %s/%s", goos, goarch)
 	}
-	name := "slime-" + build.ID
-	exe = strings.TrimSpace(lines[1]) + "/" + name
+	exe = strings.TrimSpace(lines[1]) + "/" + build.ID + "/slime"
 	installed := false
 	for _, l := range lines[2:] {
-		installed = installed || strings.TrimSpace(l) == name
+		installed = installed || strings.TrimSpace(l) == build.ID
 	}
 	if !installed {
 		log.Printf("installing slime (%s/%s, %d KiB) as %s", goos, goarch, build.Size>>10, exe)

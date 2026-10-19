@@ -35,7 +35,7 @@ func doCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "do <file.lua | -> [key=value...]",
 		Short: "Run a Lua script in the daemon",
-		Long: "Runs Lua in the daemon, against its workspaces (see internal/lua for the slime\n" +
+		Long: "Runs Lua in the daemon, against its workspaces (slime help lua has the slime\n" +
 			"table): a file, code given with -e, or stdin as -. Arguments are key=value pairs,\n" +
 			"strings in slime.args. Inside a pane, the script runs for that pane (SLIME_PANE),\n" +
 			"so calls that take a pane, tab, or workspace id default to it. What the script\n" +

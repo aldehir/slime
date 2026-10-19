@@ -41,5 +41,11 @@ zig build test
 - The reader thread must never call anything that waits on the UI thread
   (SendMessage, SetWindowTextW); use PostMessage.
 - Check `deferred.md` before building adjacent features; keep it current.
+- The CLI is its own manual: `slime help` prints every command and the
+  topics (env, ids, lua, methods, events). Each topic's text lives beside
+  the code it describes (`daemon.EnvDoc`, `rpc.IDsDoc`, `lua.Doc`,
+  `rpc.MethodDocs`); a new command, method, variable, or Lua function
+  gets its line there, not in a separate doc. `skills/slime/SKILL.md`
+  is the agent skill `slime skill install` ships; it points at the manual.
 - Commits: one line, `module: description` (e.g. `renderer: ...`,
   `input: ...`), only when asked.
