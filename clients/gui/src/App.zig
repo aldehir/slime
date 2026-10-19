@@ -134,6 +134,10 @@ next_workspace_key: u32 = 1,
 /// connection of one whose id isn't known yet.
 activate_ws: ?u32 = null,
 activate_new: ?*Daemon = null,
+/// The connection a blank browser pane was just asked of (Open browser):
+/// when it arrives focused, its URL bar takes the keys, so a site can be
+/// typed at once.
+browser_asked: ?*Daemon = null,
 /// Connections to slime on SSH hosts, bridged through the local daemon,
 /// one per host it has connected: each lists its host's workspaces as
 /// `daemon` lists the local ones, and attaches the ones shown here.
@@ -980,6 +984,18 @@ fn daemonChanged(self: *App, conn: *Daemon) void {
             }
         }
     }
+    // The blank browser pane Open browser asked for came, and is focused
+    // as asked-for panes are: its URL bar is for typing in. Whatever
+    // came instead (the split was refused) ends the asking.
+    if (self.browser_asked == conn and taken.arrivals.len > 0) {
+        self.browser_asked = null;
+        if (self.hasTabs()) {
+            const t = self.activeTab();
+            if (t.conn == conn and t.focus.content == .browser) if (t.focus.daemonPane()) |p| for (taken.arrivals) |a| {
+                if (a.pane.eql(p)) self.startUrl(t.focus);
+            };
+        }
+    }
     // Panes no tab holds (which slime doesn't send) aren't shown.
     var left = arrived.valueIterator();
     while (left.next()) |s| s.*.destroy();
@@ -1096,6 +1112,7 @@ fn dropWorkspacesOf(self: *App, conn: *const Daemon) void {
         if (w.conn == conn) self.forgetWorkspace(w.key) else i += 1;
     }
     if (self.activate_new == conn) self.activate_new = null;
+    if (self.browser_asked == conn) self.browser_asked = null;
 }
 
 /// The listed workspace `key` names.
@@ -1413,6 +1430,8 @@ fn openMenu(self: *App, target: Id.Target, anchor: Menu.Anchor) void {
                 const zoomed = t.zoom == s;
                 m.add(.{ .label = if (zoomed) L("Unzoom") else L("Zoom"), .icon = if (zoomed) .minimize_2 else .maximize_2, .action = .{ .binding = .toggle_split_zoom } });
             }
+            m.separator();
+            m.add(.{ .label = L("Open browser"), .icon = .globe, .action = .{ .part = .open_browser }, .disabled = !in_slime });
             m.separator();
             m.add(.{ .label = L("Close pane"), .icon = .x, .action = .{ .binding = .close_surface }, .danger = true });
         },
@@ -2275,6 +2294,22 @@ fn splitPane(self: *App, s: *Session, dir: Daemon.Direction) void {
         self.syncFocus();
     }
     conn.split(pane, dir, self.daemonCommand(conn)) catch |err| log.err("split failed: {}", .{err});
+    self.markDirty();
+}
+
+/// Open browser on pane `s`: a blank browser pane split off its right,
+/// whose URL bar takes the keys when it comes (`browser_asked`). It can
+/// be moved from there.
+fn openBrowser(self: *App, s: *Session) void {
+    const pane = s.daemonPane() orelse return;
+    const t = self.activeTab();
+    const conn = t.conn orelse return;
+    self.unzoom(t);
+    conn.splitBrowser(pane, .right, L("about:blank")) catch |err| {
+        log.err("opening a browser beside pane {d} failed: {}", .{ s.id, err });
+        return;
+    };
+    self.browser_asked = conn;
     self.markDirty();
 }
 
@@ -3560,6 +3595,7 @@ fn widgetClick(self: *App, hit: Id) void {
         },
         .split_right => if (self.shownPane(hit.target)) |s| self.splitPane(s, .right),
         .split_down => if (self.shownPane(hit.target)) |s| self.splitPane(s, .down),
+        .open_browser => if (self.shownPane(hit.target)) |s| self.openBrowser(s),
         .zoom => if (self.shownPane(hit.target)) |s| self.toggleZoom(s),
         .back => if (self.shownPane(hit.target)) |s| self.shell.webGo(s, .back),
         .forward => if (self.shownPane(hit.target)) |s| self.shell.webGo(s, .forward),

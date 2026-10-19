@@ -342,7 +342,9 @@ so; the host's button reconnects, reattaches, and replaces them.
 
 ## Browser panes
 
-A pane is a terminal or a browser (`slime pane split --browser <url>`).
+A pane is a terminal or a browser (`slime pane split --browser <url>`, or
+Open browser in a pane's context menu: a blank one split off its right,
+its URL bar ready to type in).
 The daemon keeps a browser's url and title; the window fills the pane
 with WebView2 in visual mode (`Web.zig`), under a strip with back,
 forward, reload (stop while loading), and a URL bar (a click selects it

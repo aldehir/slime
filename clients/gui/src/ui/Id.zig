@@ -86,6 +86,8 @@ pub const Part = enum {
     show,
     split_right,
     split_down,
+    /// A pane's menu entry that splits a blank browser pane off its right.
+    open_browser,
     zoom,
     /// A browser pane's history and reload buttons.
     back,
