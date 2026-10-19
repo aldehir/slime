@@ -10,6 +10,14 @@
 //! refresh, and an idle terminal draws the next change immediately. The
 //! timer matters where DWM doesn't pace presents at all, e.g. over Remote
 //! Desktop, where even vsync'd presents run at thousands of fps.
+//!
+//! The swap chain is the content of a DirectComposition visual, the root
+//! of the window's tree, so that content we don't draw (a browser pane's)
+//! can be composed with it: each such pane gets a container visual over
+//! the chain (`setPaneVisual`), and while there are any, a second,
+//! transparent chain over them takes what must be over panes (dialogs,
+//! the menu, the tooltip, a dragged pane). Without them the window draws
+//! into the one chain alone.
 const D3D11 = @This();
 
 const std = @import("std");
@@ -21,6 +29,7 @@ const d3d11 = win32.d3d11;
 const d3dcompiler = win32.d3dcompiler;
 const dxgi = win32.dxgi;
 const d2d1 = win32.d2d1;
+const dcomp = win32.dcomp;
 const font = @import("../font/font.zig");
 const cells = @import("cells.zig");
 const image = @import("image.zig");
@@ -35,8 +44,11 @@ const shader_source = @embedFile("shaders.hlsl");
 /// 60 Hz, for when DWM can't tell us the refresh rate.
 const default_refresh_period = 10_000_000 / 60;
 
+alloc: std.mem.Allocator,
 device: *d3d11.IDevice,
 context: *d3d11.IDeviceContext,
+factory: *dxgi.IFactory2,
+/// The ground: everything but what `overlay` takes.
 swap_chain: *dxgi.ISwapChain1,
 /// Must be passed again to ResizeBuffers.
 swap_chain_flags: u32,
@@ -87,6 +99,13 @@ brush: *d2d1.ISolidColorBrush,
 icon: ?Painter.Icon = null,
 /// The chrome's icons. Null where Direct2D can't draw SVG.
 lucide: ?Painter.LucideIcons = null,
+/// The chrome's text antialiasing, as Direct2D takes it.
+text_antialias: u32,
+comp: Composition,
+/// Browser panes' container visuals, over the ground (see `setPaneVisual`).
+pane_visuals: std.ArrayList(PaneVisualEntry) = .empty,
+/// The chain over `pane_visuals`, while there are any.
+overlay: ?OverlayChain = null,
 /// A copy of part of the last frame, for the UI to draw scaled (a pane
 /// being dragged). Kept between frames at its last size.
 capture: ?Capture = null,
@@ -173,7 +192,7 @@ pub const Pane = struct {
 pub const Error = com.Error;
 
 /// `antialias` is for the chrome's text; the grid's comes rasterized.
-pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias) Error!D3D11 {
+pub fn init(alloc: std.mem.Allocator, hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias) Error!D3D11 {
     var device: ?*d3d11.IDevice = null;
     var context: ?*d3d11.IDeviceContext = null;
     try createDevice(&device, &context);
@@ -185,7 +204,7 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias
         dxgi.CreateDXGIFactory2(0, &dxgi.IFactory2.iid, @ptrCast(&factory)),
         "CreateDXGIFactory2",
     );
-    defer com.releaseOpt(&factory);
+    errdefer com.releaseOpt(&factory);
 
     // Tearing lets a frame reach the screen without waiting for vblank
     // when DWM hands the window an independent flip (e.g. maximized on
@@ -195,21 +214,10 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias
     const swap_chain_flags = dxgi.SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
         if (tearing) dxgi.SWAP_CHAIN_FLAG_ALLOW_TEARING else 0;
 
-    var swap_chain: ?*dxgi.ISwapChain1 = null;
-    try com.check(factory.?.createSwapChainForHwnd(device.?, hwnd, &.{
-        .Width = width,
-        .Height = height,
-        .Format = buffer_format,
-        .BufferUsage = dxgi.USAGE_RENDER_TARGET_OUTPUT,
-        .BufferCount = buffer_count,
-        .Scaling = dxgi.SCALING_NONE,
-        .SwapEffect = dxgi.SWAP_EFFECT_FLIP_DISCARD,
-        .AlphaMode = dxgi.ALPHA_MODE_IGNORE,
-        .Flags = swap_chain_flags,
-    }, &swap_chain), "CreateSwapChainForHwnd");
-    errdefer com.releaseOpt(&swap_chain);
+    const swap_chain = try createChain(factory.?, device.?, width, height, dxgi.ALPHA_MODE_IGNORE, swap_chain_flags);
+    errdefer com.release(swap_chain);
 
-    const swap_chain2 = com.query(swap_chain.?, dxgi.ISwapChain2) orelse {
+    const swap_chain2 = com.query(swap_chain, dxgi.ISwapChain2) orelse {
         log.err("swap chain has no IDXGISwapChain2", .{});
         return error.HResult;
     };
@@ -262,13 +270,23 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias
     }, &box), "ID3D11Device::CreateBuffer(box)");
     errdefer com.releaseOpt(&box);
 
-    const d2d = try createD2d(device.?, antialias);
+    const text_antialias = switch (antialias) {
+        .grayscale => d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE,
+        .cleartype => d2d1.TEXT_ANTIALIAS_MODE_CLEARTYPE,
+        .aliased => d2d1.TEXT_ANTIALIAS_MODE_ALIASED,
+    };
+    const d2d = try createD2d(device.?, text_antialias);
     errdefer d2d.deinit();
 
+    const comp: Composition = try .init(hwnd, swap_chain);
+    errdefer comp.deinit();
+
     var self: D3D11 = .{
+        .alloc = alloc,
         .device = device.?,
         .context = context.?,
-        .swap_chain = swap_chain.?,
+        .factory = factory.?,
+        .swap_chain = swap_chain,
         .swap_chain_flags = swap_chain_flags,
         .present_flags = if (tearing) dxgi.PRESENT_ALLOW_TEARING else 0,
         .frame_waitable = frame_waitable,
@@ -285,10 +303,12 @@ pub fn init(hwnd: win32.HWND, width: u32, height: u32, antialias: font.Antialias
         .brush = d2d.brush,
         .icon = Painter.Icon.init(d2d.context, @embedFile("slime-small.svg"), 1024),
         .lucide = Painter.initLucide(d2d.context),
+        .text_antialias = text_antialias,
+        .comp = comp,
     };
     try self.createRenderTarget();
     self.updateRefreshRate();
-    log.info("swap chain: waitable, max latency 1, tearing={}, refresh {d:.1} Hz", .{
+    log.info("composition swap chain: waitable, max latency 1, tearing={}, refresh {d:.1} Hz", .{
         tearing,
         10_000_000.0 / @as(f64, @floatFromInt(self.refresh_period)),
     });
@@ -301,6 +321,10 @@ pub fn deinit(self: *D3D11) void {
     self.context.clearState();
     self.d2d_context.setTarget(null);
     com.releaseOpt(&self.d2d_target);
+    for (self.pane_visuals.items) |e| e.deinit();
+    self.pane_visuals.deinit(self.alloc);
+    if (self.overlay) |*o| o.deinit();
+    self.comp.deinit();
     if (self.icon) |icon| icon.deinit();
     if (self.lucide) |*icons| Painter.deinitLucide(icons);
     if (self.capture) |c| c.deinit();
@@ -318,6 +342,7 @@ pub fn deinit(self: *D3D11) void {
     _ = win32.CloseHandle(self.frame_waitable);
     _ = win32.CloseHandle(self.pace_timer);
     com.release(self.swap_chain);
+    com.release(self.factory);
     com.release(self.context);
     com.release(self.device);
     self.* = undefined;
@@ -419,13 +444,18 @@ pub fn resize(self: *D3D11, width: u32, height: u32) Error!void {
     self.width = width;
     self.height = height;
     try self.createRenderTarget();
+    if (self.overlay) |*o| try self.resizeOverlay(o);
 }
 
 /// Draw the terminals, then `ui` over them, and present. `ui` has a
-/// `paint(*Painter)` method, and `capture() ?Painter.Rect` and
+/// `paint(*Painter, Ui.Layer)` method, and `capture() ?Painter.Rect` and
 /// `paintOver(*Painter, ?Painter.Image)`: when `capture` names a part of
 /// the frame, that part is copied once `paint` is done, and `paintOver`
-/// draws over the frame with the copy. Waits for the swap chain first unless
+/// draws over the frame with the copy. While there's an overlay chain,
+/// `paint`'s `.ground` goes into the swap chain and its `.over` and
+/// `paintOver` into the overlay, which is drawn while `hasOver()` says
+/// it has something; otherwise `paint` draws `.all`. Commits the
+/// composition tree if it changed. Waits for the swap chain first unless
 /// `waitForFrame` or `frameAcquired` already did.
 pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error{ DeviceLost, HResult }!void {
     const rtv = self.rtv orelse return;
@@ -485,23 +515,63 @@ pub fn draw(self: *D3D11, alloc: std.mem.Allocator, f: Frame, ui: anytype) error
         ctx.unmap(self.uniforms.resource());
         try self.drawGrid(pane);
     }
-    try self.paintUi(ui);
-    if (ui.capture()) |region| {
-        const img = self.captureRegion(region) catch |err| img: {
+    if (self.overlay) |*o| {
+        try self.paintUi(ui, .ground);
+        const capture = ui.capture();
+        const img = if (capture) |region| self.captureRegion(region) catch |err| img: {
             log.warn("capturing the frame failed: {}", .{err});
             break :img null;
-        };
-        try self.paintOver(ui, img);
+        } else null;
+        try self.presentGround();
+        try self.drawOverlay(o, ui, capture != null, img);
+    } else {
+        try self.paintUi(ui, .all);
+        if (ui.capture()) |region| {
+            const img = self.captureRegion(region) catch |err| img: {
+                log.warn("capturing the frame failed: {}", .{err});
+                break :img null;
+            };
+            try self.paintOver(ui, img);
+        }
+        try self.presentGround();
     }
+    if (self.comp.dirty) try self.commit();
+}
 
+fn presentGround(self: *D3D11) error{ DeviceLost, HResult }!void {
     self.frame_acquired = false;
     self.frame_started = false;
-    const hr = self.swap_chain.present(0, self.present_flags);
+    try checkPresent(self.swap_chain.present(0, self.present_flags));
+}
+
+fn checkPresent(hr: win32.HRESULT) error{ DeviceLost, HResult }!void {
     if (hr == dxgi.ERROR_DEVICE_REMOVED or hr == dxgi.ERROR_DEVICE_RESET) {
         // TODO: recreate the device and all GPU resources.
         return error.DeviceLost;
     }
     try com.check(hr, "IDXGISwapChain::Present");
+}
+
+/// The overlay's frame: `ui`'s `.over` and, if `capture`, `paintOver`
+/// with `img`, over transparency. An overlay with nothing to show is
+/// presented once, cleared, and then left alone.
+fn drawOverlay(self: *D3D11, o: *OverlayChain, ui: anytype, capture: bool, img: ?Painter.Image) error{ DeviceLost, HResult }!void {
+    const over = ui.hasOver();
+    if (!over and !o.shown) return;
+    o.shown = over;
+    self.context.clearRenderTargetView(o.rtv.?, &.{ 0, 0, 0, 0 });
+    const d2d = self.d2d_context;
+    d2d.setTarget(o.d2d_target);
+    defer d2d.setTarget(self.d2d_target);
+    // ClearType needs opaque pixels under the text to blend with.
+    if (self.text_antialias == d2d1.TEXT_ANTIALIAS_MODE_CLEARTYPE) d2d.setTextAntialiasMode(d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    defer d2d.setTextAntialiasMode(self.text_antialias);
+    d2d.beginDraw();
+    var p = self.painter();
+    ui.paint(&p, .over);
+    if (capture) ui.paintOver(&p, img);
+    try com.check(d2d.endDraw(), "ID2D1DeviceContext::EndDraw(overlay)");
+    try checkPresent(o.swap_chain.present(0, 0));
 }
 
 /// Shader constants for a pane's box. Must match `Box` in shaders.hlsl.
@@ -581,11 +651,15 @@ fn drawGrid(self: *D3D11, f: Pane) Error!void {
     try self.drawImages(images, f.textures, .above_text);
 }
 
+fn painter(self: *const D3D11) Painter {
+    return .{ .ctx = self.d2d_context, .factory = self.d2d_factory, .brush = self.brush, .icon = self.icon, .lucide = if (self.lucide) |*icons| icons else null };
+}
+
 fn paintOver(self: *D3D11, ui: anytype, img: ?Painter.Image) Error!void {
     const d2d = self.d2d_context;
     d2d.beginDraw();
-    var painter: Painter = .{ .ctx = d2d, .factory = self.d2d_factory, .brush = self.brush, .icon = self.icon, .lucide = if (self.lucide) |*icons| icons else null };
-    ui.paintOver(&painter, img);
+    var p = self.painter();
+    ui.paintOver(&p, img);
     try com.check(d2d.endDraw(), "ID2D1DeviceContext::EndDraw");
 }
 
@@ -640,11 +714,11 @@ fn createCapture(self: *D3D11, w: u32, h: u32) Error!Capture {
     return .{ .texture = texture.?, .bitmap = bitmap.?, .width = w, .height = h };
 }
 
-fn paintUi(self: *D3D11, ui: anytype) Error!void {
+fn paintUi(self: *D3D11, ui: anytype, layer: anytype) Error!void {
     const d2d = self.d2d_context;
     d2d.beginDraw();
-    var painter: Painter = .{ .ctx = d2d, .factory = self.d2d_factory, .brush = self.brush, .icon = self.icon, .lucide = if (self.lucide) |*icons| icons else null };
-    ui.paint(&painter);
+    var p = self.painter();
+    ui.paint(&p, layer);
     try com.check(d2d.endDraw(), "ID2D1DeviceContext::EndDraw");
 }
 
@@ -758,19 +832,32 @@ fn uploadImages(self: *D3D11, alloc: std.mem.Allocator, images: *image.Images, t
 }
 
 fn createRenderTarget(self: *D3D11) Error!void {
+    try self.createTargets(self.swap_chain, d2d1.ALPHA_MODE_IGNORE, &self.rtv, &self.d2d_target);
+    self.d2d_context.setTarget(self.d2d_target);
+}
+
+/// Direct3D and Direct2D targets over `chain`'s back buffer.
+fn createTargets(
+    self: *D3D11,
+    chain: *dxgi.ISwapChain1,
+    alpha_mode: u32,
+    rtv: *?*d3d11.IRenderTargetView,
+    d2d_target: *?*d2d1.IBitmap1,
+) Error!void {
     // With the flip model, buffer 0 is always the one being drawn, so
     // both targets follow the swap chain as it flips.
     var back_buffer: ?*d3d11.ITexture2D = null;
     try com.check(
-        self.swap_chain.getBuffer(0, &d3d11.ITexture2D.iid, @ptrCast(&back_buffer)),
+        chain.getBuffer(0, &d3d11.ITexture2D.iid, @ptrCast(&back_buffer)),
         "IDXGISwapChain::GetBuffer",
     );
     defer com.releaseOpt(&back_buffer);
 
     try com.check(
-        self.device.createRenderTargetView(back_buffer.?.resource(), &self.rtv),
+        self.device.createRenderTargetView(back_buffer.?.resource(), rtv),
         "ID3D11Device::CreateRenderTargetView",
     );
+    errdefer com.releaseOpt(rtv);
 
     const surface = com.query(back_buffer.?, dxgi.ISurface) orelse {
         log.err("back buffer has no IDXGISurface", .{});
@@ -778,10 +865,255 @@ fn createRenderTarget(self: *D3D11) Error!void {
     };
     defer com.release(surface);
     try com.check(self.d2d_context.createBitmapFromDxgiSurface(surface, &.{
-        .pixelFormat = .{ .format = buffer_format, .alphaMode = d2d1.ALPHA_MODE_IGNORE },
+        .pixelFormat = .{ .format = buffer_format, .alphaMode = alpha_mode },
         .bitmapOptions = d2d1.BITMAP_OPTIONS_TARGET | d2d1.BITMAP_OPTIONS_CANNOT_DRAW,
-    }, &self.d2d_target), "ID2D1DeviceContext::CreateBitmapFromDxgiSurface");
-    self.d2d_context.setTarget(self.d2d_target);
+    }, d2d_target), "ID2D1DeviceContext::CreateBitmapFromDxgiSurface");
+}
+
+/// A flip-model chain for a visual's content.
+fn createChain(factory: *dxgi.IFactory2, device: *d3d11.IDevice, width: u32, height: u32, alpha_mode: u32, flags: u32) Error!*dxgi.ISwapChain1 {
+    var chain: ?*dxgi.ISwapChain1 = null;
+    try com.check(factory.createSwapChainForComposition(device, &.{
+        .Width = width,
+        .Height = height,
+        .Format = buffer_format,
+        .BufferUsage = dxgi.USAGE_RENDER_TARGET_OUTPUT,
+        .BufferCount = buffer_count,
+        // The only scaling composition takes; the buffers always match
+        // the window, so nothing is scaled.
+        .Scaling = dxgi.SCALING_STRETCH,
+        .SwapEffect = dxgi.SWAP_EFFECT_FLIP_DISCARD,
+        .AlphaMode = alpha_mode,
+        .Flags = flags,
+    }, &chain), "IDXGIFactory2::CreateSwapChainForComposition");
+    return chain.?;
+}
+
+/// The window's DirectComposition tree: a root visual whose content is
+/// the swap chain, and whose children, over it, are the panes' container
+/// visuals and then the overlay's.
+const Composition = struct {
+    device: *dcomp.IDesktopDevice,
+    target: *dcomp.ITarget,
+    root: *dcomp.IVisual,
+    /// Set when the tree changed since the last commit. Presents need
+    /// none.
+    dirty: bool = false,
+
+    fn init(hwnd: win32.HWND, ground: *dxgi.ISwapChain1) Error!Composition {
+        var device: ?*dcomp.IDesktopDevice = null;
+        try com.check(
+            dcomp.DCompositionCreateDevice3(null, &dcomp.IDesktopDevice.iid, @ptrCast(&device)),
+            "DCompositionCreateDevice3",
+        );
+        errdefer com.releaseOpt(&device);
+        var target: ?*dcomp.ITarget = null;
+        try com.check(device.?.createTargetForHwnd(hwnd, true, &target), "IDCompositionDesktopDevice::CreateTargetForHwnd");
+        errdefer com.releaseOpt(&target);
+        var root: ?*dcomp.IVisual = null;
+        try com.check(device.?.createVisual(&root), "IDCompositionDevice2::CreateVisual");
+        errdefer com.releaseOpt(&root);
+        try com.check(root.?.setContent(ground), "IDCompositionVisual::SetContent");
+        try com.check(target.?.setRoot(root.?), "IDCompositionTarget::SetRoot");
+        try com.check(device.?.commit(), "IDCompositionDevice2::Commit");
+        return .{ .device = device.?, .target = target.?, .root = root.? };
+    }
+
+    fn deinit(self: Composition) void {
+        com.release(self.root);
+        com.release(self.target);
+        com.release(self.device);
+    }
+};
+
+/// Apply what changed in the composition tree since the last commit. `draw`
+/// does it after presenting; call it when the tree changes with no frame
+/// to draw.
+pub fn commit(self: *D3D11) Error!void {
+    try com.check(self.comp.device.commit(), "IDCompositionDevice2::Commit");
+    self.comp.dirty = false;
+}
+
+/// Where and how a browser pane's visual shows.
+pub const PaneVisual = struct {
+    /// The pane's content, under its title strip, in the client area's
+    /// pixels.
+    rect: Painter.Rect,
+    /// The radius of the box's bottom corners; the top ones meet the
+    /// strip.
+    radius: f32,
+    /// Below 1, the ground under it shows through: an unfocused pane.
+    opacity: f32 = 1,
+    /// False hides it and stops its content rendering, as zoom does to
+    /// the other panes.
+    visible: bool = true,
+};
+
+const PaneVisualEntry = struct {
+    key: u64,
+    visual: *dcomp.IVisual3,
+    clip: *dcomp.IRectangleClip,
+    props: PaneVisual,
+
+    fn deinit(self: PaneVisualEntry) void {
+        com.release(self.clip);
+        com.release(self.visual);
+    }
+
+    fn apply(self: *PaneVisualEntry, p: PaneVisual) Error!void {
+        const v = self.visual.visual();
+        const c = self.clip;
+        try com.check(v.setOffsetX(p.rect.x), "IDCompositionVisual::SetOffsetX");
+        try com.check(v.setOffsetY(p.rect.y), "IDCompositionVisual::SetOffsetY");
+        // The clip is in the visual's space, which the offset moved.
+        try com.check(c.setLeft(0), "IDCompositionRectangleClip::SetLeft");
+        try com.check(c.setTop(0), "IDCompositionRectangleClip::SetTop");
+        try com.check(c.setRight(p.rect.w), "IDCompositionRectangleClip::SetRight");
+        try com.check(c.setBottom(p.rect.h), "IDCompositionRectangleClip::SetBottom");
+        try com.check(c.setBottomLeftRadiusX(p.radius), "IDCompositionRectangleClip::SetBottomLeftRadiusX");
+        try com.check(c.setBottomLeftRadiusY(p.radius), "IDCompositionRectangleClip::SetBottomLeftRadiusY");
+        try com.check(c.setBottomRightRadiusX(p.radius), "IDCompositionRectangleClip::SetBottomRightRadiusX");
+        try com.check(c.setBottomRightRadiusY(p.radius), "IDCompositionRectangleClip::SetBottomRightRadiusY");
+        try com.check(self.visual.setOpacity(p.opacity), "IDCompositionVisual3::SetOpacity");
+        try com.check(self.visual.setVisible(p.visible), "IDCompositionVisual3::SetVisible");
+        self.props = p;
+    }
+};
+
+/// Show a container visual for the pane `key` (its ID) as `props` says,
+/// over the swap chain and under the overlay. The first one made brings
+/// the overlay chain, so the UI over panes is drawn over it from the next
+/// frame. The caller hangs the pane's own visual under the one returned,
+/// which stays the same until `removePaneVisual`. Call again whenever the
+/// layout, focus, or zoom changes; the tree is committed with the next
+/// `draw` or `commit`.
+pub fn setPaneVisual(self: *D3D11, key: u64, props: PaneVisual) Error!*dcomp.IVisual {
+    for (self.pane_visuals.items) |*e| if (e.key == key) {
+        if (!std.meta.eql(e.props, props)) {
+            try e.apply(props);
+            self.comp.dirty = true;
+        }
+        return e.visual.visual();
+    };
+
+    var visual: ?*dcomp.IVisual = null;
+    try com.check(self.comp.device.createVisual(&visual), "IDCompositionDevice2::CreateVisual");
+    defer com.releaseOpt(&visual);
+    const visual3 = com.query(visual.?, dcomp.IVisual3) orelse {
+        log.err("visual has no IDCompositionVisual3", .{});
+        return error.HResult;
+    };
+    var clip: ?*dcomp.IRectangleClip = null;
+    com.check(self.comp.device.createRectangleClip(&clip), "IDCompositionDevice2::CreateRectangleClip") catch |err| {
+        com.release(visual3);
+        return err;
+    };
+    var entry: PaneVisualEntry = .{ .key = key, .visual = visual3, .clip = clip.?, .props = props };
+    errdefer entry.deinit();
+    try com.check(visual.?.setClip(clip.?), "IDCompositionVisual::SetClip");
+    try entry.apply(props);
+    self.pane_visuals.ensureUnusedCapacity(self.alloc, 1) catch return error.HResult;
+
+    // Under the overlay, or, with none yet, anywhere: the overlay goes
+    // over this one next.
+    const root = self.comp.root;
+    if (self.overlay) |o| {
+        try com.check(root.addVisual(visual.?, false, o.visual), "IDCompositionVisual::AddVisual");
+    } else {
+        try com.check(root.addVisual(visual.?, true, null), "IDCompositionVisual::AddVisual");
+        self.createOverlay(visual.?) catch |err| {
+            _ = root.removeVisual(visual.?);
+            return err;
+        };
+    }
+    self.pane_visuals.appendAssumeCapacity(entry);
+    self.comp.dirty = true;
+    return visual3.visual();
+}
+
+/// Remove the pane `key`'s visual, and the overlay with the last one.
+/// Whatever the caller hung under it goes with it.
+pub fn removePaneVisual(self: *D3D11, key: u64) void {
+    for (self.pane_visuals.items, 0..) |e, i| if (e.key == key) {
+        _ = self.comp.root.removeVisual(e.visual.visual());
+        e.deinit();
+        _ = self.pane_visuals.swapRemove(i);
+        self.comp.dirty = true;
+        break;
+    };
+    if (self.pane_visuals.items.len == 0) if (self.overlay) |*o| {
+        _ = self.comp.root.removeVisual(o.visual);
+        o.deinit();
+        self.overlay = null;
+        self.comp.dirty = true;
+        log.info("overlay chain destroyed", .{});
+    };
+}
+
+test {
+    // Nothing calls these until browser panes are drawn; keep them
+    // compiled.
+    _ = &setPaneVisual;
+    _ = &removePaneVisual;
+    _ = &commit;
+}
+
+/// A transparent chain over the panes' visuals, the window's size.
+const OverlayChain = struct {
+    swap_chain: *dxgi.ISwapChain1,
+    visual: *dcomp.IVisual,
+    rtv: ?*d3d11.IRenderTargetView = null,
+    d2d_target: ?*d2d1.IBitmap1 = null,
+    /// What was last presented isn't clear.
+    shown: bool = false,
+
+    fn releaseTargets(self: *OverlayChain) void {
+        com.releaseOpt(&self.rtv);
+        com.releaseOpt(&self.d2d_target);
+    }
+
+    fn deinit(self: *OverlayChain) void {
+        self.releaseTargets();
+        com.release(self.visual);
+        com.release(self.swap_chain);
+    }
+};
+
+/// Make the overlay chain, presented clear, and put it over `above`.
+fn createOverlay(self: *D3D11, above: *dcomp.IVisual) Error!void {
+    var o: OverlayChain = .{
+        .swap_chain = try createChain(self.factory, self.device, self.width, self.height, dxgi.ALPHA_MODE_PREMULTIPLIED, 0),
+        .visual = undefined,
+    };
+    errdefer com.release(o.swap_chain);
+    var visual: ?*dcomp.IVisual = null;
+    try com.check(self.comp.device.createVisual(&visual), "IDCompositionDevice2::CreateVisual");
+    o.visual = visual.?;
+    errdefer com.release(o.visual);
+    try self.createTargets(o.swap_chain, d2d1.ALPHA_MODE_PREMULTIPLIED, &o.rtv, &o.d2d_target);
+    errdefer o.releaseTargets();
+    try self.clearOverlay(&o);
+    try com.check(o.visual.setContent(o.swap_chain), "IDCompositionVisual::SetContent");
+    try com.check(self.comp.root.addVisual(o.visual, true, above), "IDCompositionVisual::AddVisual");
+    self.overlay = o;
+    log.info("overlay chain created {d}x{d}", .{ self.width, self.height });
+}
+
+fn clearOverlay(self: *D3D11, o: *OverlayChain) Error!void {
+    self.context.clearRenderTargetView(o.rtv.?, &.{ 0, 0, 0, 0 });
+    try com.check(o.swap_chain.present(0, 0), "IDXGISwapChain::Present(overlay)");
+    o.shown = false;
+}
+
+fn resizeOverlay(self: *D3D11, o: *OverlayChain) Error!void {
+    o.releaseTargets();
+    try com.check(
+        o.swap_chain.resizeBuffers(0, self.width, self.height, .UNKNOWN, 0),
+        "IDXGISwapChain::ResizeBuffers(overlay)",
+    );
+    try self.createTargets(o.swap_chain, d2d1.ALPHA_MODE_PREMULTIPLIED, &o.rtv, &o.d2d_target);
+    // The resized buffers hold nothing presentable.
+    try self.clearOverlay(o);
 }
 
 const D2d = struct {
@@ -800,7 +1132,7 @@ const D2d = struct {
 
 /// A Direct2D device context on our D3D device, which was created with
 /// BGRA support for this. Its DPI stays at 96, so it draws in pixels.
-fn createD2d(device: *d3d11.IDevice, antialias: font.Antialias) Error!D2d {
+fn createD2d(device: *d3d11.IDevice, text_antialias: u32) Error!D2d {
     var factory: ?*d2d1.IFactory1 = null;
     try com.check(
         d2d1.D2D1CreateFactory(d2d1.FACTORY_TYPE_SINGLE_THREADED, &d2d1.IFactory1.iid, null, @ptrCast(&factory)),
@@ -820,11 +1152,7 @@ fn createD2d(device: *d3d11.IDevice, antialias: font.Antialias) Error!D2d {
     var context: ?*d2d1.IDeviceContext = null;
     try com.check(d2d_device.?.createDeviceContext(0, &context), "ID2D1Device::CreateDeviceContext");
     errdefer com.releaseOpt(&context);
-    context.?.setTextAntialiasMode(switch (antialias) {
-        .grayscale => d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE,
-        .cleartype => d2d1.TEXT_ANTIALIAS_MODE_CLEARTYPE,
-        .aliased => d2d1.TEXT_ANTIALIAS_MODE_ALIASED,
-    });
+    context.?.setTextAntialiasMode(text_antialias);
 
     var brush: ?*d2d1.ISolidColorBrush = null;
     try com.check(context.?.createSolidColorBrush(&.{ 0, 0, 0, 1 }, &brush), "ID2D1DeviceContext::CreateSolidColorBrush");

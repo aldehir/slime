@@ -195,6 +195,7 @@ test {
     _ = @import("ui/Id.zig");
     _ = @import("renderer/Painter.zig");
     _ = @import("renderer/image.zig");
+    _ = @import("renderer/D3D11.zig");
     _ = @import("font/font.zig");
     _ = @import("input.zig");
     _ = @import("binding.zig");

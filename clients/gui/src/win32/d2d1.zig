@@ -10,6 +10,7 @@ const HRESULT = win32.HRESULT;
 const GUID = win32.GUID;
 
 pub const FACTORY_TYPE_SINGLE_THREADED: u32 = 0;
+pub const ALPHA_MODE_PREMULTIPLIED: u32 = 1;
 pub const ALPHA_MODE_IGNORE: u32 = 3;
 pub const BITMAP_OPTIONS_TARGET: u32 = 0x1;
 pub const BITMAP_OPTIONS_CANNOT_DRAW: u32 = 0x2;

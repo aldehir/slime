@@ -16,8 +16,10 @@ pub const FORMAT = enum(u32) {
 };
 
 pub const USAGE_RENDER_TARGET_OUTPUT: u32 = 0x20;
+pub const SCALING_STRETCH: u32 = 0;
 pub const SCALING_NONE: u32 = 1;
 pub const SWAP_EFFECT_FLIP_DISCARD: u32 = 4;
+pub const ALPHA_MODE_PREMULTIPLIED: u32 = 1;
 pub const ALPHA_MODE_IGNORE: u32 = 3;
 pub const MWA_NO_ALT_ENTER: u32 = 0x2;
 pub const CREATE_FACTORY_DEBUG: u32 = 0x1;
@@ -77,6 +79,22 @@ pub const IFactory2 = extern struct {
             ?*anyopaque, // IDXGIOutput (restrict to output)
             *?*ISwapChain1,
         ) HRESULT, .{ device, hwnd, desc, null, null, out });
+    }
+
+    /// A swap chain for a DirectComposition visual's content: flip model,
+    /// `SCALING_STRETCH`, and the window's size up to the caller.
+    pub fn createSwapChainForComposition(
+        self: *IFactory2,
+        device: *anyopaque,
+        desc: *const SWAP_CHAIN_DESC1,
+        out: *?*ISwapChain1,
+    ) HRESULT {
+        return com.call(self, 24, fn (
+            *anyopaque,
+            *const SWAP_CHAIN_DESC1,
+            ?*anyopaque, // IDXGIOutput (restrict to output)
+            *?*ISwapChain1,
+        ) HRESULT, .{ device, desc, null, out });
     }
 };
 

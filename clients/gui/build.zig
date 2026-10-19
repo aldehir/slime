@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
     ) orelse 0);
     exe_mod.addOptions("build_options", options);
 
-    for ([_][]const u8{ "user32", "advapi32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler", "d2d1", "shlwapi" }) |lib| {
+    for ([_][]const u8{ "user32", "advapi32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler", "d2d1", "dcomp", "shlwapi" }) |lib| {
         exe_mod.linkSystemLibrary(lib, .{});
     }
     // Drawn in the title bar, as the taskbar shows it at small sizes.
