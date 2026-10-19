@@ -2,9 +2,10 @@
 //! rounded box with a border and a shadow; over it goes a title strip at
 //! its top that holds its title and its buttons (faint until the mouse is
 //! over one). A pane without focus is dimmed. A browser pane's strip
-//! holds its history buttons and URL bar in place of the title, the
-//! site's icon (or a globe) at the bar's left, and until a browser draws
-//! its page, the page's title and url stand in for it under the strip.
+//! holds its page's title; under it goes an address row with its
+//! history buttons and URL bar, the site's icon (or a globe) at the
+//! bar's left, and until a browser draws its page, the page's title and
+//! url stand in for it under the row.
 //!
 //! Dragging a pane by its title strip (`Tree.drag`) leaves it dimmed
 //! where it was, puts a small picture of it by the mouse, and highlights
@@ -27,16 +28,16 @@ pub const gap = 10;
 /// The title strip's height.
 pub const title_height = 30;
 pub const button_size = 20;
-/// A browser's history buttons, packed closer to leave its URL bar room.
-const nav_size = 18;
-/// Between the URL bar and the buttons either side of it, and its text
-/// and its edges.
+/// A browser's address row, under its title strip.
+pub const bar_height = 38;
+/// Between the row's edges and what's in it, and above and below the
+/// URL bar in it.
+const bar_pad = 6;
+const url_inset = 5;
+/// Between the URL bar and the history buttons, and its text and its
+/// edges.
 const url_gap = 3;
-const url_pad = 7;
-/// The URL bar's width: this much of the strip, between `url_min` and
-/// `url_max`, so the strip either side of it is left to drag the pane by.
-const url_share = 0.5;
-const url_max = 640;
+const url_pad = 8;
 /// The least the URL bar keeps beside the history buttons: narrower, they
 /// go, and it takes their room.
 const url_min = 140;
@@ -73,9 +74,16 @@ fn titleRect(ui: *const Ui, node: *const Node) Rect {
     return .{ .x = f.x, .y = f.y, .w = f.w, .h = @min(f.h, ui.px(title_height)) };
 }
 
+/// A browser's address row, under the strip.
+fn barRect(ui: *const Ui, node: *const Node) Rect {
+    const f = node.rect;
+    const top = @min(f.h, ui.px(title_height));
+    return .{ .x = f.x, .y = f.y + top, .w = f.w, .h = @min(f.h - top, ui.px(bar_height)) };
+}
+
 /// The buttons at the right of the strip, each a button's width, the
-/// last at the margin; a browser's history buttons at its left, after
-/// the focus dot, unless they'd leave its URL bar too narrow (`url_min`):
+/// last at the margin; a browser's history buttons at the left of its
+/// address row, unless they'd leave its URL bar too narrow (`url_min`):
 /// then they're dropped from the node.
 pub fn layout(ui: *const Ui, node: *Node) void {
     place(ui, node);
@@ -97,40 +105,37 @@ fn place(ui: *const Ui, node: *Node) void {
         b.rect = .{ .x = strip.right() - ui.px(margin) - size - from_right * size, .y = y, .w = size, .h = size };
         ui.layoutNode(b);
     }
-    const left = if (pane.dot) strip.x + ui.px(title_pad + 8) else strip.x + ui.px(margin + 3);
-    const nav_w = ui.px(nav_size);
+    const bar = barRect(ui, node);
+    const left = bar.x + ui.px(bar_pad);
+    const bar_y = bar.y + @round((bar.h - size) / 2);
     for (nav, 0..) |*b, i| {
         const from_left: f32 = @floatFromInt(i);
-        b.rect = .{ .x = left + from_left * nav_w, .y = y, .w = nav_w, .h = size };
+        b.rect = .{ .x = left + from_left * size, .y = bar_y, .w = size, .h = size };
         ui.layoutNode(b);
     }
 }
 
-/// A browser pane's URL bar: `url_share` of the strip, centered on the
-/// pane, whatever its text; kept between its history buttons (or the
-/// focus dot) and the buttons at the right, which take precedence over
-/// its width and then its place.
+/// A browser pane's URL bar: the rest of its address row after its
+/// history buttons, to the pad at the row's right.
 fn urlRect(ui: *const Ui, node: *const Node) Rect {
     const pane = node.kind.pane;
-    const strip = titleRect(ui, node);
-    const left = if (pane.nav > 0)
-        pane.buttons[pane.nav - 1].rect.right() + ui.px(url_gap)
-    else if (pane.dot) strip.x + ui.px(title_pad + 10) else strip.x + ui.px(margin + 3);
-    const right = if (pane.buttons.len > pane.nav) pane.buttons[pane.nav].rect.x - ui.px(url_gap) else strip.right() - ui.px(margin + 3);
-    const room = @max(0, right - left);
-    const want = @round(std.math.clamp(strip.w * url_share, ui.px(url_min), ui.px(url_max)));
-    const w = @min(want, room);
-    const x = std.math.clamp(@round(strip.x + (strip.w - w) / 2), left, @max(left, right - w));
-    const inset = ui.px(4);
-    return .{ .x = x, .y = strip.y + inset, .w = w, .h = @max(0, strip.h - 2 * inset) };
+    const bar = barRect(ui, node);
+    const left = if (pane.nav > 0) pane.buttons[pane.nav - 1].rect.right() + ui.px(url_gap) else bar.x + ui.px(bar_pad);
+    const right = bar.right() - ui.px(bar_pad);
+    const inset = ui.px(url_inset);
+    return .{ .x = left, .y = bar.y + inset, .w = @max(0, right - left), .h = @max(0, bar.h - 2 * inset) };
 }
 
-/// A button, else a browser's URL bar, else the title strip, else the
-/// terminal.
+/// A button, else the title strip (which drags the pane), else a
+/// browser's URL bar or the rest of its address row (which does
+/// nothing: the strip above is enough to drag by), else the terminal.
 pub fn hitTest(ui: *const Ui, node: *const Node, x: f32, y: f32) ?Id {
     for (node.kind.pane.buttons) |*b| if (ui.hitNode(b, x, y)) |id| return id;
-    if (node.kind.pane.browser != null and urlRect(ui, node).contains(x, y)) return node.id.with(.field);
     if (titleRect(ui, node).contains(x, y)) return node.id.with(.title);
+    if (node.kind.pane.browser != null) {
+        if (urlRect(ui, node).contains(x, y)) return node.id.with(.field);
+        if (barRect(ui, node).contains(x, y)) return node.id.with(.body);
+    }
     return node.id;
 }
 
@@ -144,17 +149,16 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
         p.dot(x + ui.px(3), strip.y + strip.h / 2, ui.px(3), ui.theme.accent);
         x += ui.px(14);
     }
+    const right = if (pane.buttons.len > pane.nav) pane.buttons[pane.nav].rect.x - ui.px(6) else strip.right() - ui.px(title_pad);
+    const r: Rect = .{ .x = x, .y = strip.y, .w = @max(0, right - x), .h = strip.h };
+    if (pane.focused) {
+        p.text(pane.title, ui.fonts.get(.body_strong), r, ui.theme.text_strong);
+    } else {
+        p.text(pane.title, ui.fonts.get(.body), r, ui.theme.text_muted);
+    }
     if (pane.browser) |b| {
         paintUrl(ui, p, urlRect(ui, node), b, pane.focused);
         if (!b.live) paintPage(ui, p, b);
-    } else {
-        const right = if (pane.buttons.len > 0) pane.buttons[0].rect.x - ui.px(6) else strip.right() - ui.px(title_pad);
-        const r: Rect = .{ .x = x, .y = strip.y, .w = @max(0, right - x), .h = strip.h };
-        if (pane.focused) {
-            p.text(pane.title, ui.fonts.get(.body_strong), r, ui.theme.text_strong);
-        } else {
-            p.text(pane.title, ui.fonts.get(.body), r, ui.theme.text_muted);
-        }
     }
     ui.paintChildren(p, node);
     if (pane.dimmed) p.fillRounded(node.rect, ui.px(10), .{ pane.bg[0], pane.bg[1], pane.bg[2], dim });
@@ -312,7 +316,7 @@ test "pane buttons" {
     try std.testing.expect(!fits(&ui, 80, 3));
 }
 
-test "a browser pane's strip: history buttons, then its URL bar" {
+test "a browser pane: its title strip, then an address row with history buttons and its URL bar" {
     const ui: Ui = .{ .scale = 1, .fonts = .none, .theme = undefined };
     const id: Id = .{ .target = .{ .pane = 5 } };
     var buttons = [_]Node{ testButton(id, .back), testButton(id, .forward), testButton(id, .reload), testButton(id, .split_right), testButton(id, .split_down) };
@@ -322,32 +326,37 @@ test "a browser pane's strip: history buttons, then its URL bar" {
         .bg = undefined,
         .buttons = &buttons,
         .nav = 3,
-        .browser = .{ .url = &.{}, .page = .{ .y = title_height, .w = 400, .h = 270 }, .page_title = &.{} },
+        .browser = .{ .url = &.{}, .page = .{ .y = title_height + bar_height, .w = 400, .h = 300 - title_height - bar_height }, .page_title = &.{} },
     } }, .rect = .{ .w = 400, .h = 300 } };
     ui.layoutNode(&node);
-    try std.testing.expectEqual(@as(f32, margin + 3), buttons[0].rect.x);
-    try std.testing.expectEqual(buttons[0].rect.right(), buttons[1].rect.x);
+    // The split buttons in the strip at the right, as a terminal's.
     try std.testing.expectEqual(@as(f32, 400 - margin), buttons[4].rect.right());
+    try std.testing.expect(buttons[4].rect.bottom() <= title_height);
+    // The history buttons at the left of the row under it.
+    try std.testing.expectEqual(@as(f32, bar_pad), buttons[0].rect.x);
+    try std.testing.expect(buttons[0].rect.y >= title_height);
+    try std.testing.expectEqual(buttons[0].rect.right(), buttons[1].rect.x);
+    // The bar takes the rest of the row, to its pad at the right.
     const bar = urlRect(&ui, &node);
-    // Half the strip, centered on it, whatever the url; the rest of the
-    // strip drags the pane.
-    try std.testing.expectEqual(@as(f32, 200), bar.w);
-    try std.testing.expectEqual(@as(f32, 100), bar.x);
-    try std.testing.expectEqual(id.with(.title), ui.hitNode(&node, 80, bar.y + 5).?);
-    try std.testing.expectEqual(id.with(.title), ui.hitNode(&node, 320, bar.y + 5).?);
+    try std.testing.expectEqual(buttons[2].rect.right() + url_gap, bar.x);
+    try std.testing.expectEqual(@as(f32, 400 - bar_pad), bar.right());
+    try std.testing.expectEqual(@as(f32, title_height + url_inset), bar.y);
+    try std.testing.expectEqual(@as(f32, bar_height - 2 * url_inset), bar.h);
+    // The whole strip drags the pane; the row around the bar is inert.
+    try std.testing.expectEqual(id.with(.title), ui.hitNode(&node, 200, 10).?);
+    try std.testing.expectEqual(id.with(.body), ui.hitNode(&node, 200, title_height + 1).?);
     try std.testing.expectEqual(id.with(.field), ui.hitNode(&node, bar.x + 5, bar.y + 5).?);
     try std.testing.expectEqual(id.with(.back), ui.hitNode(&node, buttons[0].rect.x + 1, buttons[0].rect.y + 1).?);
     try std.testing.expectEqual(id.with(.split_down), ui.hitNode(&node, buttons[4].rect.x + 1, buttons[4].rect.y + 1).?);
     // Its page is the pane's, as a terminal is.
     try std.testing.expectEqual(id.with(.terminal), ui.hitNode(&node, 200, 200).?);
 
-    // At 175%, focused among two panes: half of a 1300 px window leaves
-    // the bar too little beside the history buttons, which go, and the
-    // bar moves off center to fit; a wider pane keeps them and the bar
-    // centered.
+    // At 175%, a narrow pane leaves the bar too little beside the
+    // history buttons, which go, and it takes the row; a wider pane
+    // keeps them.
     const big: Ui = .{ .scale = 1.75, .fonts = .none, .theme = undefined };
     var zoom_buttons = [_]Node{ testButton(id, .back), testButton(id, .forward), testButton(id, .reload), testButton(id, .split_right), testButton(id, .split_down), testButton(id, .zoom) };
-    for ([_]f32{ 376, 700 }) |w| {
+    for ([_]f32{ 300, 700 }) |w| {
         node.rect = .{ .w = w, .h = 820 };
         node.kind.pane.dot = true;
         node.kind.pane.buttons = &zoom_buttons;
@@ -355,21 +364,19 @@ test "a browser pane's strip: history buttons, then its URL bar" {
         big.layoutNode(&node);
         const pane = node.kind.pane;
         const wide = urlRect(&big, &node);
-        if (w == 376) {
+        if (w == 300) {
             try std.testing.expectEqual(@as(usize, 0), pane.nav);
             try std.testing.expectEqual(@as(usize, 3), pane.buttons.len);
             try std.testing.expect(big.hitNode(&node, 50, 10).?.part != .back);
-            // All the room there is, short of the minimum.
-            try std.testing.expect(wide.w >= 200 and wide.w < big.px(url_min));
-            try std.testing.expectEqual(big.px(title_pad + 10), wide.x);
-            try std.testing.expectEqual(pane.buttons[pane.nav].rect.x - big.px(url_gap), wide.right());
+            try std.testing.expectEqual(big.px(bar_pad), wide.x);
+            try std.testing.expectEqual(w - big.px(bar_pad), wide.right());
         } else {
             try std.testing.expectEqual(@as(usize, 3), pane.nav);
             try std.testing.expectEqual(id.with(.back), big.hitNode(&node, pane.buttons[0].rect.x + 1, pane.buttons[0].rect.y + 1).?);
-            try std.testing.expectEqual(@as(f32, 350), wide.w);
-            try std.testing.expectEqual(@as(f32, 175), wide.x);
-            try std.testing.expect(wide.x >= pane.buttons[2].rect.right() + big.px(url_gap));
-            try std.testing.expect(wide.right() <= pane.buttons[3].rect.x - big.px(url_gap));
+            try std.testing.expectEqual(pane.buttons[2].rect.right() + big.px(url_gap), wide.x);
+            try std.testing.expect(wide.w >= big.px(url_min));
+            // The split buttons stay in the strip, above the row.
+            try std.testing.expect(pane.buttons[3].rect.bottom() <= big.px(title_height));
         }
     }
 }

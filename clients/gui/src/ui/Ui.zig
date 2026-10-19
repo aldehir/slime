@@ -169,6 +169,11 @@ pub fn paneTitleHeight(self: *const Ui) f32 {
     return self.px(widgets.PaneStrip.title_height);
 }
 
+/// The height of a browser pane's address row, under its title strip.
+pub fn paneBarHeight(self: *const Ui) f32 {
+    return self.px(widgets.PaneStrip.bar_height);
+}
+
 pub fn toggleSidebar(self: *Ui) void {
     self.sidebar_shown = !self.sidebar_shown;
     self.hover = .none;

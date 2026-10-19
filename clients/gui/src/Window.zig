@@ -371,6 +371,7 @@ fn geometry(self: *const Window) App.Geometry {
         .pane_area = self.ui.paneArea(&self.frame),
         .gap = self.ui.paneGap(),
         .title_height = self.ui.paneTitleHeight(),
+        .bar_height = self.ui.paneBarHeight(),
         .inset = @intFromFloat(self.frame.inset),
         .padding = self.paddingPx(),
         .cell = .{ .width = m.cell_width, .height = m.cell_height },

@@ -346,10 +346,13 @@ A pane is a terminal or a browser (`slime pane split --browser <url>`, or
 Open browser in a pane's context menu: a blank one split off its right,
 its URL bar ready to type in).
 The daemon keeps a browser's url and title; the window fills the pane
-with WebView2 in visual mode (`Web.zig`), under a strip with back,
-forward, reload (stop while loading), and a URL bar (a click selects it
-all, Enter sends `pane.navigate`, Escape puts it back). The mouse is
-forwarded to the page, its keys go to it but for the app's bindings,
+with WebView2 in visual mode (`Web.zig`), under its title strip (the
+page's title, and the split and zoom buttons) and an address row with
+back, forward, reload (stop while loading), and a URL bar (a click
+selects it all, Enter sends `pane.navigate`, Escape puts it back); only
+the strip drags the pane. The mouse is forwarded to the page (a right
+click opens the page's own menu, not slime's; the strip and row open
+slime's), its keys go to it but for the app's bindings,
 and a pane without a browser (no runtime, or one that failed) shows its
 title and url and why (`.plans/browser-pane-plan.md`). The URL bar shows
 the site's favicon (a globe without one), a dragged pane's picture has

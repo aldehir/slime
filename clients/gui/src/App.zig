@@ -594,8 +594,10 @@ pub const Geometry = struct {
     /// The part of it a tab's panes tile, and the gap between them.
     pane_area: Rect = .{},
     gap: f32 = 0,
-    /// A pane's title strip, above its terminal.
+    /// A pane's title strip, above its terminal, and a browser pane's
+    /// address row under that.
     title_height: f32 = 0,
+    bar_height: f32 = 0,
     /// Space inside the terminal area, before the grid, at its left and
     /// top, which border the chrome. Already in `padding`.
     inset: u32 = 0,
@@ -1474,11 +1476,15 @@ fn menuTargetExists(self: *App) bool {
 }
 
 /// A right click came up at `pos`: open the menu of the row or pane
-/// there, in place of any open. A field being edited keeps its click.
+/// there, in place of any open. A field being edited keeps its click,
+/// and a browser's page keeps it too: its browser got the click
+/// (`paneMouse`) and shows its own menu, so slime's would be a second.
+/// The pane's chrome still opens slime's.
 fn contextMenu(self: *App, pos: win32.POINT) void {
     self.closeMenu();
     const hit = self.hitAt(pos);
     if (hit.part == .field) return;
+    if (hit.part == .terminal) if (self.shownPane(hit.target)) |s| if (s.browser()) |b| if (b.live()) return;
     switch (hit.target) {
         .local, .host, .workspace, .tab, .pane => {},
         else => return,
@@ -3727,10 +3733,11 @@ fn placeTab(self: *App, t: *Tab, into: *Placement) void {
     };
     var pad = g.padding;
     pad.top -|= g.inset;
-    const strip = g.title_height;
     const m = g.cell;
     for (into.panes.items) |*p| {
-        p.rect = Placement.under(p.frame, strip);
+        // A browser's page is under its address row too.
+        const chrome = if (p.session.content == .browser) g.title_height + g.bar_height else g.title_height;
+        p.rect = Placement.under(p.frame, chrome);
         const w = @as(u32, @intFromFloat(p.rect.w)) -| pad.left -| pad.right;
         const h = @as(u32, @intFromFloat(p.rect.h)) -| pad.top -| pad.bottom;
         p.cols = @intCast(std.math.clamp(w / m.width, 1, std.math.maxInt(u16)));
