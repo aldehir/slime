@@ -92,6 +92,8 @@ const (
 	PaneWrite       = "pane.write"
 	PaneText        = "pane.text"
 	PaneInfo        = "pane.info"
+	PaneNavigate    = "pane.navigate"
+	PaneVisited     = "pane.visited"
 	Subscribe       = "subscribe"
 	HostConnect     = "host.connect"
 	HostAnswer      = "host.answer"
@@ -129,6 +131,7 @@ const (
 	EvPanePwd               = "pane.pwd"
 	EvPaneBell              = "pane.bell"
 	EvPaneStatus            = "pane.status"
+	EvPaneURL               = "pane.url"
 	EvHostChanged           = "host.changed"
 	EvHostPrompt            = "host.prompt"
 	EvScriptOutput          = "script.output"
@@ -395,13 +398,44 @@ type LayoutChild struct {
 	Node  *Layout `json:"node"`
 }
 
-// PaneSpec says what a new pane runs: Command (CreateProcessW syntax
-// on Windows; empty for the default shell) in Cwd, with Env added to
-// the daemon's environment.
+// PaneSpec says what a new pane is: of Kind terminal (the default),
+// it runs Command (CreateProcessW syntax on Windows; empty for the
+// default shell) in Cwd, with Env added to the daemon's environment;
+// a browser shows URL, which it must have, and takes no command.
 type PaneSpec struct {
+	Kind    PaneKind          `json:"kind,omitempty"`
+	URL     string            `json:"url,omitempty"`
 	Command string            `json:"command,omitempty"`
 	Cwd     string            `json:"cwd,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+}
+
+// PaneKind is what fills a pane: a terminal (""), or a browser, whose
+// page is the window's and of which the daemon keeps only the url and
+// title.
+type PaneKind string
+
+const (
+	PaneTerminal PaneKind = ""
+	PaneBrowser  PaneKind = "browser"
+)
+
+// Validate checks a spec: a known kind, and a browser with a url and
+// no command.
+func (p *PaneSpec) Validate() error {
+	switch p.Kind {
+	case PaneTerminal:
+	case PaneBrowser:
+		if p.Command != "" {
+			return errors.New("rpc: a browser pane runs no command")
+		}
+		if p.URL == "" {
+			return errors.New("rpc: a browser pane needs a url")
+		}
+	default:
+		return fmt.Errorf("rpc: no pane kind %q", p.Kind)
+	}
+	return nil
 }
 
 func (l *Layout) IsLeaf() bool { return l.Pane != nil }
@@ -430,7 +464,7 @@ func (l *Layout) Validate() error {
 		return errors.New("rpc: empty layout")
 	}
 	if l.IsLeaf() {
-		return nil
+		return l.Pane.Validate()
 	}
 	if l.Axis != Row && l.Axis != Column {
 		return fmt.Errorf("rpc: bad split axis %d", uint8(l.Axis))
@@ -546,14 +580,18 @@ type WorkspaceDesc struct {
 // PaneDesc is a pane as workspace.list and pane.info describe it. ID
 // names its tab and workspace too.
 type PaneDesc struct {
-	ID      PaneID `json:"id"`
-	Command string `json:"command"`
-	Title   string `json:"title,omitempty"`
-	Pwd     string `json:"pwd,omitempty"`
-	Cols    uint16 `json:"cols"`
-	Rows    uint16 `json:"rows"`
-	Created int64  `json:"created"` // unix milliseconds
-	PID     uint32 `json:"pid"`
+	ID PaneID `json:"id"`
+	// Kind is the pane's (omitted for a terminal); a browser has URL
+	// and Title, and no command, pid, or size.
+	Kind    PaneKind `json:"kind,omitempty"`
+	URL     string   `json:"url,omitempty"`
+	Command string   `json:"command"`
+	Title   string   `json:"title,omitempty"`
+	Pwd     string   `json:"pwd,omitempty"`
+	Cols    uint16   `json:"cols"`
+	Rows    uint16   `json:"rows"`
+	Created int64    `json:"created"` // unix milliseconds
+	PID     uint32   `json:"pid"`
 	// Status is what the pane's programs report doing (OSC 7501),
 	// oldest update first.
 	Status []StatusRecord `json:"status,omitempty"`
@@ -631,13 +669,16 @@ type WorkspaceResizeParams struct {
 
 // TabNewParams adds a tab: Layout's panes, or one running Command
 // (CreateProcessW syntax on Windows; empty for the default shell) in
-// Cwd with Env, sized Size if given. Name names the tab. The
+// Cwd with Env, or of Kind browser showing URL, sized Size if given.
+// Name names the tab. The
 // workspace's viewers get pane.attached and workspace.changed, then
 // the caller gets Created; a viewer's own call focuses the new tab.
 type TabNewParams struct {
 	Workspace uint32            `json:"workspace"`
 	Name      string            `json:"name,omitempty"`
 	Layout    *Layout           `json:"layout,omitempty"`
+	Kind      PaneKind          `json:"kind,omitempty"`
+	URL       string            `json:"url,omitempty"`
 	Command   string            `json:"command,omitempty"`
 	Cwd       string            `json:"cwd,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
@@ -662,12 +703,15 @@ type TabLayoutParams struct {
 }
 
 // PaneSplitParams starts a pane beside Pane, on side Direction, taking
-// Share basis points of its space (half if zero). Replies as tab.new
-// does; a viewer's own call focuses the new pane.
+// Share basis points of its space (half if zero): a terminal running
+// Command, or of Kind browser showing URL, as PaneSpec says. Replies as
+// tab.new does; a viewer's own call focuses the new pane.
 type PaneSplitParams struct {
 	Pane      PaneID            `json:"pane"`
 	Direction Direction         `json:"direction"`
 	Share     uint16            `json:"share,omitempty"`
+	Kind      PaneKind          `json:"kind,omitempty"`
+	URL       string            `json:"url,omitempty"`
 	Command   string            `json:"command,omitempty"`
 	Cwd       string            `json:"cwd,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
@@ -707,6 +751,23 @@ type PaneTextParams struct {
 
 type PaneTextResult struct {
 	Text string `json:"text"`
+}
+
+// PaneNavigateParams sends browser pane Pane to URL: the daemon keeps
+// it, and the pane's viewers get pane.url, each window's browser
+// following.
+type PaneNavigateParams struct {
+	Pane PaneID `json:"pane"`
+	URL  string `json:"url"`
+}
+
+// PaneVisitedParams is a viewer's report that its browser for pane
+// Pane is at URL, titled Title: the daemon keeps both, the pane's other
+// viewers get pane.url, and the subscribers pane.title.
+type PaneVisitedParams struct {
+	Pane  PaneID `json:"pane"`
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
 }
 
 // SubscribeParams says which notifications this connection wants
@@ -771,13 +832,16 @@ type PaneMovedParams struct {
 }
 
 // PaneAttachedParams starts a pane's attachment to the viewer it goes
-// to: its frames follow, the first a full one, with a Notice for its
-// title and pwd if it has them. ID places it, for a viewer of several
-// workspaces. MovedFrom is the id it had, if it just moved tabs: the
-// viewer's attachment under that id is over.
+// to: a terminal's frames follow, the first a full one, with a Notice
+// for its title and pwd if it has them; a browser (Kind) has URL and
+// nothing follows. ID places it, for a viewer of several workspaces.
+// MovedFrom is the id it had, if it just moved tabs: the viewer's
+// attachment under that id is over.
 type PaneAttachedParams struct {
-	ID        PaneID `json:"id"`
-	MovedFrom PaneID `json:"moved_from,omitzero"`
+	ID        PaneID   `json:"id"`
+	MovedFrom PaneID   `json:"moved_from,omitzero"`
+	Kind      PaneKind `json:"kind,omitempty"`
+	URL       string   `json:"url,omitempty"`
 	// Command is what the pane runs, for a client that didn't start it.
 	Command string         `json:"command"`
 	Status  []StatusRecord `json:"status,omitempty"`
@@ -791,10 +855,16 @@ type PaneExitedParams struct {
 }
 
 // PaneTitleParams: pane.title, the pane's title as the program set it
-// (OSC 0/2).
+// (OSC 0/2), or a browser's page title.
 type PaneTitleParams struct {
 	ID    PaneID `json:"id"`
 	Title string `json:"title"`
+}
+
+// PaneURLParams: pane.url, a browser pane was sent to URL.
+type PaneURLParams struct {
+	ID  PaneID `json:"id"`
+	URL string `json:"url"`
 }
 
 // PanePwdParams: pane.pwd, the pane's working directory as the shell

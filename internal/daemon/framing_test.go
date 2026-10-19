@@ -466,7 +466,7 @@ func TestFramesReplyOutsideLock(t *testing.T) {
 	}
 	// The reply waits on the child. The pane must still answer a lock
 	// holder meanwhile.
-	pane := h.srv.pane(d.pane)
+	pane := h.srv.pane(d.pane).(*Pane)
 	done := make(chan struct{})
 	go func() {
 		pane.desc()
@@ -568,7 +568,7 @@ func TestNoticeDroppedResent(t *testing.T) {
 	d := newDrawer(t, h)
 	d.ack(d.draw(5 * time.Second))
 	p := h.pty(0)
-	pane := h.srv.pane(d.pane)
+	pane := h.srv.pane(d.pane).(*Pane)
 	pane.mu.Lock()
 	var c *conn
 	for c = range pane.fr.viewers {

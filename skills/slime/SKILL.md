@@ -54,6 +54,10 @@ Don't guess flags, methods, or fields: read them from `slime help`.
   prints its id; `slime pane text <id>` reads its screen and scrollback
   without disturbing it; `slime pane write <id> <text>` types into it,
   where a carriage return presses enter.
+- `slime pane split right --browser <url>` opens a browser pane instead:
+  the window's browser shows the page, and slime keeps only its url and
+  title. `slime pane navigate <id> <url>` sends it elsewhere; `write` and
+  `text` are for terminals and fail on it.
 - A pane's program ending ends the pane. To keep a result on screen,
   run a shell and write the command to it.
 - `slime do <file.lua>` runs Lua in the daemon; `slime do <action>` runs

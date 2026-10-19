@@ -48,7 +48,7 @@ type Server struct {
 	nextScript uint32
 	workspaces map[uint32]*workspace
 	tabs       map[TabID]*tab
-	panes      map[PaneID]*Pane
+	panes      map[PaneID]pane
 	// moved forwards the id a pane had before it moved tabs to its
 	// current one, for as long as it lives: a shell's SLIME_PANE still
 	// finds it. One hop: a pane that moves again rewrites its entries.
@@ -98,7 +98,7 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		idle:       opts.Idle,
 		workspaces: map[uint32]*workspace{},
 		tabs:       map[TabID]*tab{},
-		panes:      map[PaneID]*Pane{},
+		panes:      map[PaneID]pane{},
 		moved:      map[PaneID]PaneID{},
 		conns:      map[*conn]struct{}{},
 		scripts:    map[uint32]*script{},
@@ -248,11 +248,11 @@ func (s *Server) dispatch(c *conn, id PaneID, m Message) {
 	case *Call:
 		s.call(c, m.Request)
 	case *Ack:
-		if p := s.pane(id); p != nil {
+		if p, ok := s.pane(id).(*Pane); ok {
 			p.ack(c, m.Seq)
 		}
 	case *Event:
-		if p := s.pane(id); p != nil {
+		if p, ok := s.pane(id).(*Pane); ok {
 			p.event(c, m.Data)
 		}
 	case *Resize:
@@ -279,7 +279,7 @@ func writeError(rw io.ReadWriteCloser, msg string) {
 	rw.Close()
 }
 
-func (s *Server) pane(id PaneID) *Pane {
+func (s *Server) pane(id PaneID) pane {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.paneLocked(id)
@@ -287,7 +287,7 @@ func (s *Server) pane(id PaneID) *Pane {
 
 // paneLocked finds a pane by its id, or by one it had before moving
 // tabs.
-func (s *Server) paneLocked(id PaneID) *Pane {
+func (s *Server) paneLocked(id PaneID) pane {
 	if p := s.panes[id]; p != nil {
 		return p
 	}
@@ -299,8 +299,12 @@ func (s *Server) paneLocked(id PaneID) *Pane {
 
 // startPane starts a child and its terminal for pane id, outside the
 // server's lock: spawning takes a while. The caller registers it
-// (addPaneLocked), or closes it if what it was for is gone by then.
+// (addPaneLocked), or closes it if what it was for is gone by then. A
+// browser has neither: its spec is all there is.
 func (s *Server) startPane(id PaneID, spec *rpc.PaneSpec, size Size) (*started, error) {
+	if spec.Kind == rpc.PaneBrowser {
+		return &started{id: id, spec: spec}, nil
+	}
 	// The config's shell, if it names one, is run as given; the
 	// platform's default is the pty's to pick, and named for the pane.
 	command := spec.Command
@@ -356,12 +360,14 @@ func (s *Server) list() *rpc.WorkspaceListResult {
 	return out
 }
 
-// Close kills every pane.
+// Close kills every terminal.
 func (s *Server) Close() {
 	s.mu.Lock()
 	ps := make([]*Pane, 0, len(s.panes))
 	for _, p := range s.panes {
-		ps = append(ps, p)
+		if p, ok := p.(*Pane); ok {
+			ps = append(ps, p)
+		}
 	}
 	s.mu.Unlock()
 	for _, p := range ps {

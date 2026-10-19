@@ -303,3 +303,43 @@ func TestLogAndNoExit(t *testing.T) {
 		t.Errorf("logs %q", h.logs)
 	}
 }
+
+// slime.layout.browser is a browser leaf; slime.pane.navigate takes the
+// pane as split does, from pane_id when left out.
+func TestBrowser(t *testing.T) {
+	h := &fakeHost{}
+	ctx := Context{Pane: rpc.PaneID{WS: 1, Tab: 2, N: 3}}
+	res, err := run(t, h, ctx, `
+		slime.pane.navigate{ url = "https://a.example" }
+		slime.pane.navigate{ pane = "1.2.5", url = "https://b.example" }
+		return slime.layout.vertical(slime.layout.pane{}, slime.layout.browser{ url = "https://c.example" })
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var l rpc.Layout
+	if err := json.Unmarshal(res, &l); err != nil {
+		t.Fatalf("%v: %s", err, res)
+	}
+	if err := l.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if p := l.Children[1].Node.Pane; p.Kind != rpc.PaneBrowser || p.URL != "https://c.example" {
+		t.Errorf("browser leaf %+v", p)
+	}
+	if p := l.Children[0].Node.Pane; p.Kind != rpc.PaneTerminal {
+		t.Errorf("terminal leaf %+v", p)
+	}
+	want := []call{
+		{"pane.navigate", `{"pane":"1.2.3","url":"https://a.example"}`},
+		{"pane.navigate", `{"pane":"1.2.5","url":"https://b.example"}`},
+	}
+	if len(h.calls) != len(want) {
+		t.Fatalf("calls %v", h.calls)
+	}
+	for i, c := range want {
+		if h.calls[i] != c {
+			t.Errorf("call %d: %v, want %v", i, h.calls[i], c)
+		}
+	}
+}

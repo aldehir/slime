@@ -28,20 +28,23 @@ var MethodDocs = []MethodDoc{
 	{WorkspaceFocus, "{tab?, pane?, zoomed?}", "{}",
 		"tab becomes active, pane its focus (and names the tab if tab is left out), zoomed the zoomed pane (\"\" unzooms)"},
 	{WorkspaceInfo, "{id}", "WorkspaceDesc", ""},
-	{TabNew, "{workspace, name?, layout?: Layout, command?, cwd?, env?, size?}", "Created",
-		"pane is the first pane, which names the tab"},
+	{TabNew, "{workspace, name?, layout?: Layout, kind?, url?, command?, cwd?, env?, size?}", "Created",
+		"pane is the first pane, which names the tab; without a layout, one pane as PaneSpec says"},
 	{TabClose, "{id}", "{}", ""},
 	{TabRename, "{id, name}", "{}", ""},
 	{TabLayout, "{id, tree: Node}", "{}", "same panes, new shares (a divider drag)"},
 	{TabInfo, "{id}", "Tab", ""},
-	{PaneSplit, "{pane, direction: right|down|left|up, share?: 1..9999, command?, cwd?, env?}", "Created",
-		"share is the new pane's, in basis points (5000 default)"},
+	{PaneSplit, "{pane, direction: right|down|left|up, share?: 1..9999, kind?, url?, command?, cwd?, env?}", "Created",
+		"share is the new pane's, in basis points (5000 default); the rest is the new pane's PaneSpec"},
 	{PaneMove, "{pane, tab?, side?: right|down|left|up}", "Created",
 		"into tab along side, or a new tab of its own without tab; the result is the pane's new id, and its old ids keep finding it"},
 	{PaneKill, "{id}", "{}", ""},
-	{PaneWrite, "{id, text}", "{}", "as typed; no newline is added, a \"\\r\" presses enter"},
-	{PaneText, "{id, vt?: bool}", "{text}", "the screen and scrollback: plain, or the VT that redraws it"},
+	{PaneWrite, "{id, text}", "{}", "as typed; no newline is added, a \"\\r\" presses enter; not a browser's"},
+	{PaneText, "{id, vt?: bool}", "{text}", "the screen and scrollback: plain, or the VT that redraws it; not a browser's"},
 	{PaneInfo, "{id}", "PaneDesc", "a moved pane is found under its old id and described under its current one"},
+	{PaneNavigate, "{pane, url}", "{}", "sends a browser pane to url: every window showing it follows (pane.url)"},
+	{PaneVisited, "{pane, url, title?}", "{}",
+		"a window's browser reports where it went: the daemon keeps url and title, the pane's other viewers get pane.url, and subscribers pane.title"},
 	{ScriptRun, "{source, name?, args?: object, pane?, detach?}", "{id}",
 		"returns at once; the script's output and end arrive as script.output and script.done"},
 	{ScriptCancel, "{id}", "{}", ""},
@@ -65,16 +68,20 @@ var MethodDocs = []MethodDoc{
 const ShapesDoc = `A workspace id is an integer; a tab id is the string "w.t" and a pane id
 "w.t.p"; "" is none where one is optional. Times are unix milliseconds.
 
-  Layout         {pane: {command?, cwd?, env?}}
+  Layout         {pane: PaneSpec}
                  | {split: {axis: row|column, children: [{share?, node: Layout}]}}
                  shares in basis points summing to 10000, or all absent for equal parts
   Node           {pane: "w.t.p"} | {split: {axis, children: [{share, node: Node}]}}
                  (a built tab's tree)
+  PaneSpec       {kind?: browser, url?, command?, cwd?, env?}: a terminal (no kind)
+                 runs command (the shell if none); a browser shows url, which it
+                 needs, and takes no command
   Workspace      {id, name, active_tab: "w.t", tabs: [Tab]}
   WorkspaceDesc  Workspace plus {attached, viewers?, detached_at?}
   Tab            {id: "w.t", name?, tree: Node, focus?: "w.t.p", zoomed?: "w.t.p"}
-  PaneDesc       {id: "w.t.p", command, title?, pwd?, cols, rows, created, pid,
-                  status?: [{id, state, progress}]}
+  PaneDesc       {id: "w.t.p", kind?, url?, command, title?, pwd?, cols, rows, created,
+                  pid, status?: [{id, state, progress}]}: a browser has kind, url,
+                  and title, and zeros for the terminal's
   Created        {pane: "w.t.p"}
   Host           {id, dest, state: connecting|connected|failed|lost|gone, text?}
   Config         {path, settings: object, keymap: [Binding], actions: [{name, title?, args?}],
@@ -108,9 +115,10 @@ var EventDocs = []EventDoc{
 	{EvTabSelected, "{id}"},
 	{EvPaneCreated, "{id}"},
 	{EvPaneMoved, "{id, from}: to another tab, under a new id"},
-	{EvPaneAttached, "{id, moved_from?, command, status?} (viewers only; frames follow)"},
+	{EvPaneAttached, "{id, moved_from?, kind?, url?, command, status?} (viewers only; a terminal's frames follow, a browser's nothing)"},
 	{EvPaneExited, "{id, status}"},
-	{EvPaneTitle, "{id, title}: the program set the title (subscribers only; viewers have it in the pane's notices)"},
+	{EvPaneTitle, "{id, title}: the program set the title, or a browser's page is titled so (subscribers only; viewers have it in the pane's notices, or their browser)"},
+	{EvPaneURL, "{id, url}: a browser pane was sent to url (pane.navigate, or another window's pane.visited); its viewers' browsers follow"},
 	{EvPanePwd, "{id, pwd}: the shell reported its directory (OSC 7)"},
 	{EvPaneBell, "{id}"},
 	{EvPaneStatus, "{id, status: [{id, state, progress}]}: a program's status report changed (OSC 7501); every record now"},

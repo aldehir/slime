@@ -206,6 +206,10 @@ func lsCommand() *cobra.Command {
 					fmt.Fprintf(w, "  tab %s%s\t%s\t%s\n", t.ID, mark(t.ID == ws.ActiveTab), t.Name, layoutString(t.Tree))
 					for _, id := range t.Tree.Panes() {
 						p := panes[id]
+						if p.Kind == rpc.PaneBrowser {
+							fmt.Fprintf(w, "    pane %s%s\tbrowser\t\t%s\n", id, mark(id == t.Focus), browserString(p))
+							continue
+						}
 						title := p.Title
 						if title == "" {
 							title = p.Command
@@ -217,6 +221,15 @@ func lsCommand() *cobra.Command {
 			return w.Flush()
 		},
 	}
+}
+
+// browserString shows a browser pane by its url, after its title if
+// it has one.
+func browserString(p rpc.PaneDesc) string {
+	if p.Title == "" {
+		return p.URL
+	}
+	return p.Title + "  " + p.URL
 }
 
 // workspaceState says whether a workspace is shown, by how many, or
@@ -365,9 +378,10 @@ func wsCommand() *cobra.Command {
 
 func tabCommand() *cobra.Command {
 	var (
-		wsID  uint32
-		name  string
-		split string
+		wsID    uint32
+		name    string
+		split   string
+		browser string
 	)
 	newTab := &cobra.Command{
 		Use:   "new [command]...",
@@ -375,8 +389,12 @@ func tabCommand() *cobra.Command {
 		Long: "Starts a tab in a workspace: the one given, else the pane's own inside a\n" +
 			"pane ($SLIME_WORKSPACE), else the most recently detached, else a new one. Each\n" +
 			"command (CreateProcessW syntax; empty for the shell) gets a pane, sharing the\n" +
-			"tab equally along --split.",
+			"tab equally along --split. With --browser, one browser pane showing the url\n" +
+			"instead, and no command.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("browser") && len(args) > 0 {
+				return fmt.Errorf("--browser takes no command")
+			}
 			var axis rpc.Axis
 			switch split {
 			case "right", "h":
@@ -410,8 +428,12 @@ func tabCommand() *cobra.Command {
 					ws = w.ID
 				}
 			}
+			layout := layoutOf(args, axis)
+			if cmd.Flags().Changed("browser") {
+				layout = &rpc.Layout{Pane: &rpc.PaneSpec{Kind: rpc.PaneBrowser, URL: browser}}
+			}
 			var created rpc.Created
-			if err := c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: ws, Name: name, Layout: layoutOf(args, axis)}, &created); err != nil {
+			if err := c.Call(rpc.TabNew, rpc.TabNewParams{Workspace: ws, Name: name, Layout: layout}, &created); err != nil {
 				return err
 			}
 			if jsonOut {
@@ -424,6 +446,7 @@ func tabCommand() *cobra.Command {
 	newTab.Flags().Uint32VarP(&wsID, "workspace", "w", envWorkspace(), "workspace to start it in (default $SLIME_WORKSPACE)")
 	newTab.Flags().StringVarP(&name, "name", "n", "", "name the tab")
 	newTab.Flags().StringVar(&split, "split", "right", "how several commands share the tab: right (side by side) or down (stacked)")
+	newTab.Flags().StringVar(&browser, "browser", "", "a browser pane showing this url, rather than a command's")
 
 	tab := &cobra.Command{Use: "tab", Short: "Start, rename, close, and describe tabs"}
 	tab.AddCommand(newTab, &cobra.Command{
@@ -475,13 +498,15 @@ func paneCommand() *cobra.Command {
 	var (
 		percent float64
 		asVT    bool
+		browser string
 	)
 	split := &cobra.Command{
 		Use:   "split [pane] right|down|left|up [command]",
 		Short: "Start a pane beside another (this one, by default), and print its id",
 		Long: "Starts a pane on a side of another, running command (empty for the shell),\n" +
-			"taking --percent of its space. Without a pane, beside the one this console\n" +
-			"runs in ($SLIME_PANE).",
+			"taking --percent of its space; with --browser, a browser pane showing the url,\n" +
+			"which a window's browser fills, and no command. Without a pane, beside the one\n" +
+			"this console runs in ($SLIME_PANE).",
 		Args: cobra.RangeArgs(1, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pane, args, err := paneArg(args)
@@ -502,6 +527,12 @@ func paneCommand() *cobra.Command {
 			if len(args) == 2 {
 				p.Command = args[1]
 			}
+			if cmd.Flags().Changed("browser") {
+				if p.Command != "" {
+					return fmt.Errorf("--browser takes no command")
+				}
+				p.Kind, p.URL = rpc.PaneBrowser, browser
+			}
 			var created rpc.Created
 			if err := call(rpc.PaneSplit, p, &created); err != nil {
 				return err
@@ -514,6 +545,25 @@ func paneCommand() *cobra.Command {
 		},
 	}
 	split.Flags().Float64VarP(&percent, "percent", "p", 50, "how much of the pane's space the new one takes")
+	split.Flags().StringVar(&browser, "browser", "", "a browser pane showing this url, rather than a command's")
+	navigate := &cobra.Command{
+		Use:   "navigate [pane] <url>",
+		Short: "Send a browser pane (this one, by default) to a url, in every window showing it",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := envPane()
+			if len(args) == 2 {
+				var err error
+				if id, err = rpc.ParsePaneID(args[0]); err != nil {
+					return err
+				}
+				args = args[1:]
+			} else if id.IsZero() {
+				return errNoPane
+			}
+			return call(rpc.PaneNavigate, rpc.PaneNavigateParams{Pane: id, URL: args[0]}, nil)
+		},
+	}
 	move := &cobra.Command{
 		Use:   "move [pane] <tab|new> [right|down|left|up]",
 		Short: "Move a pane along a side of another tab, or into a new tab of its own, and print its new id",
@@ -602,8 +652,8 @@ func paneCommand() *cobra.Command {
 	}
 	text.Flags().BoolVar(&asVT, "vt", false, "print the VT that redraws it rather than plain text")
 
-	pane := &cobra.Command{Use: "pane", Short: "Split, move, focus, kill, write to, and read panes"}
-	pane.AddCommand(split, move, focus, text, &cobra.Command{
+	pane := &cobra.Command{Use: "pane", Short: "Split, move, focus, kill, write to, read, and navigate panes"}
+	pane.AddCommand(split, move, focus, text, navigate, &cobra.Command{
 		Use:   "kill [pane]...",
 		Short: "End panes (this one, with none given)",
 		Args:  cobra.ArbitraryArgs,
@@ -671,6 +721,11 @@ func paneCommand() *cobra.Command {
 				return printJSON(d)
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			if d.Kind == rpc.PaneBrowser {
+				fmt.Fprintf(w, "pane\t%s\nkind\t%s\nurl\t%s\ntitle\t%s\ncreated\t%s\n",
+					d.ID, d.Kind, d.URL, d.Title, time.UnixMilli(d.Created).Format(time.RFC3339))
+				return w.Flush()
+			}
 			fmt.Fprintf(w, "pane\t%s\ncommand\t%s\ntitle\t%s\npwd\t%s\nsize\t%dx%d\npid\t%d\ncreated\t%s\n",
 				d.ID, d.Command, d.Title, d.Pwd, d.Cols, d.Rows, d.PID, time.UnixMilli(d.Created).Format(time.RFC3339))
 			for _, r := range d.Status {

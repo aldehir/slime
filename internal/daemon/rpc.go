@@ -81,6 +81,8 @@ var methods = map[string]handler{
 	rpc.PaneWrite:       method((*Server).paneWrite),
 	rpc.PaneText:        method((*Server).paneText),
 	rpc.PaneInfo:        method((*Server).paneInfo),
+	rpc.PaneNavigate:    method((*Server).paneNavigate),
+	rpc.PaneVisited:     method((*Server).paneVisited),
 	rpc.Subscribe:       method((*Server).subscribe),
 	rpc.HostConnect:     method((*Server).hostConnect),
 	rpc.HostAnswer:      method((*Server).hostAnswer),

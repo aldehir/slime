@@ -41,14 +41,18 @@ THE SLIME TABLE
                              neither tab nor pane gets pane from pane_id
   slime.tab.<m>{...}         tab.<m>; tab.new gets workspace, the rest id
                              from tab_id
-  slime.pane.<m>{...}        pane.<m>; split and move get pane, the rest id
-                             from pane_id
+  slime.pane.<m>{...}        pane.<m>; split, move, navigate, and visited get
+                             pane, the rest id from pane_id: so
+                             slime.pane.navigate{url = "..."} sends this
+                             script's browser pane there
   slime.id.parse(id)         {workspace, tab, pane} from 1, "1.2", or "1.2.3"
                              (the parts it has); nil, err for anything else
   slime.id.tab(w, t)         "w.t" and "w.t.p" from numbers
   slime.id.pane(w, t, p)
   slime.layout.pane{command, cwd, env}
                              a leaf for tabs in workspace.new or layout in tab.new
+  slime.layout.browser{url}  a browser leaf: a pane a window's browser fills,
+                             showing url (which it needs)
   slime.layout.horizontal([ratio,] a, b, ...)
                              side by side (a row split); ratio is a's share (0 to
                              1), the rest share what's left equally; no ratio
@@ -267,6 +271,14 @@ Watch for bells until stopped (slime do --detach watch.lua; slime scripts kill <
   end)
   slime.every(60, function() slime.log("still watching") end)
 
+A browser beside this pane, following where its windows go (pane.url):
+
+  local b = assert(slime.pane.split{ direction = "right", kind = "browser", url = "http://localhost:8080" })
+  slime.on("pane.url", function(ctx, ev)
+    if ev.id == b.pane then slime.log("browser at", ev.url) end
+  end)
+  slime.pane.navigate{ pane = b.pane, url = "http://localhost:8080/docs" }
+
 Shell out (on the daemon's host):
 
   local r = assert(slime.exec({ "git", "status", "--short" }, { cwd = slime.args.dir }))
@@ -296,6 +308,7 @@ func (r *Runner) install(ctx Context) {
 	layout := L.NewTable()
 	L.SetFuncs(layout, map[string]glua.LGFunction{
 		"pane":       layoutPane,
+		"browser":    layoutBrowser,
 		"horizontal": func(L *glua.LState) int { return layoutSplit(L, rpc.Row) },
 		"vertical":   func(L *glua.LState) int { return layoutSplit(L, rpc.Column) },
 	})
@@ -364,8 +377,8 @@ func (r *Runner) namespace(group string) *glua.LTable {
 // workspace.new's attach (so the windows on the script's workspace open
 // the new one; attach = false leaves it detached, true asks for the
 // default), workspace.focus's pane (or tab, with no pane to fill),
-// tab.new's workspace, a pane method's id, and the pane a split or move
-// starts from.
+// tab.new's workspace, a pane method's id, and the pane a split or
+// move starts from, or a browser's navigate and visited name.
 func (r *Runner) fillContext(method string, params *glua.LTable) {
 	var field, from string
 	group, name, _ := strings.Cut(method, ".")
@@ -401,7 +414,7 @@ func (r *Runner) fillContext(method string, params *glua.LTable) {
 			field, from = "id", "tab_id"
 		}
 	case "pane":
-		if name == "split" || name == "move" {
+		if name == "split" || name == "move" || name == "navigate" || name == "visited" {
 			field, from = "pane", "pane_id"
 		} else {
 			field, from = "id", "pane_id"
@@ -590,6 +603,17 @@ func idPart(L *glua.LState, i int) uint32 {
 // layout tree, in the form tab.new and workspace.new take.
 func layoutPane(L *glua.LState) int {
 	spec := L.OptTable(1, L.NewTable())
+	leaf := L.NewTable()
+	leaf.RawSetString("pane", spec)
+	L.Push(leaf)
+	return 1
+}
+
+// layoutBrowser is slime.layout.browser{url}: a leaf whose pane is a
+// browser.
+func layoutBrowser(L *glua.LState) int {
+	spec := L.OptTable(1, L.NewTable())
+	spec.RawSetString("kind", glua.LString(rpc.PaneBrowser))
 	leaf := L.NewTable()
 	leaf.RawSetString("pane", spec)
 	L.Push(leaf)

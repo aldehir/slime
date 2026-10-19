@@ -102,7 +102,7 @@ func TestConPTY(t *testing.T) {
 	w2.until(pane, "got first")
 	// ConPTY turns on win32-input-mode, which the daemon must track to
 	// encode keys for it.
-	p := srv.pane(pane)
+	p := srv.pane(pane).(*Pane)
 	p.mu.Lock()
 	win32 := p.win32InputLocked()
 	t.Logf("modes seen: %+v", p.modes)

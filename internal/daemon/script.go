@@ -77,10 +77,10 @@ func (s *Server) startScriptLocked(cl *callCtx, name string, pane PaneID, detach
 	if !pane.IsZero() {
 		// The pane as it's named now, if it moved.
 		p := s.paneLocked(pane)
-		if p == nil || p.tab == nil {
+		if p == nil || p.tabOf() == nil {
 			return nil, errNoPane
 		}
-		pane = p.id
+		pane = p.paneID()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.nextScript++

@@ -11,6 +11,26 @@ import (
 	"github.com/aldehir/slime/internal/vt"
 )
 
+// pane is what fills a leaf of a tab: a terminal (*Pane) or a browser
+// (*BrowserPane). The server reaches either through it; the layout
+// doesn't care which.
+type pane interface {
+	// paneID and tabOf are its id and tab, which setTab and
+	// renameLocked change. Under the server's lock.
+	paneID() PaneID
+	tabOf() *tab
+	setTab(t *tab)
+	renameLocked(id PaneID)
+	attach(c *conn, size Size, from PaneID) error
+	detach(c *conn)
+	resize(c *conn, size Size)
+	cell() Size
+	kill()
+	write(b []byte) error
+	text(asVT bool) (string, error)
+	desc() rpc.PaneDesc
+}
+
 // Pane is a pty and the terminal its output is fed to. Its viewers are
 // its workspace's, set by the server as workspaces are attached and
 // detached; each gets its own frames of the one terminal.
@@ -384,6 +404,10 @@ func (p *Pane) cell() Size {
 
 // kill ends the child; run reports the exit and cleans up.
 func (p *Pane) kill() { go p.pty.Close() }
+
+func (p *Pane) paneID() PaneID { return p.id }
+func (p *Pane) tabOf() *tab    { return p.tab }
+func (p *Pane) setTab(t *tab)  { p.tab = t }
 
 // renameLocked gives the pane the id it has in its new tab. Under the
 // server's lock.

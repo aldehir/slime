@@ -422,7 +422,7 @@ func (w *window) text(pane PaneID) string {
 
 // serverText is the daemon's own copy of a pane's screen.
 func (h *harness) serverText(id PaneID) string {
-	p := h.srv.pane(id)
+	p := h.srv.pane(id).(*Pane)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s, _ := p.term.Text()
@@ -1437,7 +1437,7 @@ func TestModesTracked(t *testing.T) {
 	pane := w.newWorkspace()
 	h.pty(0).emit("\x1b[?9001h\x1b[?1004hmark")
 	w.until(pane, "mark")
-	p := h.srv.pane(pane)
+	p := h.srv.pane(pane).(*Pane)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	want := []mode{{num: 9001, enabled: true}}
