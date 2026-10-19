@@ -65,8 +65,13 @@ const L = std.unicode.utf8ToUtf16LeStringLiteral;
 /// The title bar's height with the sidebar, and without it.
 pub const titlebar_height = 36;
 pub const titlebar_height_plain = 40;
-/// The sidebar's width.
-pub const sidebar_width = 240;
+/// The sidebar's width to start with, and the range dragging its edge
+/// keeps it in.
+pub const default_sidebar_width = 240;
+pub const min_sidebar_width = 160;
+pub const max_sidebar_width = 600;
+/// How far either side of the sidebar's edge takes hold of it.
+pub const sidebar_edge_grip = 4;
 
 /// Pixels per DIP: the monitor's scale times `zoom`.
 scale: f32,
@@ -77,6 +82,8 @@ theme: Theme,
 /// The tabs are listed in a sidebar; hidden, the terminal area takes
 /// the width.
 sidebar_shown: bool = true,
+/// The sidebar's width in DIPs, as its edge was last dragged.
+sidebar_width: f32 = default_sidebar_width,
 /// What the mouse is over, and what a button went down on.
 hover: Id = .none,
 pressed: Id = .none,
@@ -132,7 +139,7 @@ pub fn px(self: *const Ui, dip: f32) f32 {
 /// Where the regions go in a window `width` by `height`.
 pub fn frame(self: *const Ui, width: f32, height: f32) Frame {
     const bar_h = self.px(if (self.sidebar_shown) titlebar_height else titlebar_height_plain);
-    const side_w = if (self.sidebar_shown) @min(self.px(sidebar_width), width) else 0;
+    const side_w = if (self.sidebar_shown) @min(self.px(self.sidebar_width), width) else 0;
     const h = @max(0, height - bar_h);
     return .{
         .window = .{ .w = width, .h = height },
@@ -617,6 +624,12 @@ test "the frame, with and without the sidebar" {
     try std.testing.expectEqual(@as(f32, 0), f.sidebar.w);
     try std.testing.expectEqual(@as(f32, 0), f.terminal.x);
     try std.testing.expectEqual(f.window.w, f.terminal.w);
+    // Shown again at a dragged width, it takes that.
+    ui.toggleSidebar();
+    ui.sidebar_width = 300;
+    f = ui.frame(1000, 600);
+    try std.testing.expectEqual(@as(f32, 300), f.sidebar.w);
+    try std.testing.expectEqual(@as(f32, 300), f.terminal.x);
 }
 
 test "layout and hit testing a small tree" {

@@ -80,6 +80,8 @@ const Builder = struct {
         try regions.append(self.arena, try self.titleBar());
         if (self.ui.sidebar_shown) try regions.append(self.arena, try self.sidebar());
         try regions.append(self.arena, try self.terminal());
+        // Over both, so the edge is taken hold of before anything under it.
+        if (self.ui.sidebar_shown) try regions.append(self.arena, self.sidebarEdge());
         if (self.dialog()) |d| try regions.append(self.arena, d);
         // A menu is over everything: the window under it is its scrim,
         // which takes the click that closes it.
@@ -162,6 +164,14 @@ const Builder = struct {
             .justify = .end,
         } } };
         return .{ .kind = .{ .stack = try self.nodes(&.{ column, stats_column }) }, .rect = self.frame.sidebar };
+    }
+
+    /// The strip astride the sidebar's edge that drags its width: over
+    /// the sidebar's padding and the terminal area's gap, nothing drawn.
+    fn sidebarEdge(self: *const Builder) Node {
+        const grip = self.ui.px(Ui.sidebar_edge_grip);
+        const s = self.frame.sidebar;
+        return .{ .id = .window(.sidebar_edge), .kind = .hit_area, .rect = .{ .x = s.right() - grip, .y = s.y, .w = 2 * grip, .h = s.h } };
     }
 
     /// Local, with its workspaces and then its tabs in no workspace

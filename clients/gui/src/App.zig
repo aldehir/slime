@@ -152,6 +152,9 @@ drag: ?Drag = null,
 /// A pane pressed on its title strip, which drags it once the mouse moves
 /// far enough, until the button's up.
 pane_drag: ?PaneDrag = null,
+/// The sidebar's edge being dragged, which has the mouse until the
+/// button's up.
+sidebar_drag: ?SidebarDrag = null,
 /// The tab a middle click went down on, to close it on release.
 middle_pressed: ?Id.Target = null,
 
@@ -237,6 +240,17 @@ const Drop = struct {
     place: Tab.Place,
     rect: Rect,
 };
+
+const SidebarDrag = struct {
+    /// The sidebar's width (DIPs) and the mouse's x when the button went
+    /// down.
+    from: f32,
+    origin: i32,
+};
+
+/// The least the terminal area keeps, in DIPs, when the sidebar's edge
+/// is dragged toward it.
+const min_terminal_width = 200;
 
 /// A host's slime, bridged through the local daemon. A session stands in
 /// for its panes until they come (`standIn`).
@@ -669,6 +683,7 @@ fn sessionEvent(self: *App, id: u32, what: @FieldType(@FieldType(Msg, "session")
 /// Losing the capture mid-drag (alt+tab, a modal window) ends it.
 fn captureLost(self: *App) void {
     if (self.drag != null) self.endDrag();
+    if (self.sidebar_drag != null) self.endSidebarDrag();
     // A pane drag that lost the mouse lands nowhere.
     self.cancelDrag();
     if (self.mouse_in_terminal) {
@@ -2064,6 +2079,32 @@ fn sendLayout(self: *App, t: *const Tab) void {
     conn.layout(t.id, root) catch |err| log.err("sending the layout failed: {}", .{err});
 }
 
+/// Start dragging the sidebar's edge from the mouse at `pos`.
+fn startSidebarDrag(self: *App, pos: win32.POINT) void {
+    self.hideTip();
+    self.sidebar_drag = .{ .from = self.ui.sidebar_width, .origin = pos.x };
+    self.shell.captureMouse();
+}
+
+/// Move the sidebar's edge to the mouse, within the sidebar's range and
+/// leaving the terminal area its least, laying the window out again as
+/// it goes.
+fn sidebarDragTo(self: *App, d: SidebarDrag, pos: win32.POINT) void {
+    const dx = @as(f32, @floatFromInt(pos.x - d.origin)) / self.ui.scale;
+    const room = self.frame.window.w / self.ui.scale - min_terminal_width;
+    const most = @max(Ui.min_sidebar_width, @min(Ui.max_sidebar_width, room));
+    const w = std.math.clamp(d.from + dx, Ui.min_sidebar_width, most);
+    if (w == self.ui.sidebar_width) return;
+    self.ui.sidebar_width = w;
+    self.shell.relayout();
+}
+
+fn endSidebarDrag(self: *App) void {
+    // First: releasing the capture comes back as `capture_lost`.
+    self.sidebar_drag = null;
+    self.shell.releaseMouse();
+}
+
 /// Drop a drag (of a divider or a pane) whose tree is about to change, as
 /// it stands: slime's tree, or the pane closing, decides the layout now.
 fn cancelDrag(self: *App) void {
@@ -2727,6 +2768,7 @@ pub fn cursor(self: *App, pos: win32.POINT) Cursor {
         else => null,
     };
     if (divider) |d| cursor_ = if (d.axis() == .row) .size_we else .size_ns;
+    if (self.sidebar_drag != null or hit.eql(.window(.sidebar_edge))) cursor_ = .size_we;
     if (self.pane_drag) |d| if (d.at != null) {
         cursor_ = .size_all;
     };
@@ -2791,6 +2833,11 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
         if (!held) self.endPaneDrag();
         return;
     }
+    if (self.sidebar_drag) |d| {
+        self.sidebarDragTo(d, pos);
+        if (!held) self.endSidebarDrag();
+        return;
+    }
 
     if (self.mouse_in_terminal) {
         if (self.focusedSession()) |s| s.mouseInput(msg, wparam, self.toPane(s, pos));
@@ -2832,6 +2879,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
     switch (msg) {
         win32.WM_LBUTTONDOWN => {
             if (hit.target == .divider) return self.startDrag(hit.target.divider, pos);
+            if (hit.eql(.window(.sidebar_edge))) return self.startSidebarDrag(pos);
             if (hit.part == .title) if (self.shownPane(hit.target)) |pane| return self.startPaneDrag(pane, pos);
             self.setPressed(hit);
             self.shell.captureMouse();
@@ -3458,6 +3506,34 @@ test "the tabs can all go and a new one come while the active index is past them
     try std.testing.expect(!app.mouse_in_terminal);
     try std.testing.expect(app.focusedSession() == null);
     app.active = 0;
+}
+
+test "dragging the sidebar's edge resizes it, within its range" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+
+    const edge: i32 = @intFromFloat(t.frame.sidebar.right());
+    const y: i32 = 300;
+    try std.testing.expectEqual(Cursor.size_we, app.cursor(.{ .x = edge - 2, .y = y }));
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONDOWN, .wparam = win32.MK_LBUTTON, .pos = .{ .x = edge, .y = y } } });
+    try std.testing.expect(app.sidebar_drag != null);
+    try std.testing.expect(shell.captured);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = win32.MK_LBUTTON, .pos = .{ .x = edge + 60, .y = y } } });
+    try std.testing.expectEqual(@as(f32, Ui.default_sidebar_width + 60), app.ui.sidebar_width);
+    // Dragged past the window, the sidebar stops at its widest.
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = win32.MK_LBUTTON, .pos = .{ .x = 2000, .y = y } } });
+    try std.testing.expectEqual(@as(f32, Ui.max_sidebar_width), app.ui.sidebar_width);
+    try std.testing.expectEqual(Cursor.size_we, app.cursor(.{ .x = 2000, .y = y }));
+    // And no narrower than its least.
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = win32.MK_LBUTTON, .pos = .{ .x = -100, .y = y } } });
+    try std.testing.expectEqual(@as(f32, Ui.min_sidebar_width), app.ui.sidebar_width);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONUP, .wparam = 0, .pos = .{ .x = -100, .y = y } } });
+    try std.testing.expect(app.sidebar_drag == null);
+    try std.testing.expect(!shell.captured);
+    try std.testing.expectEqual(@as(f32, Ui.min_sidebar_width), app.ui.frame(1000, 600).sidebar.w);
 }
 
 test "a mouse move builds the tree at most once, even with a frame pending" {

@@ -55,6 +55,8 @@ pub const Part = enum {
     /// The caption button, or a tab's close button.
     close,
     toggle_sidebar,
+    /// The sidebar's right edge, which drags its width.
+    sidebar_edge,
     /// The terminal area under a dialog, away from its controls; or the
     /// window under a context menu.
     scrim,
