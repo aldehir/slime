@@ -44,6 +44,14 @@ pub fn main(init: std.process.Init) !void {
     var config: Config = undefined;
     var keymap: []binding.Entry = &.{};
     defer Daemon.freeKeymap(init.gpa, keymap);
+    var source: Config.Source = .{ .dir = config_dir };
+    defer init.gpa.free(source.path);
+    // Why init.lua didn't load, for the window to show once it's up.
+    var daemon_errors: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (daemon_errors.items) |e| init.gpa.free(e);
+        daemon_errors.deinit(init.gpa);
+    }
     if (daemon) |conn| {
         var result = conn.config() catch |err| blk: {
             std.log.err("asking slime for its config failed: {}", .{err});
@@ -51,8 +59,12 @@ pub fn main(init: std.process.Init) !void {
         };
         defer if (result) |*r| r.deinit();
         const desc: Daemon.Json.Config = if (result) |r| r.value else .{};
-        for (desc.errors) |e| std.log.err("init.lua: {s}", .{e});
-        config = try loadConfig(init, config_dir, desc);
+        for (desc.errors) |e| {
+            std.log.err("init.lua: {s}", .{e});
+            try daemon_errors.append(init.gpa, try init.gpa.dupe(u8, e));
+        }
+        source.path = try init.gpa.dupe(u8, desc.path);
+        config = try Config.loadFrom(init.gpa, init.io, desc.settings, source);
         keymap = try Daemon.keymapFromJson(init.gpa, desc.keymap);
     } else {
         config = .init(init.gpa);
@@ -67,8 +79,9 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(local_command);
 
     // The window owns the connection from here, failing or not.
-    const window = try Window.create(init.gpa, init.io, &config, keymap, &hosts, &shown, command_line, local_command, daemon);
+    const window = try Window.create(init.gpa, init.io, &config, source, keymap, &hosts, &shown, command_line, local_command, daemon);
     defer window.destroy();
+    if (daemon_errors.items.len > 0 or config.errors.items.len > 0) try window.app.setNotice(daemon_errors.items);
 
     // Handle every pending message (input first) before drawing, so a
     // flood of output can't delay keys. The frame gate is only waited on
@@ -110,38 +123,6 @@ fn decodePng(alloc: std.mem.Allocator, data: []const u8) ghostty_vt.sys.DecodeEr
         else => error.InvalidData,
     };
     return .{ .width = img.width, .height = img.height, .data = img.data };
-}
-
-/// Build the config from the daemon's settings, with user themes in
-/// `themes` next to init.lua (else in the config directory) and the
-/// bundled ones in `themes` next to the executable.
-fn loadConfig(init: std.process.Init, dir: ?[]const u8, desc: Daemon.Json.Config) !Config {
-    const alloc = init.gpa;
-    const exe_dir = std.process.executableDirPathAlloc(init.io, alloc) catch null;
-    defer if (exe_dir) |d| alloc.free(d);
-    const init_dir: ?[]const u8 = if (desc.path.len > 0) std.fs.path.dirname(desc.path) else null;
-    return Config.load(alloc, init.io, desc.settings, .{
-        .dir = init_dir orelse dir,
-        .resources_dir = exe_dir,
-        .light = appsUseLightTheme(),
-    });
-}
-
-/// Windows' app mode is light (Settings > Personalization > Colors).
-fn appsUseLightTheme() bool {
-    const L = std.unicode.utf8ToUtf16LeStringLiteral;
-    var value: u32 = 0;
-    var size: u32 = @sizeOf(u32);
-    const status = win32.RegGetValueW(
-        win32.HKEY_CURRENT_USER,
-        L("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-        L("AppsUseLightTheme"),
-        win32.RRF_RT_REG_DWORD,
-        null,
-        &value,
-        &size,
-    );
-    return status == 0 and value != 0;
 }
 
 /// The command to run in the terminal: our own command line after the

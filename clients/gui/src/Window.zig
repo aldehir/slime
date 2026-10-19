@@ -65,8 +65,11 @@ const tip_timer_id = 6;
 
 alloc: Allocator,
 io: std.Io,
-/// Outlives the window.
-config: *const Config,
+/// Outlives the window. Built again on a reload (`reloadConfig`), in
+/// place, so the app's and the sessions' pointers to it hold.
+config: *Config,
+/// Where the config came from, to build it again.
+source: Config.Source,
 hwnd: ?win32.HWND = null,
 /// The last stats report, which the sidebar shows.
 stats_text: [max_stats_len]u16 = undefined,
@@ -126,7 +129,7 @@ stats: Stats = .{},
 /// `local_command`. `daemon` is the connection `config` and `keymap`
 /// came from, if one was made; the window owns it from here and goes
 /// on with it.
-pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []const binding.Entry, hosts: *Hosts, shown: *Shown, command_line: []const u16, local_command: []const u16, daemon: ?*Daemon) !*Window {
+pub fn create(alloc: Allocator, io: std.Io, config: *Config, source: Config.Source, keymap: []const binding.Entry, hosts: *Hosts, shown: *Shown, command_line: []const u16, local_command: []const u16, daemon: ?*Daemon) !*Window {
     // Ours until the app has it.
     var pending = daemon;
     errdefer if (pending) |conn| conn.deinit();
@@ -143,6 +146,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []con
         .alloc = alloc,
         .io = io,
         .config = config,
+        .source = source,
         .output_event = output_event,
         .grid = undefined,
         .ui = undefined,
@@ -276,6 +280,61 @@ fn setFontSize(self: *Window, size_pt: f32) void {
     if (size == self.grid.size_pt) return;
     self.grid.setSize(size);
     self.layout();
+}
+
+/// Build the config again from `settings` (JSON, what init.lua reloaded
+/// as) and apply it. What can't be built (a font) keeps what's in use.
+fn reloadConfig(self: *Window, settings: []const u8) void {
+    var arena: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), settings, .{}) catch |err| {
+        log.err("the reloaded settings aren't JSON: {}", .{err});
+        return;
+    };
+    const config = Config.loadFrom(self.alloc, self.io, parsed, self.source) catch |err| {
+        log.err("building the config failed: {}", .{err});
+        return;
+    };
+    self.applyConfig(config);
+}
+
+/// Make `new` the config: the chrome's theme and scale, the font (a new
+/// grid, when it changed), the renderer's text, every session's colors,
+/// and the layout.
+fn applyConfig(self: *Window, new: Config) void {
+    var old = self.config.*;
+    defer old.deinit();
+    const fonts_changed = old.@"font-size" != new.@"font-size" or
+        old.@"font-antialias" != new.@"font-antialias" or
+        !sameStrings(old.@"font-family".items, new.@"font-family".items);
+    const zoom_changed = old.@"chrome-scale" != new.@"chrome-scale";
+    const antialias_changed = old.@"font-antialias" != new.@"font-antialias";
+    self.config.* = new;
+    const config = self.config;
+
+    const theme: Ui.Theme = .init(config.background, config.foreground);
+    self.ui.theme = theme;
+    if (self.hwnd) |hwnd| {
+        const dark: win32.BOOL = if (theme.light) win32.FALSE else win32.TRUE;
+        _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL));
+    }
+    if (zoom_changed) self.ui.setZoom(self.dpi, config.@"chrome-scale") catch |err| log.err("chrome scale change failed: {}", .{err});
+    if (fonts_changed) {
+        if (font.Grid.init(self.alloc, self.io, config.@"font-family".items, config.@"font-size", self.dpi, config.@"font-antialias")) |grid| {
+            self.grid.deinit();
+            self.grid = grid;
+            if (self.renderer) |*r| r.dropAtlases();
+        } else |err| log.err("font change failed: {}", .{err});
+    }
+    if (antialias_changed) if (self.renderer) |*r| r.setTextAntialias(config.@"font-antialias");
+    self.app.configChanged();
+    self.layout();
+}
+
+fn sameStrings(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
 }
 
 /// The caption buttons, which come as non-client messages.
@@ -694,6 +753,7 @@ const shell_vtable: App.Shell.VTable = .{
     .fontSize = shellFontSize,
     .setFontSize = shellSetFontSize,
     .relayout = shellRelayout,
+    .reloadConfig = shellReloadConfig,
     .stats = shellStats,
     .webMouse = shellWebMouse,
     .webGo = shellWebGo,
@@ -813,6 +873,10 @@ fn shellSetFontSize(ctx: *anyopaque, size_pt: f32) void {
 
 fn shellRelayout(ctx: *anyopaque) void {
     fromCtx(ctx).layout();
+}
+
+fn shellReloadConfig(ctx: *anyopaque, settings: []const u8) void {
+    fromCtx(ctx).reloadConfig(settings);
 }
 
 fn shellStats(ctx: *anyopaque) []const u16 {

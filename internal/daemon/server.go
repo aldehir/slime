@@ -66,6 +66,7 @@ type Server struct {
 	configPath   string
 	config       *config.Config
 	configErrors []string
+	watch        time.Duration
 }
 
 // Options configure a Server.
@@ -81,6 +82,9 @@ type Options struct {
 	// Config is the init.lua to evaluate at start (config.Path());
 	// empty evaluates nothing, and config.reload stays empty.
 	Config string
+	// Watch is how often Serve looks at the config's files for a change
+	// that reloads it (watch.go); zero never looks.
+	Watch time.Duration
 }
 
 // defaultSize is a pane's size when nothing says otherwise.
@@ -108,6 +112,7 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		idleC:      make(chan struct{}),
 		stopC:      make(chan struct{}),
 		configPath: opts.Config,
+		watch:      opts.Watch,
 	}
 	if opts.Config != "" {
 		s.loadConfig()
@@ -122,6 +127,11 @@ func (s *Server) Serve(l net.Listener) error {
 	s.mu.Lock()
 	s.checkIdleLocked()
 	s.mu.Unlock()
+	if s.watch > 0 && s.configPath != "" {
+		stop := make(chan struct{})
+		defer close(stop)
+		go s.watchConfig(s.watch, stop)
+	}
 	errc := make(chan error, 1)
 	go func() {
 		for {

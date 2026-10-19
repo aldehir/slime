@@ -274,11 +274,7 @@ pub fn init(alloc: std.mem.Allocator, hwnd: win32.HWND, width: u32, height: u32,
     }, &box), "ID3D11Device::CreateBuffer(box)");
     errdefer com.releaseOpt(&box);
 
-    const text_antialias = switch (antialias) {
-        .grayscale => d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE,
-        .cleartype => d2d1.TEXT_ANTIALIAS_MODE_CLEARTYPE,
-        .aliased => d2d1.TEXT_ANTIALIAS_MODE_ALIASED,
-    };
+    const text_antialias = textAntialiasMode(antialias);
     const d2d = try createD2d(device.?, text_antialias);
     errdefer d2d.deinit();
 
@@ -1172,6 +1168,29 @@ const D2d = struct {
 
 /// A Direct2D device context on our D3D device, which was created with
 /// BGRA support for this. Its DPI stays at 96, so it draws in pixels.
+fn textAntialiasMode(antialias: font.Antialias) u32 {
+    return switch (antialias) {
+        .grayscale => d2d1.TEXT_ANTIALIAS_MODE_GRAYSCALE,
+        .cleartype => d2d1.TEXT_ANTIALIAS_MODE_CLEARTYPE,
+        .aliased => d2d1.TEXT_ANTIALIAS_MODE_ALIASED,
+    };
+}
+
+/// The font grid was made anew (a config reload): its atlases are
+/// uploaded afresh, whatever generation they're at.
+pub fn dropAtlases(self: *D3D11) void {
+    for ([_]*AtlasTexture{ &self.atlas, &self.color_atlas, &self.lcd_atlas }) |a| {
+        a.deinit();
+        a.* = .{};
+    }
+}
+
+/// Change the chrome's text antialiasing: `font-antialias` was reloaded.
+pub fn setTextAntialias(self: *D3D11, antialias: font.Antialias) void {
+    self.text_antialias = textAntialiasMode(antialias);
+    self.d2d_context.setTextAntialiasMode(self.text_antialias);
+}
+
 fn createD2d(device: *d3d11.IDevice, text_antialias: u32) Error!D2d {
     var factory: ?*d2d1.IFactory1 = null;
     try com.check(

@@ -26,7 +26,9 @@ func configCommand() *cobra.Command {
 		Use:   "config",
 		Short: "Show, check, and reload the daemon's init.lua",
 		Long: "The daemon evaluates init.lua (slime config path says where; SLIME_CONFIG\n" +
-			"overrides) when it starts and on slime config reload. slime help lua describes\n" +
+			"overrides) when it starts, whenever it or a .lua file beside it changes, and on\n" +
+			"slime config reload; a file that fails keeps the config as it was, and the\n" +
+			"windows show why. slime help lua describes\n" +
 			"what the file can do: slime.config for the settings, slime.bind for keys, and\n" +
 			"slime.action for actions that slime do and key bindings run.",
 	}

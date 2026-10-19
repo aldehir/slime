@@ -13,12 +13,12 @@ import (
 )
 
 // The config: init.lua (internal/config), evaluated when the server
-// starts and on config.reload. What it set is what config.get answers
-// and config.changed carries; its actions and function bindings run
-// here as scripts do (action.invoke), in the config's own state, one at
-// a time. A reload that fails keeps the last good config and reports
-// why; one that succeeds swaps it in and closes the old once nothing
-// runs in it.
+// starts, on config.reload, and when its files change (watch.go). What
+// it set is what config.get answers and config.changed carries; its
+// actions and function bindings run here as scripts do (action.invoke),
+// in the config's own state, one at a time. A reload that fails keeps
+// the last good config and reports why; one that succeeds swaps it in
+// and closes the old once nothing runs in it.
 
 // configHost is what the config's Lua reaches: the server, in process.
 type configHost struct{ s *Server }
@@ -90,14 +90,18 @@ func (s *Server) configGet(_ *callCtx, _ rpc.Empty) (*rpc.ConfigDesc, error) {
 	return s.configDescLocked(), nil
 }
 
-// configReload evaluates the file again and tells everyone subscribed
-// how it went, whether or not it replaced the config.
 func (s *Server) configReload(_ *callCtx, _ rpc.Empty) (*rpc.ConfigDesc, error) {
+	return s.reloadConfig(), nil
+}
+
+// reloadConfig evaluates the file again and tells everyone subscribed
+// how it went, whether or not it replaced the config.
+func (s *Server) reloadConfig() *rpc.ConfigDesc {
 	desc := s.loadConfig()
 	s.mu.Lock()
 	s.emitLocked(rpc.EvConfigChanged, desc, nil)
 	s.mu.Unlock()
-	return desc, nil
+	return desc
 }
 
 // configCheck evaluates the file (or another) without keeping it.

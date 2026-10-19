@@ -47,6 +47,10 @@ const tip_warm_ms = 1000;
 /// activity: ConPTY redraws on every resize.
 const resize_quiet_ms = 500;
 
+/// The most lines the notice under the title bar shows; the rest are
+/// counted.
+const max_notice_lines = 4;
+
 alloc: Allocator,
 /// Outlives the app.
 config: *const Config,
@@ -115,6 +119,13 @@ blink_visible: bool = true,
 
 /// What takes the keyboard from the terminal, if anything.
 mode: Mode = .terminal,
+
+/// What's wrong with the config, in the strip under the title bar until
+/// it's dismissed or a reload has nothing wrong: the first line of each
+/// of the daemon's errors (init.lua failing to load) and of the
+/// window's (`Config.errors`), LF-separated, `max_notice_lines` at
+/// most. Empty for none. Owned.
+notice: []u16 = &.{},
 
 /// The connection to slime: local sessions are panes of the workspaces
 /// it holds, those shown here. Null if it couldn't be reached.
@@ -468,6 +479,10 @@ pub const Shell = struct {
         setFontSize: *const fn (*anyopaque, f32) void,
         /// Lay the window out again: the UI's frame changed.
         relayout: *const fn (*anyopaque) void,
+        /// Build the config again from the settings init.lua reloaded
+        /// as (JSON) and apply it: the chrome, the font, every session's
+        /// colors. `config` describes the new one after.
+        reloadConfig: *const fn (*anyopaque, []const u8) void,
         /// The frame stats the sidebar shows, if built with them.
         stats: *const fn (*anyopaque) []const u16,
         /// A mouse message (or WM_MOUSELEAVE) for a browser pane's page,
@@ -556,6 +571,9 @@ pub const Shell = struct {
     }
     fn relayout(self: Shell) void {
         self.vt.relayout(self.ctx);
+    }
+    fn reloadConfig(self: Shell, settings: []const u8) void {
+        self.vt.reloadConfig(self.ctx, settings);
     }
     pub fn stats(self: Shell) []const u16 {
         return self.vt.stats(self.ctx);
@@ -650,7 +668,7 @@ pub fn init(opts: Options) !App {
             .hwnd = opts.hwnd,
             .output_event = opts.output_event,
             .bytes = opts.stats_bytes,
-            .clipboard_write = opts.config.@"clipboard-write",
+            .clipboard_write = .init(opts.config.@"clipboard-write"),
         },
         .notify = .{ .hwnd = opts.hwnd, .msg = messages.WM_APP_DAEMON },
         .arena = .init(opts.alloc),
@@ -681,6 +699,7 @@ pub fn start(self: *App, command_line: []const u16) !void {
 /// the window does while its renderer is still up.
 pub fn deinit(self: *App) void {
     self.destroyTabs();
+    self.alloc.free(self.notice);
     // Hanging up detaches the workspaces; slime keeps them for the next
     // window.
     if (self.daemon) |conn| conn.deinit();
@@ -2022,12 +2041,10 @@ fn bridgeHost(self: *App, e: *HostEntry, make: bool) !void {
 /// connections lost.
 fn daemonPosted(self: *App) void {
     if (self.daemon) |conn| {
-        if (conn.takeKeymap()) |entries| {
-            defer Daemon.freeKeymap(self.alloc, entries);
-            // An open menu names keys from the bindings being replaced.
-            self.closeMenu();
-            self.keymap.apply(entries) catch |err| log.err("applying the keymap failed: {}", .{err});
-            self.markDirty();
+        if (conn.takeConfig()) |reloaded| {
+            var r = reloaded;
+            defer r.deinit(self.alloc);
+            self.configReloaded(r);
         }
         self.workspacesChanged(conn);
         self.daemonChanged(conn);
@@ -2058,6 +2075,85 @@ fn daemonPosted(self: *App) void {
     self.pruneRemotes();
     // A lost connection's rows may have been all there was to show.
     self.closeIfNothingLeft();
+}
+
+/// Take up the config init.lua reloaded as: the keys at once, and the
+/// settings through the window, which builds the config again and
+/// applies it; then the notice says what's wrong with it, if anything.
+fn configReloaded(self: *App, reloaded: Daemon.ConfigUpdate) void {
+    // An open menu names keys from the bindings being replaced.
+    self.closeMenu();
+    self.keymap.apply(reloaded.keymap) catch |err| log.err("applying the keymap failed: {}", .{err});
+    self.shell.reloadConfig(reloaded.settings);
+    self.setNotice(reloaded.errors) catch |err| log.err("showing the config's errors failed: {}", .{err});
+    self.markDirty();
+}
+
+/// The config was built again (`Shell.reloadConfig`): what was copied
+/// from it is taken again, and every session is told.
+pub fn configChanged(self: *App) void {
+    self.wake.clipboard_write.store(self.config.@"clipboard-write", .release);
+    for (self.tabs.items) |t| {
+        var it = t.iterator();
+        while (it.next()) |s| s.configChanged();
+    }
+    self.markDirty();
+}
+
+/// Show what's wrong with the config under the title bar: `daemon_errors`
+/// (why init.lua didn't load), then what the window's settings got
+/// wrong (`Config.errors`); nothing, for none.
+pub fn setNotice(self: *App, daemon_errors: []const []const u8) !void {
+    var text: std.ArrayList(u16) = .empty;
+    errdefer text.deinit(self.alloc);
+    var lines: u8 = 0;
+    var more: usize = 0;
+    for ([_][]const []const u8{ daemon_errors, self.config.errors.items }) |list| {
+        for (list) |e| {
+            if (lines == max_notice_lines) {
+                more += 1;
+                continue;
+            }
+            if (lines > 0) try text.append(self.alloc, '\n');
+            // A Lua error's first line says where; its trace is for the log.
+            const line = e[0 .. std.mem.indexOfScalar(u8, e, '\n') orelse e.len];
+            try appendUtf16(&text, self.alloc, line);
+            lines += 1;
+        }
+    }
+    if (more > 0) {
+        var buf: [96]u8 = undefined;
+        try text.append(self.alloc, '\n');
+        try appendUtf16(&text, self.alloc, std.fmt.bufPrint(&buf, "\u{2026} and {d} more", .{more}) catch unreachable);
+        lines += 1;
+    }
+    self.alloc.free(self.notice);
+    self.notice = try text.toOwnedSlice(self.alloc);
+    if (self.ui.notice_lines != lines) {
+        self.ui.notice_lines = lines;
+        _ = self.ui.setHover(.none);
+        self.shell.relayout();
+    }
+    self.markDirty();
+}
+
+fn appendUtf16(text: *std.ArrayList(u16), alloc: Allocator, s: []const u8) !void {
+    const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, s) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    defer alloc.free(utf16);
+    try text.appendSlice(alloc, utf16);
+}
+
+/// Close the notice; the next reload with something wrong shows it again.
+fn dismissNotice(self: *App) void {
+    self.alloc.free(self.notice);
+    self.notice = &.{};
+    self.ui.notice_lines = 0;
+    _ = self.ui.setHover(.none);
+    self.shell.relayout();
+    self.markDirty();
 }
 
 /// Show the workspaces `conn` was told to open here: a script run from
@@ -3546,6 +3642,7 @@ fn widgetClick(self: *App, hit: Id) void {
             self.ui.toggleSidebar();
             self.shell.relayout();
         },
+        .dismiss => self.dismissNotice(),
         // A section's header makes a workspace on its daemon (connecting
         // a host first); a workspace's row, a tab in it. With no daemon
         // listing workspaces, Local's connects to one, which shows some.
@@ -3855,6 +3952,7 @@ pub const TestShell = struct {
         if (s.browser()) |b| b.failed = null;
     }
     fn webCapture(_: *anyopaque, _: *Session, _: bool) void {}
+    fn reloadConfig(_: *anyopaque, _: []const u8) void {}
     fn webAnswer(ctx: *anyopaque, _: *Session, answer: Web.Answer) void {
         self_(ctx).answer = answer;
     }
@@ -3894,6 +3992,7 @@ pub const TestShell = struct {
         .webRetry = webRetry,
         .webCapture = webCapture,
         .webAnswer = webAnswer,
+        .reloadConfig = reloadConfig,
     };
 
     fn shell(self: *TestShell) Shell {
@@ -3985,6 +4084,42 @@ test "the connect field opens on its button, takes text, and closes on Escape" {
     // Its release goes nowhere, and alt+F4 is still Windows'.
     try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYUP, .wparam = win32.VK_ESCAPE, .lparam = 0 } }));
     try std.testing.expectEqual(Result.default, app.update(.{ .key = .{ .msg = win32.WM_SYSKEYDOWN, .wparam = win32.VK_F4, .lparam = 0 } }));
+}
+
+test "the notice shows the config's errors' first lines, counts the rest, and closes on its button" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    try std.testing.expect(Ui.find(app.view(), .window(.notice)) == null);
+
+    // The daemon's errors come first, then the settings'; a Lua error's
+    // trace stays out.
+    try t.config.errors.append(t.config._arena.allocator(), "unknown setting font.weight");
+    try app.setNotice(&.{"init.lua:3: nope\nstack traceback:\n\t[C]: in ?"});
+    try std.testing.expectEqual(2, t.ui.notice_lines);
+    try std.testing.expectEqualSlices(u16, L("init.lua:3: nope\nunknown setting font.weight"), app.notice);
+    t.frame = t.ui.frame(1000, 600);
+    try std.testing.expect(Ui.find(app.view(), .window(.notice)).?.kind == .row);
+    try std.testing.expect(Ui.find(app.view(), .window(.dismiss)) != null);
+
+    // Past the most lines shown, the rest are counted.
+    try app.setNotice(&.{ "a", "b", "c", "d", "e", "f" });
+    try std.testing.expectEqual(max_notice_lines + 1, t.ui.notice_lines);
+    try std.testing.expect(std.mem.endsWith(u16, app.notice, L("d\n\u{2026} and 3 more")));
+
+    // Its button closes it; a reload with nothing wrong clears it too.
+    try std.testing.expectEqual(Result.handled, app.update(.{ .click = .window(.dismiss) }));
+    try std.testing.expectEqual(0, t.ui.notice_lines);
+    try std.testing.expectEqual(0, app.notice.len);
+    t.frame = t.ui.frame(1000, 600);
+    try std.testing.expect(Ui.find(app.view(), .window(.notice)) == null);
+    t.config.errors.clearRetainingCapacity();
+    try app.setNotice(&.{"again"});
+    try std.testing.expectEqual(1, t.ui.notice_lines);
+    try app.setNotice(&.{});
+    try std.testing.expectEqual(0, t.ui.notice_lines);
 }
 
 test "a key sequence runs its binding on the last key; Escape or losing the focus ends it" {

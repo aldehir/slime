@@ -56,9 +56,6 @@ than being piecemealed with MessageBox and the like.
   commands: unbracketed text with a newline, or any paste containing the
   bracketed-paste terminator `ESC [201~`. We paste without asking. The
   control-byte stripping in `encodePaste` still applies.
-- **Config errors on screen.** Unknown keys and bad values, and an
-  `init.lua` that failed to load, only go to the log and `slime config
-  show` (Ghostty shows them in a banner).
 - **Select all** in a pane's context menu: slime has no event for it.
 - **A field's context menu** (cut, copy, paste) on the host field and a
   workspace's name being edited; a right click there does nothing.
@@ -517,16 +514,33 @@ run Lua at a time, so a blocking call lets the others run.
 The daemon's `init.lua` (`slime config path`) is the configuration:
 `slime.config{...}` is one table the daemon hands every window
 (`config.get`), which `Config.zig` maps onto its fields (fonts, colors,
-themes, padding, word characters, clipboard, ssh) once at startup; the
-daemon keeps `shell.command`. Themes stay Ghostty theme files, looked
-up beside `init.lua` and beside the exe. `slime.bind` lays bindings
-over `binding.zig`'s defaults, which every window takes up again on
-`slime config reload`.
+themes, padding, word characters, clipboard, ssh); the daemon keeps
+`shell.command`. Themes stay Ghostty theme files, looked up beside
+`init.lua` and beside the exe. `slime.bind` lays bindings over
+`binding.zig`'s defaults. The daemon evaluates the file again when it
+or a `.lua` beside it changes (`internal/daemon/watch.go` polls once a
+second) and on `slime config reload`; `config.changed` carries the
+result to every window, which takes up the keys and builds its config
+again (`Window.applyConfig`: theme, chrome scale, a new `Grid` when the
+font changed, every session's colors), and shows what's wrong with it
+in a strip under the title bar (`App.setNotice`): a file that failed to
+load, with the last good config kept, or settings it couldn't take.
 
-- **Reloading the settings** while running: a reload changes the keys
-  at once, but the fonts, colors, and the rest wait for the next window.
-  Colors can be swapped under the lock; font changes need a new `Grid`
-  and atlas.
+- **The notice shows first lines only**, four at most, and nothing of a
+  Lua error's trace; `slime config show` has the daemon's in full. It's
+  dismissed by its button alone (no key), and isn't an element of the
+  keyboard's.
+- **The window's own warnings** (unknown keys, bad values) go only to
+  the notice and the window's stderr: the daemon doesn't know the
+  settings' schema, so `slime config show` and `check` can't list them.
+- **Settings sessions read at their start** don't change for the ones
+  running: `ssh.terminfo` (the TERM a host was logged in to with), and
+  a pane's `browser.idle` timer already armed.
+- **A font-size change on reload** resets what ctrl+plus/minus set,
+  as Ghostty's does.
+- **Watching the config polls**, so a change shows within a second or
+  two; `ReadDirectoryChangesW` would be instant, at the cost of its own
+  code per platform and of handling editors that rename over the file.
 - **Following light/dark changes** live (`WM_SETTINGCHANGE` with
   "ImmersiveColorSet"), and reporting them with mode 2031
   (`CSI ?997;1n`/`2n`). The mode is read once at startup.

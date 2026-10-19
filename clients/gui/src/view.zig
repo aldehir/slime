@@ -96,6 +96,7 @@ const Builder = struct {
     fn build(self: *Builder) Allocator.Error!Tree {
         var regions: std.ArrayList(Node) = .empty;
         try regions.append(self.arena, try self.titleBar());
+        if (self.frame.notice.h > 0) try regions.append(self.arena, try self.notice());
         if (self.ui.sidebar_shown) try regions.append(self.arena, try self.sidebar());
         try regions.append(self.arena, try self.terminal());
         // Over both, so the edge is taken hold of before anything under it.
@@ -141,6 +142,22 @@ const Builder = struct {
             self.captionButton(.close, maximized),
         });
         return .{ .id = .window(.caption), .kind = .{ .row = .{ .children = children, .bg = t.ground } }, .rect = self.frame.titlebar };
+    }
+
+    /// The strip under the title bar that says what's wrong with the
+    /// config, with a button that closes it.
+    fn notice(self: *const Builder) Allocator.Error!Node {
+        const t = &self.ui.theme;
+        const children = try self.nodes(&.{
+            .{ .kind = .{ .spacer = 14 } },
+            .{ .kind = .{ .icon = .{ .icon = .shield_alert, .size = 16, .color = t.danger } } },
+            .{ .kind = .{ .spacer = 10 } },
+            .{ .kind = .{ .lines = .{ .text = self.app.notice, .font = .body, .color = t.text, .line_height = Ui.notice_line_height } } },
+            .{ .kind = .{ .spacer = 8 } },
+            .{ .id = .window(.dismiss), .kind = .{ .icon_button = .{ .icon = .x, .size = 16, .tip = L("Dismiss") } } },
+            .{ .kind = .{ .spacer = 10 } },
+        });
+        return .{ .id = .window(.notice), .kind = .{ .row = .{ .children = children, .bg = t.notice } }, .rect = self.frame.notice };
     }
 
     fn captionButton(self: *const Builder, part: Id.Part, maximized: bool) Node {

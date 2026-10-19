@@ -287,7 +287,8 @@ pub const Wake = struct {
     /// Child output fed to the terminal, counted for the stats, if built.
     bytes: ?*std.atomic.Value(u64),
     /// Whether a program may write the clipboard (OSC 52).
-    clipboard_write: Config.ClipboardAccess,
+    /// Read on the reader thread, set on the UI thread (a reload).
+    clipboard_write: std.atomic.Value(Config.ClipboardAccess),
 };
 
 pub const CellSize = struct { width: u32, height: u32 };
@@ -654,7 +655,7 @@ fn daemonNotice(ctx: *anyopaque, n: Daemon.Notice) void {
             self.postTitle();
         },
         .clipboard => {
-            const access = self.wake.clipboard_write;
+            const access = self.wake.clipboard_write.load(.acquire);
             if (access != .allow) return log.info("denied a clipboard write (clipboard-write = {t})", .{access});
             self.queueClipboard(n.text);
         },
@@ -1019,6 +1020,14 @@ fn send(self: *Session, ev: Events.Event) void {
     var w: std.Io.Writer = .fixed(&buf);
     Events.encode(&w, ev) catch return log.warn("{t} event too big", .{ev});
     s.conn.event(s.pane, w.buffered());
+}
+
+/// The config was reloaded: slime takes the colors and the selection's
+/// settings again, and its next frame shows them; clipboard writes go
+/// by the new setting.
+pub fn configChanged(self: *Session) void {
+    self.wake.clipboard_write.store(self.env.config.@"clipboard-write", .release);
+    self.sendSettings();
 }
 
 /// Tell slime what selection and the terminal's colors go by here.

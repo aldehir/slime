@@ -72,6 +72,9 @@ pub const min_sidebar_width = 160;
 pub const max_sidebar_width = 600;
 /// How far either side of the sidebar's edge takes hold of it.
 pub const sidebar_edge_grip = 4;
+/// The notice's line height, and the space over and under its lines.
+pub const notice_line_height = 18;
+pub const notice_pad = 7;
 
 /// Pixels per DIP: the monitor's scale times `zoom`.
 scale: f32,
@@ -84,6 +87,9 @@ theme: Theme,
 sidebar_shown: bool = true,
 /// The sidebar's width in DIPs, as its edge was last dragged.
 sidebar_width: f32 = default_sidebar_width,
+/// Lines in the notice under the title bar (what's wrong with the
+/// config); 0 while there's none.
+notice_lines: u8 = 0,
 /// What the mouse is over, and what a button went down on.
 hover: Id = .none,
 pressed: Id = .none,
@@ -95,6 +101,8 @@ tip: Id = .none,
 pub const Frame = struct {
     window: Rect = .{},
     titlebar: Rect = .{},
+    /// The notice under the title bar. Empty while there's none.
+    notice: Rect = .{},
     /// The sidebar. Empty while hidden.
     sidebar: Rect = .{},
     terminal: Rect = .{},
@@ -123,6 +131,12 @@ pub fn setDpi(self: *Ui, dpi: u32) !void {
     self.scale = scale;
 }
 
+/// Change `chrome-scale` (a config reload), keeping the rest as it is.
+pub fn setZoom(self: *Ui, dpi: u32, zoom: f32) !void {
+    self.zoom = std.math.clamp(zoom, min_zoom, max_zoom);
+    try self.setDpi(dpi);
+}
+
 /// The range `chrome-scale` is clamped to.
 const min_zoom = 0.5;
 const max_zoom = 3;
@@ -139,13 +153,17 @@ pub fn px(self: *const Ui, dip: f32) f32 {
 /// Where the regions go in a window `width` by `height`.
 pub fn frame(self: *const Ui, width: f32, height: f32) Frame {
     const bar_h = self.px(if (self.sidebar_shown) titlebar_height else titlebar_height_plain);
+    const lines: f32 = @floatFromInt(self.notice_lines);
+    const notice_h = if (lines > 0) self.px(2 * notice_pad + lines * notice_line_height) else 0;
     const side_w = if (self.sidebar_shown) @min(self.px(self.sidebar_width), width) else 0;
-    const h = @max(0, height - bar_h);
+    const top = bar_h + notice_h;
+    const h = @max(0, height - top);
     return .{
         .window = .{ .w = width, .h = height },
         .titlebar = .{ .w = width, .h = bar_h },
-        .sidebar = .{ .y = bar_h, .w = side_w, .h = h },
-        .terminal = .{ .x = side_w, .y = bar_h, .w = width - side_w, .h = h },
+        .notice = .{ .y = bar_h, .w = width, .h = notice_h },
+        .sidebar = .{ .y = top, .w = side_w, .h = h },
+        .terminal = .{ .x = side_w, .y = top, .w = width - side_w, .h = h },
         .corner = self.px(10),
         .inset = self.px(10),
     };
@@ -664,6 +682,19 @@ test "the frame, with and without the sidebar" {
     f = ui.frame(1000, 600);
     try std.testing.expectEqual(@as(f32, 300), f.sidebar.w);
     try std.testing.expectEqual(@as(f32, 300), f.terminal.x);
+    // A notice takes its lines under the title bar, from the sidebar
+    // and the terminal area alike.
+    ui.notice_lines = 2;
+    f = ui.frame(1000, 600);
+    try std.testing.expectEqual(@as(f32, 2 * notice_pad + 2 * notice_line_height), f.notice.h);
+    try std.testing.expectEqual(f.titlebar.h, f.notice.y);
+    try std.testing.expectEqual(f.notice.bottom(), f.sidebar.y);
+    try std.testing.expectEqual(f.notice.bottom(), f.terminal.y);
+    try std.testing.expectEqual(@as(f32, 600), f.terminal.bottom());
+    ui.notice_lines = 0;
+    f = ui.frame(1000, 600);
+    try std.testing.expectEqual(@as(f32, 0), f.notice.h);
+    try std.testing.expectEqual(f.titlebar.h, f.terminal.y);
 }
 
 test "layout and hit testing a small tree" {

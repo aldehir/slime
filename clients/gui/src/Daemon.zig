@@ -143,9 +143,9 @@ focus_calls: std.ArrayList(u32) = .empty,
 attach_calls: std.ArrayList(AttachCall) = .empty,
 /// Ids of our `hostList` calls, whose replies become `hosts` events.
 host_lists: std.ArrayList(u32) = .empty,
-/// The keymap init.lua last set (`config.changed`), until the UI thread
-/// takes it (`takeKeymap`); only the latest matters.
-keymap: ?[]binding.Entry = null,
+/// The config init.lua last loaded as (`config.changed`), until the UI
+/// thread takes it (`takeConfig`); only the latest matters.
+config_update: ?ConfigUpdate = null,
 /// The connection ended; every live pane was told why.
 lost: bool = false,
 /// `deinit` is hanging up, so the reader's end isn't a loss.
@@ -200,6 +200,25 @@ pub const WorkspaceInfo = struct {
 
     pub fn deinit(self: *WorkspaceInfo, alloc: Allocator) void {
         alloc.free(self.name);
+    }
+};
+
+/// A config the daemon reloaded (`config.changed`): the window's share
+/// of it. Owned; `deinit` frees it.
+pub const ConfigUpdate = struct {
+    /// init.lua's bindings, for `binding.Keymap`.
+    keymap: []binding.Entry,
+    /// slime.config's table, as JSON, for `Config.loadFrom`.
+    settings: []const u8,
+    /// Why the file failed to load, if it did (what the rest describes
+    /// is then the config before).
+    errors: []const []const u8,
+
+    pub fn deinit(self: *ConfigUpdate, alloc: Allocator) void {
+        freeKeymap(alloc, self.keymap);
+        alloc.free(self.settings);
+        for (self.errors) |e| alloc.free(e);
+        alloc.free(self.errors);
     }
 };
 
@@ -1205,7 +1224,7 @@ fn freeState(self: *Daemon) void {
     self.host_events.deinit(self.alloc);
     for (self.workspace_events.items) |*e| e.deinit(self.alloc);
     self.workspace_events.deinit(self.alloc);
-    if (self.keymap) |k| freeKeymap(self.alloc, k);
+    if (self.config_update) |*u| u.deinit(self.alloc);
     if (self.remote) |r| {
         self.alloc.free(r.dest);
         self.alloc.free(r.term);
@@ -1290,13 +1309,13 @@ pub fn take(self: *Daemon) Taken {
     };
 }
 
-/// Take the keymap init.lua last set, if it changed since the last
-/// take. The caller frees it (`freeKeymap`). UI thread.
-pub fn takeKeymap(self: *Daemon) ?[]binding.Entry {
+/// Take the config init.lua last loaded as, if it changed since the
+/// last take. The caller frees it (`ConfigUpdate.deinit`). UI thread.
+pub fn takeConfig(self: *Daemon) ?ConfigUpdate {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
-    defer self.keymap = null;
-    return self.keymap;
+    defer self.config_update = null;
+    return self.config_update;
 }
 
 /// Run the function init.lua bound as `lua`, for `pane` (none for no
@@ -1732,11 +1751,21 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
         .@"config.changed" => {
             const c = try std.json.parseFromValueLeaky(Json.Config, a, params, json_opts);
             for (c.errors) |e| log.warn("init.lua: {s}", .{e});
-            const entries = try keymapFromJson(self.alloc, c.keymap);
+            var errors: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (errors.items) |e| self.alloc.free(e);
+                errors.deinit(self.alloc);
+            }
+            for (c.errors) |e| try errors.append(self.alloc, try self.alloc.dupe(u8, e));
+            const settings = try std.json.Stringify.valueAlloc(self.alloc, c.settings, .{});
+            errdefer self.alloc.free(settings);
+            const keymap = try keymapFromJson(self.alloc, c.keymap);
+            errdefer freeKeymap(self.alloc, keymap);
+            const update: ConfigUpdate = .{ .keymap = keymap, .settings = settings, .errors = try errors.toOwnedSlice(self.alloc) };
             win32.AcquireSRWLockExclusive(&self.lock);
             defer win32.ReleaseSRWLockExclusive(&self.lock);
-            if (self.keymap) |old| freeKeymap(self.alloc, old);
-            self.keymap = entries;
+            if (self.config_update) |*old| old.deinit(self.alloc);
+            self.config_update = update;
             if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
         },
         .@"pane.attached" => {

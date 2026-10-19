@@ -133,7 +133,7 @@ func serve(logger *slog.Logger, idle time.Duration, hosts daemon.HostOptions) er
 		return err
 	}
 	defer rt.Close(ctx)
-	srv, err := daemon.NewServer(rt, daemon.Options{Log: logger, Idle: idle, Hosts: hosts, Config: config.Path()})
+	srv, err := daemon.NewServer(rt, daemon.Options{Log: logger, Idle: idle, Hosts: hosts, Config: config.Path(), Watch: time.Second})
 	if err != nil {
 		return err
 	}

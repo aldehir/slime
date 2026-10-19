@@ -52,6 +52,9 @@ pub const Theme = struct {
     success: Color,
     /// Over a terminal behind a dialog.
     scrim: Color,
+    /// The strip under the title bar that says what's wrong with the
+    /// config.
+    notice: Color,
     /// A dialog, raised from the terminal, and its edge.
     dialog: Color,
     dialog_outline: Color,
@@ -95,6 +98,7 @@ pub const Theme = struct {
             .warning = Painter.rgb(if (light) 0xb7791f else 0xe0af68),
             .success = Painter.rgb(if (light) 0x2f855a else 0x9ece6a),
             .scrim = .{ 0.05, 0.05, 0.08, if (light) 0.25 else 0.45 },
+            .notice = mix(ground, Painter.rgb(if (light) 0xc4314b else 0xf0848f), if (light) 0.16 else 0.2),
             .dialog = mix(b, f, if (light) 0.03 else 0.06),
             .dialog_outline = mix(b, f, 0.13),
             .pane_border = withAlpha(f, if (light) 0.14 else 0.09),

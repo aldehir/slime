@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aldehir/slime/internal/pty"
 	"github.com/aldehir/slime/internal/rpc"
@@ -273,5 +274,52 @@ func TestConfigCancelOnHangup(t *testing.T) {
 	}
 	if _, done := followScript(t, other, started.ID); done.OK || done.Error != "cancelled" {
 		t.Errorf("done %+v", done)
+	}
+}
+
+// TestConfigWatch: a change to init.lua, or to a module beside it, is
+// reloaded by itself once the files hold still, config.changed and all;
+// a broken file reports its errors and keeps the config.
+func TestConfigWatch(t *testing.T) {
+	h, path := newConfigHarness(t, `slime.config{ shell = { command = "one" } }`)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go h.srv.watchConfig(10*time.Millisecond, stop)
+	sub := h.connect()
+	if err := sub.Call(rpc.Subscribe, rpc.SubscribeParams{Events: []string{"config.*"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	mod := filepath.Join(filepath.Dir(path), "mod.lua")
+	if err := os.WriteFile(mod, []byte(`return "two"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`slime.config{ shell = { command = require("mod") } }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var changed rpc.ConfigDesc
+	json.Unmarshal(nextNotification(t, sub, rpc.EvConfigChanged), &changed)
+	if changed.Errors != nil || string(changed.Settings) != `{"shell":{"command":"two"}}` {
+		t.Errorf("after editing init.lua: %s", mustJSON(changed))
+	}
+
+	// The module alone.
+	if err := os.WriteFile(mod, []byte(`return "three"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed = rpc.ConfigDesc{}
+	json.Unmarshal(nextNotification(t, sub, rpc.EvConfigChanged), &changed)
+	if changed.Errors != nil || string(changed.Settings) != `{"shell":{"command":"three"}}` {
+		t.Errorf("after editing mod.lua: %s", mustJSON(changed))
+	}
+
+	// A broken file: the errors go out, and the config stays.
+	if err := os.WriteFile(path, []byte(`error("nope")`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed = rpc.ConfigDesc{}
+	json.Unmarshal(nextNotification(t, sub, rpc.EvConfigChanged), &changed)
+	if len(changed.Errors) != 1 || !strings.Contains(changed.Errors[0], "nope") || string(changed.Settings) != `{"shell":{"command":"three"}}` {
+		t.Errorf("after breaking init.lua: %s", mustJSON(changed))
 	}
 }

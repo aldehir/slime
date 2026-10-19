@@ -63,6 +63,9 @@ pub const Part = enum {
     /// The terminal area under a dialog, away from its controls; or the
     /// window under a context menu.
     scrim,
+    /// The notice under the title bar, and its button that closes it.
+    notice,
+    dismiss,
     /// A context menu's box, between its entries.
     menu,
     /// The host field, or the button that opens it.

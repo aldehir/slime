@@ -1,9 +1,10 @@
 //! User configuration: the settings init.lua's `slime.config{...}` set,
 //! which the daemon hands every window as one JSON object (config.get).
-//! The window takes the keys it understands and warns about the rest;
-//! a bad value is logged and keeps its default (there's no UI to report
-//! them in yet). The field names are Ghostty's, which the theme files
-//! (Ghostty's format, `key = value` lines) still use.
+//! The window takes the keys it understands and keeps a line about each
+//! of the rest (`errors`), which it shows under its title bar with the
+//! daemon's; a bad value keeps its default. The field names are
+//! Ghostty's, which the theme files (Ghostty's format, `key = value`
+//! lines) still use.
 //!
 //! ```lua
 //! slime.config{
@@ -29,6 +30,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const font = @import("font/font.zig");
+const win32 = @import("win32/win32.zig");
 
 const RGB = ghostty_vt.color.RGB;
 
@@ -88,6 +90,10 @@ palette: Palette = .{},
 /// Windows app mode. Names are looked up in `themes` next to init.lua,
 /// then in `themes` next to the executable.
 theme: ?Theme = null,
+
+/// What the settings got wrong, a line each: unknown keys, bad values
+/// (which keep their defaults), a theme that wasn't found. Logged too.
+errors: std.ArrayList([]const u8) = .empty,
 
 /// Owns every string and list above.
 _arena: std.heap.ArenaAllocator,
@@ -161,7 +167,8 @@ pub const Padding = struct {
     }
 };
 
-pub const ClipboardAccess = enum {
+/// Sized, so a session can hold it atomically.
+pub const ClipboardAccess = enum(u8) {
     allow,
     deny,
     ask,
@@ -231,9 +238,52 @@ pub fn defaultDir(alloc: Allocator, environ: *const std.process.Environ.Map) !?[
     return try std.fs.path.join(alloc, &.{ base, "slime" });
 }
 
+/// Where a config's files are: what `loadFrom` needs besides the
+/// settings, so the window can build one again on a reload.
+pub const Source = struct {
+    /// The daemon's init.lua, whose directory's `themes` comes first.
+    /// Empty for none (no daemon).
+    path: []const u8 = "",
+    /// The config directory (`defaultDir`), looked in when the path
+    /// says nothing.
+    dir: ?[]const u8 = null,
+};
+
 /// The defaults alone: what a window uses with no daemon to ask.
 pub fn init(gpa: Allocator) Config {
     return .{ ._arena = .init(gpa) };
+}
+
+/// Build the config from the daemon's settings, with user themes in
+/// `themes` next to init.lua (else in the config directory), the
+/// bundled ones in `themes` next to the executable, and the light theme
+/// of a pair if Windows' app mode is light.
+pub fn loadFrom(gpa: Allocator, io: std.Io, settings: std.json.Value, source: Source) Allocator.Error!Config {
+    const exe_dir = std.process.executableDirPathAlloc(io, gpa) catch null;
+    defer if (exe_dir) |d| gpa.free(d);
+    const init_dir: ?[]const u8 = if (source.path.len > 0) std.fs.path.dirname(source.path) else null;
+    return load(gpa, io, settings, .{
+        .dir = init_dir orelse source.dir,
+        .resources_dir = exe_dir,
+        .light = appsUseLightTheme(),
+    });
+}
+
+/// Windows' app mode is light (Settings > Personalization > Colors).
+fn appsUseLightTheme() bool {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var value: u32 = 0;
+    var size: u32 = @sizeOf(u32);
+    const status = win32.RegGetValueW(
+        win32.HKEY_CURRENT_USER,
+        L("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+        L("AppsUseLightTheme"),
+        win32.RRF_RT_REG_DWORD,
+        null,
+        &value,
+        &size,
+    );
+    return status == 0 and value != 0;
 }
 
 /// Build the config from `settings`, the object the daemon describes
@@ -247,7 +297,7 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
         .object => |o| o,
         .null => return self,
         else => {
-            log.warn("settings aren't a table", .{});
+            try self.warn("settings aren't a table", .{});
             return self;
         },
     };
@@ -256,12 +306,12 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
         if (Theme.fromJson(alloc, value)) |theme| {
             self.theme = theme;
             const name = if (opts.light) theme.light else theme.dark;
-            if (try findTheme(alloc, io, name, opts)) |path| {
+            if (try self.findTheme(io, name, opts)) |path| {
                 try self.loadTheme(io, path);
-            } else log.warn("theme \"{s}\" not found", .{name});
+            } else try self.warn("theme \"{s}\" not found", .{name});
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => log.warn("theme: a name or {{ light, dark }}", .{}),
+            else => try self.warn("theme: a name or {{ light, dark }}", .{}),
         }
     }
 
@@ -272,13 +322,13 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
         if (std.mem.eql(u8, key, "theme") or std.mem.eql(u8, key, "shell") or std.mem.eql(u8, key, "host")) continue; // handled above; the daemon's
         const Section = enum { font, colors, window, chrome, selection, clipboard, ssh, browser };
         const section = std.meta.stringToEnum(Section, key) orelse {
-            log.warn("unknown setting \"{s}\"", .{key});
+            try self.warn("unknown setting \"{s}\"", .{key});
             continue;
         };
         const fields = switch (value) {
             .object => |o| o,
             else => {
-                log.warn("{s}: a table is needed", .{key});
+                try self.warn("{s}: a table is needed", .{key});
                 continue;
             },
         };
@@ -287,8 +337,8 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
             const name = f.key_ptr.*;
             self.setJson(alloc, section, name, f.value_ptr.*) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.UnknownKey => log.warn("unknown setting {s}.{s}", .{ key, name }),
-                else => log.warn("{s}.{s}: invalid value: {}", .{ key, name, err }),
+                error.UnknownKey => try self.warn("unknown setting {s}.{s}", .{ key, name }),
+                else => try self.warn("{s}.{s}: invalid value: {t}", .{ key, name, err }),
             };
         }
     }
@@ -298,6 +348,14 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
 pub fn deinit(self: *Config) void {
     self._arena.deinit();
     self.* = undefined;
+}
+
+/// Note something wrong with the settings: logged, and kept in `errors`
+/// for the window to show.
+fn warn(self: *Config, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+    log.warn(fmt, args);
+    const alloc = self._arena.allocator();
+    try self.errors.append(alloc, try std.fmt.allocPrint(alloc, fmt, args));
 }
 
 /// Set one setting of a section from its JSON value.
@@ -423,10 +481,11 @@ fn enumOf(comptime T: type, value: std.json.Value) !T {
 
 /// An absolute path as is, else the first `themes\<name>` that exists in
 /// the config directory, then the resources directory.
-fn findTheme(alloc: Allocator, io: std.Io, name: []const u8, opts: LoadOptions) !?[]const u8 {
+fn findTheme(self: *Config, io: std.Io, name: []const u8, opts: LoadOptions) !?[]const u8 {
+    const alloc = self._arena.allocator();
     if (std.fs.path.isAbsolute(name)) return name;
     if (std.mem.indexOfAny(u8, name, "/\\") != null) {
-        log.warn("theme \"{s}\" must be a name or an absolute path", .{name});
+        try self.warn("theme \"{s}\" must be a name or an absolute path", .{name});
         return null;
     }
     for ([_]?[]const u8{ opts.dir, opts.resources_dir }) |dir| {
@@ -448,7 +507,7 @@ fn loadTheme(self: *Config, io: std.Io, path: []const u8) Allocator.Error!void {
     const alloc = self._arena.allocator();
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        log.warn("{s}: {}", .{ path, err });
+        try self.warn("{s}: {t}", .{ path, err });
         return;
     };
     log.info("loading theme {s}", .{path});
@@ -463,15 +522,15 @@ fn applyTheme(self: *Config, text: []const u8, path: []const u8) Allocator.Error
         const line = std.mem.trim(u8, raw, whitespace ++ "\r");
         if (line.len == 0 or line[0] == '#') continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            log.warn("{s}:{d}: expected key = value", .{ path, number });
+            try self.warn("{s}:{d}: expected key = value", .{ path, number });
             continue;
         };
         const key = std.mem.trim(u8, line[0..eq], whitespace);
         const value = std.mem.trim(u8, line[eq + 1 ..], whitespace);
         const quoted = value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"';
         self.setThemeKey(key, if (quoted) value[1 .. value.len - 1] else value) catch |err| switch (err) {
-            error.UnknownKey => log.warn("{s}:{d}: themes set colors only, not \"{s}\"", .{ path, number, key }),
-            else => log.warn("{s}:{d}: invalid value for {s}: {}", .{ path, number, key, err }),
+            error.UnknownKey => try self.warn("{s}:{d}: themes set colors only, not \"{s}\"", .{ path, number, key }),
+            else => try self.warn("{s}:{d}: invalid value for {s}: {t}", .{ path, number, key, err }),
         };
     }
 }
@@ -567,6 +626,14 @@ test "padding, word chars, theme, clipboard, and bad values keep defaults" {
     try std.testing.expectEqual(12, c.@"font-size");
     try std.testing.expectEqual(.grayscale, c.@"font-antialias");
     try std.testing.expectEqual(RGB{ .r = 0x28, .g = 0x2c, .b = 0x34 }, c.background);
+    // A line for each thing wrong, in the settings' order, after the
+    // theme's, which is looked at first and names a file that isn't
+    // there.
+    try std.testing.expectEqual(6, c.errors.items.len);
+    try std.testing.expectEqualStrings("theme \"Catppuccin Mocha\" not found", c.errors.items[0]);
+    try std.testing.expectEqualStrings("font.size: invalid value: InvalidValue", c.errors.items[1]);
+    try std.testing.expectEqualStrings("unknown setting font.weight", c.errors.items[3]);
+    try std.testing.expectEqualStrings("unknown setting \"nonsense\"", c.errors.items[5]);
 
     var none = try testConfig("null");
     defer none.deinit();

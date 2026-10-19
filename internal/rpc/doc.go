@@ -53,7 +53,7 @@ var MethodDocs = []MethodDoc{
 		"runs an action init.lua defined (name) or a function it bound (lua) for pane; answers as script.run does, with script.output and script.done following"},
 	{ConfigGet, "none", "Config", "the daemon's init.lua as last evaluated"},
 	{ConfigReload, "none", "Config",
-		"evaluates init.lua again: on success it replaces the settings, keymap, and actions and config.changed goes out; on failure the last good ones stay and errors says why (to config.changed too)"},
+		"evaluates init.lua again, as a change to it or a .lua beside it does by itself: on success it replaces the settings, keymap, and actions and config.changed goes out; on failure the last good ones stay and errors says why (to config.changed too)"},
 	{ConfigCheck, "{path?}", "Config", "evaluates init.lua (or path) without applying it"},
 	{Subscribe, "{events: [\"pane.exited\", \"host.*\", \"*\"]}", "{}", "needs a connection (not from Lua, which has slime.on)"},
 	{ClientQueue, "{workspace, name, args?: object}", "{}",
@@ -132,7 +132,7 @@ var EventDocs = []EventDoc{
 	{EvScriptDone, "{id, ok, result?, error?}"},
 	{EvHostChanged, "Host"},
 	{EvHostPrompt, "{host, kind, title?, text?, detail?, error?, questions?}"},
-	{EvConfigChanged, "Config: after config.reload, whether it succeeded (errors says)"},
+	{EvConfigChanged, "Config: after config.reload, or the file changing on disk, whether it succeeded (errors says)"},
 	{EvClientAction, "{workspace, name, args?}: a script asked the workspace's viewers to perform a window action (client.queue)"},
 }
 
