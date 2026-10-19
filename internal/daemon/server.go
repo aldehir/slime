@@ -58,6 +58,8 @@ type Server struct {
 	hosts   hostTable
 	idleT   *time.Timer
 	idleC   chan struct{} // closed when the idle timer fires
+	stopped bool          // daemon.stop was called
+	stopC   chan struct{} // closed once its caller has the reply
 
 	// The config (config.go): the file, what it last loaded as (nil
 	// until one loads), and why the last evaluation failed, if it did.
@@ -104,6 +106,7 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		scripts:    map[uint32]*script{},
 		hosts:      newHostTable(opts.Hosts),
 		idleC:      make(chan struct{}),
+		stopC:      make(chan struct{}),
 		configPath: opts.Config,
 	}
 	if opts.Config != "" {
@@ -112,8 +115,9 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 	return s, nil
 }
 
-// Serve accepts clients on l until l fails or the server has been idle
-// for Options.Idle, when it closes l and returns nil.
+// Serve accepts clients on l until l fails, the server has been idle for
+// Options.Idle, or daemon.stop is called, when it closes l and returns
+// nil; after a stop it kills every terminal first.
 func (s *Server) Serve(l net.Listener) error {
 	s.mu.Lock()
 	s.checkIdleLocked()
@@ -136,7 +140,38 @@ func (s *Server) Serve(l net.Listener) error {
 		s.log.Info("idle; exiting")
 		l.Close()
 		return nil
+	case <-s.stopC:
+		s.log.Info("stopped; exiting")
+		l.Close()
+		s.Close()
+		return nil
 	}
+}
+
+// daemonStop ends the daemon. The reply goes out first, and Serve
+// returns once the caller's connection has written it (or a second has
+// passed), so `slime stop` hears back before the pipe goes away.
+func (s *Server) daemonStop(cl *callCtx, _ rpc.Empty) (rpc.Empty, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cl.reply(rpc.Empty{})
+	if s.stopped {
+		return rpc.Empty{}, nil
+	}
+	s.stopped = true
+	if cl.c == nil {
+		close(s.stopC)
+		return rpc.Empty{}, nil
+	}
+	cl.c.closeAfterFlush()
+	go func() {
+		select {
+		case <-cl.c.done:
+		case <-time.After(time.Second):
+		}
+		close(s.stopC)
+	}()
+	return rpc.Empty{}, nil
 }
 
 // checkIdleLocked starts the idle timer when nothing is left, and stops
@@ -202,7 +237,7 @@ func (s *Server) handle(rw io.ReadWriteCloser) {
 	for {
 		f, err := r.Read()
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, os.ErrClosed) {
 				s.log.Info("client read", "err", err)
 			}
 			return

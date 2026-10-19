@@ -59,7 +59,7 @@ func newCommand() *cobra.Command {
 		SilenceUsage:  true,
 	}
 	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "print results as JSON, as the daemon replies")
-	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
+	root.AddCommand(serveCommand(), stopCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
 		paneCommand(), doCommand(), actionsCommand(), scriptsCommand(), configCommand(), callCommand(), skillCommand())
 	root.AddCommand(hostCommands()...)
 	root.AddCommand(topicCommands()...)
@@ -139,6 +139,28 @@ func serve(logger *slog.Logger, idle time.Duration, hosts daemon.HostOptions) er
 	}
 	logger.Info("serving", "pipe", name, "pid", os.Getpid(), "config", config.Path())
 	return srv.Serve(l)
+}
+
+func stopCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop [instance]",
+		Short: "End the daemon of an instance, and every pane it owns",
+		Long: "Stops the daemon of an instance: the one named, or SLIME_INSTANCE's. Every\n" +
+			"pane's program is killed, and windows showing them see slime hang up. The\n" +
+			"daemon in ordinary use has no instance name and isn't stopped this way: it\n" +
+			"exits by itself once nothing is left in it (slime serve --idle).",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// The instance picks the pipe through the same variable the
+			// daemon and its panes carry (slime help env).
+			if len(args) == 1 {
+				os.Setenv("SLIME_INSTANCE", args[0])
+			} else if os.Getenv("SLIME_INSTANCE") == "" {
+				return errors.New("no instance: name one, or set SLIME_INSTANCE")
+			}
+			return call(rpc.DaemonStop, nil, nil)
+		},
+	}
 }
 
 func connectCommand() *cobra.Command {

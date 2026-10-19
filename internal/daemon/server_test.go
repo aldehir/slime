@@ -1516,3 +1516,65 @@ func TestIdleExit(t *testing.T) {
 		t.Fatal("didn't exit when idle")
 	}
 }
+
+// TestDaemonStop: daemon.stop answers its caller, then Serve kills the
+// panes and returns, however much is still open.
+func TestDaemonStop(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		ptys []*fakePty
+	)
+	srv, err := NewServer(runtime(t), Options{
+		Spawn: func(o pty.Options) (pty.Pty, error) {
+			p := newFakePty(o)
+			mu.Lock()
+			ptys = append(ptys, p)
+			mu.Unlock()
+			return p, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error)
+	go func() { done <- srv.Serve(l) }()
+
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewClient(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var ws rpc.Workspace
+	if err := c.Call(rpc.WorkspaceNew, rpc.WorkspaceNewParams{Tabs: []*rpc.Layout{{Pane: &rpc.PaneSpec{Command: "sh"}}}}, &ws); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Call(rpc.DaemonStop, nil, nil); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("didn't exit when stopped")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ptys) != 1 {
+		t.Fatalf("%d ptys", len(ptys))
+	}
+	select {
+	case <-ptys[0].exited:
+	default:
+		t.Error("the pane's pty wasn't closed")
+	}
+}

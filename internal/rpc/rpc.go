@@ -107,6 +107,7 @@ const (
 	ConfigCheck     = "config.check"
 	ActionInvoke    = "action.invoke"
 	ClientQueue     = "client.queue"
+	DaemonStop      = "daemon.stop"
 )
 
 // Notifications. A workspace's viewers get their workspace's without

@@ -24,7 +24,7 @@ zig build test
   `scripts\build-vt-lib.ps1` once. `scripts\race.ps1` runs `-race`.
 - A test build attaches to the daemon already running (one pipe per user,
   `\\.\pipe\slime-<sid>`). Set `SLIME_INSTANCE=<name>` so it starts its
-  own, and stop that one by PID when done.
+  own, and `slime stop <name>` ends it (panes and all) when done.
 - Without the setup script, clang picks a legacy MSVC and the C++ deps fail
   with `char16_t` undeclared. Don't remove the machine's old VS installs.
 

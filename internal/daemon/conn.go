@@ -22,9 +22,10 @@ type conn struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
 	queue    []queued
-	queued   int  // counted bytes in queue
-	closed   bool // nothing more is sent
-	draining bool // close once the queue is empty
+	queued   int           // counted bytes in queue
+	closed   bool          // nothing more is sent
+	draining bool          // close once the queue is empty
+	done     chan struct{} // closed when the write loop has exited
 
 	// Workspaces this client views, and the events it subscribed to
 	// beyond theirs. Guarded by the server's lock.
@@ -41,7 +42,7 @@ type queued struct {
 }
 
 func newConn(rw io.ReadWriteCloser, log *slog.Logger) *conn {
-	c := &conn{rw: rw, log: log, viewing: map[uint32]*workspace{}}
+	c := &conn{rw: rw, log: log, viewing: map[uint32]*workspace{}, done: make(chan struct{})}
 	c.cond = sync.NewCond(&c.mu)
 	go c.writeLoop()
 	return c
@@ -78,6 +79,7 @@ func (c *conn) enqueue(id PaneID, m Message, force bool) bool {
 }
 
 func (c *conn) writeLoop() {
+	defer close(c.done)
 	for {
 		c.mu.Lock()
 		for len(c.queue) == 0 && !c.closed && !c.draining {

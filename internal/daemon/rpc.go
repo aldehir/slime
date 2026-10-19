@@ -96,6 +96,7 @@ var methods = map[string]handler{
 	rpc.ConfigCheck:     method((*Server).configCheck),
 	rpc.ActionInvoke:    method((*Server).actionInvoke),
 	rpc.ClientQueue:     method((*Server).clientQueue),
+	rpc.DaemonStop:      method((*Server).daemonStop),
 }
 
 // Methods lists the control plane's methods.
