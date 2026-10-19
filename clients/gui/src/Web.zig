@@ -24,8 +24,9 @@
 //! longer than `browser.idle` is closed too (`closeIdle`), and the next
 //! placement opens the pane's url again.
 //!
-//! A page opening a window splits its pane with a browser pane there
-//! (`Events.new_window`). Camera, microphone, and location are denied;
+//! A page opening a window on a click splits its pane with a browser
+//! pane there (`Events.new_window`); one opening it by itself opens
+//! nothing. Camera, microphone, and location are denied;
 //! other permissions are asked about in the window's dialog
 //! (`Events.permission`), one at a time per pane.
 
@@ -40,6 +41,7 @@ const wv = win32.webview2;
 const Session = @import("Session.zig");
 const Renderer = @import("renderer/D3D11.zig");
 const Daemon = @import("Daemon.zig");
+const Config = @import("Config.zig");
 const Painter = Renderer.Painter;
 
 const log = std.log.scoped(.web);
@@ -200,6 +202,8 @@ const Env = struct {
     args: ?[:0]u16 = null,
     /// Its browser process, once a WebView has said.
     pid: u32 = 0,
+    /// Our BrowserProcessExited handler's, while `closing` has one on.
+    exit_token: ?wv.EventRegistrationToken = null,
     /// Views waiting for it, each holding a reference.
     waiting: std.ArrayList(*View) = .empty,
     completed: Callback(wv.EnvironmentCompletedHandler, Env, "completed", envCreated) = .{},
@@ -233,10 +237,18 @@ const Env = struct {
         self.web.alloc.destroy(self);
     }
 
-    /// Release the environment, if it holds one.
+    /// Release the environment, if it holds one, its exit handler taken
+    /// off first: the handler is in this `Env`, which goes after.
     fn letGo(self: *Env) void {
         switch (self.state) {
-            .ready, .closing => |e| com.release(e),
+            .ready, .closing => |e| {
+                if (self.exit_token) |token| if (com.query(e, wv.IEnvironment5)) |e5| {
+                    defer com.release(e5);
+                    _ = e5.removeBrowserProcessExited(token);
+                };
+                self.exit_token = null;
+                com.release(e);
+            },
             .creating, .failed, .retired => {},
         }
         self.state = .failed;
@@ -374,7 +386,9 @@ fn env(self: *Web, host: u32) !*Env {
 /// no name resolved here but the proxy's own, which Chromium's
 /// prefetcher would otherwise look up past it. Loopback goes through
 /// too (`<-loopback>` undoes Chromium's implicit bypass): localhost is
-/// the host's. Null for no proxy.
+/// the host's. WebRTC sends no UDP but through the proxy, which takes
+/// none: SOCKS is TCP here, and a STUN or TURN server at an IP would
+/// otherwise be reached from this machine's network. Null for no proxy.
 pub fn browserArgs(alloc: Allocator, proxy: []const u16) !?[:0]u16 {
     if (proxy.len == 0) return null;
     const scheme = L("socks5://");
@@ -390,6 +404,7 @@ pub fn browserArgs(alloc: Allocator, proxy: []const u16) !?[:0]u16 {
         L(" --host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE "),
         addr[0..colon],
         L("\" --proxy-bypass-list=\"<-loopback>\""),
+        L(" --force-webrtc-ip-handling-policy=disable_non_proxied_udp"),
     }, 0);
 }
 
@@ -397,7 +412,7 @@ test browserArgs {
     const alloc = std.testing.allocator;
     const args = (try browserArgs(alloc, L("socks5://127.0.0.1:40123"))).?;
     defer alloc.free(args);
-    try std.testing.expectEqualSlices(u16, L("--proxy-server=socks5://127.0.0.1:40123 --host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE 127.0.0.1\" --proxy-bypass-list=\"<-loopback>\""), args);
+    try std.testing.expectEqualSlices(u16, L("--proxy-server=socks5://127.0.0.1:40123 --host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE 127.0.0.1\" --proxy-bypass-list=\"<-loopback>\" --force-webrtc-ip-handling-policy=disable_non_proxied_udp"), args);
     try std.testing.expectEqual(@as(?[:0]u16, null), try browserArgs(alloc, L("")));
     try std.testing.expectError(error.BadProxy, browserArgs(alloc, L("http://127.0.0.1:8080")));
     try std.testing.expectError(error.BadProxy, browserArgs(alloc, L("socks5://127.0.0.1:1\" --evil")));
@@ -550,7 +565,10 @@ fn retire(self: *Web, e: *Env) void {
             if (browserRunning(e.pid)) if (com.query(environment, wv.IEnvironment5)) |e5| {
                 defer com.release(e5);
                 var token: wv.EventRegistrationToken = .{};
-                if (e5.addBrowserProcessExited(&e.exited.iface, &token) >= 0) return;
+                if (e5.addBrowserProcessExited(&e.exited.iface, &token) >= 0) {
+                    e.exit_token = token;
+                    return;
+                }
             };
             self.drop(e);
         },
@@ -620,17 +638,19 @@ fn forceDrop(self: *Web, e: *Env) void {
 }
 
 /// A click on browser pane `s`'s stand-in: its browser gets another go.
-/// One waiting on its host's old browser stops waiting (`forceDrop`).
+/// One waiting on its host's old browser stops waiting (`forceDrop`);
+/// one whose environment failed to start drops it, and the next
+/// placement makes another.
 pub fn retry(self: *Web, s: *Session) void {
     const b = s.browser() orelse return;
     const was = b.failed orelse return;
     b.failed = null;
-    if (was.ptr != reconnecting.ptr) return;
     const host = hostOf(s);
     for (self.envs.items) |e| if (e.host == host) {
         switch (e.state) {
-            .closing, .retired => self.forceDrop(e),
-            .creating, .ready, .failed => {},
+            .closing, .retired => if (was.ptr == reconnecting.ptr) self.forceDrop(e),
+            .failed => if (was.ptr == start_failed.ptr) self.drop(e),
+            .creating, .ready => {},
         }
         break;
     };
@@ -717,6 +737,104 @@ test "an environment retired while it's made waits, and a click drops it" {
     // `envCreated` coming after finds it gone: drop does nothing.
     web.drop(e);
     e.unhold();
+}
+
+test "a click on a pane whose browser couldn't start drops the failed environment" {
+    const alloc = std.testing.allocator;
+    var events: TestEvents = .{};
+    var web: Web = .init(alloc, @ptrFromInt(0x1000), events.events(), 96);
+    defer web.deinit();
+    var config: Config = .init(alloc);
+    defer config.deinit();
+    var s = try Session.testBrowser(alloc, &config, L("https://example.com/"));
+    defer s.deinitContent();
+    const e = try alloc.create(Env);
+    e.* = .{ .web = &web, .host = 0, .state = .failed };
+    try web.envs.append(alloc, e);
+    const b = s.browser().?;
+
+    // Another failure leaves it: a crashed page's environment is fine.
+    b.failed = page_crashed;
+    web.retry(&s);
+    try std.testing.expectEqual(@as(?[]const u8, null), b.failed);
+    try std.testing.expectEqual(@as(usize, 1), web.envs.items.len);
+
+    b.failed = start_failed;
+    web.retry(&s);
+    try std.testing.expectEqual(@as(?[]const u8, null), b.failed);
+    try std.testing.expectEqual(@as(usize, 0), web.envs.items.len);
+}
+
+/// A permission request's arguments, or its deferral, with no browser
+/// behind them: what `Pending.answer` calls, counted.
+const FakeRequest = extern struct {
+    vtable: com.VTable = @ptrCast(&slots),
+    state: i32 = -1,
+    completed: u32 = 0,
+    released: u32 = 0,
+
+    const slots = [_]*const anyopaque{
+        @ptrCast(&queryInterface), @ptrCast(&addRef),   @ptrCast(&release),
+        @ptrCast(&complete),       @ptrCast(&unused),   @ptrCast(&unused),
+        @ptrCast(&unused),         @ptrCast(&putState), @ptrCast(&unused),
+    };
+
+    fn queryInterface(_: *FakeRequest, _: *const win32.GUID, out: *?*anyopaque) callconv(.winapi) win32.HRESULT {
+        out.* = null;
+        return com.E_NOINTERFACE;
+    }
+    fn addRef(_: *FakeRequest) callconv(.winapi) u32 {
+        return 1;
+    }
+    fn release(self: *FakeRequest) callconv(.winapi) u32 {
+        self.released += 1;
+        return 0;
+    }
+    /// The deferral's Complete.
+    fn complete(self: *FakeRequest) callconv(.winapi) win32.HRESULT {
+        self.completed += 1;
+        return com.S_OK;
+    }
+    /// The arguments' put_State.
+    fn putState(self: *FakeRequest, state: i32) callconv(.winapi) win32.HRESULT {
+        self.state = state;
+        return com.S_OK;
+    }
+    fn unused(_: *FakeRequest) callconv(.winapi) win32.HRESULT {
+        return com.E_NOTIMPL;
+    }
+};
+
+test "a view shut with a question open answers it, and its pane stops asking" {
+    const alloc = std.testing.allocator;
+    var events: TestEvents = .{};
+    var web: Web = .init(alloc, @ptrFromInt(0x1000), events.events(), 96);
+    defer web.deinit();
+    var config: Config = .init(alloc);
+    defer config.deinit();
+    var s = try Session.testBrowser(alloc, &config, L("https://example.com/"));
+    defer s.deinitContent();
+    const b = s.browser().?;
+    var args: FakeRequest = .{};
+    var deferral: FakeRequest = .{};
+
+    const v = try alloc.create(View);
+    v.* = .{ .web = &web, .session = &s, .key = s.id };
+    try web.views.append(alloc, v);
+    b.view = v;
+    v.pending = .{ .args = @ptrCast(&args), .deferral = @ptrCast(&deferral) };
+    b.asking = true;
+
+    // Its page crashed: the view goes, and the question with it.
+    v.fail(page_crashed);
+    try std.testing.expect(!b.asking);
+    try std.testing.expectEqual(@as(?*View, null), b.view);
+    try std.testing.expectEqualSlices(u8, page_crashed, b.failed.?);
+    try std.testing.expectEqual(@as(usize, 0), web.views.items.len);
+    try std.testing.expectEqual(@intFromEnum(wv.PermissionState.deny), args.state);
+    try std.testing.expectEqual(@as(u32, 1), deferral.completed);
+    try std.testing.expectEqual(@as(u32, 1), args.released);
+    try std.testing.expectEqual(@as(u32, 1), deferral.released);
 }
 
 /// A COM object WebView2 calls back, embedded in `Outer` as `field`:
@@ -807,6 +925,11 @@ pub const View = struct {
     want_preview: bool = false,
     /// A permission the window is asking the user about.
     pending: ?Pending = null,
+    /// The navigation slime sent the page on (`followTo`), which isn't
+    /// reported back wherever it lands (`Session.Browser.followed`):
+    /// `asked` from its Navigate to its NavigationStarting, then `on`,
+    /// with its id, until it completes.
+    following: union(enum) { none, asked, on: u64 } = .none,
 
     created: Callback(wv.CompositionControllerCompletedHandler, View, "created", controllerCreated) = .{},
     navigation_starting: Callback(wv.NavigationStartingEventHandler, View, "navigation_starting", navigationStarting) = .{},
@@ -893,6 +1016,8 @@ pub const View = struct {
         if (self.state == .closed) return;
         self.state = .closed;
         if (self.browser()) |b| b.view = null;
+        // While it has the session, whose question it ends.
+        self.settle(.dismiss);
         self.session = null;
         const web = self.web;
         for (web.views.items, 0..) |v, i| if (v == self) {
@@ -900,7 +1025,6 @@ pub const View = struct {
             break;
         };
         self.unplace();
-        self.settle(.dismiss);
         self.want_preview = false;
         com.releaseOpt(&self.preview_stream);
         if (self.controller) |c| _ = c.close();
@@ -920,15 +1044,17 @@ pub const View = struct {
         p.answer(a);
     }
 
-    /// Shut the view, its pane standing in saying `why`.
+    /// Shut the view, its pane standing in saying `why`. The view may be
+    /// gone after.
     fn fail(self: *View, why: []const u8) void {
         const s = self.session;
+        const events = self.web.events;
         if (self.browser()) |b| {
             b.failed = why;
             b.loading = false;
         }
         self.shut();
-        if (s) |session| self.web.events.changed(self.web.events.ctx, session);
+        if (s) |session| events.changed(events.ctx, session);
     }
 
     /// Take the view's visual out of the tree.
@@ -1091,18 +1217,31 @@ fn setUp(self: *View, comp: *wv.ICompositionController) !void {
     _ = controller.putBounds(self.bounds);
     _ = controller.putIsVisible(self.shown);
     try r.commit();
-    if (self.browser()) |b| navigate(self, b.url);
+    // Where slime sent it while it was made is slime's; its own url (a
+    // new pane's, one closed while hidden) is reported as it lands.
+    if (self.browser()) |b| {
+        if (b.followed != null) followTo(self, b.url) else _ = navigate(self, b.url);
+    }
     if (self.session) |s| web.events.changed(web.events.ctx, s);
 }
 
-/// Go to `url`.
-fn navigate(self: *View, url: []const u16) void {
-    const w = self.webview orelse return;
-    const z = self.web.alloc.dupeZ(u16, url) catch return;
+/// Go to `url`. False if the WebView wouldn't.
+fn navigate(self: *View, url: []const u16) bool {
+    const w = self.webview orelse return false;
+    const z = self.web.alloc.dupeZ(u16, url) catch return false;
     defer self.web.alloc.free(z);
     log.debug("pane {d} goes to {f}", .{ self.key, std.unicode.fmtUtf16Le(url) });
-    com.check(w.navigate(z), "ICoreWebView2::Navigate") catch
+    com.check(w.navigate(z), "ICoreWebView2::Navigate") catch {
         log.warn("can't go to {f}", .{std.unicode.fmtUtf16Le(url)});
+        return false;
+    };
+    return true;
+}
+
+/// Go to `url` because slime said: where it lands isn't reported.
+fn followTo(self: *View, url: []const u16) void {
+    self.following = .asked;
+    if (!navigate(self, url)) self.following = .none;
 }
 
 /// The WebView's url and title as the daemon hears them, and the pane
@@ -1119,25 +1258,58 @@ fn reportVisit(self: *View) void {
     var url: []const u16 = if (source) |src| std.mem.span(src) else &.{};
     // A data: url's source is empty: it's where it was sent.
     if (url.len == 0) url = (s.browser() orelse return).url;
-    s.visited(url, if (title) |t| std.mem.span(t) else &.{});
+    _ = s.visited(url, if (title) |t| std.mem.span(t) else &.{});
     self.web.events.changed(self.web.events.ctx, s);
 }
 
-fn navigationStarting(self: *View, _: *wv.IWebView, _: *wv.IUnknown) win32.HRESULT {
-    const b = self.browser() orelse return com.S_OK;
+/// A navigation the user made here (a link, a gesture, our Navigate)
+/// is theirs, and reported as it lands; slime's (`followTo`), its
+/// redirects, and the page's script going on from it aren't, so two
+/// windows on a page that bounces to a fresh url don't send each other
+/// round.
+fn navigationStarting(self: *View, _: *wv.IWebView, args: *wv.INavigationStartingEventArgs) win32.HRESULT {
+    const s = self.session orelse return com.S_OK;
+    const b = s.browser() orelse return com.S_OK;
+    var redirected: win32.BOOL = 0;
+    var user: win32.BOOL = 0;
+    var id: u64 = 0;
+    _ = args.getIsRedirected(&redirected);
+    _ = args.getIsUserInitiated(&user);
+    _ = args.getNavigationId(&id);
+    if (redirected == 0) {
+        if (self.following == .asked) {
+            self.following = .{ .on = id };
+        } else if (user != 0) {
+            self.following = .none;
+            s.ownNavigation();
+        }
+    }
     b.loading = true;
-    self.web.events.changed(self.web.events.ctx, self.session.?);
+    self.web.events.changed(self.web.events.ctx, s);
     return com.S_OK;
 }
 
-fn navigationCompleted(self: *View, _: *wv.IWebView, _: *wv.IUnknown) win32.HRESULT {
+fn navigationCompleted(self: *View, _: *wv.IWebView, args: *wv.INavigationCompletedEventArgs) win32.HRESULT {
     const b = self.browser() orelse return com.S_OK;
+    var id: u64 = 0;
+    _ = args.getNavigationId(&id);
+    switch (self.following) {
+        .on => |on| if (on == id) {
+            self.following = .none;
+        },
+        .none, .asked => {},
+    }
     b.loading = false;
     self.web.events.changed(self.web.events.ctx, self.session.?);
     return com.S_OK;
 }
 
-fn sourceChanged(self: *View, _: *wv.IWebView, _: *wv.IUnknown) win32.HRESULT {
+fn sourceChanged(self: *View, _: *wv.IWebView, args: *wv.ISourceChangedEventArgs) win32.HRESULT {
+    // A change within the page once slime's navigation is done (an
+    // in-page link) is the user's.
+    var new_document: win32.BOOL = 1;
+    _ = args.getIsNewDocument(&new_document);
+    if (new_document == 0 and self.following == .none) if (self.session) |s| s.ownNavigation();
     reportVisit(self);
     return com.S_OK;
 }
@@ -1159,8 +1331,10 @@ fn historyChanged(self: *View, w: *wv.IWebView, _: ?*wv.IUnknown) win32.HRESULT 
     return com.S_OK;
 }
 
-/// A page opening a window opens it in a pane split off its own, or,
-/// where the window can't split it, in its own.
+/// A page opening a window on a click opens it in a pane split off its
+/// own, or, where the window can't split it, in its own. One its script
+/// opens by itself (a timer, a load) opens nothing: a page can't fill
+/// the window with panes, or take the focus.
 fn newWindow(self: *View, _: *wv.IWebView, args: *wv.INewWindowRequestedEventArgs) win32.HRESULT {
     _ = args.putHandled(true);
     var uri: ?win32.LPWSTR = null;
@@ -1168,8 +1342,17 @@ fn newWindow(self: *View, _: *wv.IWebView, args: *wv.INewWindowRequestedEventArg
     defer win32.CoTaskMemFree(uri);
     const url = std.mem.span(uri orelse return com.S_OK);
     if (url.len == 0) return com.S_OK;
-    if (self.session) |s| if (self.web.events.new_window(self.web.events.ctx, s, url)) return com.S_OK;
-    navigate(self, url);
+    var user: win32.BOOL = 0;
+    _ = args.getIsUserInitiated(&user);
+    if (user == 0) {
+        log.debug("pane {d}'s page opened a window by itself, at {f}: not opened", .{ self.key, std.unicode.fmtUtf16Le(url) });
+        return com.S_OK;
+    }
+    const s = self.session orelse return com.S_OK;
+    if (self.web.events.new_window(self.web.events.ctx, s, url)) return com.S_OK;
+    self.following = .none;
+    s.ownNavigation();
+    _ = navigate(self, url);
     return com.S_OK;
 }
 
@@ -1575,7 +1758,7 @@ pub fn follow(self: *Web, s: *Session) void {
     _ = w.getSource(&source);
     defer win32.CoTaskMemFree(source);
     if (!shouldNavigate(if (source) |src| std.mem.span(src) else null, b.url)) return;
-    navigate(v, b.url);
+    followTo(v, b.url);
 }
 
 /// Whether a page at `source` should go to `url`.
@@ -1591,7 +1774,12 @@ pub const Nav = @import("App.zig").Nav;
 pub fn go(self: *Web, s: *Session, nav: Nav) void {
     _ = self;
     const b = s.browser() orelse return;
-    const w = (b.view orelse return).webview orelse return;
+    const v = b.view orelse return;
+    const w = v.webview orelse return;
+    if (nav == .back or nav == .forward) {
+        v.following = .none;
+        s.ownNavigation();
+    }
     _ = switch (nav) {
         .back => w.goBack(),
         .forward => w.goForward(),

@@ -189,6 +189,15 @@ pub const Browser = struct {
     /// The url slime last said, for `titleUpdate` to take. Owned.
     /// Guarded by `lock`.
     next_url: ?[]u16 = null,
+    /// The url slime sent the page to, until the user takes it elsewhere
+    /// here (`ownNavigation`): where the page lands, a redirect, is
+    /// shown but reported as this, so two windows on a page that
+    /// bounces to a fresh url don't send each other round. Owned. UI
+    /// thread only, as `typed`.
+    followed: ?[]u16 = null,
+    /// The url the URL bar sent, until slime's echo of it comes, which
+    /// is the user's and not followed. Owned.
+    typed: ?[]u16 = null,
     /// What the strip's back, forward, and reload buttons go by, as the
     /// browser reports them.
     can_go_back: bool = false,
@@ -217,6 +226,8 @@ pub const Browser = struct {
         setImage(&self.preview, null);
         alloc.free(self.url);
         if (self.next_url) |u| alloc.free(u);
+        if (self.followed) |u| alloc.free(u);
+        if (self.typed) |u| alloc.free(u);
     }
 
     /// Replace `slot`'s image with `img`, letting the old one go.
@@ -406,7 +417,7 @@ pub fn destroy(self: *Session) void {
     alloc.destroy(self);
 }
 
-fn deinitContent(self: *Session) void {
+pub fn deinitContent(self: *Session) void {
     switch (self.content) {
         inline else => |*c| c.deinit(self.alloc),
     }
@@ -846,7 +857,8 @@ pub fn title(self: *const Session) []const u16 {
 
 /// Take the program's new title, and a browser's url. Clears the
 /// pending flag before reading, so a change made after the read posts
-/// again. Returns true if a url came, which the browser goes to.
+/// again. Returns true if a url came, which the browser goes to, as
+/// slime's (`Browser.followed`) unless the URL bar sent it.
 pub fn titleUpdate(self: *Session) bool {
     self.title_pending.store(false, .release);
     self.lockTerminal();
@@ -858,19 +870,38 @@ pub fn titleUpdate(self: *Session) bool {
     b.next_url = null;
     self.alloc.free(b.url);
     b.url = url;
+    if (b.followed) |old| self.alloc.free(old);
+    b.followed = null;
+    if (b.typed) |typed| if (std.mem.eql(u16, typed, url)) {
+        self.alloc.free(typed);
+        b.typed = null;
+        return true;
+    };
+    b.followed = self.alloc.dupe(u16, url) catch null;
     return true;
 }
 
-/// The pane's browser went to `url`, whose page is titled `title`: the
-/// pane shows them, and slime hears, for its other windows to follow.
-/// UI thread.
-pub fn visited(self: *Session, url: []const u16, page_title: []const u16) void {
+/// The user took the pane's page elsewhere in this window (a link,
+/// back or forward, a window it opened): where it lands is reported
+/// again. UI thread.
+pub fn ownNavigation(self: *Session) void {
     const b = self.browser() orelse return;
+    if (b.followed) |old| self.alloc.free(old);
+    b.followed = null;
+}
+
+/// The pane's browser went to `url`, whose page is titled `title`: the
+/// pane shows them, and slime hears, for its other windows to follow;
+/// on a page slime sent it to (`Browser.followed`), slime hears that
+/// url, with the title. Returns the url slime is told, null if nothing
+/// changed. UI thread.
+pub fn visited(self: *Session, url: []const u16, page_title: []const u16) ?[]const u16 {
+    const b = self.browser() orelse return null;
     const moved = !std.mem.eql(u16, b.url, url);
     const retitled = !std.mem.eql(u16, self.title_buf[0..self.title_len], page_title[0..@min(page_title.len, max_title_len)]);
-    if (!moved and !retitled) return;
+    if (!moved and !retitled) return null;
     if (moved) {
-        const copy = self.alloc.dupe(u16, url) catch return;
+        const copy = self.alloc.dupe(u16, url) catch return null;
         self.alloc.free(b.url);
         b.url = copy;
     }
@@ -880,8 +911,10 @@ pub fn visited(self: *Session, url: []const u16, page_title: []const u16) void {
     @memcpy(self.next_title_buf[0..self.title_len], page_title[0..self.title_len]);
     self.next_title_len = self.title_len;
     self.unlockTerminal();
-    const s = self.live() orelse return;
-    s.conn.paneVisited(s.pane, url, page_title) catch |err| log.warn("telling slime where the browser went failed: {}", .{err});
+    const told = b.followed orelse b.url;
+    const s = self.live() orelse return told;
+    s.conn.paneVisited(s.pane, told, page_title) catch |err| log.warn("telling slime where the browser went failed: {}", .{err});
+    return told;
 }
 
 /// Where a browser pane's page is; null for a terminal.
@@ -902,6 +935,9 @@ pub fn navigate(self: *Session, to: []const u16) !void {
     const copy = try self.alloc.dupe(u16, to);
     self.alloc.free(b.url);
     b.url = copy;
+    self.ownNavigation();
+    if (b.typed) |old| self.alloc.free(old);
+    b.typed = self.alloc.dupe(u16, to) catch null;
     self.lockTerminal();
     defer self.unlockTerminal();
     self.title_len = 0;
@@ -1257,7 +1293,7 @@ test typedUrl {
 
 /// A browser session as `create` makes one from an arrival, without a
 /// connection, for the tests.
-fn testBrowser(alloc: Allocator, config: *const Config, url: []const u16) !Session {
+pub fn testBrowser(alloc: Allocator, config: *const Config, url: []const u16) !Session {
     return .{
         .alloc = alloc,
         .wake = undefined,
@@ -1299,10 +1335,35 @@ test "a browser goes by its page's title, else its host, and takes slime's url" 
 
     // Its own browser went somewhere: shown at once, with no connection
     // to tell.
-    s.visited(L("https://example.net/"), L("Net"));
+    s.ownNavigation();
+    try std.testing.expectEqualSlices(u16, L("https://example.net/"), s.visited(L("https://example.net/"), L("Net")).?);
     try std.testing.expectEqualSlices(u16, L("https://example.net/"), s.pageUrl().?);
     try std.testing.expectEqualSlices(u16, L("Net"), s.title());
     try std.testing.expect(!s.browser().?.live());
+}
+
+test "a url slime sent that redirects elsewhere isn't reported, but its title is" {
+    const alloc = std.testing.allocator;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var config: Config = .init(alloc);
+    defer config.deinit();
+    var s = try testBrowser(alloc, &config, L("https://example.com/"));
+    defer s.deinitContent();
+
+    s.title_pending.store(true, .release);
+    daemonUrl(&s, "https://example.org/login");
+    try std.testing.expect(s.titleUpdate());
+    // The page lands on a fresh url: shown here, and slime hears the
+    // url it sent, with the page's title.
+    try std.testing.expectEqualSlices(u16, L("https://example.org/login"), s.visited(L("https://example.org/login?nonce=1"), L("Log in")).?);
+    try std.testing.expectEqualSlices(u16, L("https://example.org/login?nonce=1"), s.pageUrl().?);
+    try std.testing.expectEqualSlices(u16, L("Log in"), s.title());
+    // Nothing new: nothing told.
+    try std.testing.expectEqual(@as(?[]const u16, null), s.visited(L("https://example.org/login?nonce=1"), L("Log in")));
+
+    // A link the user followed here is reported where it lands.
+    s.ownNavigation();
+    try std.testing.expectEqualSlices(u16, L("https://example.org/home"), s.visited(L("https://example.org/home"), L("Home")).?);
 }
 
 test "a browser's page is up only once its WebView is" {

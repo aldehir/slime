@@ -352,8 +352,12 @@ and a pane without a browser (no runtime, or one that failed) shows its
 title and url and why (`.plans/browser-pane-plan.md`). The URL bar shows
 the site's favicon (a globe without one), a dragged pane's picture has
 the page in it (`CapturePreview` at drag start), and a page opening a
-window (`target=_blank`, `window.open`) splits its pane with a browser
-pane to the right, or navigates in place where the pane can't be split.
+window on a click (`target=_blank`, `window.open`) splits its pane with
+a browser pane to the right, or navigates in place where the pane can't
+be split; one its script opens by itself (a timer, on load) opens
+nothing. A window that follows a url slime sent shows where the page
+lands but reports only the title, so two windows on a site that bounces
+to a fresh url each load don't send each other round.
 A browser hidden (tab switched away, another pane zoomed) longer than
 `browser.idle` seconds (600; 0 never) is closed, and opens its url again
 when shown. Camera, microphone, and location requests are denied
@@ -369,10 +373,13 @@ A browser pane in a host's workspace browses the host's network: its
 WebView2 environment is the host's
 (`%LOCALAPPDATA%\slime\webview\host-<hash of dest>`, cookies apart from
 local's and kept per destination), started with `--proxy-server=` the daemon's SOCKS proxy
-plus `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"` and
-`--proxy-bypass-list="<-loopback>"`, so every connection and name
-lookup happens on the host, localhost and 127.0.0.0/8 included (a dev
-server on the host is `http://localhost:3000`). With the proxy
+plus `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"`,
+`--proxy-bypass-list="<-loopback>"`, and
+`--force-webrtc-ip-handling-policy=disable_non_proxied_udp` (SOCKS
+carries TCP only; WebRTC must not send UDP from here), so every
+connection and name lookup happens on the host, localhost and
+127.0.0.0/8 included (a dev server on the host is
+`http://localhost:3000`). With the proxy
 off (`host.proxy = false`) the folder is still the host's but pages go
 out locally. A browser keeps the arguments it started with, and a
 second environment on the folder silently joins it, so when a host is

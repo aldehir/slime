@@ -81,9 +81,9 @@ pub fn Handler(comptime iid_: []const u8, comptime A_: type, comptime B_: type) 
 
 pub const EnvironmentCompletedHandler = Handler("4e8a3389-c9d8-4bd2-b6b5-124fee6cc14d", HRESULT, ?*IEnvironment);
 pub const CompositionControllerCompletedHandler = Handler("02fab84b-1428-4fb7-ad45-1b2e64736184", HRESULT, ?*ICompositionController);
-pub const NavigationStartingEventHandler = Handler("9adbe429-f36d-432b-9ddc-f8881fbd76e3", *IWebView, *IUnknown);
-pub const NavigationCompletedEventHandler = Handler("d33a35bf-1c49-4f98-93ab-006e0533fe1c", *IWebView, *IUnknown);
-pub const SourceChangedEventHandler = Handler("3c067f9f-5388-4772-8b48-79f7ef1ab37c", *IWebView, *IUnknown);
+pub const NavigationStartingEventHandler = Handler("9adbe429-f36d-432b-9ddc-f8881fbd76e3", *IWebView, *INavigationStartingEventArgs);
+pub const NavigationCompletedEventHandler = Handler("d33a35bf-1c49-4f98-93ab-006e0533fe1c", *IWebView, *INavigationCompletedEventArgs);
+pub const SourceChangedEventHandler = Handler("3c067f9f-5388-4772-8b48-79f7ef1ab37c", *IWebView, *ISourceChangedEventArgs);
 pub const HistoryChangedEventHandler = Handler("c79a420c-efd9-4058-9295-3e8b4bcab645", *IWebView, ?*IUnknown);
 pub const DocumentTitleChangedEventHandler = Handler("f5f2b923-953e-4042-9f95-f3a118e1afd4", *IWebView, ?*IUnknown);
 pub const NewWindowRequestedEventHandler = Handler("d4c185fe-c81c-4989-97af-2d3fa7ab5651", *IWebView, *INewWindowRequestedEventArgs);
@@ -161,6 +161,10 @@ pub const IEnvironment5 = extern struct {
     /// data folder let go.
     pub fn addBrowserProcessExited(self: *IEnvironment5, h: *BrowserProcessExitedEventHandler, token: *EventRegistrationToken) HRESULT {
         return com.call(self, 12, fn (*BrowserProcessExitedEventHandler, *EventRegistrationToken) HRESULT, .{ h, token });
+    }
+
+    pub fn removeBrowserProcessExited(self: *IEnvironment5, token: EventRegistrationToken) HRESULT {
+        return com.call(self, 13, fn (EventRegistrationToken) HRESULT, .{token});
     }
 };
 
@@ -403,6 +407,52 @@ pub const INewWindowRequestedEventArgs = extern struct {
     /// Without a new window put, handled means no window opens.
     pub fn putHandled(self: *INewWindowRequestedEventArgs, handled: bool) HRESULT {
         return com.call(self, 6, fn (BOOL) HRESULT, .{@as(BOOL, @intFromBool(handled))});
+    }
+
+    /// Whether a user gesture (a click) opened it, not the page's script
+    /// alone.
+    pub fn getIsUserInitiated(self: *INewWindowRequestedEventArgs, out: *BOOL) HRESULT {
+        return com.call(self, 8, fn (*BOOL) HRESULT, .{out});
+    }
+};
+
+/// ICoreWebView2NavigationStartingEventArgs.
+pub const INavigationStartingEventArgs = extern struct {
+    vtable: com.VTable,
+
+    /// A gesture's, or one of ours through the API (Navigate, GoBack),
+    /// not the page's script alone.
+    pub fn getIsUserInitiated(self: *INavigationStartingEventArgs, out: *BOOL) HRESULT {
+        return com.call(self, 4, fn (*BOOL) HRESULT, .{out});
+    }
+
+    /// A redirect of a navigation already started.
+    pub fn getIsRedirected(self: *INavigationStartingEventArgs, out: *BOOL) HRESULT {
+        return com.call(self, 5, fn (*BOOL) HRESULT, .{out});
+    }
+
+    /// Its redirects keep it.
+    pub fn getNavigationId(self: *INavigationStartingEventArgs, out: *u64) HRESULT {
+        return com.call(self, 9, fn (*u64) HRESULT, .{out});
+    }
+};
+
+/// ICoreWebView2NavigationCompletedEventArgs.
+pub const INavigationCompletedEventArgs = extern struct {
+    vtable: com.VTable,
+
+    pub fn getNavigationId(self: *INavigationCompletedEventArgs, out: *u64) HRESULT {
+        return com.call(self, 5, fn (*u64) HRESULT, .{out});
+    }
+};
+
+/// ICoreWebView2SourceChangedEventArgs.
+pub const ISourceChangedEventArgs = extern struct {
+    vtable: com.VTable,
+
+    /// False for a change within the page (a fragment, pushState).
+    pub fn getIsNewDocument(self: *ISourceChangedEventArgs, out: *BOOL) HRESULT {
+        return com.call(self, 3, fn (*BOOL) HRESULT, .{out});
     }
 };
 

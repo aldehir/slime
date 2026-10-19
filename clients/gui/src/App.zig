@@ -3812,8 +3812,7 @@ pub const TestShell = struct {
         if (s.browser()) |b| b.failed = null;
     }
     fn webCapture(_: *anyopaque, _: *Session, _: bool) void {}
-    fn webAnswer(ctx: *anyopaque, s: *Session, answer: Web.Answer) void {
-        if (s.browser()) |b| b.asking = false;
+    fn webAnswer(ctx: *anyopaque, _: *Session, answer: Web.Answer) void {
         self_(ctx).answer = answer;
     }
 

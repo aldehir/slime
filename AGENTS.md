@@ -38,8 +38,10 @@ zig build test
   safely.
 - Win32/COM bindings are hand-written; take vtable slots from Zig's bundled
   mingw headers (inherited methods count, IUnknown is 3). WebView2's
-  (`win32/webview2.zig`) come from the NuGet package's `WebView2.h`, at
-  the version build.zig fetches, which mingw doesn't have.
+  (`win32/webview2.zig`), which mingw doesn't have, come from
+  `build/native/include/WebView2.h` in the Microsoft.Web.WebView2 NuGet
+  package of the version build.zig names; `scripts/fetch-webview2.ps1`
+  keeps only the loader DLL and license, so no copy is local.
 - The reader thread must never call anything that waits on the UI thread
   (SendMessage, SetWindowTextW); use PostMessage.
 - Check `deferred.md` before building adjacent features; keep it current.
