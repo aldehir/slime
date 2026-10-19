@@ -114,18 +114,21 @@ mode: Mode = .terminal,
 /// The connection to slime: local sessions are panes of the workspaces
 /// it holds, those shown here. Null if it couldn't be reached.
 daemon: ?*Daemon = null,
-/// slime's workspaces, as it lists them, in its order. The shown ones
-/// are attached on `daemon`, their tabs in `tabs`; the rest are a header
-/// each in the sidebar.
+/// The workspaces every connection lists, the local daemon's and each
+/// host's, each daemon's in its order. The shown ones are attached on
+/// their connection, their tabs in `tabs`; the rest are a row each in
+/// the sidebar.
 workspaces: std.ArrayList(Workspace) = .empty,
+/// The next `Workspace.key`.
+next_workspace_key: u32 = 1,
 /// A workspace just asked for here (shown from the sidebar, or made):
-/// its active tab is shown when its tabs come. `activate_new` is for one
-/// whose id isn't known yet.
+/// its active tab is shown when its tabs come. `activate_new` is the
+/// connection of one whose id isn't known yet.
 activate_ws: ?u32 = null,
-activate_new: bool = false,
-/// Connections to slime on SSH hosts, bridged through the local daemon:
-/// a host's sessions are panes of the workspace its slime holds for
-/// this window.
+activate_new: ?*Daemon = null,
+/// Connections to slime on SSH hosts, bridged through the local daemon,
+/// one per host it has connected: each lists its host's workspaces as
+/// `daemon` lists the local ones, and attaches the ones shown here.
 remotes: std.ArrayList(Remote) = .empty,
 /// The hosts the local daemon knows, by its id for each, as it last
 /// reported them (`hostsChanged`). Matched to the remembered list by
@@ -180,6 +183,7 @@ pub const Mode = union(enum) {
 
 /// A workspace's name being edited.
 pub const Rename = struct {
+    /// The workspace's key.
     ws: u32,
     field: TextField,
 };
@@ -187,6 +191,7 @@ pub const Rename = struct {
 /// Asking whether to kill a workspace. The dialog's strings point into
 /// the buffers, so it stays where it is.
 pub const Confirm = struct {
+    /// The workspace's key.
     ws: u32,
     dialog: Dialog,
     title: [TextField.max_len + 32]u16 = undefined,
@@ -252,25 +257,26 @@ const SidebarDrag = struct {
 /// is dragged toward it.
 const min_terminal_width = 200;
 
-/// A host's slime, bridged through the local daemon. A session stands in
-/// for its panes until they come (`standIn`).
+/// A host's slime, bridged through the local daemon from when it has the
+/// host connected until the bridge is lost and nothing shows its panes.
+/// While a user waits for a pane there, a session stands in for the
+/// host's panes until they come (`standIn`).
 const Remote = struct {
     conn: *Daemon,
     /// The daemon's id for the host.
     host: u32,
-    /// The host's workspaces whose structures have come, with the tab
-    /// each shows as active, as `Workspace.active_tab` keeps it for the
-    /// local ones. There's no list of a host's workspaces beyond this.
-    workspaces: std.ArrayList(RemoteWorkspace) = .empty,
 };
 
-const RemoteWorkspace = struct {
-    id: u32,
-    active_tab: Daemon.TabRef = .none,
-};
-
-/// A workspace of the local daemon, as it last described it.
+/// A workspace as its daemon, the local one or a host's, last described
+/// it.
 pub const Workspace = struct {
+    /// The window's number for it, never reused: what the chrome names
+    /// it by (`Id.Target.workspace`). Daemons' ids repeat across
+    /// connections.
+    key: u32,
+    /// The connection that lists it.
+    conn: *Daemon,
+    /// Its daemon's id for it.
     id: u32,
     /// Owned.
     name: []u16,
@@ -278,7 +284,7 @@ pub const Workspace = struct {
     tabs: usize,
     /// Connections viewing it, this one included.
     viewers: usize,
-    /// Attached on `daemon`: its tabs are in `tabs`, or about to be.
+    /// Attached on `conn`: its tabs are in `tabs`, or about to be.
     shown: bool,
     /// The tab the daemon shows as active while it's shown, as its
     /// structure last said or we last told it (`syncFocus`).
@@ -569,7 +575,7 @@ pub fn deinit(self: *App) void {
     if (self.daemon) |conn| conn.deinit();
     for (self.workspaces.items) |w| self.alloc.free(w.name);
     self.workspaces.deinit(self.alloc);
-    for (self.remotes.items) |*r| self.freeRemote(r);
+    for (self.remotes.items) |r| r.conn.deinit();
     self.remotes.deinit(self.alloc);
     for (self.host_states.items) |e| {
         self.alloc.free(e.dest);
@@ -755,7 +761,7 @@ fn tabIndexOf(self: *const App, target: Id.Target) ?usize {
 /// The workspace `target` names, if it's listed.
 fn workspaceOf(self: *App, target: Id.Target) ?*Workspace {
     return switch (target) {
-        .workspace => |id| self.workspaceEntry(id),
+        .workspace => |key| self.workspaceEntry(key),
         else => null,
     };
 }
@@ -791,7 +797,7 @@ const Target = union(enum) {
 /// what slime has, else a new one running `command`), making a tab of
 /// each of their tabs. If that fails, a tab says why.
 fn connectDaemon(self: *App, command: []const u16) !void {
-    const conn = Daemon.connect(self.alloc, self.notify, self.shell.frameInterval(), self.daemonArea(), self.daemonSize(), command, self.shown.wanted()) catch |err| {
+    const conn = Daemon.connect(self.alloc, self.notify, self.shell.frameInterval(), self.daemonArea(), self.daemonSize(), command, self.shown.wanted(null)) catch |err| {
         log.err("connecting to slime failed: {}", .{err});
         return self.spawnFailed("couldn't start slime", err);
     };
@@ -801,6 +807,7 @@ fn connectDaemon(self: *App, command: []const u16) !void {
     conn.start() catch |err| {
         log.err("starting slime's reader failed: {}", .{err});
         self.destroyTabs();
+        self.dropWorkspacesOf(conn);
         conn.deinit();
         self.daemon = null;
         return self.spawnFailed("couldn't read from slime", err);
@@ -838,17 +845,15 @@ fn daemonChanged(self: *App, conn: *Daemon) void {
         };
     }
     for (taken.structures) |st| {
-        var wanted = false;
-        if (conn == self.daemon) {
-            const was_shown = if (self.workspaceEntry(st.id)) |w| w.shown else false;
-            self.workspaceShown(st);
-            // One the user just showed or made is what they want to see.
-            wanted = self.activate_ws == st.id or (!was_shown and self.activate_new);
-        }
+        const was_shown = if (self.workspaceIn(conn, st.id)) |w| w.shown else false;
+        self.workspaceShown(conn, st);
+        // One the user just showed or made is what they want to see.
+        const key = if (self.workspaceIn(conn, st.id)) |w| w.key else 0;
+        const wanted = (self.activate_ws != null and self.activate_ws.? == key) or (!was_shown and self.activate_new == conn);
         self.applyStructure(conn, st, &arrived) catch |err| log.err("laying out slime's tabs failed: {}", .{err});
         if (!wanted) continue;
         self.activate_ws = null;
-        self.activate_new = false;
+        self.activate_new = null;
         for (self.tabs.items, 0..) |t, k| {
             if (t.conn == conn and t.ws == st.id and (t.id.eql(st.active_tab) or st.active_tab.isNone())) {
                 self.activate(k);
@@ -873,7 +878,7 @@ fn closeIfNothingLeft(self: *App) void {
     self.shell.postClose();
 }
 
-/// Take up what the local daemon said about its workspaces: keep the
+/// Take up what `conn`'s daemon said about its workspaces: keep the
 /// list as it has it, and let go of the tabs of one it took away.
 fn workspacesChanged(self: *App, conn: *Daemon) void {
     const events = conn.takeWorkspaces();
@@ -881,15 +886,14 @@ fn workspacesChanged(self: *App, conn: *Daemon) void {
         for (events) |*e| e.deinit(self.alloc);
         self.alloc.free(events);
     }
-    if (conn != self.daemon) return;
     for (events) |e| switch (e) {
-        .list => |list| for (list) |w| self.workspaceInfo(w),
-        .created, .changed => |w| self.workspaceInfo(w),
-        .viewers => |v| if (self.workspaceEntry(v.id)) |w| {
+        .list => |list| for (list) |w| self.workspaceInfo(conn, w),
+        .created, .changed => |w| self.workspaceInfo(conn, w),
+        .viewers => |v| if (self.workspaceIn(conn, v.id)) |w| {
             w.viewers = v.count;
         },
-        .destroyed => |id| self.workspaceGone(id),
-        .attach_failed => |id| if (self.workspaceEntry(id)) |w| {
+        .destroyed => |id| self.workspaceGone(conn, id),
+        .attach_failed => |id| if (self.workspaceIn(conn, id)) |w| {
             w.shown = false;
             self.rememberShown();
         },
@@ -898,13 +902,13 @@ fn workspacesChanged(self: *App, conn: *Daemon) void {
     self.markDirty();
 }
 
-/// Record what the daemon said of workspace `w`, adding it to the list
-/// if it's new. Whether it's shown here is `workspaceShown`'s to say:
-/// one attached at connect has a structure, which says so.
-fn workspaceInfo(self: *App, w: Daemon.WorkspaceInfo) void {
-    const entry = self.workspaceEntry(w.id) orelse entry: {
+/// Record what `conn`'s daemon said of its workspace `w`, adding it to
+/// the list if it's new. Whether it's shown here is `workspaceShown`'s
+/// to say: one attached at connect has a structure, which says so.
+fn workspaceInfo(self: *App, conn: *Daemon, w: Daemon.WorkspaceInfo) void {
+    const entry = self.workspaceIn(conn, w.id) orelse entry: {
         const name = self.alloc.dupe(u16, w.name) catch return;
-        self.workspaces.append(self.alloc, .{ .id = w.id, .name = name, .tabs = 0, .viewers = 0, .shown = false }) catch {
+        self.workspaces.append(self.alloc, .{ .key = self.nextWorkspaceKey(), .conn = conn, .id = w.id, .name = name, .tabs = 0, .viewers = 0, .shown = false }) catch {
             self.alloc.free(name);
             return;
         };
@@ -919,85 +923,134 @@ fn workspaceInfo(self: *App, w: Daemon.WorkspaceInfo) void {
     if (w.viewers) |n| entry.viewers = n;
 }
 
-/// A structure came for workspace `st`: it's shown here, named and
-/// sized as the structure says.
-fn workspaceShown(self: *App, st: *const Daemon.Structure) void {
-    self.workspaceInfo(.{ .id = st.id, .name = st.name, .tabs = st.tabs.len, .active_tab = st.active_tab, .viewers = null });
-    const entry = self.workspaceEntry(st.id) orelse return;
+/// A structure came from `conn` for workspace `st`: it's shown here,
+/// named and sized as the structure says.
+fn workspaceShown(self: *App, conn: *Daemon, st: *const Daemon.Structure) void {
+    self.workspaceInfo(conn, .{ .id = st.id, .name = st.name, .tabs = st.tabs.len, .active_tab = st.active_tab, .viewers = null });
+    const entry = self.workspaceIn(conn, st.id) orelse return;
     if (!entry.shown) {
         entry.shown = true;
         self.rememberShown();
     }
 }
 
-/// Workspace `id` is gone: so are its tabs here, and its row.
-fn workspaceGone(self: *App, id: u32) void {
-    self.cancelDrag();
-    var i: usize = 0;
-    while (i < self.tabs.items.len) {
-        const t = self.tabs.items[i];
-        if (t.conn == self.daemon and t.ws == id) self.dropTab(i) else i += 1;
-    }
-    switch (self.mode) {
-        .rename => |r| if (r.ws == id) self.cancelRename(),
-        .confirm => |c| if (c.ws == id) self.closeConfirm(),
-        .menu => |m| if (std.meta.eql(m.target, Id.Target{ .workspace = id })) self.closeMenu(),
-        .terminal, .connect => {},
-    }
-    for (self.workspaces.items, 0..) |w, k| {
-        if (w.id != id) continue;
-        self.alloc.free(w.name);
-        _ = self.workspaces.orderedRemove(k);
-        break;
-    }
-    self.rememberShown();
-    self.closeIfNothingLeft();
-}
-
-fn workspaceEntry(self: *App, id: u32) ?*Workspace {
-    for (self.workspaces.items) |*w| {
-        if (w.id == id) return w;
-    }
-    return null;
-}
-
-/// Remember which workspaces are shown, for the next window.
-fn rememberShown(self: *App) void {
-    const conn = self.daemon orelse return;
-    var ids: [64]u32 = undefined;
-    var n: usize = 0;
-    for (self.workspaces.items) |w| {
-        if (!w.shown or n == ids.len) continue;
-        ids[n] = w.id;
-        n += 1;
-    }
-    self.shown.set(conn.pid, ids[0..n]);
-}
-
-/// Show workspace `id`: attach it, so its tabs come (`daemon_posted`).
-fn showWorkspace(self: *App, id: u32) void {
-    const conn = self.daemon orelse return;
-    const entry = self.workspaceEntry(id) orelse return;
-    if (entry.shown or conn.isLost()) return;
-    conn.attach(id, self.daemonArea()) catch |err| return log.err("showing workspace {d} failed: {}", .{ id, err });
-    entry.shown = true;
-    self.activate_ws = id;
-    self.rememberShown();
-    self.markDirty();
-}
-
-/// Hide workspace `id`: let go of its tabs, which slime keeps running.
-fn hideWorkspace(self: *App, id: u32) void {
-    const conn = self.daemon orelse return;
-    const entry = self.workspaceEntry(id) orelse return;
-    if (!entry.shown) return;
+/// `conn`'s workspace `id` is gone: so are its tabs here, and its row.
+fn workspaceGone(self: *App, conn: *Daemon, id: u32) void {
     self.cancelDrag();
     var i: usize = 0;
     while (i < self.tabs.items.len) {
         const t = self.tabs.items[i];
         if (t.conn == conn and t.ws == id) self.dropTab(i) else i += 1;
     }
-    conn.detach(id);
+    if (self.workspaceIn(conn, id)) |w| self.forgetWorkspace(w.key);
+    self.rememberShown();
+    self.closeIfNothingLeft();
+}
+
+/// Take workspace `key` out of the list, closing whatever was about it.
+fn forgetWorkspace(self: *App, key: u32) void {
+    switch (self.mode) {
+        .rename => |r| if (r.ws == key) self.cancelRename(),
+        .confirm => |c| if (c.ws == key) self.closeConfirm(),
+        .menu => |m| if (std.meta.eql(m.target, Id.Target{ .workspace = key })) self.closeMenu(),
+        .terminal, .connect => {},
+    }
+    if (self.activate_ws == key) self.activate_ws = null;
+    for (self.workspaces.items, 0..) |w, k| {
+        if (w.key != key) continue;
+        self.alloc.free(w.name);
+        _ = self.workspaces.orderedRemove(k);
+        break;
+    }
+    _ = self.ui.setHover(.none);
+    self.markDirty();
+}
+
+/// Connection `conn` is lost: its workspaces can't be shown or hidden
+/// any more, so their rows go. Its tabs stay, saying so (a host's until
+/// a new connection there replaces them), and what was shown stays
+/// remembered for the next connection to the same daemon.
+fn dropWorkspacesOf(self: *App, conn: *const Daemon) void {
+    var i: usize = 0;
+    while (i < self.workspaces.items.len) {
+        const w = self.workspaces.items[i];
+        if (w.conn == conn) self.forgetWorkspace(w.key) else i += 1;
+    }
+    if (self.activate_new == conn) self.activate_new = null;
+}
+
+/// The listed workspace `key` names.
+fn workspaceEntry(self: *const App, key: u32) ?*Workspace {
+    for (self.workspaces.items) |*w| {
+        if (w.key == key) return w;
+    }
+    return null;
+}
+
+/// `conn`'s workspace `id`, if it's listed.
+fn workspaceIn(self: *const App, conn: *const Daemon, id: u32) ?*Workspace {
+    for (self.workspaces.items) |*w| {
+        if (w.conn == conn and w.id == id) return w;
+    }
+    return null;
+}
+
+fn nextWorkspaceKey(self: *App) u32 {
+    if (self.next_workspace_key == 0) self.next_workspace_key = 1;
+    const key = self.next_workspace_key;
+    self.next_workspace_key +%= 1;
+    return key;
+}
+
+/// Remember which workspaces are shown on each daemon, for the next
+/// window. A lost connection's set stays as it was, for the next
+/// connection to that daemon.
+fn rememberShown(self: *App) void {
+    if (self.daemon) |conn| if (!conn.isLost()) self.rememberShownOn(conn, null);
+    for (self.remotes.items) |r| {
+        if (r.conn.attachState() != .attached or r.conn.isLost()) continue;
+        self.rememberShownOn(r.conn, r.conn.hostDest().?);
+    }
+}
+
+/// Remember the workspaces shown on `conn`, the daemon on host `dest` or
+/// the local one for null.
+fn rememberShownOn(self: *App, conn: *const Daemon, dest: ?[]const u16) void {
+    var ids: [64]u32 = undefined;
+    var n: usize = 0;
+    for (self.workspaces.items) |w| {
+        if (w.conn != conn or !w.shown or n == ids.len) continue;
+        ids[n] = w.id;
+        n += 1;
+    }
+    self.shown.set(dest, conn.pid, ids[0..n]);
+}
+
+/// Show workspace `key`: attach it, so its tabs come (`daemon_posted`).
+fn showWorkspace(self: *App, key: u32) void {
+    const entry = self.workspaceEntry(key) orelse return;
+    const conn = entry.conn;
+    if (entry.shown or conn.isLost()) return;
+    conn.attach(entry.id, self.daemonArea()) catch |err| return log.err("showing workspace {d} failed: {}", .{ entry.id, err });
+    entry.shown = true;
+    self.activate_ws = key;
+    self.rememberShown();
+    self.markDirty();
+}
+
+/// Hide workspace `key`: let go of its tabs, which its slime keeps
+/// running.
+fn hideWorkspace(self: *App, key: u32) void {
+    const entry = self.workspaceEntry(key) orelse return;
+    const conn = entry.conn;
+    if (!entry.shown) return;
+    self.cancelDrag();
+    var i: usize = 0;
+    while (i < self.tabs.items.len) {
+        const t = self.tabs.items[i];
+        if (t.conn == conn and t.ws == entry.id) self.dropTab(i) else i += 1;
+    }
+    conn.detach(entry.id);
     entry.shown = false;
     // Shown again, its structure says.
     entry.active_tab = .none;
@@ -1007,21 +1060,19 @@ fn hideWorkspace(self: *App, id: u32) void {
     self.markDirty();
 }
 
-/// Make a workspace with a tab running the local command, shown here.
-fn newWorkspace(self: *App) void {
-    const conn = self.localDaemon() orelse return;
-    conn.newWorkspace(&.{}, self.local_command) catch |err| return log.err("new workspace failed: {}", .{err});
-    self.activate_new = true;
+/// Make a workspace on `conn` with a tab running its shell, shown here.
+fn newWorkspace(self: *App, conn: *Daemon) void {
+    conn.newWorkspace(&.{}, self.daemonCommand(conn)) catch |err| return log.err("new workspace failed: {}", .{err});
+    self.activate_new = conn;
 }
 
-/// Ask before killing workspace `id`, unless it has nothing running.
-fn askKillWorkspace(self: *App, id: u32) void {
-    const conn = self.daemon orelse return;
-    const entry = self.workspaceEntry(id) orelse return;
-    if (entry.tabs == 0) return conn.killWorkspace(id);
+/// Ask before killing workspace `key`, unless it has nothing running.
+fn askKillWorkspace(self: *App, key: u32) void {
+    const entry = self.workspaceEntry(key) orelse return;
+    if (entry.tabs == 0) return entry.conn.killWorkspace(entry.id);
     self.cancelConnect();
     self.cancelRename();
-    self.mode = .{ .confirm = .{ .ws = id, .dialog = undefined } };
+    self.mode = .{ .confirm = .{ .ws = key, .dialog = undefined } };
     const c = &self.mode.confirm;
     const prefix = std.unicode.utf8ToUtf16LeStringLiteral("Kill workspace \u{201c}");
     const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\u{201d}?");
@@ -1052,7 +1103,7 @@ fn confirmAction(self: *App, action: Dialog.Action) void {
         .confirm => |c| c.ws,
         else => return,
     };
-    if (action == .accept) if (self.daemon) |conn| conn.killWorkspace(ws);
+    if (action == .accept) if (self.workspaceEntry(ws)) |w| w.conn.killWorkspace(w.id);
     self.closeConfirm();
 }
 
@@ -1063,12 +1114,12 @@ fn closeConfirm(self: *App) void {
     self.markDirty();
 }
 
-/// Edit workspace `id`'s name in its header.
-fn startRename(self: *App, id: u32) void {
-    const entry = self.workspaceEntry(id) orelse return;
+/// Edit workspace `key`'s name in its row.
+fn startRename(self: *App, key: u32) void {
+    const entry = self.workspaceEntry(key) orelse return;
     self.cancelConnect();
     self.closeConfirm();
-    self.mode = .{ .rename = .{ .ws = id, .field = .{} } };
+    self.mode = .{ .rename = .{ .ws = key, .field = .{} } };
     const field = &self.mode.rename.field;
     field.insert(entry.name);
     field.press(.select_all, false, false);
@@ -1091,8 +1142,8 @@ fn submitRename(self: *App) void {
         else => return,
     };
     const name = std.mem.trim(u16, r.field.text(), &.{ ' ', '\t' });
-    if (name.len > 0) if (self.daemon) |conn| {
-        conn.renameWorkspace(r.ws, name) catch |err| log.err("renaming workspace {d} failed: {}", .{ r.ws, err });
+    if (name.len > 0) if (self.workspaceEntry(r.ws)) |w| {
+        w.conn.renameWorkspace(w.id, name) catch |err| log.err("renaming workspace {d} failed: {}", .{ w.id, err });
     };
     self.cancelRename();
 }
@@ -1130,12 +1181,12 @@ fn openMenu(self: *App, target: Id.Target, anchor: Menu.Anchor) void {
     switch (target) {
         // Local's header makes a workspace, or a tab with no daemon to
         // list workspaces, as its button does.
-        .local => if (self.workspaces.items.len == 0)
+        .local => if (self.sectionCount(0) == 0)
             m.add(.{ .label = L("New tab"), .icon = .plus, .action = .{ .part = .new_tab } })
         else
             m.add(.{ .label = L("New workspace"), .icon = .plus, .action = .{ .part = .new_tab } }),
-        .workspace => |id| {
-            const w = self.workspaceEntry(id) orelse return;
+        .workspace => |key| {
+            const w = self.workspaceEntry(key) orelse return;
             m.add(.{ .label = L("New tab"), .icon = .plus, .action = .{ .part = .new_tab } });
             m.separator();
             if (w.shown)
@@ -1146,12 +1197,15 @@ fn openMenu(self: *App, target: Id.Target, anchor: Menu.Anchor) void {
             m.separator();
             m.add(.{ .label = L("Kill"), .icon = .trash, .action = .{ .part = .kill }, .danger = true });
         },
+        // A host's header makes a workspace there, as its button does,
+        // once the host is connected.
         .host => |h| {
             if (h >= self.hosts.items.items.len) return;
             const live = self.hostLive(h);
-            m.add(.{ .label = if (live) L("New tab") else L("Connect"), .icon = if (live) .plus else .plug, .action = .{ .part = .new_tab } });
+            m.add(.{ .label = if (live) L("New workspace") else L("Connect"), .icon = if (live) .plus else .plug, .action = .{ .part = .new_tab } });
             m.separator();
-            m.add(.{ .label = L("Forget host"), .icon = .x, .action = .{ .part = .forget }, .disabled = self.hostHasTabs(h) });
+            if (live) m.add(.{ .label = L("Disconnect"), .icon = .unplug, .action = .{ .part = .disconnect } });
+            m.add(.{ .label = L("Forget host"), .icon = .x, .action = .{ .part = .forget }, .disabled = self.hostInUse(h) });
         },
         .tab => {
             if (self.tabIndexOf(target) == null) return;
@@ -1206,7 +1260,7 @@ fn menuTargetExists(self: *App) bool {
     return switch (target) {
         .local => true,
         .host => |h| h < self.hosts.items.items.len,
-        .workspace => |id| self.workspaceEntry(id) != null,
+        .workspace => |key| self.workspaceEntry(key) != null,
         .tab => self.tabIndexOf(target) != null,
         .pane => self.sessionOf(target) != null,
         else => false,
@@ -1270,18 +1324,55 @@ fn menuKey(self: *App, m: *Menu, vk: u32) bool {
     return true;
 }
 
-/// The sidebar group of local workspace `id`, if it's listed.
-pub fn workspaceGroup(self: *const App, id: u32) ?usize {
-    for (self.workspaces.items, 0..) |w, i| {
-        if (w.id == id) return i;
-    }
-    return null;
+/// The sidebar's sections, each a header with its workspaces' rows and
+/// then its tabs in no workspace: Local is 0, and remembered host `h` is
+/// 1 + h. The section `conn`'s workspaces are listed in, if their host
+/// is remembered (one isn't forgotten while a connection to it lives).
+pub fn sectionOf(self: *const App, conn: *const Daemon) ?usize {
+    const dest = conn.hostDest() orelse return 0;
+    return 1 + (self.hosts.indexOf(dest) orelse return null);
 }
 
-/// How many places in the sidebar's order come before the hosts': one
-/// per workspace, and one for local tabs in none.
-pub fn localGroups(self: *const App) usize {
-    return self.workspaces.items.len + 1;
+/// The section tab `t` is listed in, by where its focused pane runs.
+fn sectionOfTab(self: *const App, t: *const Tab) usize {
+    const dest = t.focus.hostDest() orelse return 0;
+    return 1 + (self.hosts.indexOf(dest) orelse return 0);
+}
+
+/// How many workspaces section `s` lists.
+pub fn sectionCount(self: *const App, s: usize) usize {
+    var n: usize = 0;
+    for (self.workspaces.items) |w| {
+        if (self.sectionOf(w.conn) == s) n += 1;
+    }
+    return n;
+}
+
+/// The sidebar's groups, which order the tabs: each section's
+/// workspaces in the list's order, then its tabs in no workspace. The
+/// first group of section `s`.
+fn sectionBase(self: *const App, s: usize) usize {
+    var g: usize = 0;
+    for (0..s) |k| g += self.sectionCount(k) + 1;
+    return g;
+}
+
+/// The group of section `s`'s tabs in no workspace: after its
+/// workspaces'.
+pub fn noneGroup(self: *const App, s: usize) usize {
+    return self.sectionBase(s) + self.sectionCount(s);
+}
+
+/// The sidebar group of workspace `key`, if it's listed.
+pub fn workspaceGroup(self: *const App, key: u32) ?usize {
+    const target = self.workspaceEntry(key) orelse return null;
+    const s = self.sectionOf(target.conn) orelse return null;
+    var i: usize = 0;
+    for (self.workspaces.items) |w| {
+        if (w.key == key) return self.sectionBase(s) + i;
+        if (self.sectionOf(w.conn) == s) i += 1;
+    }
+    return null;
 }
 
 /// Lay out `conn`'s tabs of workspace `st.id` as `st` has them, in its
@@ -1532,18 +1623,12 @@ fn nextSessionId(self: *App) u32 {
 }
 
 /// Where `t` is listed, as the sidebar orders tabs: its workspace's
-/// place, for a local tab in one; after every workspace for a local tab
-/// in none (there while slime couldn't be reached, or no longer lists
-/// it); then each host's. Tabs are kept in this order.
+/// place, or its section's tabs in no workspace (there while slime
+/// couldn't be reached or no longer lists it, or standing in for a
+/// host's panes). Tabs are kept in this order.
 pub fn groupOf(self: *const App, t: *const Tab) usize {
-    const dest = t.focus.hostDest() orelse return self.workspaceGroup(t.ws) orelse self.workspaces.items.len;
-    // A host isn't forgotten while sessions use it.
-    return self.localGroups() + (self.hosts.indexOf(dest) orelse return self.workspaces.items.len);
-}
-
-/// The place of host `h`'s tabs in the sidebar's order (`groupOf`).
-fn hostGroup(self: *const App, h: usize) usize {
-    return self.localGroups() + h;
+    if (t.conn) |conn| if (self.workspaceIn(conn, t.ws)) |w| if (self.workspaceGroup(w.key)) |g| return g;
+    return self.noneGroup(self.sectionOfTab(t));
 }
 
 /// Where a tab in group `g` goes: after the group's last.
@@ -1588,22 +1673,21 @@ fn standIn(self: *const App, dest: []const u16) ?Found {
     return null;
 }
 
-/// A tab where the active tab is: its workspace, or its host. With
-/// nothing shown, or an active tab in neither, the first shown
-/// workspace's, else a new workspace.
+/// A tab where the active tab is: its workspace, or the host its
+/// stand-in waits on. With nothing shown, or an active tab in neither,
+/// the first shown workspace's, else a new local workspace.
 fn newSession(self: *App) void {
     if (self.hasTabs()) {
         const t = self.activeTab();
-        if (t.focus.hostDest()) |dest| {
-            if (self.hosts.indexOf(dest)) |h| return self.openOnHost(h) catch |err| log.err("new session failed: {}", .{err});
-        } else if (self.workspaceGroup(t.ws)) |w| {
-            return self.newTabInWorkspace(w);
-        }
+        if (t.conn) |conn| if (self.workspaceIn(conn, t.ws)) |w| return self.newTabInWorkspace(w.key);
+        if (t.focus.hostDest()) |dest| if (self.hosts.indexOf(dest)) |h| {
+            return self.openOnHost(h) catch |err| log.err("new session failed: {}", .{err});
+        };
     }
-    for (self.workspaces.items, 0..) |w, i| {
-        if (w.shown) return self.newTabInWorkspace(i);
+    for (self.workspaces.items) |w| {
+        if (w.shown) return self.newTabInWorkspace(w.key);
     }
-    self.newWorkspace();
+    if (self.localDaemon()) |conn| self.newWorkspace(conn);
 }
 
 /// The local daemon, for a new tab or workspace: a tab says why not if
@@ -1621,29 +1705,28 @@ fn localDaemon(self: *App) ?*Daemon {
     return conn;
 }
 
-/// A tab in workspace `w`, shown first if it's hidden. The tab comes
-/// when its pane does (`daemon_posted`).
-fn newTabInWorkspace(self: *App, w: usize) void {
-    const conn = self.localDaemon() orelse return;
-    if (w >= self.workspaces.items.len) return;
-    const ws = self.workspaces.items[w].id;
-    if (!self.workspaces.items[w].shown) self.showWorkspace(ws);
-    conn.tabNew(ws, self.local_command, self.daemonSize()) catch |err| log.err("new tab in slime failed: {}", .{err});
+/// A tab in workspace `key` running its daemon's shell, shown first if
+/// it's hidden. The tab comes when its pane does (`daemon_posted`).
+fn newTabInWorkspace(self: *App, key: u32) void {
+    const w = self.workspaceEntry(key) orelse return;
+    const conn = w.conn;
+    if (conn.isLost()) return;
+    if (!w.shown) self.showWorkspace(key);
+    conn.tabNew(w.id, self.daemonCommand(conn), self.daemonSize()) catch |err| log.err("new tab in slime failed: {}", .{err});
 }
 
-/// A session on remembered host `h`: a tab of the workspace the host's
-/// slime holds for us, through the daemon we're attached to there, or
-/// else one we bridge to, once the daemon has the host connected. Until
-/// then a session stands in, where logging in asks what it needs; the
-/// panes replace it once they come (`remoteChanged`). A host the daemon
-/// can't connect, or slime can't run on, gets the reason there; ssh.exe
-/// in a local tab still reaches it.
+/// Open remembered host `h`: a workspace on its slime, through the
+/// connection that lists them, once the daemon has the host connected
+/// and the connection has attached. While either is under way, show the
+/// session standing in, where logging in asks what it needs; the host's
+/// panes replace it once they come (`remoteChanged`). Otherwise ask the
+/// daemon to connect the host, with a stand-in for the login. A host the
+/// daemon can't connect, or slime can't run on, gets the reason there;
+/// ssh.exe in a local tab still reaches it.
 fn openOnHost(self: *App, h: usize) !void {
     const dest = self.hosts.items.items[h];
     if (self.remoteOn(dest)) |r| switch (r.conn.attachState()) {
-        // The tab comes when its pane does (`daemon_posted`), in
-        // whichever of the host's workspaces is attached.
-        .attached => return r.conn.tabNew(r.conn.anyAttached() orelse return, &.{}, self.daemonSize()),
+        .attached => return self.newWorkspace(r.conn),
         // Still attaching: show where.
         .connecting => {
             if (self.standIn(dest)) |found| self.activate(found.tab);
@@ -1662,7 +1745,7 @@ fn openOnHost(self: *App, h: usize) !void {
         return;
     }
     if (self.hostEntry(dest)) |e| switch (e.state) {
-        .connected => return self.bridgeHost(e),
+        .connected => return self.bridgeHost(e, true),
         .connecting => {
             // Another window is logging in; wait for it.
             try self.spawnSession(.{ .waiting = dest });
@@ -1694,40 +1777,49 @@ fn remoteOn(self: *App, dest: []const u16) ?*Remote {
     return null;
 }
 
-/// Bridge to the slime on host `e`, which the daemon has connected. A
-/// session stands in for its panes (one already, if logging in made it)
-/// until they come.
-fn bridgeHost(self: *App, e: *HostEntry) !void {
+/// Bridge to the slime on host `e`, which the daemon has connected, to
+/// list its workspaces and show the ones the last window did there. With
+/// `make`, a user is waiting for a pane there: a session stands in for
+/// the host's panes (one already, if logging in made it) until they come,
+/// and its slime makes a workspace if it has none to show.
+fn bridgeHost(self: *App, e: *HostEntry, make: bool) !void {
     try self.remotes.ensureUnusedCapacity(self.alloc, 1);
-    const found = self.standIn(e.dest) orelse found: {
-        try self.spawnSession(.{ .waiting = e.dest });
-        break :found self.standIn(e.dest).?;
-    };
-    const s = found.s;
-    if (s.login != null) self.closeLogin(s);
-    const remote = Daemon.connectRemote(self.alloc, self.notify, self.shell.frameInterval(), e.id, e.dest, Session.sshTerm(self.config), self.daemonArea(), self.daemonSize()) catch |err| {
+    if (make and self.standIn(e.dest) == null) try self.spawnSession(.{ .waiting = e.dest });
+    const stand_in: ?*Session = if (self.standIn(e.dest)) |found| found.s else null;
+    if (stand_in) |s| if (s.login != null) self.closeLogin(s);
+    var want = self.shown.wanted(e.dest);
+    want.make = make;
+    const remote = Daemon.connectRemote(self.alloc, self.notify, self.shell.frameInterval(), e.id, e.dest, Session.sshTerm(self.config), self.daemonArea(), self.daemonSize(), want) catch |err| {
         log.err("bridging to slime on {f} failed: {}", .{ std.unicode.fmtUtf16Le(e.dest), err });
-        s.showEnded(@errorName(err));
+        if (stand_in) |s| s.showEnded(@errorName(err));
         return;
     };
     self.remotes.appendAssumeCapacity(.{ .conn = remote, .host = e.id });
 }
 
-/// Take up what slime connections posted: panes that arrived, what the
-/// daemon said about workspaces and hosts, workspaces to show here, and
-/// how attaching to hosts' went.
+/// Take up what slime connections posted: panes that arrived, what each
+/// daemon said about its workspaces (and the local one about hosts),
+/// workspaces to show here, how attaching to hosts' went, and
+/// connections lost.
 fn daemonPosted(self: *App) void {
     if (self.daemon) |conn| {
         self.workspacesChanged(conn);
         self.daemonChanged(conn);
         self.hostsChanged(conn);
         self.openWorkspaces(conn);
+        if (conn.isLost()) self.dropWorkspacesOf(conn);
     }
     var i: usize = 0;
     while (i < self.remotes.items.len) {
-        switch (self.remotes.items[i].conn.attachState()) {
+        const conn = self.remotes.items[i].conn;
+        switch (conn.attachState()) {
             .connecting => {},
-            .attached => self.remoteChanged(&self.remotes.items[i]),
+            .attached => {
+                self.workspacesChanged(conn);
+                self.remoteChanged(&self.remotes.items[i]);
+                self.openWorkspaces(conn);
+                if (conn.isLost()) self.dropWorkspacesOf(conn);
+            },
             .failed => {
                 self.remoteFailed(i);
                 continue;
@@ -1743,7 +1835,7 @@ fn daemonPosted(self: *App) void {
 fn openWorkspaces(self: *App, conn: *Daemon) void {
     const ids = conn.takeOpens();
     defer self.alloc.free(ids);
-    for (ids) |id| self.showWorkspace(id);
+    for (ids) |id| if (self.workspaceIn(conn, id)) |w| self.showWorkspace(w.key);
 }
 
 /// Take up what host's slime `r` sent. Once its panes have come, they
@@ -1751,6 +1843,9 @@ fn openWorkspaces(self: *App, conn: *Daemon) void {
 /// we lost on the host, which showed the same panes as they were.
 fn remoteChanged(self: *App, r: *Remote) void {
     self.daemonChanged(r.conn);
+    // A lost connection's tabs are what a new one replaces, not what
+    // replaces a stand-in.
+    if (r.conn.isLost()) return;
     const dest = r.conn.hostDest().?;
     const found = self.standIn(dest) orelse return;
     // In tabs of their own by now.
@@ -1775,18 +1870,20 @@ fn remoteChanged(self: *App, r: *Remote) void {
 }
 
 /// Host's slime `remotes[i]` couldn't attach: let it go. Its stand-in
-/// says why.
+/// says why, if a user was waiting; else only the log does, and the next
+/// try from the host's header gets a stand-in.
 fn remoteFailed(self: *App, i: usize) void {
-    var r = self.remotes.orderedRemove(i);
+    const r = self.remotes.orderedRemove(i);
     // After the stand-in is done with the failure's text.
-    defer self.freeRemote(&r);
+    defer r.conn.deinit();
     const found = self.standIn(r.conn.hostDest().?) orelse return;
     self.markDirty();
     found.s.showEnded(r.conn.failure.text());
 }
 
-/// Let go of hosts' daemons nothing shows any more: one whose stand-in
-/// was closed before its panes came, or whose tabs have all gone.
+/// Let go of hosts' connections that are lost and show nothing any
+/// more: no tab of theirs is left, and no stand-in waits on the host. A
+/// live one stays to list the host's workspaces.
 fn pruneRemotes(self: *App) void {
     var i: usize = 0;
     while (i < self.remotes.items.len) {
@@ -1794,54 +1891,24 @@ fn pruneRemotes(self: *App) void {
         const shown = self.standIn(r.conn.hostDest().?) != null or for (self.tabs.items) |t| {
             if (t.conn == r.conn) break true;
         } else false;
-        if (shown or r.conn.attachState() == .failed) {
+        if (shown or !r.conn.isLost()) {
             i += 1;
             continue;
         }
-        var gone = self.remotes.orderedRemove(i);
-        self.freeRemote(&gone);
+        const gone = self.remotes.orderedRemove(i);
+        gone.conn.deinit();
     }
-}
-
-/// Hang up on a host's slime and forget what it showed.
-fn freeRemote(self: *App, r: *Remote) void {
-    r.conn.deinit();
-    r.workspaces.deinit(self.alloc);
-}
-
-/// The remote on connection `conn`, if it's one of ours.
-fn remoteOf(self: *App, conn: *const Daemon) ?*Remote {
-    for (self.remotes.items) |*r| {
-        if (r.conn == conn) return r;
-    }
-    return null;
 }
 
 /// The tab the daemon shows as active in workspace `ws` of `conn`, as
 /// its structure last said or we last told it. None if nothing has said.
 fn activeTabIn(self: *App, conn: *const Daemon, ws: u32) Daemon.TabRef {
-    if (conn == self.daemon) return if (self.workspaceEntry(ws)) |w| w.active_tab else .none;
-    const r = self.remoteOf(conn) orelse return .none;
-    for (r.workspaces.items) |w| {
-        if (w.id == ws) return w.active_tab;
-    }
-    return .none;
+    return if (self.workspaceIn(conn, ws)) |w| w.active_tab else .none;
 }
 
-/// Note the tab shown as active in workspace `ws` of `conn`. A host's
-/// workspace is first heard of this way.
+/// Note the tab shown as active in workspace `ws` of `conn`.
 fn setActiveTabIn(self: *App, conn: *const Daemon, ws: u32, tab: Daemon.TabRef) void {
-    if (conn == self.daemon) {
-        if (self.workspaceEntry(ws)) |w| w.active_tab = tab;
-        return;
-    }
-    const r = self.remoteOf(conn) orelse return;
-    for (r.workspaces.items) |*w| {
-        if (w.id != ws) continue;
-        w.active_tab = tab;
-        return;
-    }
-    r.workspaces.append(self.alloc, .{ .id = ws, .active_tab = tab }) catch {};
+    if (self.workspaceIn(conn, ws)) |w| w.active_tab = tab;
 }
 
 /// Take up what the daemon said about hosts: keep each host's state,
@@ -1899,23 +1966,26 @@ fn hostState(self: *App, h: Daemon.HostInfo) void {
     defer if (!connecting and h.state != .connected) {
         e.ours = false;
     };
-    const found = self.standIn(e.dest) orelse return;
-    const s = found.s;
+    // A stand-in is a user waiting for a pane on the host.
+    const stand_in: ?*Session = if (self.standIn(e.dest)) |found| found.s else null;
     switch (h.state) {
         .connecting => {
             // The stand-in that asked gets the prompts; any other just
             // follows along.
-            const login = self.loginFor(s, e) orelse return;
+            const login = self.loginFor(stand_in orelse return, e) orelse return;
             if (e.text.len > 0) login.info(e.text);
         },
+        // Every window lists a connected host's workspaces; one with a
+        // user waiting shows a pane there too.
         .connected => {
             if (self.remoteOn(e.dest) != null) return;
-            self.bridgeHost(e) catch |err| {
+            self.bridgeHost(e, stand_in != null) catch |err| {
                 log.err("bridging to {f} failed: {}", .{ std.unicode.fmtUtf16Le(e.dest), err });
-                s.showEnded(@errorName(err));
+                if (stand_in) |s| s.showEnded(@errorName(err));
             };
         },
         .failed, .lost, .gone, _ => {
+            const s = stand_in orelse return;
             var buf: [512]u8 = undefined;
             const why = std.unicode.utf16LeToUtf8(&buf, e.text) catch 0;
             if (s.login) |login| login.fail(buf[0..why]);
@@ -2238,20 +2308,34 @@ fn focusPane(self: *App, s: *Session) void {
     self.activated();
 }
 
-/// Whether a tab is on remembered host `h`.
-fn hostHasTabs(self: *const App, h: usize) bool {
-    for (self.tabs.items) |t| {
-        if (self.groupOf(t) == self.hostGroup(h)) return true;
+/// Whether remembered host `h` is in use: a tab is on it, or a
+/// connection to its slime lists its workspaces.
+pub fn hostInUse(self: *const App, h: usize) bool {
+    const dest = self.hosts.items.items[h];
+    for (self.tabs.items) |t| if (t.focus.hostDest()) |d| {
+        if (std.mem.eql(u16, d, dest)) return true;
+    };
+    for (self.remotes.items) |r| {
+        if (std.mem.eql(u16, r.conn.hostDest().?, dest)) return true;
     }
     return false;
 }
 
-/// Drop remembered host `h` from the sidebar, if no tab uses it.
+/// Drop remembered host `h` from the sidebar, if nothing uses it.
 fn forgetHost(self: *App, h: usize) void {
-    if (h >= self.hosts.items.items.len or self.hostHasTabs(h)) return;
+    if (h >= self.hosts.items.items.len or self.hostInUse(h)) return;
     self.hosts.remove(h);
     _ = self.ui.setHover(.none);
     self.markDirty();
+}
+
+/// Hang up on remembered host `h`: the daemon ends its connection, and
+/// with it every window's bridge there, whose tabs stay saying so.
+fn disconnectHost(self: *App, h: usize) void {
+    if (h >= self.hosts.items.items.len) return;
+    const daemon = self.daemon orelse return;
+    const e = self.hostEntry(self.hosts.items.items[h]) orelse return;
+    daemon.hostDisconnect(e.id);
 }
 
 /// Close pane `s` of tab `ti`, killing what runs in it. Closing a tab's
@@ -2926,29 +3010,33 @@ fn widgetClick(self: *App, hit: Id) void {
             self.ui.toggleSidebar();
             self.shell.relayout();
         },
-        // Local's header makes a workspace; a host's, a tab there; a
-        // workspace's row, a tab in it. With no daemon to list
-        // workspaces, Local's makes a tab.
+        // A section's header makes a workspace on its daemon (connecting
+        // a host first); a workspace's row, a tab in it. With no daemon
+        // listing workspaces, Local's connects to one, which shows some.
         .new_tab => switch (hit.target) {
-            .local => if (self.workspaces.items.len == 0) self.newSession() else self.newWorkspace(),
+            .local => if (self.localDaemon()) |conn| self.newWorkspace(conn),
             .host => |h| self.openOnHost(h) catch |err| log.err("new session failed: {}", .{err}),
-            .workspace => |id| if (self.workspaceGroup(id)) |w| self.newTabInWorkspace(w),
+            .workspace => |key| self.newTabInWorkspace(key),
             else => {},
         },
         .forget => switch (hit.target) {
             .host => |h| self.forgetHost(h),
             else => {},
         },
+        .disconnect => switch (hit.target) {
+            .host => |h| self.disconnectHost(h),
+            else => {},
+        },
         .body => switch (hit.target) {
             .menu => |i| self.chooseItem(i),
             else => if (self.workspaceOf(hit.target)) |ws| {
-                if (ws.shown) self.hideWorkspace(ws.id) else self.showWorkspace(ws.id);
+                if (ws.shown) self.hideWorkspace(ws.key) else self.showWorkspace(ws.key);
             },
         },
-        .show => if (self.workspaceOf(hit.target)) |ws| self.showWorkspace(ws.id),
-        .hide => if (self.workspaceOf(hit.target)) |ws| self.hideWorkspace(ws.id),
-        .kill => if (self.workspaceOf(hit.target)) |ws| self.askKillWorkspace(ws.id),
-        .rename => if (self.workspaceOf(hit.target)) |ws| self.startRename(ws.id),
+        .show => if (self.workspaceOf(hit.target)) |ws| self.showWorkspace(ws.key),
+        .hide => if (self.workspaceOf(hit.target)) |ws| self.hideWorkspace(ws.key),
+        .kill => if (self.workspaceOf(hit.target)) |ws| self.askKillWorkspace(ws.key),
+        .rename => if (self.workspaceOf(hit.target)) |ws| self.startRename(ws.key),
         .connect => self.startConnect(),
         .button => if (hit.target == .dialog) {
             const i = hit.target.dialog;
@@ -3251,12 +3339,16 @@ pub const TestApp = struct {
     shown: Shown,
     ui: Ui,
     frame: Ui.Frame,
+    /// Stands in for the local daemon as the connection the tests'
+    /// workspaces are listed on (`workspace`); its calls fail quietly.
+    daemon: Daemon = undefined,
     app: App = undefined,
 
     pub fn init(self: *TestApp, shell: *TestShell) !void {
         const alloc = std.testing.allocator;
         self.hosts = try Hosts.load(alloc, undefined, null);
         self.shown = try Shown.load(alloc, undefined, null);
+        self.daemon = Daemon.unconnected(alloc);
         self.ui = .{ .scale = 1, .fonts = .none, .theme = .init(self.config.background, self.config.foreground) };
         self.frame = self.ui.frame(1000, 600);
         self.app = try App.init(.{
@@ -3279,6 +3371,17 @@ pub const TestApp = struct {
         self.shown.deinit();
         self.hosts.deinit();
         self.config.deinit();
+    }
+
+    /// List workspace `id` of the test daemon's, as it would describe it.
+    /// Returns its key.
+    pub fn workspace(self: *TestApp, id: u32, name: []const u16, tabs: usize, viewers: usize, shown: bool) !u32 {
+        const alloc = std.testing.allocator;
+        const owned = try alloc.dupe(u16, name);
+        errdefer alloc.free(owned);
+        const key = self.app.nextWorkspaceKey();
+        try self.app.workspaces.append(alloc, .{ .key = key, .conn = &self.daemon, .id = id, .name = owned, .tabs = tabs, .viewers = viewers, .shown = shown });
+        return key;
     }
 };
 
@@ -3350,16 +3453,15 @@ test "a right click opens a workspace's menu, which the keyboard works and a cli
     try t.init(&shell);
     defer t.deinit();
     const app = &t.app;
-    const alloc = std.testing.allocator;
-    try app.workspaces.append(alloc, .{ .id = 7, .name = try alloc.dupe(u16, L("alpha")), .tabs = 2, .viewers = 1, .shown = false });
+    const key = try t.workspace(7, L("alpha"), 2, 1, false);
 
-    const row = Ui.find(app.view(), .{ .target = .{ .workspace = 7 } }).?.rect;
+    const row = Ui.find(app.view(), .{ .target = .{ .workspace = key } }).?.rect;
     const at: win32.POINT = .{ .x = @intFromFloat(row.x + 30), .y = @intFromFloat(row.y + 5) };
     _ = app.update(.{ .context_menu = at });
     try std.testing.expect(app.mode == .menu);
     try std.testing.expect(app.keyboard() == .menu);
     const m = &app.mode.menu;
-    try std.testing.expectEqual(Id.Target{ .workspace = 7 }, m.target);
+    try std.testing.expectEqual(Id.Target{ .workspace = key }, m.target);
     // New tab, Show (it's hidden), Rename, and Kill, in groups.
     try std.testing.expectEqual(@as(usize, 6), m.count);
     try std.testing.expectEqualSlices(u16, L("Show"), m.entry(2).?.label);
@@ -3395,8 +3497,9 @@ test "a right click opens a workspace's menu, which the keyboard works and a cli
     _ = app.update(.{ .focus = false });
     try std.testing.expect(app.mode == .terminal);
     _ = app.update(.{ .context_menu = at });
-    app.workspaceGone(7);
+    app.workspaceGone(&t.daemon, 7);
     try std.testing.expect(app.mode == .terminal);
+    try std.testing.expectEqual(@as(usize, 0), app.workspaces.items.len);
     // Nothing there: no menu.
     _ = app.update(.{ .context_menu = .{ .x = 500, .y = 300 } });
     try std.testing.expect(app.mode == .terminal);
@@ -3408,27 +3511,30 @@ test "choosing a menu entry clicks the control, after the menu has closed" {
     try t.init(&shell);
     defer t.deinit();
     const app = &t.app;
-    const alloc = std.testing.allocator;
-    try app.workspaces.append(alloc, .{ .id = 7, .name = try alloc.dupe(u16, L("alpha")), .tabs = 0, .viewers = 1, .shown = true });
+    const key = try t.workspace(7, L("alpha"), 0, 1, true);
 
-    app.openMenu(.{ .workspace = 7 }, .{ .point = .{ .x = 100, .y = 100 } });
+    app.openMenu(.{ .workspace = key }, .{ .point = .{ .x = 100, .y = 100 } });
     // Rename is the fourth item: Enter on it edits the name in the row.
     app.mode.menu.focus = 3;
     try std.testing.expectEqualSlices(u16, L("Rename"), app.mode.menu.entry(3).?.label);
     _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_RETURN, .lparam = 0 } });
     try std.testing.expect(app.mode == .rename);
-    try std.testing.expectEqual(@as(u32, 7), app.mode.rename.ws);
+    try std.testing.expectEqual(key, app.mode.rename.ws);
     try std.testing.expectEqualSlices(u16, L("alpha"), app.mode.rename.field.text());
     // Opening a menu ends the rename.
-    app.openMenu(.{ .workspace = 7 }, .{ .point = .{ .x = 100, .y = 100 } });
+    app.openMenu(.{ .workspace = key }, .{ .point = .{ .x = 100, .y = 100 } });
     try std.testing.expect(app.mode == .menu);
     // A click on an entry chooses it too: Hide, as the workspace is shown.
     try std.testing.expectEqualSlices(u16, L("Hide"), app.mode.menu.entry(2).?.label);
     _ = app.update(.{ .click = .{ .target = .{ .menu = 2 } } });
     try std.testing.expect(app.mode == .terminal);
-    // A disabled entry can't be chosen.
+    try std.testing.expect(!app.workspaceEntry(key).?.shown);
+    // A disabled entry can't be chosen. A host that isn't connected has
+    // Connect and Forget host, and nothing to disconnect.
     _ = try app.hosts.add(L("ssh://devbox"));
     app.openMenu(.{ .host = 0 }, .{ .point = .{ .x = 100, .y = 100 } });
+    try std.testing.expectEqual(@as(usize, 3), app.mode.menu.count);
+    try std.testing.expectEqualSlices(u16, L("Connect"), app.mode.menu.entry(0).?.label);
     try std.testing.expect(!app.mode.menu.entry(2).?.disabled);
     app.mode.menu.items[2].entry.disabled = true;
     _ = app.update(.{ .click = .{ .target = .{ .menu = 2 } } });

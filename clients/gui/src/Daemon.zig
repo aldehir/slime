@@ -163,6 +163,10 @@ const AttachCall = struct { id: u32, ws: u32 };
 pub const Wanted = struct {
     pid: u32 = 0,
     ids: []const u32 = &.{},
+    /// Someone is waiting for a pane: with nothing to attach, make a
+    /// workspace, and with no pane in what's attached, a tab. Off, the
+    /// connection lists the daemon's workspaces and shows what it has.
+    make: bool = true,
 };
 
 /// A workspace as the daemon lists it (rpc.WorkspaceDesc), for the
@@ -227,6 +231,8 @@ const Remote = struct {
     dest: []const u16,
     /// The TERM its panes get. Owned.
     term: []const u8,
+    /// What the reader attaches. Its ids are owned.
+    want: Wanted,
 };
 
 /// A host's state as the daemon reports it (rpc.HostState).
@@ -830,24 +836,26 @@ pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area
 /// Connect to the slime on host `host` (the daemon's id for it, which it
 /// has `connected`), through a second connection to the local daemon's
 /// pipe that it splices to the host's. The reader does the rest: it
-/// attaches as `connect` does, a new workspace's tab running the host's
-/// shell, and posts `notify` once `state` says how that went. The panes
-/// then wait in `arrivals`. `term` is the TERM the host's panes get. UI
-/// thread.
-pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host_id: u32, dest: []const u16, term: []const u8, area: Area, size: Size) !*Daemon {
+/// lists and attaches as `connect` does (`want` says what, any new
+/// workspace's tab running the host's shell), and posts `notify` once
+/// `state` says how that went. The panes then wait in `arrivals`. `term`
+/// is the TERM the host's panes get. UI thread.
+pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host_id: u32, dest: []const u16, term: []const u8, area: Area, size: Size, want: Wanted) !*Daemon {
     var pipe: Pipe = try .open(false);
     errdefer pipe.close();
     const owned_dest = try alloc.dupe(u16, dest);
     errdefer alloc.free(owned_dest);
     const owned_term = try alloc.dupe(u8, term);
     errdefer alloc.free(owned_term);
+    const owned_ids = try alloc.dupe(u32, want.ids);
+    errdefer alloc.free(owned_ids);
     const self = try alloc.create(Daemon);
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
         .pipe = pipe,
         .notify = notify,
-        .remote = .{ .host = host_id, .dest = owned_dest, .term = owned_term },
+        .remote = .{ .host = host_id, .dest = owned_dest, .term = owned_term, .want = .{ .pid = want.pid, .ids = owned_ids, .make = want.make } },
         .state = .init(.connecting),
         .area = area,
         .size = size,
@@ -861,9 +869,10 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host
 /// the local daemon), list the workspaces, and attach the ones to show,
 /// reading the replies in line, before the reader routes frames: the one
 /// SLIME_WORKSPACE names (local only), else those `want` remembers if
-/// this is the daemon it remembers them from, else all of them. With
-/// none left, a new one. A window needs a pane, so a tab running
-/// `command` is made if none has one.
+/// this is the daemon it remembers them from, else all of them. If
+/// `want` says someone waits for a pane: with none left, a new
+/// workspace, and a tab running `command` if no attached one has a
+/// pane.
 fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16, want: Wanted) !void {
     try self.handshake(buf);
 
@@ -903,6 +912,7 @@ fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []cons
         _ = try self.applyWorkspace(reply.value);
         log.info("attached workspace {d}", .{id});
     }
+    if (!want.make) return;
     if (self.anyAttached() == null) {
         var reply = try self.awaitReply(buf, try self.call("workspace.new", no_params), std.json.Value);
         defer reply.deinit();
@@ -1007,7 +1017,7 @@ fn remoteLoop(self: *Daemon) void {
     putStr(self.alloc, &p, r.term) catch return self.fail(error.OutOfMemory);
     self.send(.bridge, .none, p.items) catch |err| return self.fail(err);
     // The host's own shell: the command is for its slime to run.
-    self.attachFirst(buf, self.area, self.size, &.{}, .{}) catch |err| return self.fail(err);
+    self.attachFirst(buf, self.area, self.size, &.{}, r.want) catch |err| return self.fail(err);
     log.info("attached {d} workspace(s) on {f}", .{ self.attached.count(), std.unicode.fmtUtf16Le(self.hostLabel()) });
     self.state.store(.attached, .release);
     self.posting.store(true, .release);
@@ -1056,7 +1066,18 @@ fn freeState(self: *Daemon) void {
     if (self.remote) |r| {
         self.alloc.free(r.dest);
         self.alloc.free(r.term);
+        self.alloc.free(r.want.ids);
     }
+}
+
+/// A connection to nothing, for tests of what the app lists on one: its
+/// calls fail quietly, as a lost daemon's do.
+pub fn unconnected(alloc: Allocator) Daemon {
+    return .{
+        .alloc = alloc,
+        .pipe = .{ .read_h = win32.INVALID_HANDLE_VALUE, .write_h = win32.INVALID_HANDLE_VALUE, .events = .{ win32.INVALID_HANDLE_VALUE, win32.INVALID_HANDLE_VALUE } },
+        .notify = .{ .hwnd = undefined, .msg = 0 },
+    };
 }
 
 /// Take what the daemon said about hosts since the last look, in order.
@@ -1197,9 +1218,8 @@ fn isAttached(self: *Daemon, ws: u32) bool {
     return self.attached.contains(ws);
 }
 
-/// Some workspace attached here, if any: where a host's new tab goes,
-/// the app having no list of a host's workspaces. UI thread.
-pub fn anyAttached(self: *Daemon) ?u32 {
+/// Some workspace attached here, if any.
+fn anyAttached(self: *Daemon) ?u32 {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     var it = self.attached.keyIterator();
@@ -1791,7 +1811,8 @@ fn loseAll(self: *Daemon, why: []const u8) void {
     self.loseAllLocked(why);
 }
 
-/// Tell every live pane it's gone from us. Pending ones are dropped.
+/// Tell every live pane it's gone from us, and the UI thread, whose list
+/// of the daemon's workspaces is stale. Pending ones are dropped.
 fn loseAllLocked(self: *Daemon, why: []const u8) void {
     if (self.lost) return;
     self.lost = true;
@@ -1802,6 +1823,7 @@ fn loseAllLocked(self: *Daemon, why: []const u8) void {
         .live => |sink| sink.ended(sink.ctx, why),
     };
     self.panes.clearRetainingCapacity();
+    if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
 }
 
 /// `s` as UTF-16, or its bytes as Latin-1 if it isn't UTF-8.

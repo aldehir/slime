@@ -22,4 +22,5 @@ pub const shield_alert = @embedFile("shield-alert.svg");
 pub const shield_question_mark = @embedFile("shield-question-mark.svg");
 pub const terminal = @embedFile("terminal.svg");
 pub const trash = @embedFile("trash.svg");
+pub const unplug = @embedFile("unplug.svg");
 pub const x = @embedFile("x.svg");

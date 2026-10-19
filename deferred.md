@@ -147,9 +147,14 @@ host connected without logging in. `slime host connect|ls|disconnect`
 drive it from a console.
 
 The sidebar lists every host connected to before (`hosts` in the config
-directory), grouping sessions under them. A host's header button
-connects (a plug) or, once connected, opens another tab there (`+`). A host with no sessions can be forgotten with the ×
-that shows on hover.
+directory), each a section like Local: once the daemon has the host
+connected, every window bridges to the host's slime to list its
+workspaces, each a row that shows, hides, renames, and kills as a local
+one does, with the ones the last window showed there attached
+(`workspaces` keeps a list per host). A host's header button connects
+(a plug) or, once connected, makes a workspace there (`+`); its menu
+also disconnects the host. A host nothing uses can be forgotten with
+the × that shows on hover.
 
 Icon buttons name themselves in a tooltip once the mouse rests on them
 (the system hover time), with the key that does the same where there is
@@ -170,7 +175,14 @@ one.
 
 - **Logging in, in the header.** A host shows `+` from the moment the
   daemon starts connecting, before it's logged in. Sessions left from a
-  dead connection aren't dimmed.
+  dead connection aren't dimmed, and sit flat under the host (their
+  workspace rows go with the connection) until a new connection there
+  replaces them.
+- **A bridge that fails with nobody waiting** (the window listing a
+  connected host's workspaces at startup, say against a host daemon
+  from another build) says so only in the log; the host's header shows
+  it connected, and the next `+` there tries again with a stand-in that
+  shows why.
 - **The new session key hint** went with the "New session" button.
   Ctrl+Shift+T opens one in the active session's group.
 - **More of `~/.ssh/config`.** The daemon reads Host blocks and
@@ -206,14 +218,15 @@ attached or not. If slime can't be started, a tab says why.
 
 On SSH hosts it's the same daemon, built for Linux on x86-64 and
 carried in `remote/` beside the exe. The local slime installs it as
-`~/.cache/slime/bin/slime-<build>` and splices each window's second
-connection to `slime connect` there (its socket is
-`/tmp/slime-<uid>/sock`). Until the host's panes come, a session stands
-in for them, where logging in asks what it needs. Where slime can't
-run (another OS, no gzip, a full disk), connecting fails and the
-stand-in says why; ssh.exe in a local tab still reaches the host. A
-dropped connection leaves its panes saying so; the host's button
-reconnects, reattaches, and replaces them.
+`~/.cache/slime/bin/slime-<build>` and splices a second connection from
+each window to `slime connect` there (its socket is
+`/tmp/slime-<uid>/sock`), which lists the host's workspaces as the
+first lists the local ones. While a user waits for a pane there, a
+session stands in for the host's panes, where logging in asks what it
+needs. Where slime can't run (another OS, no gzip, a full disk),
+connecting fails and the stand-in says why; ssh.exe in a local tab
+still reaches the host. A dropped connection leaves its panes saying
+so; the host's button reconnects, reattaches, and replaces them.
 
 - **Losing the local slime** leaves its panes saying so, and new local
   tabs say so too until the next window, which starts a new daemon.
@@ -243,15 +256,8 @@ reconnects, reattaches, and replaces them.
   font grid, and Ctrl+= resizes every pane.
 - **A zoomed pane's pty takes the whole tab's size** while it's zoomed,
   so the others reflow when it's unzoomed.
-- **A host's workspaces aren't listed.** The sidebar lists the local
-  daemon's workspaces; a host's slime attaches every workspace it has
-  (or makes one) and shows their tabs flat under the host, with no
-  headers to show, hide, make, or kill them. The bridged connection has
-  the same list and events; the sidebar needs a level for it.
-- **`workspace.open` from a host's slime isn't followed.** A script run
-  in a pane on a host that makes a workspace tells the bridged
-  connection to open it, and the window only logs it, since it has no
-  list for the host's workspaces to show it in.
+- **`SLIME_WORKSPACE` names a local workspace only.** On a host the
+  window lists what the last one showed there, or everything.
 - **`SLIME_WORKSPACE` is in every pane's shell**, so a `slime-gui`
   started from a pane shows that pane's workspace alone, as the
   variable has always meant, rather than what the last window showed.

@@ -174,25 +174,32 @@ const Builder = struct {
         return .{ .id = .window(.sidebar_edge), .kind = .hit_area, .rect = .{ .x = s.right() - grip, .y = s.y, .w = 2 * grip, .h = s.h } };
     }
 
-    /// Local, with its workspaces and then its tabs in no workspace
-    /// (there while slime couldn't be reached), then each remembered host
-    /// with its tabs.
+    /// Local, then each remembered host: each with its daemon's
+    /// workspaces and then its tabs in no workspace (there while slime
+    /// couldn't be reached, or standing in for a host's panes).
     fn sections(self: *const Builder) Allocator.Error![]TreeRow {
         const app = self.app;
         var rows: std.ArrayList(TreeRow) = .empty;
-        var local: std.ArrayList(TreeRow) = .empty;
-        for (app.workspaces.items, 0..) |w, i| try local.append(self.arena, try self.workspaceRow(w, i));
-        for (app.tabs.items) |t| {
-            if (app.groupOf(t) == app.workspaces.items.len) try local.append(self.arena, try self.tabRow(t));
-        }
-        try rows.append(self.arena, .{ .node = try self.header(.local, L("Local"), .local, local.items.len), .children = local.items, .section = true });
+        const local = try self.sectionRows(0);
+        try rows.append(self.arena, .{ .node = try self.header(.local, L("Local"), .local), .children = local, .section = true });
         for (app.hosts.items.items, 0..) |dest, h| {
-            var tabs: std.ArrayList(TreeRow) = .empty;
-            for (app.tabs.items) |t| {
-                if (app.groupOf(t) == app.localGroups() + h) try tabs.append(self.arena, try self.tabRow(t));
-            }
+            const children = try self.sectionRows(1 + h);
             const kind: HostKind = if (app.hostLive(h)) .connected else .disconnected;
-            try rows.append(self.arena, .{ .node = try self.header(.{ .host = @intCast(h) }, Hosts.label(dest), kind, tabs.items.len), .children = tabs.items, .section = true });
+            try rows.append(self.arena, .{ .node = try self.header(.{ .host = @intCast(h) }, Hosts.label(dest), kind), .children = children, .section = true });
+        }
+        return rows.items;
+    }
+
+    /// Section `s`'s rows: its workspaces, then its tabs in none.
+    fn sectionRows(self: *const Builder, s: usize) Allocator.Error![]TreeRow {
+        const app = self.app;
+        var rows: std.ArrayList(TreeRow) = .empty;
+        for (app.workspaces.items) |w| {
+            if (app.sectionOf(w.conn) == s) try rows.append(self.arena, try self.workspaceRow(w));
+        }
+        const none = app.noneGroup(s);
+        for (app.tabs.items) |t| {
+            if (app.groupOf(t) == none) try rows.append(self.arena, try self.tabRow(t));
         }
         return rows.items;
     }
@@ -206,10 +213,10 @@ const Builder = struct {
     };
 
     /// A section's header: its name in capitals, with a button at the
-    /// right that makes a workspace under Local, or opens a tab on a host
-    /// (a plug while it isn't connected); a host with no tabs gets one to
-    /// forget it while the mouse is over the header.
-    fn header(self: *const Builder, target: Id.Target, label: []const u16, kind: HostKind, tabs: usize) Allocator.Error!Node {
+    /// right that makes a workspace on its daemon (a plug that connects
+    /// a host first); a host nothing uses gets one to forget it while the
+    /// mouse is over the header.
+    fn header(self: *const Builder, target: Id.Target, label: []const u16, kind: HostKind) Allocator.Error!Node {
         const app = self.app;
         const t = &self.ui.theme;
         const id: Id = .{ .target = target };
@@ -217,20 +224,20 @@ const Builder = struct {
         try items.append(self.arena, .{ .kind = .{ .spacer = 2 } });
         try items.append(self.arena, .{ .kind = .{ .label = .{ .text = label, .font = .section, .color = t.text_muted, .upper = true } } });
         try items.append(self.arena, .{ .kind = .{ .spacer = label_gap } });
-        // A host with no tabs can be dropped from the list.
-        if (kind != .local and tabs == 0 and self.ui.hover.on(target)) {
+        // A host nothing uses can be dropped from the list.
+        if (kind != .local and !app.hostInUse(target.host) and self.ui.hover.on(target)) {
             // Lucide's x spans 12 of its 24 units: 8 DIPs in this box.
             try items.append(self.arena, .{ .id = id.with(.forget), .kind = .{ .icon_button = .{ .icon = .x, .size = 16, .tip = L("Forget host") } } });
             try items.append(self.arena, .{ .kind = .{ .spacer = button_gap } });
         }
         const none: []const u16 = &.{};
         const tip, const key = switch (kind) {
-            .local => if (app.workspaces.items.len > 0)
+            .local => if (app.sectionCount(0) > 0)
                 .{ L("New workspace"), none }
             else
                 .{ L("New tab"), if (self.activeGroupIs(target)) new_tab_key.slice() else none },
             .disconnected => .{ L("Connect"), none },
-            .connected => .{ L("New tab"), if (self.activeGroupIs(target)) new_tab_key.slice() else none },
+            .connected => .{ L("New workspace"), none },
         };
         try items.append(self.arena, if (kind == .disconnected)
             // Lucide's plug spans 16 of its 24 units: 11 DIPs in this box,
@@ -245,16 +252,16 @@ const Builder = struct {
         return .{ .id = id, .kind = .{ .row = .{ .children = items.items, .h = header_height } } };
     }
 
-    /// Whether the active tab is in the group `target` names: Local's
-    /// own tabs, or a host's.
+    /// Whether the active tab is in the group `target` names: a
+    /// section's tabs in no workspace, or a workspace.
     fn activeGroupIs(self: *const Builder, target: Id.Target) bool {
         const app = self.app;
         if (!app.hasTabs()) return false;
         const g = app.groupOf(app.activeTab());
         return switch (target) {
-            .local => g == app.workspaces.items.len,
-            .host => |h| g == app.localGroups() + h,
-            .workspace => |id| app.workspaceGroup(id) == g,
+            .local => g == app.noneGroup(0),
+            .host => |h| g == app.noneGroup(1 + h),
+            .workspace => |key| app.workspaceGroup(key) == g,
             else => false,
         };
     }
@@ -264,17 +271,18 @@ const Builder = struct {
     /// before which a hidden workspace shows how many tabs it has, and
     /// one other windows show, an eye. Hiding, renaming, and killing it
     /// are in its context menu. Being renamed, the row is the field.
-    fn workspaceRow(self: *const Builder, w: App.Workspace, index: usize) Allocator.Error!TreeRow {
+    fn workspaceRow(self: *const Builder, w: App.Workspace) Allocator.Error!TreeRow {
         const app = self.app;
         const t = &self.ui.theme;
-        const target: Id.Target = .{ .workspace = w.id };
+        const target: Id.Target = .{ .workspace = w.key };
         const id: Id = .{ .target = target };
+        const group = app.workspaceGroup(w.key);
         var tabs: std.ArrayList(TreeRow) = .empty;
         for (app.tabs.items) |tab| {
-            if (app.groupOf(tab) == index) try tabs.append(self.arena, try self.tabRow(tab));
+            if (app.groupOf(tab) == group) try tabs.append(self.arena, try self.tabRow(tab));
         }
 
-        if (app.mode == .rename and app.mode.rename.ws == w.id) {
+        if (app.mode == .rename and app.mode.rename.ws == w.key) {
             const children = try self.nodes(&.{
                 .{ .kind = .{ .fold = .{ .folded = !w.shown, .color = t.text_muted } } },
                 .{ .id = id.with(.field), .kind = .{ .text_field = .{
@@ -571,15 +579,14 @@ test "sections and their rows come in the sidebar's order, by id" {
     try t.init(&shell);
     defer t.deinit();
     const app = &t.app;
-    const alloc = std.testing.allocator;
-    try app.workspaces.append(alloc, .{ .id = 10, .name = try alloc.dupe(u16, L("alpha")), .tabs = 3, .viewers = 1, .shown = false });
-    try app.workspaces.append(alloc, .{ .id = 11, .name = try alloc.dupe(u16, L("beta")), .tabs = 0, .viewers = 2, .shown = true });
+    const k10 = try t.workspace(10, L("alpha"), 3, 1, false);
+    const k11 = try t.workspace(11, L("beta"), 0, 2, true);
     _ = try app.hosts.add(L("ssh://devbox"));
 
     const built = app.view();
     const local = Ui.find(built, .{ .target = .local }).?;
-    const hidden = Ui.find(built, .{ .target = .{ .workspace = 10 } }).?;
-    const shown = Ui.find(built, .{ .target = .{ .workspace = 11 } }).?;
+    const hidden = Ui.find(built, .{ .target = .{ .workspace = k10 } }).?;
+    const shown = Ui.find(built, .{ .target = .{ .workspace = k11 } }).?;
     const host = Ui.find(built, .{ .target = .{ .host = 0 } }).?;
     // Local's header, its workspaces flush under it, then the host.
     try std.testing.expectEqual(t.frame.sidebar.x + sidebar_pad_x, local.rect.x);
@@ -589,25 +596,25 @@ test "sections and their rows come in the sidebar's order, by id" {
     try std.testing.expectEqual(hidden.rect.bottom() + TreeList.row_gap, shown.rect.y);
     try std.testing.expectEqual(shown.rect.bottom() + TreeList.row_gap + TreeList.section_gap, host.rect.y);
     // Each has its tab button; the host, not yet connected, a plug.
-    try std.testing.expect(Ui.find(built, .{ .target = .{ .workspace = 10 }, .part = .new_tab }) != null);
+    try std.testing.expect(Ui.find(built, .{ .target = .{ .workspace = k10 }, .part = .new_tab }) != null);
     try std.testing.expectEqual(Painter.Lucide.plug, Ui.find(built, .{ .target = .{ .host = 0 }, .part = .new_tab }).?.kind.icon_button.icon);
     try std.testing.expectEqual(Painter.Lucide.plus, Ui.find(built, .{ .target = .local, .part = .new_tab }).?.kind.icon_button.icon);
-    // A host with no tabs can be forgotten, once the mouse is over it.
+    // A host nothing uses can be forgotten, once the mouse is over it.
     try std.testing.expect(Ui.find(built, .{ .target = .{ .host = 0 }, .part = .forget }) == null);
     app.ui.hover = .{ .target = .{ .host = 0 } };
     try std.testing.expect(Ui.find(app.view(), .{ .target = .{ .host = 0 }, .part = .forget }) != null);
     // A workspace's row lights under the mouse, with no buttons but its
     // tab button: its actions are in its menu.
-    app.ui.hover = .{ .target = .{ .workspace = 11 } };
+    app.ui.hover = .{ .target = .{ .workspace = k11 } };
     const lit = app.view();
-    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .kill }) == null);
-    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .hide }) == null);
+    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = k11 }, .part = .kill }) == null);
+    try std.testing.expect(Ui.find(lit, .{ .target = .{ .workspace = k11 }, .part = .hide }) == null);
     // Hit testing finds the row and its button where they are.
-    const plus = Ui.find(lit, .{ .target = .{ .workspace = 11 }, .part = .new_tab }).?;
-    try std.testing.expectEqual(Id{ .target = .{ .workspace = 11 }, .part = .new_tab }, app.ui.hitTest(lit, plus.rect.x + 1, plus.rect.y + 1));
+    const plus = Ui.find(lit, .{ .target = .{ .workspace = k11 }, .part = .new_tab }).?;
+    try std.testing.expectEqual(Id{ .target = .{ .workspace = k11 }, .part = .new_tab }, app.ui.hitTest(lit, plus.rect.x + 1, plus.rect.y + 1));
     // (`shown` was in the tree before this one, which the arena dropped.)
-    const shown_lit = Ui.find(lit, .{ .target = .{ .workspace = 11 } }).?;
-    try std.testing.expectEqual(Id{ .target = .{ .workspace = 11 } }, app.ui.hitTest(lit, shown_lit.rect.x + 25, shown_lit.rect.y + 2));
+    const shown_lit = Ui.find(lit, .{ .target = .{ .workspace = k11 } }).?;
+    try std.testing.expectEqual(Id{ .target = .{ .workspace = k11 } }, app.ui.hitTest(lit, shown_lit.rect.x + 25, shown_lit.rect.y + 2));
     try std.testing.expectEqual(Id.window(.connect), app.ui.hitTest(lit, t.frame.sidebar.x + 20, t.frame.sidebar.bottom() - sidebar_pad_bottom - 5));
     // With nothing shown, the terminal area says what the sidebar is for.
     try std.testing.expectEqual(Id.none, app.ui.hitTest(lit, t.frame.terminal.x + 100, t.frame.terminal.y + 100));
@@ -619,9 +626,8 @@ test "a context menu is over everything, and the window under it is scrim" {
     try t.init(&shell);
     defer t.deinit();
     const app = &t.app;
-    const alloc = std.testing.allocator;
-    try app.workspaces.append(alloc, .{ .id = 5, .name = try alloc.dupe(u16, L("alpha")), .tabs = 0, .viewers = 1, .shown = true });
-    var m: Menu = .{ .target = .{ .workspace = 5 }, .anchor = .{ .point = .{ .x = 100, .y = 100 } } };
+    const key = try t.workspace(5, L("alpha"), 0, 1, true);
+    var m: Menu = .{ .target = .{ .workspace = key }, .anchor = .{ .point = .{ .x = 100, .y = 100 } } };
     m.add(.{ .label = L("New tab"), .action = .{ .part = .new_tab } });
     m.add(.{ .label = L("Kill"), .action = .{ .part = .kill }, .danger = true });
     app.mode = .{ .menu = m };
@@ -632,7 +638,7 @@ test "a context menu is over everything, and the window under it is scrim" {
     try std.testing.expectEqual(Id{ .target = .{ .menu = 0 } }, app.ui.hitTest(built, box.rect.x + 20, box.rect.y + 10));
     try std.testing.expectEqual(Id{ .target = .{ .menu = 1 } }, app.ui.hitTest(built, box.rect.x + 20, box.rect.bottom() - 10));
     // The row it's about, and the title bar, are under the scrim.
-    const row = Ui.find(built, .{ .target = .{ .workspace = 5 } }).?;
+    const row = Ui.find(built, .{ .target = .{ .workspace = key } }).?;
     try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, row.rect.x + 2, row.rect.y + 2));
     try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, 500, 5));
 }
@@ -643,13 +649,12 @@ test "a workspace being renamed is all field" {
     try t.init(&shell);
     defer t.deinit();
     const app = &t.app;
-    const alloc = std.testing.allocator;
-    try app.workspaces.append(alloc, .{ .id = 5, .name = try alloc.dupe(u16, L("alpha")), .tabs = 0, .viewers = 1, .shown = true });
-    app.mode = .{ .rename = .{ .ws = 5, .field = .{} } };
+    const key = try t.workspace(5, L("alpha"), 0, 1, true);
+    app.mode = .{ .rename = .{ .ws = key, .field = .{} } };
     const built = app.view();
-    const field_id: Id = .{ .target = .{ .workspace = 5 }, .part = .field };
+    const field_id: Id = .{ .target = .{ .workspace = key }, .part = .field };
     const row = Ui.find(built, field_id).?;
     try std.testing.expectEqual(field_id, app.ui.hitTest(built, row.rect.x + 2, row.rect.y + 2));
     try std.testing.expectEqual(field_id, app.ui.hitTest(built, row.rect.right() - 10, row.rect.y + 5));
-    try std.testing.expect(Ui.find(built, .{ .target = .{ .workspace = 5 }, .part = .new_tab }) == null);
+    try std.testing.expect(Ui.find(built, .{ .target = .{ .workspace = key }, .part = .new_tab }) == null);
 }

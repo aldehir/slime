@@ -14,9 +14,9 @@ part: Part = .body,
 /// Nothing: empty space, or no widget.
 pub const none: Id = .{ .target = .none };
 
-/// The model object a widget is about. Tabs and panes are keyed by
-/// numbers the window hands out, not the daemon's ids: each slime (the
-/// local one, and each host's) numbers its own tabs and panes, so those
+/// The model object a widget is about. Workspaces, tabs, and panes are
+/// keyed by numbers the window hands out, not the daemon's ids: each
+/// slime (the local one, and each host's) numbers its own, so those
 /// repeat across connections in one window.
 pub const Target = union(enum) {
     none,
@@ -28,7 +28,7 @@ pub const Target = union(enum) {
     /// A remembered SSH host, by its place in the hosts list: a host that
     /// isn't connected has no id from the daemon.
     host: u32,
-    /// A workspace of the local daemon, by its id.
+    /// A workspace of the local daemon or a host's, by `App.Workspace.key`.
     workspace: u32,
     /// A tab, by `Tab.key`.
     tab: u32,
@@ -71,9 +71,11 @@ pub const Part = enum {
     /// A pane's terminal in the terminal area.
     terminal,
     /// A header's or row's button that opens a tab (or a workspace under
-    /// Local, or connects a host first).
+    /// a section's header, or connects a host first).
     new_tab,
     forget,
+    /// A host's menu entry that hangs up on it.
+    disconnect,
     kill,
     rename,
     /// A workspace's menu entries that hide it, and show it.
