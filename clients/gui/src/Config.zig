@@ -9,7 +9,7 @@
 //! ```lua
 //! slime.config{
 //!   font = { family = { "Cascadia Code", "Consolas" }, size = 12, antialias = "grayscale" },
-//!   theme = "Catppuccin Mocha",            -- a file under themes/; or { light = "...", dark = "..." }
+//!   theme = "Catppuccin Mocha",            -- a bundled theme or a file under themes/; or { light = "...", dark = "..." }
 //!   colors = { background = "#282c34", foreground = "#ffffff", cursor = "#ffcc00",
 //!              cursor_text = "cell-background", selection_background = "#345",
 //!              selection_foreground = "cell-foreground", palette = { "#000", "#800" } },
@@ -22,11 +22,14 @@
 //! }
 //! ```
 //!
-//! The theme loads first (`themes` beside init.lua, then beside the
-//! executable), and every color the user set applies over it.
+//! The theme loads first (`themes` beside init.lua, then the bundled
+//! ones, embedded), and every color the user set applies over it.
 const Config = @This();
 
 const std = @import("std");
+/// The bundled themes, Ghostty's iTerm2-Color-Schemes release, which
+/// the build embeds (`embedThemes` in build.zig).
+const themes = @import("themes");
 const Allocator = std.mem.Allocator;
 const ghostty_vt = @import("ghostty-vt");
 const font = @import("font/font.zig");
@@ -88,7 +91,7 @@ palette: Palette = .{},
 
 /// A theme name or absolute path, or a light/dark pair to follow the
 /// Windows app mode. Names are looked up in `themes` next to init.lua,
-/// then in `themes` next to the executable.
+/// then among the bundled themes.
 theme: ?Theme = null,
 
 /// What the settings got wrong, a line each: unknown keys, bad values
@@ -220,11 +223,9 @@ pub const Theme = struct {
 };
 
 pub const LoadOptions = struct {
-    /// Where init.lua is: its `themes` directory comes first. Null looks
-    /// only beside the executable.
+    /// Where init.lua is: its `themes` directory comes before the
+    /// bundled themes. Null looks only at the bundled ones.
     dir: ?[]const u8,
-    /// Where the bundled themes live.
-    resources_dir: ?[]const u8 = null,
     /// Pick the light theme of a light/dark pair.
     light: bool = false,
 };
@@ -255,16 +256,13 @@ pub fn init(gpa: Allocator) Config {
 }
 
 /// Build the config from the daemon's settings, with user themes in
-/// `themes` next to init.lua (else in the config directory), the
-/// bundled ones in `themes` next to the executable, and the light theme
-/// of a pair if Windows' app mode is light.
+/// `themes` next to init.lua (else in the config directory) over the
+/// bundled ones, and the light theme of a pair if Windows' app mode is
+/// light.
 pub fn loadFrom(gpa: Allocator, io: std.Io, settings: std.json.Value, source: Source) Allocator.Error!Config {
-    const exe_dir = std.process.executableDirPathAlloc(io, gpa) catch null;
-    defer if (exe_dir) |d| gpa.free(d);
     const init_dir: ?[]const u8 = if (source.path.len > 0) std.fs.path.dirname(source.path) else null;
     return load(gpa, io, settings, .{
         .dir = init_dir orelse source.dir,
-        .resources_dir = exe_dir,
         .light = appsUseLightTheme(),
     });
 }
@@ -306,8 +304,13 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
         if (Theme.fromJson(alloc, value)) |theme| {
             self.theme = theme;
             const name = if (opts.light) theme.light else theme.dark;
-            if (try self.findTheme(io, name, opts)) |path| {
+            if (!std.fs.path.isAbsolute(name) and std.mem.indexOfAny(u8, name, "/\\") != null) {
+                try self.warn("theme \"{s}\" must be a name or an absolute path", .{name});
+            } else if (try self.findTheme(io, name, opts)) |path| {
                 try self.loadTheme(io, path);
+            } else if (bundledTheme(name)) |text| {
+                log.info("loading bundled theme {s}", .{name});
+                try self.applyTheme(text, name);
             } else try self.warn("theme \"{s}\" not found", .{name});
         } else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -479,18 +482,18 @@ fn enumOf(comptime T: type, value: std.json.Value) !T {
     return std.meta.stringToEnum(T, try stringOf(value)) orelse error.InvalidValue;
 }
 
-/// An absolute path as is, else the first `themes\<name>` that exists in
-/// the config directory, then the resources directory.
+/// An absolute path as is, else `themes\<name>` in the config directory
+/// if it exists. Null for a name to look up among the bundled themes.
 fn findTheme(self: *Config, io: std.Io, name: []const u8, opts: LoadOptions) !?[]const u8 {
-    const alloc = self._arena.allocator();
     if (std.fs.path.isAbsolute(name)) return name;
-    if (std.mem.indexOfAny(u8, name, "/\\") != null) {
-        try self.warn("theme \"{s}\" must be a name or an absolute path", .{name});
-        return null;
-    }
-    for ([_]?[]const u8{ opts.dir, opts.resources_dir }) |dir| {
-        const path = try std.fs.path.join(alloc, &.{ dir orelse continue, "themes", name });
-        if (fileExists(io, path)) return path;
+    const path = try std.fs.path.join(self._arena.allocator(), &.{ opts.dir orelse return null, "themes", name });
+    return if (fileExists(io, path)) path else null;
+}
+
+/// The text of the bundled theme called `name`, if there is one.
+pub fn bundledTheme(name: []const u8) ?[]const u8 {
+    for (themes.list) |t| {
+        if (std.mem.eql(u8, t.name, name)) return t.text;
     }
     return null;
 }
@@ -608,7 +611,7 @@ test "padding, word chars, theme, clipboard, and bad values keep defaults" {
     var c = try testConfig(
         \\{"window": {"padding": {"x": [2, 4], "y": 6}},
         \\ "selection": {"word_chars": "\\t;\\u{2502}"},
-        \\ "theme": {"light": "Catppuccin Latte", "dark": "Catppuccin Mocha"},
+        \\ "theme": {"light": "No Such Latte", "dark": "No Such Mocha"},
         \\ "clipboard": {"write": "deny"}, "chrome": {"scale": 1.25}, "ssh": {"terminfo": false}, "browser": {"idle": 30},
         \\ "font": {"size": -1, "antialias": "subpixel", "weight": 3}, "colors": {"background": "nope"}, "nonsense": 1}
     );
@@ -616,8 +619,8 @@ test "padding, word chars, theme, clipboard, and bad values keep defaults" {
     try std.testing.expectEqual(Padding{ .top_left = 2, .bottom_right = 4 }, c.@"window-padding-x");
     try std.testing.expectEqual(Padding{ .top_left = 6, .bottom_right = 6 }, c.@"window-padding-y");
     try std.testing.expectEqualSlices(u21, &.{ 0, '\t', ';', 0x2502 }, c.@"selection-word-chars".codepoints);
-    try std.testing.expectEqualStrings("Catppuccin Latte", c.theme.?.light);
-    try std.testing.expectEqualStrings("Catppuccin Mocha", c.theme.?.dark);
+    try std.testing.expectEqualStrings("No Such Latte", c.theme.?.light);
+    try std.testing.expectEqualStrings("No Such Mocha", c.theme.?.dark);
     try std.testing.expectEqual(.ask, c.@"clipboard-read");
     try std.testing.expectEqual(.deny, c.@"clipboard-write");
     try std.testing.expectEqual(1.25, c.@"chrome-scale");
@@ -630,7 +633,7 @@ test "padding, word chars, theme, clipboard, and bad values keep defaults" {
     // theme's, which is looked at first and names a file that isn't
     // there.
     try std.testing.expectEqual(6, c.errors.items.len);
-    try std.testing.expectEqualStrings("theme \"Catppuccin Mocha\" not found", c.errors.items[0]);
+    try std.testing.expectEqualStrings("theme \"No Such Mocha\" not found", c.errors.items[0]);
     try std.testing.expectEqualStrings("font.size: invalid value: InvalidValue", c.errors.items[1]);
     try std.testing.expectEqualStrings("unknown setting font.weight", c.errors.items[3]);
     try std.testing.expectEqualStrings("unknown setting \"nonsense\"", c.errors.items[5]);
@@ -666,4 +669,30 @@ test "theme under user colors" {
     var light = try load(std.testing.allocator, io, parsed.value, .{ .dir = dir, .light = true });
     defer light.deinit();
     try std.testing.expectEqual(RGB{ .r = 0xee, .g = 0xee, .b = 0xee }, light.background);
+}
+
+test "bundled themes, under a user file of the same name" {
+    var mocha = try testConfig(
+        \\{"theme": "Catppuccin Mocha", "colors": {"foreground": "#333333"}}
+    );
+    defer mocha.deinit();
+    try std.testing.expectEqual(0, mocha.errors.items.len);
+    try std.testing.expectEqual(RGB{ .r = 0x1e, .g = 0x1e, .b = 0x2e }, mocha.background);
+    try std.testing.expectEqual(RGB{ .r = 0x33, .g = 0x33, .b = 0x33 }, mocha.foreground);
+    try std.testing.expect(bundledTheme("Catppuccin Latte") != null);
+    try std.testing.expect(bundledTheme("catppuccin mocha") == null);
+
+    // A user's themes\Catppuccin Mocha wins over the bundled one.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "themes");
+    try tmp.dir.writeFile(io, .{ .sub_path = "themes/Catppuccin Mocha", .data = "background = #101010\n" });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"theme\": \"Catppuccin Mocha\"}", .{});
+    defer parsed.deinit();
+    var user = try load(std.testing.allocator, io, parsed.value, .{ .dir = dir });
+    defer user.deinit();
+    try std.testing.expectEqual(RGB{ .r = 0x10, .g = 0x10, .b = 0x10 }, user.background);
 }

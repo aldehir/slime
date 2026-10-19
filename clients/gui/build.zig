@@ -45,6 +45,9 @@ pub fn build(b: *std.Build) void {
     exe_mod.addAnonymousImport("slime-small.svg", .{ .root_source_file = b.path("assets/icon/slime-small.svg") });
     // The chrome's icons, embedded by the module next to them.
     exe_mod.addAnonymousImport("lucide", .{ .root_source_file = b.path("assets/icons/lucide/lucide.zig") });
+    // The bundled themes for the `theme` config key, embedded: hundreds
+    // of small files are slow to unpack and copy around next to the exe.
+    exe_mod.addAnonymousImport("themes", .{ .root_source_file = embedThemes(b) });
     // The frame and event codecs slime's library defines (src/Screen.zig),
     // imported from the daemon's tree rather than copied.
     exe_mod.addAnonymousImport("frame", .{ .root_source_file = b.path("../../internal/vt/frame.zig") });
@@ -86,16 +89,6 @@ pub fn build(b: *std.Build) void {
     exe.entry = .{ .symbol_name = "mainCRTStartup" };
     b.installArtifact(exe);
 
-    // Themes for the `theme` config key, in `themes` next to the exe.
-    if (b.lazyDependency("iterm2_themes", .{})) |themes| {
-        b.installDirectory(.{
-            .source_dir = themes.path(""),
-            .install_dir = .bin,
-            .install_subdir = "themes",
-            .exclude_extensions = &.{".md"},
-        });
-    }
-
     const icons = b.addInstallDirectory(.{
         .source_dir = icon.png_dir,
         .install_dir = .prefix,
@@ -110,6 +103,40 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = exe_mod });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit_tests).step);
+}
+
+/// A module listing every theme of the iTerm2-Color-Schemes release
+/// (`iterm2_themes`) with its text embedded, sorted by name:
+/// `pub const list = [_]Theme{ .{ .name, .text }, ... }`. The files are
+/// copied beside the generated source so `@embedFile` can reach them.
+/// Empty until the lazy dependency is fetched, which reruns the build.
+fn embedThemes(b: *std.Build) std.Build.LazyPath {
+    const io = b.graph.io;
+    const wf = b.addWriteFiles();
+    var source: std.Io.Writer.Allocating = .init(b.allocator);
+    const w = &source.writer;
+    w.writeAll("pub const Theme = struct { name: []const u8, text: []const u8 };\npub const list = [_]Theme{\n") catch @panic("OOM");
+    if (b.lazyDependency("iterm2_themes", .{})) |dep| {
+        _ = wf.addCopyDirectory(dep.path(""), "themes", .{ .exclude_extensions = &.{".md"} });
+        var names: std.ArrayList([]const u8) = .empty;
+        var dir = dep.builder.build_root.handle.openDir(io, ".", .{ .iterate = true }) catch @panic("themes: can't open the dependency");
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch @panic("themes: can't list the dependency")) |entry| {
+            if (entry.kind != .file or std.mem.endsWith(u8, entry.name, ".md")) continue;
+            names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lessThan);
+        for (names.items) |name| {
+            w.print("    .{{ .name = \"{f}\", .text = @embedFile(\"themes/{f}\") }},\n", .{ std.zig.fmtString(name), std.zig.fmtString(name) }) catch @panic("OOM");
+        }
+    }
+    w.writeAll("};\n") catch @panic("OOM");
+    return wf.add("themes.zig", source.written());
 }
 
 const Icon = struct {

@@ -190,7 +190,7 @@ one without applying it.
 
   slime.config{
     font = { family = { "Cascadia Code", "Consolas" }, size = 12, antialias = "grayscale" },
-    theme = "Catppuccin Mocha",      -- a Ghostty theme file under themes/ (its file name)
+    theme = "Catppuccin Mocha",      -- a bundled Ghostty theme, or a file under themes/ beside init.lua
     colors = { background = "#282c34", cursor = "#ffcc00" },
     window = { padding = { x = 3, y = 3 } },
     chrome = { scale = 1 },

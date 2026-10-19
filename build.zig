@@ -48,18 +48,9 @@ pub fn build(b: *std.Build) void {
         ) orelse 300,
     });
     // A dependency installs into a prefix of its own under .zig-cache, so
-    // the window and its themes are installed here, into ours, the way
-    // clients/gui/build.zig does for itself.
+    // the window is installed here, into ours.
     const gui_exe = gui.artifact("slime-gui");
     b.installArtifact(gui_exe);
-    if (gui.builder.lazyDependency("iterm2_themes", .{})) |themes| {
-        b.installDirectory(.{
-            .source_dir = themes.path(""),
-            .install_dir = .bin,
-            .install_subdir = "themes",
-            .exclude_extensions = &.{".md"},
-        });
-    }
     b.step("icons", "Render the app icon PNGs into zig-out/icons").dependOn(&gui.builder.top_level_steps.get("icons").?.step);
 
     installConpty(b);

@@ -516,7 +516,8 @@ The daemon's `init.lua` (`slime config path`) is the configuration:
 (`config.get`), which `Config.zig` maps onto its fields (fonts, colors,
 themes, padding, word characters, clipboard, ssh); the daemon keeps
 `shell.command`. Themes stay Ghostty theme files, looked up beside
-`init.lua` and beside the exe. `slime.bind` lays bindings over
+`init.lua`, then among the bundled ones (embedded in slime-gui.exe,
+`embedThemes` in its build.zig). `slime.bind` lays bindings over
 `binding.zig`'s defaults. The daemon evaluates the file again when it
 or a `.lua` beside it changes (`internal/daemon/watch.go` polls once a
 second) and on `slime config reload`; `config.changed` carries the
