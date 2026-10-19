@@ -869,10 +869,10 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host
 /// the local daemon), list the workspaces, and attach the ones to show,
 /// reading the replies in line, before the reader routes frames: the one
 /// SLIME_WORKSPACE names (local only), else those `want` remembers if
-/// this is the daemon it remembers them from, else all of them. If
-/// `want` says someone waits for a pane: with none left, a new
-/// workspace, and a tab running `command` if no attached one has a
-/// pane.
+/// this is the daemon it remembers them from (none, if it remembers
+/// none and only lists), else all of them. If `want` says someone waits
+/// for a pane: with none left, a new workspace, and a tab running
+/// `command` if no attached one has a pane.
 fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16, want: Wanted) !void {
     try self.handshake(buf);
 
@@ -896,10 +896,14 @@ fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []cons
     if (requested != 0 and listed(list.value, requested)) {
         try ids.append(self.alloc, requested);
     } else {
-        if (want.pid == self.pid) for (want.ids) |id| {
+        const remembered = want.pid == self.pid;
+        if (remembered) for (want.ids) |id| {
             if (listed(list.value, id)) try ids.append(self.alloc, id);
         };
-        if (ids.items.len == 0) for (list.value.workspaces) |w| try ids.append(self.alloc, w.id);
+        // A window that remembers showing nothing on this daemon shows
+        // nothing, while it only lists; one that needs a pane, or has no
+        // memory of the daemon, shows everything.
+        if (ids.items.len == 0 and (want.make or !remembered)) for (list.value.workspaces) |w| try ids.append(self.alloc, w.id);
     }
     for (ids.items) |id| {
         const call_id = try self.call("workspace.attach", .{ .id = id, .area = area });

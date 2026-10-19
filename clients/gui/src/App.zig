@@ -1828,6 +1828,8 @@ fn daemonPosted(self: *App) void {
         i += 1;
     }
     self.pruneRemotes();
+    // A lost connection's rows may have been all there was to show.
+    self.closeIfNothingLeft();
 }
 
 /// Show the workspaces `conn` was told to open here: a script run from
@@ -1839,21 +1841,24 @@ fn openWorkspaces(self: *App, conn: *Daemon) void {
 }
 
 /// Take up what host's slime `r` sent. Once its panes have come, they
-/// replace the session that stood in for them, and the tabs of daemons
-/// we lost on the host, which showed the same panes as they were.
+/// replace the session that stood in for them, if one did, and the tabs
+/// of connections we lost on the host, which showed the same panes as
+/// they were.
 fn remoteChanged(self: *App, r: *Remote) void {
     self.daemonChanged(r.conn);
     // A lost connection's tabs are what a new one replaces, not what
     // replaces a stand-in.
     if (r.conn.isLost()) return;
     const dest = r.conn.hostDest().?;
-    const found = self.standIn(dest) orelse return;
     // In tabs of their own by now.
     const first = for (self.tabs.items) |t| {
         if (t.conn == r.conn) break t;
     } else return;
-    var show = found.tab == self.active;
-    self.dropTab(found.tab);
+    var show = false;
+    if (self.standIn(dest)) |found| {
+        show = found.tab == self.active;
+        self.dropTab(found.tab);
+    }
     var i: usize = 0;
     while (i < self.tabs.items.len) {
         const old = self.tabs.items[i].conn;
@@ -1874,6 +1879,7 @@ fn remoteChanged(self: *App, r: *Remote) void {
 /// try from the host's header gets a stand-in.
 fn remoteFailed(self: *App, i: usize) void {
     const r = self.remotes.orderedRemove(i);
+    self.dropWorkspacesOf(r.conn);
     // After the stand-in is done with the failure's text.
     defer r.conn.deinit();
     const found = self.standIn(r.conn.hostDest().?) orelse return;
@@ -1896,6 +1902,9 @@ fn pruneRemotes(self: *App) void {
             continue;
         }
         const gone = self.remotes.orderedRemove(i);
+        // Its rows may still be listed: the loss may not have been
+        // posted yet.
+        self.dropWorkspacesOf(gone.conn);
         gone.conn.deinit();
     }
 }
@@ -1963,6 +1972,9 @@ fn hostState(self: *App, h: Daemon.HostInfo) void {
     self.markDirty();
 
     const connecting = h.state == .connecting;
+    // A host the daemon is connecting (from a console, or another window)
+    // gets a section here, which its connection's workspaces list under.
+    if (connecting or h.state == .connected) _ = self.hosts.add(e.dest) catch {};
     defer if (!connecting and h.state != .connected) {
         e.ours = false;
     };

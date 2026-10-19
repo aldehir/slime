@@ -147,7 +147,8 @@ host connected without logging in. `slime host connect|ls|disconnect`
 drive it from a console.
 
 The sidebar lists every host connected to before (`hosts` in the config
-directory), each a section like Local: once the daemon has the host
+directory), and any the daemon is connecting (from a console, or another
+window), each a section like Local: once the daemon has the host
 connected, every window bridges to the host's slime to list its
 workspaces, each a row that shows, hides, renames, and kills as a local
 one does, with the ones the last window showed there attached
@@ -177,7 +178,8 @@ one.
   daemon starts connecting, before it's logged in. Sessions left from a
   dead connection aren't dimmed, and sit flat under the host (their
   workspace rows go with the connection) until a new connection there
-  replaces them.
+  shows a tab, which replaces them; one that lists the host but shows
+  nothing leaves them.
 - **A bridge that fails with nobody waiting** (the window listing a
   connected host's workspaces at startup, say against a host daemon
   from another build) says so only in the log; the host's header shows
