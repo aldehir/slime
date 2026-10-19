@@ -28,8 +28,8 @@ pub const Pane = struct {
     session: *Session,
     /// All of it: its title strip and terminal.
     frame: Rect,
-    /// Its terminal, under the strip. Filled in after `Tab.place`, with
-    /// the rest.
+    /// Its terminal, or a browser's page, under the strip (`under`).
+    /// Filled in after `Tab.place`, with the rest.
     rect: Rect = .{},
     /// The space around the grid in `rect`: the configured padding, plus
     /// what's left over of a cell at the right and bottom.
@@ -38,6 +38,13 @@ pub const Pane = struct {
     cols: u16 = 0,
     rows: u16 = 0,
 };
+
+/// What a pane's `frame` holds under its title strip, `strip` tall: its
+/// terminal, or its browser's page.
+pub fn under(frame: Rect, strip: f32) Rect {
+    const top = @min(strip, frame.h);
+    return .{ .x = frame.x, .y = frame.y + top, .w = frame.w, .h = frame.h - top };
+}
 
 /// A junction of dividers: one passing through it and one ending at
 /// it, or two where dividers on both sides of the first line up.

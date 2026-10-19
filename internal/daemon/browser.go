@@ -49,7 +49,7 @@ func (b *BrowserPane) renameLocked(id PaneID) {
 }
 
 // attach adds c to the viewers and tells it the pane's url, from which
-// its window opens the page; nothing follows.
+// its window opens the page, and its title; nothing follows.
 func (b *BrowserPane) attach(c *conn, _ Size, from PaneID) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -57,7 +57,7 @@ func (b *BrowserPane) attach(c *conn, _ Size, from PaneID) error {
 		return nil
 	}
 	b.viewers[c] = struct{}{}
-	c.sendForce(NoPane, notify(rpc.EvPaneAttached, rpc.PaneAttachedParams{ID: b.id, MovedFrom: from, Kind: rpc.PaneBrowser, URL: b.url}))
+	c.sendForce(NoPane, notify(rpc.EvPaneAttached, rpc.PaneAttachedParams{ID: b.id, MovedFrom: from, Kind: rpc.PaneBrowser, URL: b.url, Title: b.title}))
 	return nil
 }
 
@@ -113,28 +113,36 @@ func (b *BrowserPane) desc() rpc.PaneDesc {
 	return rpc.PaneDesc{ID: b.id, Kind: rpc.PaneBrowser, URL: b.url, Title: b.title, Created: b.created.UnixMilli()}
 }
 
-// visitLocked keeps url, and title unless keepTitle, and sends pane.url
-// to the viewers but skip and to the subscribers if the url changed, or
-// always. It reports whether the title changed. Under the server's lock.
-func (b *BrowserPane) visitLocked(url, title string, keepTitle, always bool, skip *conn) (titled bool) {
+// visitLocked keeps url and title, and sends pane.url to the viewers
+// but skip and to the subscribers if the url changed, or always, and
+// pane.title likewise if the title changed. Under the server's lock.
+func (b *BrowserPane) visitLocked(url, title string, always bool, skip *conn) {
 	b.mu.Lock()
 	if b.done {
 		b.mu.Unlock()
-		return false
+		return
 	}
 	moved := always || url != b.url
 	b.url = url
-	if !keepTitle && title != b.title {
+	titled := title != b.title
+	if titled {
 		b.title = title
-		titled = true
 	}
 	id := b.id
 	told := []*conn{skip}
-	if moved {
-		n := notify(rpc.EvPaneURL, rpc.PaneURLParams{ID: id, URL: url})
+	if moved || titled {
+		var ns []*Notify
+		if moved {
+			ns = append(ns, notify(rpc.EvPaneURL, rpc.PaneURLParams{ID: id, URL: url}))
+		}
+		if titled {
+			ns = append(ns, notify(rpc.EvPaneTitle, rpc.PaneTitleParams{ID: id, Title: title}))
+		}
 		for c := range b.viewers {
 			if c != skip {
-				c.sendForce(NoPane, n)
+				for _, n := range ns {
+					c.sendForce(NoPane, n)
+				}
 				told = append(told, c)
 			}
 		}
@@ -143,7 +151,9 @@ func (b *BrowserPane) visitLocked(url, title string, keepTitle, always bool, ski
 	if moved {
 		b.srv.emitLocked(rpc.EvPaneURL, rpc.PaneURLParams{ID: id, URL: url}, nil, told...)
 	}
-	return titled
+	if titled {
+		b.srv.emitLocked(rpc.EvPaneTitle, rpc.PaneTitleParams{ID: id, Title: title}, nil, told...)
+	}
 }
 
 // browserLocked finds browser pane id, by an id it had too.
@@ -160,7 +170,8 @@ func (s *Server) browserLocked(id PaneID) (*BrowserPane, error) {
 }
 
 // paneNavigate sends a browser pane to a url: every viewer's browser
-// follows (pane.url), the caller's too if it views the pane.
+// follows (pane.url), the caller's too if it views the pane. The title
+// was the last page's, so it goes until a browser reports the new one.
 func (s *Server) paneNavigate(_ *callCtx, p rpc.PaneNavigateParams) (rpc.Empty, error) {
 	if p.URL == "" {
 		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "pane.navigate needs a url")
@@ -171,13 +182,13 @@ func (s *Server) paneNavigate(_ *callCtx, p rpc.PaneNavigateParams) (rpc.Empty, 
 	if err != nil {
 		return rpc.Empty{}, err
 	}
-	b.visitLocked(p.URL, "", true, true, nil)
+	b.visitLocked(p.URL, "", true, nil)
 	return rpc.Empty{}, nil
 }
 
 // paneVisited is a viewer's browser reporting where it went and what
-// the page is titled: the other viewers follow (pane.url), and the
-// subscribers hear the title as a terminal's (pane.title).
+// the page is titled: the other viewers follow (pane.url) and show the
+// title, and the subscribers hear both (pane.title as a terminal's).
 func (s *Server) paneVisited(cl *callCtx, p rpc.PaneVisitedParams) (rpc.Empty, error) {
 	if p.URL == "" {
 		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "pane.visited needs a url")
@@ -188,8 +199,6 @@ func (s *Server) paneVisited(cl *callCtx, p rpc.PaneVisitedParams) (rpc.Empty, e
 	if err != nil {
 		return rpc.Empty{}, err
 	}
-	if b.visitLocked(p.URL, p.Title, false, false, cl.c) {
-		s.emitLocked(rpc.EvPaneTitle, rpc.PaneTitleParams{ID: b.paneID(), Title: p.Title}, nil)
-	}
+	b.visitLocked(p.URL, p.Title, false, cl.c)
 	return rpc.Empty{}, nil
 }

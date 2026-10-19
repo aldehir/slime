@@ -5,7 +5,8 @@ const TextField = @This();
 
 const std = @import("std");
 
-pub const max_len = 256;
+/// Room for a long URL in a browser pane's URL bar.
+pub const max_len = 2048;
 
 buf: [max_len]u16 = undefined,
 len: usize = 0,

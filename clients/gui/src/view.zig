@@ -444,9 +444,13 @@ const Builder = struct {
         const t = &self.ui.theme;
         const id: Id = .{ .target = .{ .pane = s.id } };
         const focused = tab_active and s == tab.focus;
+        const icon: Painter.Lucide = switch (s.content) {
+            .terminal => .terminal,
+            .browser => .globe,
+        };
         const children = try self.nodes(&.{
             .{ .kind = .{ .spacer = 6 } },
-            .{ .kind = .{ .icon = .{ .icon = .terminal, .size = 14, .color = if (focused) t.accent else t.text_muted } } },
+            .{ .kind = .{ .icon = .{ .icon = icon, .size = 14, .color = if (focused) t.accent else t.text_muted } } },
             .{ .kind = .{ .spacer = 8 } },
             .{ .kind = .{ .label = .{ .text = s.title(), .color = if (focused) t.text_strong else t.text_muted } } },
             .{ .kind = .{ .spacer = label_gap } },
@@ -479,13 +483,16 @@ const Builder = struct {
                 const s = p.session;
                 const id: Id = .{ .target = .{ .pane = s.id } };
                 const focused = s == tab.focus;
+                const buttons = try self.paneButtons(id, s, tab, p.frame.w, several);
                 try items.append(self.arena, .{ .id = id.with(.terminal), .kind = .{ .pane = .{
                     .title = s.title(),
                     .focused = focused,
                     .dot = several and focused,
                     .dimmed = several and !focused,
-                    .bg = toColor(s.cells.default_bg),
-                    .buttons = try self.paneButtons(id, s, tab, p.frame.w, several),
+                    .bg = toColor(s.background()),
+                    .buttons = buttons.nodes,
+                    .nav = buttons.nav,
+                    .browser = try self.browserPane(s, p.rect),
                 } }, .rect = p.frame });
             }
             for (app.placed().dividers.items, 0..) |d, i| {
@@ -507,17 +514,39 @@ const Builder = struct {
         return .{ .kind = .{ .canvas = items.items }, .rect = self.frame.terminal, .clip = true };
     }
 
+    const PaneButtons = struct {
+        nodes: []Node = &.{},
+        /// The first this many are a browser's history buttons.
+        nav: usize = 0,
+    };
+
     /// A pane's buttons: split right and down, and zoom while the tab
     /// has several panes, if it runs in slime and is wide enough to hold
-    /// them with room for some title.
-    fn paneButtons(self: *const Builder, id: Id, s: *const Session, tab: *const Tab, frame_w: f32, several: bool) Allocator.Error![]Node {
-        if (s.daemonPane() == null) return &.{};
+    /// them with room for some title. A browser's back, forward, and
+    /// reload come first, unlit until a browser can use them; the strip
+    /// drops them where they'd leave its URL bar too narrow.
+    fn paneButtons(self: *const Builder, id: Id, s: *const Session, tab: *const Tab, frame_w: f32, several: bool) Allocator.Error!PaneButtons {
+        if (s.daemonPane() == null) return .{};
+        const nav: []const Id.Part = if (s.content == .browser) &.{ .back, .forward, .reload } else &.{};
         const parts: []const Id.Part = if (several) &.{ .split_right, .split_down, .zoom } else &.{ .split_right, .split_down };
-        if (!PaneStrip.fits(self.ui, frame_w, parts.len)) return &.{};
+        // The history buttons go first, as the strip lays them out.
+        if (!PaneStrip.fits(self.ui, frame_w, parts.len)) return .{};
         const focused = s == tab.focus;
         const zoomed = tab.zoom == s;
-        const buttons = try self.arena.alloc(Node, parts.len);
-        for (buttons, parts) |*b, part| {
+        const buttons = try self.arena.alloc(Node, nav.len + parts.len);
+        const off = self.ui.theme.text_strong;
+        for (buttons[0..nav.len], nav) |*b, part| {
+            // The arrows span 14 of their 24 units and the circle 18:
+            // about 9 and 10 DIPs in these boxes.
+            const icon: Painter.Lucide, const size: f32 = switch (part) {
+                .back => .{ .arrow_left, 15 },
+                .forward => .{ .arrow_right, 15 },
+                .reload => .{ .rotate_cw, 13 },
+                else => unreachable,
+            };
+            b.* = .{ .id = id.with(part), .kind = .{ .icon = .{ .icon = icon, .size = size, .box = PaneStrip.button_size, .color = .{ off[0], off[1], off[2], 0.2 } } } };
+        }
+        for (buttons[nav.len..], parts) |*b, part| {
             const none: []const u16 = &.{};
             const icon: Painter.Lucide, const tip: []const u16, const key: []const u16 = switch (part) {
                 .split_right => .{ .columns_2, L("Split right"), if (focused) self.keys.split_right.slice() else none },
@@ -529,7 +558,32 @@ const Builder = struct {
             // odd size centers the split's middle line on a pixel.
             b.* = .{ .id = id.with(part), .kind = .{ .icon_button = .{ .icon = icon, .size = 13, .style = .faint, .tip = tip, .key = key } } };
         }
-        return buttons;
+        return .{ .nodes = buttons, .nav = nav.len };
+    }
+
+    /// A browser pane's URL bar, and what stands in for its page in
+    /// `page`, under its strip. Null for a terminal.
+    fn browserPane(self: *const Builder, s: *Session, page: Rect) Allocator.Error!?tree.BrowserPane {
+        const url = s.pageUrl() orelse return null;
+        const app = self.app;
+        const editing = app.mode == .url and app.mode.url.pane == s.id;
+        var ended: []const u16 = &.{};
+        if (s.ended) {
+            const why = if (s.daemonLoss()) |loss| loss.text() else "ended";
+            const text = try std.fmt.allocPrint(self.arena, "[{s}. Press any key to close.]", .{why});
+            ended = std.unicode.utf8ToUtf16LeAlloc(self.arena, text) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => &.{},
+            };
+        }
+        return .{
+            .url = url,
+            .field = if (editing) &app.mode.url.field else null,
+            .caret = editing and app.focused and app.blink_visible,
+            .page = page,
+            .page_title = s.title(),
+            .ended = ended,
+        };
     }
 
     /// The kill dialog, or the active session's login, over the
@@ -545,7 +599,7 @@ const Builder = struct {
             .dialog = d,
             .caret = app.focused and app.blink_visible,
             .spinner = app.spinner_step,
-            .terminal_bg = if (focus_session) |s| toColor(s.cells.default_bg) else self.ui.theme.ground,
+            .terminal_bg = if (focus_session) |s| toColor(s.background()) else self.ui.theme.ground,
         } }, .rect = self.frame.terminal };
     }
 

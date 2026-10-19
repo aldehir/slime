@@ -182,6 +182,8 @@ pub const Mode = union(enum) {
     connect: TextField,
     /// A workspace's name being edited in its row.
     rename: Rename,
+    /// A browser pane's URL bar being typed in.
+    url: UrlEdit,
     /// Asking before killing a workspace, over the terminal area.
     confirm: Confirm,
     /// A context menu, over everything, until it's chosen from or
@@ -193,6 +195,13 @@ pub const Mode = union(enum) {
 pub const Rename = struct {
     /// The workspace's key.
     ws: u32,
+    field: TextField,
+};
+
+/// A browser pane's URL bar being typed in.
+pub const UrlEdit = struct {
+    /// The pane's session's id.
+    pane: u32,
     field: TextField,
 };
 
@@ -213,6 +222,8 @@ pub const Keyboard = union(enum) {
     terminal,
     connect: *TextField,
     rename: *TextField,
+    /// A browser pane's URL bar.
+    url: *TextField,
     confirm: *Dialog,
     menu: *Menu,
     login: *Login,
@@ -220,7 +231,7 @@ pub const Keyboard = union(enum) {
     /// The text field typed into, if one has the keyboard.
     pub fn field(self: Keyboard) ?*TextField {
         return switch (self) {
-            .connect, .rename => |f| f,
+            .connect, .rename, .url => |f| f,
             .login => |l| l.dialog.focused(),
             .terminal, .confirm, .menu => null,
         };
@@ -996,7 +1007,7 @@ fn forgetWorkspace(self: *App, key: u32) void {
         .rename => |r| if (r.ws == key) self.cancelRename(),
         .confirm => |c| if (c.ws == key) self.closeConfirm(),
         .menu => |m| if (std.meta.eql(m.target, Id.Target{ .workspace = key })) self.closeMenu(),
-        .terminal, .connect => {},
+        .terminal, .connect, .url => {},
     }
     if (self.activate_ws == key) self.activate_ws = null;
     for (self.workspaces.items, 0..) |w, k| {
@@ -2538,6 +2549,8 @@ fn deactivate(self: *App) void {
     const had_mouse = self.mouse_in_terminal;
     self.mouse_in_terminal = false;
     if (had_mouse) self.shell.releaseMouse();
+    // Its URL bar goes with its focus.
+    self.cancelUrl();
     s.cancelSelection();
     if (self.focused) s.reportFocus(false);
 }
@@ -2731,11 +2744,10 @@ fn blinkTick(self: *App) void {
     // Only redraw if the last frame's cursor blinks. One that starts
     // blinking later picks up the phase from here.
     if (self.focusedSession()) |s| {
-        const c = s.screen.cursor;
-        if (c.visible and c.blinking) self.markDirty();
+        if (s.cursorBlinks()) self.markDirty();
     }
     switch (self.keyboard()) {
-        .connect, .rename => self.markDirty(),
+        .connect, .rename, .url => self.markDirty(),
         .terminal, .confirm, .menu, .login => {},
     }
 }
@@ -2783,6 +2795,57 @@ fn connectKey(self: *App, field: *TextField, vk: u32) bool {
     }
     self.keyHandled();
     return true;
+}
+
+/// Give browser pane `s` the keys in its URL bar, its url all selected,
+/// as browsers do. A click in a bar being edited leaves it be.
+fn startUrl(self: *App, s: *Session) void {
+    const url = s.pageUrl() orelse return;
+    if (self.mode == .url and self.mode.url.pane == s.id) return;
+    self.focusPane(s);
+    self.mode = .{ .url = .{ .pane = s.id, .field = .{} } };
+    const field = &self.mode.url.field;
+    field.insert(url);
+    field.press(.select_all, false, false);
+    self.resetBlink();
+    self.markDirty();
+}
+
+/// Close the URL bar, its url as it was, and give the keys back to the
+/// pane.
+fn cancelUrl(self: *App) void {
+    if (self.mode != .url) return;
+    self.mode = .terminal;
+    self.markDirty();
+}
+
+/// Send the pane to the url in its bar, and close it.
+fn submitUrl(self: *App, edit: *UrlEdit) void {
+    const text = std.mem.trim(u16, edit.field.text(), &.{ ' ', '\t' });
+    if (text.len > 0) if (self.findSession(edit.pane)) |found| {
+        found.s.navigate(text) catch |err| log.err("navigating failed: {}", .{err});
+    };
+    self.cancelUrl();
+}
+
+/// A key down while a URL bar has the keyboard. Returns false for keys
+/// it doesn't take.
+fn urlKey(self: *App, field: *TextField, vk: u32) bool {
+    switch (vk) {
+        win32.VK_RETURN => self.submitUrl(&self.mode.url),
+        win32.VK_ESCAPE => self.cancelUrl(),
+        else => if (!self.editKey(field, vk, true)) return false,
+    }
+    self.keyHandled();
+    return true;
+}
+
+/// Whether the URL bar being edited is still on screen: its pane is
+/// shown in the active tab.
+fn urlShown(self: *App) bool {
+    if (self.mode != .url) return true;
+    const found = self.findSession(self.mode.url.pane) orelse return false;
+    return found.tab == self.active and self.activeTab().shows(found.s);
 }
 
 /// Edit `field` for an editing key, as Windows edit controls do.
@@ -2844,6 +2907,7 @@ pub fn keyboard(self: *App) Keyboard {
     switch (self.mode) {
         .connect => |*f| return .{ .connect = f },
         .rename => |*r| return .{ .rename = &r.field },
+        .url => |*u| return .{ .url = &u.field },
         .confirm => |*c| return .{ .confirm = &c.dialog },
         .menu => |*m| return .{ .menu = m },
         .terminal => {},
@@ -2957,8 +3021,9 @@ fn anyWorking(self: *App) bool {
 /// is gone. The renderer calls this once a frame; `hitAt` reuses the
 /// tree while nothing has changed (`currentTree`).
 pub fn view(self: *App) *const Tree {
-    // A menu about something that's gone goes too.
+    // A menu about something that's gone goes too, and a URL bar.
     if (!self.menuTargetExists()) self.closeMenu();
+    if (!self.urlShown()) self.cancelUrl();
     // The builder reads the placement.
     _ = self.placed();
     _ = self.arena.reset(.retain_capacity);
@@ -3109,6 +3174,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
     // Clicking anywhere else closes the host field, and a rename.
     if (press and !hit.eql(.window(.connect))) self.cancelConnect();
     if (press and !(hit.part == .field and hit.target == .workspace)) self.cancelRename();
+    if (press and !(hit.part == .field and hit.target == .pane)) self.cancelUrl();
     if (hit.part == .terminal) {
         const pane = self.shownPane(hit.target) orelse return;
         if (press) {
@@ -3217,11 +3283,15 @@ fn widgetClick(self: *App, hit: Id) void {
             if (i >= buttons.len or buttons[i].disabled) return;
             if (self.mode == .confirm) self.confirmAction(buttons[i].action) else self.loginAction(buttons[i].action);
         },
-        .field => if (hit.target == .dialog) {
-            const d = self.activeDialog() orelse return;
-            d.focus = .{ .field = hit.target.dialog };
-            self.resetBlink();
-            self.markDirty();
+        .field => switch (hit.target) {
+            .dialog => |i| {
+                const d = self.activeDialog() orelse return;
+                d.focus = .{ .field = i };
+                self.resetBlink();
+                self.markDirty();
+            },
+            .pane => if (self.shownPane(hit.target)) |s| self.startUrl(s),
+            else => {},
         },
         .close => if (self.tabIndexOf(hit.target)) |i| self.closeTab(i),
         .fold => if (self.tabIndexOf(hit.target)) |i| {
@@ -3258,6 +3328,7 @@ fn keyInput(self: *App, k: Msg.Key) Result {
             const taken = down and switch (tag) {
                 .connect => self.connectKey(owner, vk),
                 .rename => self.renameKey(owner, vk),
+                .url => self.urlKey(owner, vk),
                 .confirm => self.confirmKey(owner, vk),
                 .menu => self.menuKey(owner, vk),
                 .login => self.loginKey(owner, vk),
@@ -3358,8 +3429,7 @@ fn placeTab(self: *App, t: *Tab, into: *Placement) void {
     const strip = g.title_height;
     const m = g.cell;
     for (into.panes.items) |*p| {
-        const top = @min(strip, p.frame.h);
-        p.rect = .{ .x = p.frame.x, .y = p.frame.y + top, .w = p.frame.w, .h = p.frame.h - top };
+        p.rect = Placement.under(p.frame, strip);
         const w = @as(u32, @intFromFloat(p.rect.w)) -| pad.left -| pad.right;
         const h = @as(u32, @intFromFloat(p.rect.h)) -| pad.top -| pad.bottom;
         p.cols = @intCast(std.math.clamp(w / m.width, 1, std.math.maxInt(u16)));

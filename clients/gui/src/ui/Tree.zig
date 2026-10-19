@@ -253,8 +253,29 @@ pub const Pane = struct {
     dimmed: bool = false,
     /// Its terminal's default background.
     bg: Color,
-    /// Its buttons at the right of the strip, left to right.
+    /// Its buttons at the right of the strip, left to right; but the
+    /// first `nav`, a browser's, go at the left, before its URL bar.
     buttons: []Node = &.{},
+    nav: usize = 0,
+    /// A browser pane's URL bar, in place of the title, and what stands
+    /// in for its page.
+    browser: ?BrowserPane = null,
+};
+
+pub const BrowserPane = struct {
+    /// Where the page is, shown in the bar while it isn't edited.
+    url: []const u16,
+    /// The bar, while it has the keyboard.
+    field: ?*const TextField = null,
+    /// The field's caret shows.
+    caret: bool = false,
+    /// The pane under its strip (`Placement.Pane.rect`), where the page
+    /// goes.
+    page: Rect,
+    /// What stands in for the page: its title, and why the pane ended,
+    /// if it did.
+    page_title: []const u16,
+    ended: []const u16 = &.{},
 };
 
 pub const DialogView = struct {

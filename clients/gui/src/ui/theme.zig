@@ -21,6 +21,9 @@ pub const Theme = struct {
     surface_hover: Color,
     /// A list row under the mouse.
     row_hover: Color,
+    /// A field at rest over a pane's strip (the url bar): a tint of the
+    /// text, so it shows on the pane's own background in either mode.
+    field: Color,
     /// Icon buttons under the mouse, and while pressed.
     button_hover: Color,
     button_pressed: Color,
@@ -72,6 +75,7 @@ pub const Theme = struct {
             .surface = mix(ground, f, 0.07),
             .surface_hover = mix(ground, f, 0.11),
             .row_hover = mix(ground, f, 0.05),
+            .field = withAlpha(f, 0.07),
             .button_hover = withAlpha(f, 0.08),
             .button_pressed = withAlpha(f, 0.05),
             .close_hover = Painter.rgb(0xc42b1c),

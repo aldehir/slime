@@ -1,9 +1,12 @@
 //! One pane in a window: what slime draws of it, and the input it sends.
-//! slime runs the terminal (cmd/slime); the session applies the
-//! frames slime sends to `screen`, and turns window messages into events
+//! A pane is a terminal or a browser (`content`). slime runs the
+//! terminal (cmd/slime); the session applies the frames slime sends to
+//! its `screen`, and turns window messages into events
 //! (internal/vt/event.zig) that slime handles against the terminal:
-//! keys, mouse reports and selection, the wheel, pastes. Heap allocated,
-//! as the connection's reader holds a pointer to it.
+//! keys, mouse reports and selection, the wheel, pastes. A browser's
+//! page is the window's; slime keeps its url and title, which the
+//! session follows. Heap allocated, as the connection's reader holds a
+//! pointer to it.
 //!
 //! The connection's reader hands the session frames and notices under
 //! `lock`; the UI thread applies the frames when it draws. Mouse
@@ -49,9 +52,11 @@ env: Env,
 /// arrive after it's gone.
 id: u32,
 
-/// Shown while the program hasn't set a title: its name.
+/// Shown while the program hasn't set a title: its name. Empty for a
+/// browser, which goes by its url's host until its page has a title.
 default_title: []const u16,
-/// The program's title (OSC 0/2). Empty for none. UI thread only.
+/// The program's title (OSC 0/2), or a browser's page title. Empty for
+/// none. UI thread only.
 title_buf: [max_title_len]u16 = undefined,
 title_len: usize = 0,
 /// The title as slime last said, for `titleUpdate` to take. Guarded by
@@ -61,46 +66,12 @@ next_title_len: usize = 0,
 /// Set while a WM_APP_TITLE_CHANGED is queued, so a program that
 /// retitles rapidly posts one message rather than flooding the queue.
 title_pending: std.atomic.Value(bool) = .init(false),
-/// A clipboard write for the UI thread to make: the program's (OSC 52),
-/// or a copy's text. Writing on the reader thread could deadlock:
-/// emptying the clipboard sends a message to its previous owner, which
-/// is often us. Empty clears the clipboard. Guarded by `lock`.
-clipboard_write: ?[]u8 = null,
 
 lock: win32.SRWLOCK = .{},
-/// Frames slime sent that aren't applied yet, each u32 seq, u32 length,
-/// then the frame. Guarded by `lock`.
-frames: std.ArrayList(u8) = .empty,
-/// What `applyFrames` swaps `frames` for, to apply them unlocked.
-applying: std.ArrayList(u8) = .empty,
-/// The pane as of the frames applied. UI thread only.
-screen: Frames.Screen = .{},
-/// The last frame applied, and the last acked. UI thread only.
-applied: u32 = 0,
-acked: u32 = 0,
-cells: Cells = .{},
-/// The kitty images slime sent and where the last frame placed them.
-/// UI thread only.
-images: Images = .{},
-textures: Renderer.ImageTextures = .{},
-/// The image slime is sending in pieces, until it's whole. Reader
-/// thread only.
-image_in: ImageIn = .{},
-/// Images received, inflated, for `applyFrames` to install before the
-/// frames that place them. Guarded by `lock`.
-pending_images: std.ArrayList(QueuedImage) = .empty,
-/// What `applyFrames` swaps `pending_images` for.
-installing: std.ArrayList(QueuedImage) = .empty,
 
-/// The grid the layout fits the pane (`resize`), which a screen no frames
-/// come to takes itself. Where the pane is on screen isn't the session's
-/// to know: the window's `Placement` has it.
-cols: u16 = 0,
-rows: u16 = 0,
-/// What slime was last told of the pane's size and geometry, so a
-/// layout that changes nothing sends nothing.
-sized: ?Daemon.Size = null,
-geometry: ?event.Geometry = null,
+/// What fills the pane. Chosen when the session is made, and never
+/// changes, so the reader may look at which it is.
+content: Content,
 
 transport: ?Transport = null,
 
@@ -127,18 +98,106 @@ unseen: std.atomic.Value(bool) = .init(false),
 /// A frame arrived while another session was shown. UI thread only.
 activity: bool = false,
 
-/// The first half of a surrogate pair from a lone WM_CHAR.
-high_surrogate: ?u16 = null,
-
-/// The tag of the last copy asked for.
-copy_tag: u32 = 0,
-
 /// What programs in the session report doing (OSC 7501), as slime
 /// keeps it. Guarded by `lock`.
 program_status: ProgramStatus = .{},
 /// `program_status` changed since the window last looked. Set by the
 /// reader thread.
 status_changed: std.atomic.Value(bool) = .init(false),
+
+/// What fills a pane.
+pub const Content = union(enum) {
+    terminal: Terminal,
+    browser: Browser,
+};
+
+/// A terminal pane's screen, and what drawing it and talking to its
+/// program take.
+pub const Terminal = struct {
+    /// Frames slime sent that aren't applied yet, each u32 seq, u32
+    /// length, then the frame. Guarded by `lock`.
+    frames: std.ArrayList(u8) = .empty,
+    /// What `applyFrames` swaps `frames` for, to apply them unlocked.
+    applying: std.ArrayList(u8) = .empty,
+    /// The pane as of the frames applied. UI thread only.
+    screen: Frames.Screen = .{},
+    /// The last frame applied, and the last acked. UI thread only.
+    applied: u32 = 0,
+    acked: u32 = 0,
+    cells: Cells = .{},
+    /// The kitty images slime sent and where the last frame placed them.
+    /// UI thread only.
+    images: Images = .{},
+    textures: Renderer.ImageTextures = .{},
+    /// The image slime is sending in pieces, until it's whole. Reader
+    /// thread only.
+    image_in: ImageIn = .{},
+    /// Images received, inflated, for `applyFrames` to install before the
+    /// frames that place them. Guarded by `lock`.
+    pending_images: std.ArrayList(QueuedImage) = .empty,
+    /// What `applyFrames` swaps `pending_images` for.
+    installing: std.ArrayList(QueuedImage) = .empty,
+
+    /// The grid the layout fits the pane (`resize`), which a screen no
+    /// frames come to takes itself. Where the pane is on screen isn't the
+    /// session's to know: the window's `Placement` has it.
+    cols: u16 = 0,
+    rows: u16 = 0,
+    /// What slime was last told of the pane's size and geometry, so a
+    /// layout that changes nothing sends nothing.
+    sized: ?Daemon.Size = null,
+    geometry: ?event.Geometry = null,
+
+    /// The first half of a surrogate pair from a lone WM_CHAR.
+    high_surrogate: ?u16 = null,
+
+    /// The tag of the last copy asked for.
+    copy_tag: u32 = 0,
+
+    /// A clipboard write for the UI thread to make: the program's (OSC
+    /// 52), or a copy's text. Writing on the reader thread could
+    /// deadlock: emptying the clipboard sends a message to its previous
+    /// owner, which is often us. Empty clears the clipboard. Guarded by
+    /// `lock`.
+    clipboard_write: ?[]u8 = null,
+
+    fn deinit(self: *Terminal, alloc: Allocator) void {
+        self.textures.deinit(alloc);
+        self.cells.deinit(alloc);
+        self.images.deinit(alloc);
+        for (self.pending_images.items) |*q| Images.freePixels(alloc, &q.image);
+        self.pending_images.deinit(alloc);
+        for (self.installing.items) |*q| Images.freePixels(alloc, &q.image);
+        self.installing.deinit(alloc);
+        self.image_in.data.deinit(alloc);
+        self.screen.deinit(alloc);
+        self.frames.deinit(alloc);
+        self.applying.deinit(alloc);
+        if (self.clipboard_write) |text| alloc.free(text);
+    }
+};
+
+/// A browser pane: where its page is. slime keeps the url and the page's
+/// title (the session's `title`); the page itself, its history, and the
+/// browser showing it will be the window's.
+pub const Browser = struct {
+    /// Where the page is: as slime last said (pane.url), or the URL bar
+    /// sent. Owned. UI thread only.
+    url: []u16 = &.{},
+    /// The url slime last said, for `titleUpdate` to take. Owned.
+    /// Guarded by `lock`.
+    next_url: ?[]u16 = null,
+    /// What the strip's back, forward, and reload buttons go by, once a
+    /// browser reports them.
+    can_go_back: bool = false,
+    can_go_forward: bool = false,
+    loading: bool = false,
+
+    fn deinit(self: *Browser, alloc: Allocator) void {
+        alloc.free(self.url);
+        if (self.next_url) |u| alloc.free(u);
+    }
+};
 
 /// What a session shows.
 const Transport = union(enum) {
@@ -156,8 +215,8 @@ const Pane = struct { conn: *Daemon, pane: Daemon.PaneRef };
 
 /// What a new session shows.
 pub const Launch = union(enum) {
-    /// A pane of the workspace slime keeps for this window. The arrival
-    /// stays the caller's.
+    /// A pane of the workspace slime keeps for this window: a terminal or
+    /// a browser, as the arrival says. The arrival stays the caller's.
     daemon: struct {
         conn: *Daemon,
         arrival: *const Daemon.Arrival,
@@ -225,15 +284,22 @@ pub const DaemonLoss = struct {
     }
 };
 
-/// Start showing `launch` in a new session with a grid of `cols` x `rows`.
+/// Start showing `launch` in a new session; a terminal gets a grid of
+/// `cols` x `rows`.
 pub fn create(alloc: Allocator, wake: Wake, env: Env, id: u32, launch: Launch, cols: u16, rows: u16) !*Session {
     const config = env.config;
     const self = try alloc.create(Session);
     errdefer alloc.destroy(self);
+    const browsing: ?*const Daemon.Arrival = switch (launch) {
+        .daemon => |s| if (s.arrival.kind == .browser) s.arrival else null,
+        else => null,
+    };
     const default_title = try alloc.dupe(u16, switch (launch) {
-        // A host's shell, which slime lists with no command, goes by the
-        // host until it sets a title.
-        .daemon => |s| if (s.arrival.command.len == 0 and s.conn.host() != null)
+        .daemon => |s| if (browsing != null)
+            &.{}
+            // A host's shell, which slime lists with no command, goes by
+            // the host until it sets a title.
+        else if (s.arrival.command.len == 0 and s.conn.host() != null)
             s.conn.hostLabel()
         else
             programName(s.arrival.command),
@@ -247,14 +313,24 @@ pub fn create(alloc: Allocator, wake: Wake, env: Env, id: u32, launch: Launch, c
         .env = env,
         .id = id,
         .default_title = default_title,
-        .cols = cols,
-        .rows = rows,
+        .content = .{ .terminal = .{ .cols = cols, .rows = rows } },
     };
-    errdefer self.screen.deinit(alloc);
-    // Until the first frame says otherwise.
-    self.screen.colors.background = config.background;
-    self.screen.colors.foreground = config.foreground;
-    self.screen.colors.palette = config.palette.colors;
+    if (browsing) |a| {
+        self.content = .{ .browser = .{ .url = try alloc.dupe(u16, a.url) } };
+        // As slime last heard; kept as the next too, so the first url
+        // that comes doesn't take it.
+        self.title_len = @min(a.title.len, max_title_len);
+        @memcpy(self.title_buf[0..self.title_len], a.title[0..self.title_len]);
+        @memcpy(self.next_title_buf[0..self.title_len], a.title[0..self.title_len]);
+        self.next_title_len = self.title_len;
+    }
+    errdefer self.deinitContent();
+    if (self.term()) |t| {
+        // Until the first frame says otherwise.
+        t.screen.colors.background = config.background;
+        t.screen.colors.foreground = config.foreground;
+        t.screen.colors.palette = config.palette.colors;
+    }
 
     switch (launch) {
         .daemon => |s| {
@@ -272,6 +348,7 @@ pub fn create(alloc: Allocator, wake: Wake, env: Env, id: u32, launch: Launch, c
                 .image = daemonImage,
                 .notice = daemonNotice,
                 .copied = daemonCopied,
+                .url = daemonUrl,
                 .ended = daemonEnded,
             });
         },
@@ -291,20 +368,31 @@ pub fn destroy(self: *Session) void {
     const alloc = self.alloc;
     if (self.login) |l| l.destroy();
     self.stopTransport();
-    self.textures.deinit(alloc);
-    self.cells.deinit(alloc);
-    self.images.deinit(alloc);
-    for (self.pending_images.items) |*q| Images.freePixels(alloc, &q.image);
-    self.pending_images.deinit(alloc);
-    for (self.installing.items) |*q| Images.freePixels(alloc, &q.image);
-    self.installing.deinit(alloc);
-    self.image_in.data.deinit(alloc);
-    self.screen.deinit(alloc);
-    self.frames.deinit(alloc);
-    self.applying.deinit(alloc);
-    if (self.clipboard_write) |text| alloc.free(text);
+    self.deinitContent();
     alloc.free(self.default_title);
     alloc.destroy(self);
+}
+
+fn deinitContent(self: *Session) void {
+    switch (self.content) {
+        inline else => |*c| c.deinit(self.alloc),
+    }
+}
+
+/// The terminal filling the pane, if a terminal does.
+pub fn term(self: *Session) ?*Terminal {
+    return switch (self.content) {
+        .terminal => |*t| t,
+        .browser => null,
+    };
+}
+
+/// The browser filling the pane, if a browser does.
+pub fn browser(self: *Session) ?*Browser {
+    return switch (self.content) {
+        .browser => |*b| b,
+        .terminal => null,
+    };
 }
 
 /// Let go of the pane. It runs on in slime; once released, the
@@ -341,11 +429,12 @@ fn live(self: *const Session) ?Pane {
 }
 
 /// Sink for a daemon pane's frames. On the connection's reader thread,
-/// under its lock.
+/// under its lock. A browser gets none.
 fn daemonDraw(ctx: *anyopaque, seq: u32, data: []const u8) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
+    const t = self.term() orelse return;
     self.lockTerminal();
-    const queued = self.queueFrame(seq, data);
+    const queued = queueFrame(self.alloc, t, seq, data);
     self.unlockTerminal();
     // The screen is wrong until the next full frame.
     queued catch return log.err("dropped frame {d}: out of memory", .{seq});
@@ -356,16 +445,16 @@ fn daemonDraw(ctx: *anyopaque, seq: u32, data: []const u8) void {
 
 /// Keep a frame for `applyFrames`. A full frame stands alone, so what
 /// came before it goes. Call with the lock held.
-fn queueFrame(self: *Session, seq: u32, data: []const u8) !void {
+fn queueFrame(alloc: Allocator, t: *Terminal, seq: u32, data: []const u8) !void {
     if (data.len == 0) return error.BadFrame;
     const flags: Frames.Flags = @bitCast(data[0]);
-    if (flags.full) self.frames.clearRetainingCapacity();
-    try self.frames.ensureUnusedCapacity(self.alloc, 8 + data.len);
+    if (flags.full) t.frames.clearRetainingCapacity();
+    try t.frames.ensureUnusedCapacity(alloc, 8 + data.len);
     var head: [8]u8 = undefined;
     std.mem.writeInt(u32, head[0..4], seq, .little);
     std.mem.writeInt(u32, head[4..8], @intCast(data.len), .little);
-    self.frames.appendSliceAssumeCapacity(&head);
-    self.frames.appendSliceAssumeCapacity(data);
+    t.frames.appendSliceAssumeCapacity(&head);
+    t.frames.appendSliceAssumeCapacity(data);
 }
 
 /// A kitty image on its way from slime, in pieces (Daemon.ImagePiece).
@@ -386,7 +475,8 @@ const QueuedImage = struct { id: u32, image: image.Image };
 /// thread, and queued for `applyFrames`.
 fn daemonImage(ctx: *anyopaque, piece: Daemon.ImagePiece) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
-    const in = &self.image_in;
+    const t = self.term() orelse return;
+    const in = &t.image_in;
     if (piece.offset == 0) {
         in.* = .{
             .id = piece.id,
@@ -409,7 +499,7 @@ fn daemonImage(ctx: *anyopaque, piece: Daemon.ImagePiece) void {
     image.premultiply(rgba);
     self.lockTerminal();
     defer self.unlockTerminal();
-    self.pending_images.append(self.alloc, .{ .id = in.id, .image = .{
+    t.pending_images.append(self.alloc, .{ .id = in.id, .image = .{
         .generation = in.generation,
         .width = in.width,
         .height = in.height,
@@ -464,49 +554,51 @@ test inflateImage {
 /// the images that came before them, and lay the images out for the
 /// renderer. UI thread.
 pub fn applyFrames(self: *Session) void {
+    const t = self.term() orelse return;
     self.lockTerminal();
-    std.mem.swap(std.ArrayList(u8), &self.frames, &self.applying);
-    std.mem.swap(std.ArrayList(QueuedImage), &self.pending_images, &self.installing);
+    std.mem.swap(std.ArrayList(u8), &t.frames, &t.applying);
+    std.mem.swap(std.ArrayList(QueuedImage), &t.pending_images, &t.installing);
     self.unlockTerminal();
-    if (self.applying.items.len == 0 and self.installing.items.len == 0) return;
-    defer self.applying.clearRetainingCapacity();
-    defer self.installing.clearRetainingCapacity();
+    if (t.applying.items.len == 0 and t.installing.items.len == 0) return;
+    defer t.applying.clearRetainingCapacity();
+    defer t.installing.clearRetainingCapacity();
 
     // An image comes before the first frame that places it, so all of
     // them can go in first: only the last frame's placements are drawn.
-    for (self.installing.items) |*q| {
-        self.images.put(self.alloc, q.id, q.image) catch |err| {
+    for (t.installing.items) |*q| {
+        t.images.put(self.alloc, q.id, q.image) catch |err| {
             Images.freePixels(self.alloc, &q.image);
             log.err("image {d} dropped: {}", .{ q.id, err });
         };
     }
-    var rest = self.applying.items;
+    var rest = t.applying.items;
     while (rest.len >= 8) {
         const seq = std.mem.readInt(u32, rest[0..4], .little);
         const len = std.mem.readInt(u32, rest[4..8], .little);
         const data = rest[8..][0..len];
         rest = rest[8 + len ..];
-        self.applied = seq;
+        t.applied = seq;
         // Half applied, the screen is wrong until the next full frame.
-        self.screen.apply(self.alloc, data) catch |err| log.err("bad frame {d} from slime: {}", .{ seq, err });
+        t.screen.apply(self.alloc, data) catch |err| log.err("bad frame {d} from slime: {}", .{ seq, err });
     }
-    for (self.screen.dropped.items) |id| self.images.remove(self.alloc, id);
-    self.screen.dropped.clearRetainingCapacity();
+    for (t.screen.dropped.items) |id| t.images.remove(self.alloc, id);
+    t.screen.dropped.clearRetainingCapacity();
     const cell = self.env.cellSize();
-    self.images.update(self.alloc, self.screen.placements.items, cell.width, cell.height) catch |err| log.err("laying out images failed: {}", .{err});
+    t.images.update(self.alloc, t.screen.placements.items, cell.width, cell.height) catch |err| log.err("laying out images failed: {}", .{err});
 }
 
 /// Tell slime the frames applied are drawn, which lets more come. UI
 /// thread, after drawing.
 pub fn drawn(self: *Session) void {
-    if (self.applied == self.acked) return;
-    self.acked = self.applied;
+    const t = self.term() orelse return;
+    if (t.applied == t.acked) return;
+    t.acked = t.applied;
     const s = self.live() orelse return;
-    s.conn.ack(s.pane, self.applied);
+    s.conn.ack(s.pane, t.applied);
 }
 
-/// Sink for what a daemon pane did besides draw. On the connection's
-/// reader thread, under its lock.
+/// Sink for what a daemon pane did besides draw: a browser's title
+/// comes here too. On the connection's reader thread, under its lock.
 fn daemonNotice(ctx: *anyopaque, n: Daemon.Notice) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
     switch (n.kind) {
@@ -515,8 +607,7 @@ fn daemonNotice(ctx: *anyopaque, n: Daemon.Notice) void {
             self.lockTerminal();
             self.next_title_len = titleToUtf16(&self.next_title_buf, n.text);
             self.unlockTerminal();
-            if (self.title_pending.swap(true, .acq_rel)) return;
-            _ = win32.PostMessageW(self.wake.hwnd, messages.WM_APP_TITLE_CHANGED, self.id, 0);
+            self.postTitle();
         },
         .clipboard => {
             const access = self.wake.clipboard_write;
@@ -540,34 +631,60 @@ fn daemonNotice(ctx: *anyopaque, n: Daemon.Notice) void {
     }
 }
 
+/// Have the UI thread take the title and url (`titleUpdate`), unless
+/// it's been asked already.
+fn postTitle(self: *Session) void {
+    if (self.title_pending.swap(true, .acq_rel)) return;
+    _ = win32.PostMessageW(self.wake.hwnd, messages.WM_APP_TITLE_CHANGED, self.id, 0);
+}
+
+/// Sink for a browser pane's new url (pane.url): another window's
+/// browser went there, or someone sent it there. The page's title is
+/// the old page's until one comes. On the connection's reader thread,
+/// under its lock, and posted for the UI thread to take as a title is.
+fn daemonUrl(ctx: *anyopaque, url: []const u8) void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    const b = self.browser() orelse return;
+    const units = std.unicode.utf8ToUtf16LeAlloc(self.alloc, url) catch |err| return log.warn("pane.url dropped: {}", .{err});
+    self.lockTerminal();
+    if (b.next_url) |old| self.alloc.free(old);
+    b.next_url = units;
+    self.next_title_len = 0;
+    self.unlockTerminal();
+    self.postTitle();
+}
+
 /// Sink for a copy's text. On the connection's reader thread, under its
 /// lock.
 fn daemonCopied(ctx: *anyopaque, tag: u32, text: []const u8) void {
     const self: *Session = @ptrCast(@alignCast(ctx));
+    const t = self.term() orelse return;
     // Nothing was selected by the time slime looked.
-    if (text.len == 0 or tag != @atomicLoad(u32, &self.copy_tag, .monotonic)) return;
+    if (text.len == 0 or tag != @atomicLoad(u32, &t.copy_tag, .monotonic)) return;
     self.queueClipboard(text);
 }
 
 /// Hand a clipboard write to the UI thread. One that comes before the
 /// last is made replaces it.
 fn queueClipboard(self: *Session, text: []const u8) void {
+    const t = self.term() orelse return;
     const copy = self.alloc.dupe(u8, text) catch return log.warn("clipboard write dropped: out of memory", .{});
     self.lockTerminal();
     defer self.unlockTerminal();
-    if (self.clipboard_write) |pending| {
+    if (t.clipboard_write) |pending| {
         self.alloc.free(pending);
     } else {
         _ = win32.PostMessageW(self.wake.hwnd, messages.WM_APP_CLIPBOARD_WRITE, self.id, 0);
     }
-    self.clipboard_write = copy;
+    t.clipboard_write = copy;
 }
 
 /// Make the pending clipboard write.
 pub fn clipboardWriteFlush(self: *Session) void {
+    const t = self.term() orelse return;
     self.lockTerminal();
-    const pending = self.clipboard_write;
-    self.clipboard_write = null;
+    const pending = t.clipboard_write;
+    t.clipboard_write = null;
     self.unlockTerminal();
 
     const text = pending orelse return;
@@ -621,14 +738,15 @@ pub fn sshTerm(config: *const Config) []const u8 {
 }
 
 /// Keep the session after its pane was lost, or couldn't run, saying
-/// why. Any key then closes it. UI thread.
+/// why. Any key then closes it. A browser's stand-in says why from
+/// `daemonLoss`. UI thread.
 pub fn showEnded(self: *Session, why: []const u8) void {
     var buf: [512]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "[{s}. Press any key to close.]", .{why}) catch buf[0..];
     // Frames that came before the end are the last.
     self.applyFrames();
     self.ended = true;
-    self.say(text) catch |err| log.err("showing why the pane ended failed: {}", .{err});
+    if (self.term() != null) self.say(text) catch |err| log.err("showing why the pane ended failed: {}", .{err});
     self.unseen.store(true, .release);
 }
 
@@ -637,7 +755,7 @@ pub fn showEnded(self: *Session, why: []const u8) void {
 /// more. UI thread, once frames have stopped.
 fn say(self: *Session, text: []const u8) !void {
     try self.resizeScreen();
-    const screen = &self.screen;
+    const screen = &(self.term() orelse return).screen;
     if (screen.rows == 0) return;
     var y: usize = if (screen.cursor.viewport) |v| @as(usize, v.y) + 1 else 0;
     if (y >= screen.rows) {
@@ -660,16 +778,17 @@ fn say(self: *Session, text: []const u8) !void {
 /// Size the screen to the grid itself, keeping what fits: for a session
 /// no frames come to. UI thread.
 fn resizeScreen(self: *Session) !void {
-    const screen = &self.screen;
+    const t = self.term() orelse return;
+    const screen = &t.screen;
     const old_cols = screen.cols;
     const old_rows = screen.rows;
-    if (old_cols == self.cols and old_rows == self.rows) return;
-    try screen.resize(self.alloc, self.cols, self.rows);
+    if (old_cols == t.cols and old_rows == t.rows) return;
+    try screen.resize(self.alloc, t.cols, t.rows);
     for (screen.row_data.items, 0..) |*row, y| {
-        const kept: usize = if (y < old_rows) @min(old_cols, self.cols) else 0;
+        const kept: usize = if (y < old_rows) @min(old_cols, t.cols) else 0;
         @memset(row.raws.items[kept..], .{});
     }
-    if (screen.cursor.viewport) |v| if (v.x >= self.cols or v.y >= self.rows) {
+    if (screen.cursor.viewport) |v| if (v.x >= t.cols or v.y >= t.rows) {
         screen.cursor.viewport = null;
     };
 }
@@ -682,19 +801,54 @@ pub fn unlockTerminal(self: *Session) void {
     win32.ReleaseSRWLockExclusive(&self.lock);
 }
 
-/// The program's title, or its name if it set none.
+/// The program's title, or its name if it set none. A browser's page
+/// title, or with none its url's host.
 pub fn title(self: *const Session) []const u16 {
-    return if (self.title_len > 0) self.title_buf[0..self.title_len] else self.default_title;
+    if (self.title_len > 0) return self.title_buf[0..self.title_len];
+    return switch (self.content) {
+        .terminal => self.default_title,
+        .browser => |*b| urlHost(b.url),
+    };
 }
 
-/// Take the program's new title. Clears the pending flag before reading,
-/// so a change made after the read posts again.
+/// Take the program's new title, and a browser's url. Clears the
+/// pending flag before reading, so a change made after the read posts
+/// again.
 pub fn titleUpdate(self: *Session) void {
     self.title_pending.store(false, .release);
     self.lockTerminal();
     defer self.unlockTerminal();
     @memcpy(self.title_buf[0..self.next_title_len], self.next_title_buf[0..self.next_title_len]);
     self.title_len = self.next_title_len;
+    const b = self.browser() orelse return;
+    const url = b.next_url orelse return;
+    b.next_url = null;
+    self.alloc.free(b.url);
+    b.url = url;
+}
+
+/// Where a browser pane's page is; null for a terminal.
+pub fn pageUrl(self: *const Session) ?[]const u16 {
+    return switch (self.content) {
+        .browser => |*b| b.url,
+        .terminal => null,
+    };
+}
+
+/// Send a browser pane to `to`, as the URL bar does: slime is told, and
+/// the pane shows it now rather than when slime's echo comes. Its title
+/// was the last page's. UI thread.
+pub fn navigate(self: *Session, to: []const u16) !void {
+    const b = self.browser() orelse return;
+    const s = self.live() orelse return;
+    try s.conn.paneNavigate(s.pane, to);
+    const copy = try self.alloc.dupe(u16, to);
+    self.alloc.free(b.url);
+    b.url = copy;
+    self.lockTerminal();
+    defer self.unlockTerminal();
+    self.title_len = 0;
+    self.next_title_len = 0;
 }
 
 /// The most pressing thing its programs report, for the sidebar.
@@ -704,14 +858,32 @@ pub fn statusSummary(self: *Session) ?ProgramStatus.Summary {
     return self.program_status.summary();
 }
 
+/// The color the pane's box is filled with, under its strip: its
+/// terminal's default background, or the configured one.
+pub fn background(self: *const Session) ghostty_vt.color.RGB {
+    return switch (self.content) {
+        .terminal => |*t| t.cells.default_bg,
+        .browser => self.env.config.background,
+    };
+}
+
+/// Whether the screen's cursor shows and blinks.
+pub fn cursorBlinks(self: *const Session) bool {
+    return switch (self.content) {
+        .terminal => |*t| t.screen.cursor.visible and t.screen.cursor.blinking,
+        .browser => false,
+    };
+}
+
 /// Fit the pane to its place `p` from the window's layout: a new grid or
 /// cell size, and where the grid is in the pane, which slime is told for
 /// mapping the mouse to cells. UI thread.
 pub fn resize(self: *Session, p: Placement.Pane) void {
+    const t = self.term() orelse return;
     const cols = p.cols;
     const rows = p.rows;
-    self.cols = cols;
-    self.rows = rows;
+    t.cols = cols;
+    t.rows = rows;
     const s = self.live() orelse {
         self.resizeScreen() catch |err| log.err("resizing the screen failed: {}", .{err});
         return;
@@ -721,8 +893,8 @@ pub fn resize(self: *Session, p: Placement.Pane) void {
     // fonts too.
     const cell = self.env.cellSize();
     const size: Daemon.Size = .{ .cols = cols, .rows = rows, .cell_width = cell.width, .cell_height = cell.height };
-    if (self.sized == null or !std.meta.eql(self.sized.?, size)) {
-        self.sized = size;
+    if (t.sized == null or !std.meta.eql(t.sized.?, size)) {
+        t.sized = size;
         s.conn.resize(s.pane, size);
     }
 
@@ -740,13 +912,15 @@ pub fn resize(self: *Session, p: Placement.Pane) void {
         .width = width,
         .height = height,
     };
-    if (self.geometry != null and std.meta.eql(self.geometry.?, g)) return;
-    self.geometry = g;
+    if (t.geometry != null and std.meta.eql(t.geometry.?, g)) return;
+    t.geometry = g;
     self.send(.{ .geometry = g });
 }
 
-/// Send slime an event for the pane, if it's live.
+/// Send slime an event for the pane, if it's a live terminal: a
+/// browser's page takes no events through slime.
 fn send(self: *Session, ev: Events.Event) void {
+    if (self.content != .terminal) return;
     const s = self.live() orelse return;
     var buf: [Events.max_len]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -780,8 +954,10 @@ fn sendSettings(self: *Session) void {
 
 /// Send a key message: the key, and the same key as win32-input-mode
 /// (mode 9001) has it, which slime sends instead while the program asks
-/// for that.
+/// for that. A browser pane takes none: its text, posted as WM_CHAR,
+/// comes to `charInput`, which drops it too.
 pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+    if (self.content != .terminal) return;
     // TranslateMessage already posted the WM_(SYS)CHAR / WM_(SYS)DEADCHAR
     // messages this key produced. Take them so the key and its text go
     // together, as one event.
@@ -822,7 +998,11 @@ pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
 
 /// Whether the screen shows a selection.
 pub fn hasSelection(self: *const Session) bool {
-    for (self.screen.row_data.items) |row| {
+    const t = switch (self.content) {
+        .terminal => |*t| t,
+        .browser => return false,
+    };
+    for (t.screen.row_data.items) |row| {
         if (row.selection != null) return true;
     }
     return false;
@@ -833,8 +1013,9 @@ pub fn hasSelection(self: *const Session) bool {
 /// selection.
 pub fn copySelection(self: *Session) bool {
     if (!self.hasSelection()) return false;
-    const tag = self.copy_tag +% 1;
-    @atomicStore(u32, &self.copy_tag, tag, .monotonic);
+    const t = self.term().?;
+    const tag = t.copy_tag +% 1;
+    @atomicStore(u32, &t.copy_tag, tag, .monotonic);
     self.send(.{ .copy = tag });
     return true;
 }
@@ -842,6 +1023,7 @@ pub fn copySelection(self: *Session) bool {
 /// Send the clipboard's text, which slime brackets if the program asked
 /// for that (mode 2004) and makes safe.
 pub fn paste(self: *Session) void {
+    if (self.content != .terminal) return;
     const s = self.live() orelse return;
     const text = (clipboard.get(self.alloc, self.wake.hwnd) catch |err| {
         log.err("paste failed: {}", .{err});
@@ -858,20 +1040,22 @@ pub fn paste(self: *Session) void {
 }
 
 /// Send text from a WM_CHAR that no key message claimed: IME commits,
-/// alt+numpad codes, and VK_PACKET input from SendInput.
+/// alt+numpad codes, and VK_PACKET input from SendInput. A browser pane
+/// drops it.
 pub fn charInput(self: *Session, unit: u16) void {
+    const t = self.term() orelse return;
     var units: [2]u16 = undefined;
     const pair: []const u16 = if (std.unicode.utf16IsHighSurrogate(unit)) {
-        self.high_surrogate = unit;
+        t.high_surrogate = unit;
         return;
     } else if (std.unicode.utf16IsLowSurrogate(unit)) pair: {
-        units = .{ self.high_surrogate orelse return, unit };
+        units = .{ t.high_surrogate orelse return, unit };
         break :pair &units;
     } else pair: {
         units[0] = unit;
         break :pair units[0..1];
     };
-    self.high_surrogate = null;
+    t.high_surrogate = null;
 
     var utf8: [8]u8 = undefined;
     const len = std.unicode.utf16LeToUtf8(&utf8, pair) catch return;
@@ -890,12 +1074,13 @@ pub fn reportFocus(self: *Session, focused: bool) void {
 /// the program or selects with it. Motion without a button goes only to
 /// a program that asked for it.
 pub fn mouseInput(self: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
+    const t = self.term() orelse return;
     const button: ?MouseButton, const action: MouseAction = if (input.mouseButton(msg, wparam)) |b|
         .{ b[0], if (b[1]) .press else .release }
     else
         .{ input.heldButton(wparam), .motion };
     const held = input.heldButton(wparam) != null;
-    if (action == .motion and !held and !self.screen.motion) return;
+    if (action == .motion and !held and !t.screen.motion) return;
     self.send(.{ .mouse = .{
         .action = action,
         .button = button,
@@ -916,6 +1101,7 @@ pub fn cancelSelection(self: *Session) void {
 /// Send the wheel: slime reports it, sends arrow keys for alternate
 /// scroll (mode 1007), or scrolls back.
 pub fn mouseWheel(self: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
+    if (self.content != .terminal) return;
     var lines: u32 = 3;
     _ = win32.SystemParametersInfoW(win32.SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
     self.send(.{ .wheel = .{
@@ -930,7 +1116,10 @@ pub fn mouseWheel(self: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POI
 
 /// The pointer the program asked for (OSC 22).
 pub fn mouseShape(self: *const Session) ghostty_vt.MouseShape {
-    return std.enums.fromInt(ghostty_vt.MouseShape, self.screen.mouse_shape) orelse .default;
+    return switch (self.content) {
+        .terminal => |*t| std.enums.fromInt(ghostty_vt.MouseShape, t.screen.mouse_shape) orelse .default,
+        .browser => .default,
+    };
 }
 
 /// A title as UTF-16 in `out`, returning its length. libghostty-vt cuts
@@ -952,6 +1141,98 @@ test titleToUtf16 {
     // A codepoint cut off after its first byte.
     const cut = "ab\u{1f600}"[0..3];
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("ab"), out[0..titleToUtf16(&out, cut)]);
+}
+
+/// What a page with no title goes by: its url's host (and port), or the
+/// url itself if it has none: `https://alde@example.com:8443/a?b` is
+/// `example.com:8443`, `about:blank` is itself.
+pub fn urlHost(url: []const u16) []const u16 {
+    const sep = std.unicode.utf8ToUtf16LeStringLiteral("://");
+    const start = (std.mem.indexOf(u16, url, sep) orelse return url) + sep.len;
+    var host = url[start..];
+    if (std.mem.indexOfAny(u16, host, &.{ '/', '?', '#' })) |end| host = host[0..end];
+    if (std.mem.lastIndexOfScalar(u16, host, '@')) |at| host = host[at + 1 ..];
+    return if (host.len > 0) host else url;
+}
+
+test urlHost {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    try std.testing.expectEqualSlices(u16, L("example.com:8443"), urlHost(L("https://alde@example.com:8443/a?b")));
+    try std.testing.expectEqualSlices(u16, L("example.com"), urlHost(L("https://example.com")));
+    try std.testing.expectEqualSlices(u16, L("intranet"), urlHost(L("http://intranet#top")));
+    try std.testing.expectEqualSlices(u16, L("about:blank"), urlHost(L("about:blank")));
+    try std.testing.expectEqualSlices(u16, L("file:///C:/x"), urlHost(L("file:///C:/x")));
+}
+
+/// A browser session as `create` makes one from an arrival, without a
+/// connection, for the tests.
+fn testBrowser(alloc: Allocator, config: *const Config, url: []const u16) !Session {
+    return .{
+        .alloc = alloc,
+        .wake = undefined,
+        .env = .{ .config = config, .ctx = undefined, .cell_size = undefined, .on_input = undefined },
+        .id = 1,
+        .default_title = &.{},
+        .content = .{ .browser = .{ .url = try alloc.dupe(u16, url) } },
+    };
+}
+
+test "a browser goes by its page's title, else its host, and takes slime's url" {
+    const alloc = std.testing.allocator;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var config: Config = .init(alloc);
+    defer config.deinit();
+    var s = try testBrowser(alloc, &config, L("https://example.com/"));
+    defer s.deinitContent();
+    try std.testing.expectEqualSlices(u16, L("example.com"), s.title());
+    try std.testing.expectEqualSlices(u16, L("https://example.com/"), s.pageUrl().?);
+
+    // pane.title, then pane.url from the reader: the title is the new
+    // page's only once one comes for it. (Already pending: nothing's
+    // posted.)
+    s.title_pending.store(true, .release);
+    daemonNotice(&s, .{ .kind = .title, .text = "Example", .status = undefined });
+    s.titleUpdate();
+    try std.testing.expectEqualSlices(u16, L("Example"), s.title());
+    s.title_pending.store(true, .release);
+    daemonUrl(&s, "https://example.org/x");
+    s.titleUpdate();
+    try std.testing.expectEqualSlices(u16, L("https://example.org/x"), s.pageUrl().?);
+    try std.testing.expectEqualSlices(u16, L("example.org"), s.title());
+    // An update with no url leaves the url.
+    s.title_pending.store(true, .release);
+    daemonNotice(&s, .{ .kind = .title, .text = "Hello", .status = undefined });
+    s.titleUpdate();
+    try std.testing.expectEqualSlices(u16, L("https://example.org/x"), s.pageUrl().?);
+    try std.testing.expectEqualSlices(u16, L("Hello"), s.title());
+}
+
+test "a terminal's methods do nothing for a browser" {
+    const alloc = std.testing.allocator;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var config: Config = .init(alloc);
+    defer config.deinit();
+    var s = try testBrowser(alloc, &config, L("https://example.com/"));
+    defer s.deinitContent();
+    try std.testing.expect(s.term() == null);
+    try std.testing.expect(s.browser() != null);
+    // Nothing here reaches for a connection, a window, or a screen.
+    s.resize(.{ .session = &s, .frame = .{ .w = 400, .h = 300 }, .rect = .{ .w = 400, .h = 270 }, .cols = 40, .rows = 20 });
+    s.applyFrames();
+    s.drawn();
+    s.charInput('a');
+    s.keyInput(win32.WM_KEYDOWN, 'A', 0);
+    s.mouseInput(win32.WM_LBUTTONDOWN, 0, .{ .x = 5, .y = 5 });
+    s.clipboardWriteFlush();
+    daemonDraw(&s, 1, "x");
+    daemonCopied(&s, 0, "x");
+    try std.testing.expect(!s.unseen.load(.acquire));
+    try std.testing.expect(!s.hasSelection());
+    try std.testing.expect(!s.copySelection());
+    try std.testing.expect(!s.cursorBlinks());
+    try std.testing.expectEqual(ghostty_vt.MouseShape.default, s.mouseShape());
+    try std.testing.expectEqual(config.background, s.background());
+    try std.testing.expect(s.term() == null);
 }
 
 /// The program a command line runs, without its directory or `.exe`:

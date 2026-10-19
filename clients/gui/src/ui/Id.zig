@@ -87,7 +87,12 @@ pub const Part = enum {
     split_right,
     split_down,
     zoom,
-    /// A text field: a workspace's name being edited, a dialog's field.
+    /// A browser pane's history and reload buttons.
+    back,
+    forward,
+    reload,
+    /// A text field: a workspace's name being edited, a dialog's field,
+    /// a browser pane's URL bar.
     field,
     /// A dialog's button.
     button,

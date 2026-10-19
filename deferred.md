@@ -329,6 +329,19 @@ so; the host's button reconnects, reattaches, and replaces them.
   that's wanted. A window showing several workspaces has its own
   current tab among them, so this only bites windows on the same one.
 
+## Browser panes
+
+A pane is a terminal or a browser (`slime pane split --browser <url>`).
+The daemon keeps a browser's url and title; the window draws its strip
+with a URL bar (a click selects it all, Enter sends `pane.navigate`,
+Escape puts it back) and, for now, the page's title and url as text
+where the page goes (`.plans/browser-pane-plan.md`, stages 3 and 4).
+
+- **Back, forward, and reload** are drawn unlit and do nothing until a
+  browser fills the pane and says what its history allows.
+- **A narrow pane's URL bar** is cut short with an ellipsis; at rest it
+  drops `https://`, so the host comes first.
+
 ## Scripting
 
 `slime do` runs Lua in the daemon (internal/lua, gopher-lua): the

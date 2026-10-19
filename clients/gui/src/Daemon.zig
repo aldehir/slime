@@ -426,6 +426,9 @@ pub const Sink = struct {
     notice: *const fn (ctx: *anyopaque, n: Notice) void,
     /// The selection's text, answering a copy event: empty with none.
     copied: *const fn (ctx: *anyopaque, tag: u32, text: []const u8) void,
+    /// A browser pane's new url (pane.url). Its page's title comes as a
+    /// `title` notice (pane.title).
+    url: *const fn (ctx: *anyopaque, url: []const u8) void,
     /// The pane is gone from us: its child exited (`why` null), or the
     /// workspace or connection was lost (why says how).
     ended: *const fn (ctx: *anyopaque, why: ?[]const u8) void,
@@ -482,15 +485,34 @@ pub const StatusRecords = struct {
 pub const Arrival = struct {
     /// Its id, which names its tab and workspace.
     pane: PaneRef,
+    kind: PaneKind = .terminal,
     /// Owned, in the connection's allocator.
     command: []const u16,
     /// What its programs report doing (OSC 7501), oldest update first.
     /// Owned.
     status: []StatusRecord,
+    /// A browser's page and its title, as slime last heard. Owned.
+    url: []const u16 = &.{},
+    title: []const u16 = &.{},
 
     pub fn deinit(self: *Arrival, alloc: Allocator) void {
         alloc.free(self.command);
         freeStatus(alloc, self.status);
+        alloc.free(self.url);
+        alloc.free(self.title);
+    }
+};
+
+/// What fills a pane (rpc.PaneKind): a terminal slime runs, or a browser
+/// the window runs, of which slime keeps the url and title.
+pub const PaneKind = enum {
+    terminal,
+    browser,
+
+    /// As the wire names it: omitted for a terminal. A kind this build
+    /// doesn't know is a terminal, which shows nothing.
+    fn parse(text: []const u8) PaneKind {
+        return if (std.mem.eql(u8, text, "browser")) .browser else .terminal;
     }
 };
 
@@ -761,7 +783,17 @@ pub const Json = struct {
     const Tab = struct { id: TabRef, name: []const u8 = "", tree: Node, focus: PaneRef = .none, zoomed: PaneRef = .none };
     const Created = struct { pane: PaneRef = .none };
     /// `moved_from` is the id the pane had, if it just moved tabs.
-    const PaneAttached = struct { id: PaneRef, moved_from: PaneRef = .none, command: []const u8 = "", status: []const Status = &.{} };
+    const PaneAttached = struct {
+        id: PaneRef,
+        moved_from: PaneRef = .none,
+        kind: []const u8 = "",
+        url: []const u8 = "",
+        title: []const u8 = "",
+        command: []const u8 = "",
+        status: []const Status = &.{},
+    };
+    const PaneURL = struct { id: PaneRef, url: []const u8 = "" };
+    const PaneTitle = struct { id: PaneRef, title: []const u8 = "" };
     const Status = struct { id: []const u8 = "", state: u8 = 0, progress: i8 = -1 };
     const PaneExited = struct { id: PaneRef, status: u32 = 0 };
     const ClientActionJson = struct { workspace: u32 = 0, name: []const u8 = "", args: std.json.Value = .null };
@@ -802,17 +834,35 @@ const Slot = struct {
 const Pending = struct {
     /// Messages for the sink, each u8 type, u32 length, payload.
     kept: std.ArrayList(u8) = .empty,
+    kind: PaneKind = .terminal,
     command: []const u16 = &.{},
     status: []StatusRecord = &.{},
+    url: []const u16 = &.{},
+    title: []const u16 = &.{},
     /// Handed to `arrivals` already.
     arrived: bool = false,
+    /// A browser's latest url and title (pane.url, pane.title) since it
+    /// attached, for the sink. Owned.
+    next_url: ?[]u8 = null,
+    next_title: ?[]u8 = null,
 
     fn deinit(self: *Pending, alloc: Allocator) void {
         self.kept.deinit(alloc);
+        if (self.next_url) |u| alloc.free(u);
+        if (self.next_title) |t| alloc.free(t);
         if (!self.arrived) {
             alloc.free(self.command);
             freeStatus(alloc, self.status);
+            alloc.free(self.url);
+            alloc.free(self.title);
         }
+    }
+
+    /// Keep `text` as the latest in `field`.
+    fn latest(alloc: Allocator, field: *?[]u8, text: []const u8) !void {
+        const copy = try alloc.dupe(u8, text);
+        if (field.*) |old| alloc.free(old);
+        field.* = copy;
     }
 
     fn keep(self: *Pending, alloc: Allocator, f: Frame) !void {
@@ -833,6 +883,8 @@ const Pending = struct {
             deliver(sink, f) catch |err| log.warn("bad message {d} from slime: {}", .{ rest[0], err });
             rest = rest[5 + len ..];
         }
+        if (self.next_url) |u| sink.url(sink.ctx, u);
+        if (self.next_title) |t| sink.notice(sink.ctx, titleNotice(t));
     }
 };
 
@@ -1448,6 +1500,24 @@ pub fn split(self: *Daemon, pane: PaneRef, dir: Direction, command: []const u16)
     _ = try self.call("pane.split", .{ .pane = pane, .direction = dir, .share = 5000, .command = cmd });
 }
 
+/// Send browser pane `pane` to `url`: every window showing it follows,
+/// this one too (pane.url). UI thread.
+pub fn paneNavigate(self: *Daemon, pane: PaneRef, url: []const u16) !void {
+    const text = try commandUtf8(self.alloc, url);
+    defer self.alloc.free(text);
+    _ = try self.call("pane.navigate", .{ .pane = pane, .url = text });
+}
+
+/// Tell slime where this window's browser for `pane` went, and what the
+/// page is titled: the other windows showing it follow. UI thread.
+pub fn paneVisited(self: *Daemon, pane: PaneRef, url: []const u16, title: []const u16) !void {
+    const url8 = try commandUtf8(self.alloc, url);
+    defer self.alloc.free(url8);
+    const title8 = try commandUtf8(self.alloc, title);
+    defer self.alloc.free(title8);
+    _ = try self.call("pane.visited", .{ .pane = pane, .url = url8, .title = title8 });
+}
+
 /// Replace tab `tab`'s tree with `root`, which must hold the same panes:
 /// a divider was dragged. Each split's shares are scaled to sum to the
 /// whole slime wants. The tree comes back as workspace.changed. UI
@@ -1617,6 +1687,8 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
     const Event = enum {
         @"pane.attached",
         @"pane.exited",
+        @"pane.url",
+        @"pane.title",
         @"workspace.changed",
         @"workspace.detached",
         @"workspace.open",
@@ -1656,6 +1728,10 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
             const p = try std.json.parseFromValueLeaky(Json.PaneAttached, a, params, json_opts);
             const command = try toUtf16(self.alloc, p.command);
             errdefer self.alloc.free(command);
+            const url = try toUtf16(self.alloc, p.url);
+            errdefer self.alloc.free(url);
+            const title = try toUtf16(self.alloc, p.title);
+            errdefer self.alloc.free(title);
             const status = try self.alloc.alloc(StatusRecord, p.status.len);
             var made: usize = 0;
             errdefer freeStatus(self.alloc, status[0..made]);
@@ -1674,7 +1750,32 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
                 .pending => |*old| old.deinit(self.alloc),
                 .live => {},
             };
-            gop.value_ptr.* = .{ .state = .{ .pending = .{ .command = command, .status = status } } };
+            gop.value_ptr.* = .{ .state = .{ .pending = .{
+                .kind = .parse(p.kind),
+                .command = command,
+                .status = status,
+                .url = url,
+                .title = title,
+            } } };
+        },
+        // A browser pane's, to its viewers: its session follows.
+        .@"pane.url" => {
+            const p = try std.json.parseFromValueLeaky(Json.PaneURL, a, params, json_opts);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            if (self.panes.getPtr(p.id)) |slot| switch (slot.state) {
+                .pending => |*pend| try Pending.latest(self.alloc, &pend.next_url, p.url),
+                .live => |sink| sink.url(sink.ctx, p.url),
+            };
+        },
+        .@"pane.title" => {
+            const p = try std.json.parseFromValueLeaky(Json.PaneTitle, a, params, json_opts);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            if (self.panes.getPtr(p.id)) |slot| switch (slot.state) {
+                .pending => |*pend| try Pending.latest(self.alloc, &pend.next_title, p.title),
+                .live => |sink| sink.notice(sink.ctx, titleNotice(p.title)),
+            };
         },
         .@"pane.exited" => {
             const p = try std.json.parseFromValueLeaky(Json.PaneExited, a, params, json_opts);
@@ -1880,8 +1981,11 @@ fn arriveLocked(self: *Daemon, node: Node) !void {
             if (pend.arrived) return;
             try self.arrivals.append(self.alloc, .{
                 .pane = pane,
+                .kind = pend.kind,
                 .command = pend.command,
                 .status = pend.status,
+                .url = pend.url,
+                .title = pend.title,
             });
             pend.arrived = true;
         },
@@ -1912,6 +2016,11 @@ fn dropWorkspaceLocked(self: *Daemon, ws: u32, why: ?[]const u8) void {
         }
     }
     for (gone.items) |id| _ = self.panes.remove(id);
+}
+
+/// A title as a notice carries it, for a browser's, which comes as JSON.
+fn titleNotice(text: []const u8) Notice {
+    return .{ .kind = .title, .text = text, .status = .{ .r = .{ .buf = &.{} }, .left = 0 } };
 }
 
 /// Hand a pane's message to its session.
@@ -2678,4 +2787,94 @@ test "frames match the Go side's wire format" {
         0x08, 0x07, 0x06, 0x05,
         0x0c, 0x0b, 0x0a, 0x09,
     }, &b);
+}
+
+test "a browser pane arrives with its url and title, and what comes before it's adopted waits" {
+    const alloc = std.testing.allocator;
+    var d = unconnected(alloc);
+    defer d.freeState();
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const notify = struct {
+        fn f(conn: *Daemon, ar: Allocator, method: []const u8, json: []const u8) !void {
+            try conn.notified(ar, method, try std.json.parseFromSliceLeaky(std.json.Value, ar, json, .{}));
+        }
+    }.f;
+
+    try notify(&d, a, "pane.attached",
+        \\{"id":"1.1.2","kind":"browser","url":"https://example.com/","title":"Example","command":""}
+    );
+    try notify(&d, a, "pane.attached",
+        \\{"id":"1.1.1","command":"pwsh"}
+    );
+    _ = try d.applyWorkspace(try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"id":1,"name":"w","tabs":[{"id":"1.1","focus":"1.1.2","tree":{"split":{"axis":"row","children":[{"share":5000,"node":{"pane":"1.1.1"}},{"share":5000,"node":{"pane":"1.1.2"}}]}}}]}
+    , .{}));
+    const arrivals = d.arrivals.items;
+    try std.testing.expectEqual(@as(usize, 2), arrivals.len);
+    try std.testing.expectEqual(PaneKind.terminal, arrivals[0].kind);
+    try std.testing.expectEqualSlices(u16, L("pwsh"), arrivals[0].command);
+    try std.testing.expectEqual(PaneKind.browser, arrivals[1].kind);
+    try std.testing.expectEqualSlices(u16, L("https://example.com/"), arrivals[1].url);
+    try std.testing.expectEqualSlices(u16, L("Example"), arrivals[1].title);
+
+    // Where it went before its session took it, and after: the latest
+    // first, then live.
+    try notify(&d, a, "pane.url",
+        \\{"id":"1.1.2","url":"https://example.org/a"}
+    );
+    try notify(&d, a, "pane.url",
+        \\{"id":"1.1.2","url":"https://example.org/b"}
+    );
+    try notify(&d, a, "pane.title",
+        \\{"id":"1.1.2","title":"B"}
+    );
+    const Got = struct {
+        urls: [4][]const u8 = undefined,
+        n_urls: usize = 0,
+        title: []const u8 = "",
+
+        fn url(ctx: *anyopaque, u: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.urls[self.n_urls] = std.testing.allocator.dupe(u8, u) catch unreachable;
+            self.n_urls += 1;
+        }
+        fn notice(ctx: *anyopaque, n: Notice) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (n.kind != .title) return;
+            std.testing.allocator.free(self.title);
+            self.title = std.testing.allocator.dupe(u8, n.text) catch unreachable;
+        }
+        fn draw(_: *anyopaque, _: u32, _: []const u8) void {}
+        fn image(_: *anyopaque, _: ImagePiece) void {}
+        fn copied(_: *anyopaque, _: u32, _: []const u8) void {}
+        fn ended(_: *anyopaque, _: ?[]const u8) void {}
+    };
+    var got: Got = .{};
+    defer {
+        for (got.urls[0..got.n_urls]) |u| alloc.free(u);
+        alloc.free(got.title);
+    }
+    d.adopt(.{ .ws = 1, .tab = 1, .n = 2 }, .{
+        .ctx = &got,
+        .draw = Got.draw,
+        .image = Got.image,
+        .notice = Got.notice,
+        .copied = Got.copied,
+        .url = Got.url,
+        .ended = Got.ended,
+    });
+    try std.testing.expectEqual(@as(usize, 1), got.n_urls);
+    try std.testing.expectEqualStrings("https://example.org/b", got.urls[0]);
+    try std.testing.expectEqualStrings("B", got.title);
+    try notify(&d, a, "pane.url",
+        \\{"id":"1.1.2","url":"https://example.org/c"}
+    );
+    try notify(&d, a, "pane.title",
+        \\{"id":"1.1.2","title":"C"}
+    );
+    try std.testing.expectEqual(@as(usize, 2), got.n_urls);
+    try std.testing.expectEqualStrings("https://example.org/c", got.urls[1]);
+    try std.testing.expectEqualStrings("C", got.title);
 }

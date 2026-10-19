@@ -157,8 +157,8 @@ func TestBrowserNavigate(t *testing.T) {
 	}
 }
 
-// TestBrowserVisited: a viewer's report reaches the other viewers as
-// pane.url, not itself, and the subscribers as pane.url and pane.title.
+// TestBrowserVisited: a viewer's report reaches the other viewers, not
+// itself, and the subscribers as pane.url and pane.title.
 func TestBrowserVisited(t *testing.T) {
 	h := newHarness(t)
 	w1 := h.window()
@@ -180,6 +180,12 @@ func TestBrowserVisited(t *testing.T) {
 	if u := nextEvent[rpc.PaneURLParams](w2, rpc.EvPaneURL); u.ID != created.Pane || u.URL != "https://a.example/next" {
 		t.Errorf("second window got %+v", u)
 	}
+	if n := nextEvent[rpc.PaneTitleParams](w2, rpc.EvPaneTitle); n.ID != created.Pane || n.Title != "Next" {
+		t.Errorf("second window got %+v", n)
+	}
+	if n := notified(w1.c, rpc.EvPaneTitle); len(n) != 0 {
+		t.Errorf("the reporter got its own title back: %s", n)
+	}
 	id := created.Pane.String()
 	for _, want := range []string{
 		`pane.url {"id":"` + id + `","url":"https://a.example/next"}`,
@@ -197,6 +203,9 @@ func TestBrowserVisited(t *testing.T) {
 	if err := w1.c.Call(rpc.PaneVisited, rpc.PaneVisitedParams{Pane: created.Pane, URL: "https://a.example/next", Title: "Renamed"}, nil); err != nil {
 		t.Fatal(err)
 	}
+	if n := nextEvent[rpc.PaneTitleParams](w2, rpc.EvPaneTitle); n.Title != "Renamed" {
+		t.Errorf("second window got %+v", n)
+	}
 	if name, params := nextNotify(t, sub); name != rpc.EvPaneTitle || string(params) != `{"id":"`+id+`","title":"Renamed"}` {
 		t.Errorf("subscriber got %s %s", name, params)
 	}
@@ -207,6 +216,13 @@ func TestBrowserVisited(t *testing.T) {
 	}
 	if u := nextEvent[rpc.PaneURLParams](w2, rpc.EvPaneURL); u.URL != "https://z.example" {
 		t.Errorf("second window got %+v", u)
+	}
+	// The last page's title went with it.
+	if n := nextEvent[rpc.PaneTitleParams](w2, rpc.EvPaneTitle); n.Title != "" {
+		t.Errorf("second window got %+v", n)
+	}
+	if d := paneInfo(t, sub, created.Pane); d.Title != "" {
+		t.Errorf("info %+v", d)
 	}
 }
 

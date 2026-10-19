@@ -755,15 +755,15 @@ type PaneTextResult struct {
 
 // PaneNavigateParams sends browser pane Pane to URL: the daemon keeps
 // it, and the pane's viewers get pane.url, each window's browser
-// following.
+// following. The title is dropped until a viewer reports the page's.
 type PaneNavigateParams struct {
 	Pane PaneID `json:"pane"`
 	URL  string `json:"url"`
 }
 
 // PaneVisitedParams is a viewer's report that its browser for pane
-// Pane is at URL, titled Title: the daemon keeps both, the pane's other
-// viewers get pane.url, and the subscribers pane.title.
+// Pane is at URL, titled Title: the daemon keeps both, and the pane's
+// other viewers and the subscribers get pane.url and pane.title.
 type PaneVisitedParams struct {
 	Pane  PaneID `json:"pane"`
 	URL   string `json:"url"`
@@ -842,6 +842,8 @@ type PaneAttachedParams struct {
 	MovedFrom PaneID   `json:"moved_from,omitzero"`
 	Kind      PaneKind `json:"kind,omitempty"`
 	URL       string   `json:"url,omitempty"`
+	// Title is a browser's page title as its viewers last reported it.
+	Title string `json:"title,omitempty"`
 	// Command is what the pane runs, for a client that didn't start it.
 	Command string         `json:"command"`
 	Status  []StatusRecord `json:"status,omitempty"`

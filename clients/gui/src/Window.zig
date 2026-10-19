@@ -85,6 +85,13 @@ app: App,
 
 /// Scratch for `render`.
 frame_panes: std.ArrayList(Renderer.Pane) = .empty,
+/// What the renderer draws a browser pane's box from: no grid, the
+/// configured background. Never built, so never holds anything.
+blank: struct {
+    cells: @import("renderer/cells.zig").Cells = .{},
+    images: @import("renderer/image.zig").Images = .{},
+    textures: Renderer.ImageTextures = .{},
+} = .{},
 
 /// Auto-reset event slime's readers set after handing a session a
 /// frame (or program status). The message loop waits on it alongside
@@ -392,12 +399,25 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     if (tab) |tb| {
         for (app.placed().panes.items) |p| {
             const s = p.session;
+            // A browser's box, under its stand-in.
+            const term = s.term() orelse {
+                self.blank.cells.default_bg = self.config.background;
+                try self.frame_panes.append(self.alloc, .{
+                    .cells = &self.blank.cells,
+                    .images = &self.blank.images,
+                    .textures = &self.blank.textures,
+                    .frame = p.frame,
+                    .viewport = .{},
+                    .grid_offset = .{ 0, 0 },
+                });
+                continue;
+            };
             s.applyFrames();
             if (stats) t = self.stats.lap(.update, t);
             // Panes without focus show a hollow cursor, as an unfocused
             // window's does.
             const focus = s == tb.focus;
-            try s.cells.build(self.alloc, &s.screen, &self.grid, .{
+            try term.cells.build(self.alloc, &term.screen, &self.grid, .{
                 .focused = focus and app.focused and terminal_keys,
                 .blink_visible = app.blink_visible,
             }, .{
@@ -408,9 +428,9 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
             });
             if (stats) t = self.stats.lap(.build, t);
             try self.frame_panes.append(self.alloc, .{
-                .cells = &s.cells,
-                .images = &s.images,
-                .textures = &s.textures,
+                .cells = &term.cells,
+                .images = &term.images,
+                .textures = &term.textures,
                 .frame = p.frame,
                 .viewport = p.rect,
                 .grid_offset = .{ @floatFromInt(p.pad.left), @floatFromInt(p.pad.top) },
