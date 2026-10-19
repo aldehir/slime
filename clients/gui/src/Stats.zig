@@ -1,5 +1,6 @@
-//! Frame timing and output throughput, shown in the chrome once a
-//! second. Enabled with `-Dstats` (default in Debug builds).
+//! Frame timing and output throughput, shown in the sidebar once a
+//! second: from the start with `-Dstats` (default in Debug builds), or
+//! once the command palette's command turns them on.
 const Stats = @This();
 
 const std = @import("std");

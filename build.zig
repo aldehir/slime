@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         .stats = b.option(
             bool,
             "stats",
-            "Show frame timing and throughput in the window title (default: true in Debug)",
+            "Show frame timing and throughput in the sidebar from the start (default: true in Debug)",
         ) orelse (optimize == .Debug),
         .@"max-fps" = b.option(
             u32,

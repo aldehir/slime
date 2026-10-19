@@ -16,7 +16,12 @@ is attached.
 
 - **Tabs in the title bar.** The toggle only hides the sidebar; the
   tabs (titles, close buttons, overflow) aren't drawn in the bar.
-- **Sidebar scrolling.** Rows past the bottom are clipped.
+- **Sidebar scrolling.** Rows past the bottom are clipped. The palette's
+  list has the overlay scrollbar (`clients/gui/src/ui/Scrollbar.zig`:
+  a thin thumb that widens under the mouse, drags, and pages on a click
+  off the thumb) for the sidebar's tree to take up, with a scroll
+  offset of its own and the wheel over it. The terminal's scrollback
+  needs the frame to carry its length and viewport offset first.
 - **Reordering and renaming** tab rows. Rows have a context menu
   (`clients/gui/src/ui/Menu.zig`, built in `App.openMenu`); a tab's
   only closes it.
@@ -30,8 +35,16 @@ is attached.
 - **Closing a window with several sessions** doesn't ask.
 - **A session whose child exits** closes its row at once, whatever the
   exit status. The mockups keep a failed one open with its status.
-- **Keyboard access** to the chrome (focusing the list, UI Automation),
-  a key for the toggle, and jumping to a session by number.
+- **Keyboard access** to the chrome (focusing the list, UI Automation)
+  and jumping to a session by number. The command palette
+  (Ctrl+Shift+P) toggles the sidebar and switches tabs by name.
+- **The command palette** lists every tab, hidden workspace, window
+  command, init.lua action, and host; it doesn't yet put recently used
+  entries first, list the Host blocks of `~/.ssh/config` (the daemon
+  reads them, but nothing lists them), or take a Lua action's args.
+  Its own commands (show the stats, reload the
+  config, connect to a host) aren't window actions, so init.lua can't
+  bind keys to them.
 - **The chrome's colors** come from the configured background and
   foreground at startup. They don't follow a program's OSC 10/11, and
   switching between a light/dark theme pair waits on following the
@@ -178,7 +191,6 @@ one.
   the keyboard edits them.
 - **IME composition in text fields.** Committed text arrives as
   WM_CHAR, but the candidate window isn't placed at the caret.
-- **The Connect field's key** to open it from the keyboard.
 - **Long keyboard-interactive rounds.** One past eight questions is cut
   short.
 
@@ -289,9 +301,9 @@ so; the host's button reconnects, reattaches, and replaces them.
   panes), and nothing says which window has one shown beyond an eye.
 - **A tab can't move to another workspace**; `pane.move` stays within
   one, and there is no `tab.move`.
-- **The window's workspace actions have no keys**: showing, hiding,
-  making, renaming, and killing are the sidebar's buttons only, and a
-  hidden workspace can't be switched to from the keyboard.
+- **Hiding, renaming, and killing a workspace have no keys**: they're
+  the sidebar's menu only. The command palette shows a hidden one and
+  makes one.
 - **An empty shown workspace goes when the window hides it** or closes:
   the daemon drops a workspace with no tabs once no window views it, so
   one emptied by closing its tabs lives only while shown.

@@ -2,9 +2,9 @@
 //! has (workspaces, tabs, panes, hosts) and what the UI draws (`ui/Tree`).
 //! `build` makes a tree each frame, in an arena: the title bar, the
 //! sidebar as a tree of sections, workspaces, tabs, and panes, the
-//! terminal area's pane strips, a dialog over it, and a context menu over
-//! everything. What a row shows under the mouse (the buttons that
-//! appear) is decided here, from the UI's hover.
+//! terminal area's pane strips, a dialog over it, and a context menu or
+//! the command palette over everything. What a row shows under the
+//! mouse (the buttons that appear) is decided here, from the UI's hover.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,6 +21,7 @@ const tree = @import("ui/Tree.zig");
 const TreeList = @import("ui/widgets/TreeList.zig");
 const PaneStrip = @import("ui/widgets/PaneStrip.zig");
 const Popup = @import("ui/widgets/Popup.zig");
+const PaletteView = @import("ui/widgets/PaletteView.zig");
 const Web = @import("Web.zig");
 
 const Id = Ui.Id;
@@ -107,6 +108,11 @@ const Builder = struct {
         if (self.app.mode == .menu) {
             try regions.append(self.arena, .{ .id = .window(.scrim), .kind = .hit_area, .rect = self.frame.window });
             try regions.append(self.arena, self.menu(&self.app.mode.menu));
+        }
+        // So is the palette, which a click outside it closes.
+        if (self.app.mode == .palette) {
+            try regions.append(self.arena, .{ .id = .window(.scrim), .kind = .hit_area, .rect = self.frame.window });
+            try regions.append(self.arena, self.palette(&self.app.mode.palette));
         }
         return .{
             .root = .{ .kind = .{ .canvas = regions.items } },
@@ -640,6 +646,18 @@ const Builder = struct {
         return .{ .id = .window(.menu), .kind = .{ .menu = .{ .menu = m } }, .rect = Popup.place(self.ui, m, self.frame.window, size) };
     }
 
+    /// The command palette's box, under the title bar. It places itself
+    /// by the window's frame, which outlives the tree (the builder's copy
+    /// doesn't).
+    fn palette(self: *const Builder, p: *const Ui.Palette) Node {
+        const app = self.app;
+        return .{ .id = .window(.palette), .kind = .{ .palette = .{
+            .palette = p,
+            .frame = app.frame,
+            .caret = app.focused and app.blink_visible,
+        } }, .rect = PaletteView.place(self.ui, app.frame, p) };
+    }
+
     /// A pane being dragged, once the mouse has moved enough.
     fn drag(self: *const Builder) ?Tree.Drag {
         const d = self.app.pane_drag orelse return null;
@@ -764,6 +782,33 @@ test "a context menu is over everything, and the window under it is scrim" {
     const row = Ui.find(built, .{ .target = .{ .workspace = key } }).?;
     try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, row.rect.x + 2, row.rect.y + 2));
     try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, 500, 5));
+}
+
+test "the command palette is over everything, and the window under it is scrim" {
+    var shell: App.TestShell = .{};
+    var t: App.TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    const key = try t.workspace(5, L("alpha"), 2, 0, false);
+    app.openPalette();
+    const built = app.view();
+    try std.testing.expect(app.ui.hasOver(built));
+    const box = Ui.find(built, .window(.palette)).?;
+    // Centered under the title bar.
+    try std.testing.expectEqual(t.frame.titlebar.bottom() + 32, box.rect.y);
+    try std.testing.expectEqual(@as(f32, 200), box.rect.x);
+    // The hidden workspace is listed, with the commands after it.
+    const pal = &app.mode.palette;
+    try std.testing.expect(pal.count() > 1);
+    try std.testing.expectEqual(Ui.Palette.Action{ .show_workspace = key }, pal.entryOf(0).?.action);
+    try std.testing.expectEqual(Id{ .target = .{ .palette = 0 } }, app.ui.hitTest(built, box.rect.x + 40, box.rect.y + 44 + 6 + 24 + 10));
+    // The row it's about, and the title bar, are under the scrim.
+    const row = Ui.find(built, .{ .target = .{ .workspace = key } }).?;
+    try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, row.rect.x + 2, row.rect.y + 2));
+    try std.testing.expectEqual(Id.window(.scrim), app.ui.hitTest(built, 500, 5));
+    app.closePalette();
+    try std.testing.expect(!app.ui.hasOver(app.view()));
 }
 
 test "a workspace being renamed is all field" {

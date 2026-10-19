@@ -36,6 +36,8 @@ pub const Theme = colors.Theme;
 pub const TextField = @import("TextField.zig");
 pub const Dialog = @import("Dialog.zig");
 pub const Menu = @import("Menu.zig");
+pub const Palette = @import("Palette.zig");
+pub const Scrollbar = @import("Scrollbar.zig");
 pub const Id = @import("Id.zig");
 pub const Tree = @import("Tree.zig").Tree;
 pub const Node = @import("Tree.zig").Node;
@@ -53,6 +55,7 @@ const widgets = struct {
     const PaneStrip = @import("widgets/PaneStrip.zig");
     const Modal = @import("widgets/Modal.zig");
     const Popup = @import("widgets/Popup.zig");
+    const PaletteView = @import("widgets/PaletteView.zig");
     const CaptionButton = @import("widgets/CaptionButton.zig");
     const Tooltip = @import("widgets/Tooltip.zig");
 };
@@ -212,6 +215,7 @@ fn Widget(comptime tag: std.meta.Tag(Kind)) type {
         .pane => widgets.PaneStrip,
         .dialog => widgets.Modal,
         .menu => widgets.Popup,
+        .palette => widgets.PaletteView,
         .caption_button => widgets.CaptionButton,
     };
 }
@@ -324,7 +328,7 @@ pub fn hasOver(self: *const Ui, tree: *const Tree) bool {
 
 fn isOver(node: *const Node) bool {
     return switch (node.kind) {
-        .dialog, .menu => true,
+        .dialog, .menu, .palette => true,
         else => false,
     };
 }
@@ -554,6 +558,7 @@ pub const Fonts = struct {
             // Key hints, centered.
             .hint => .{ .size = 10.5, .align_ = dwrite.TEXT_ALIGNMENT_CENTER },
             .tip => .{ .size = 12 },
+            .tip_strong => .{ .weight = .SEMI_BOLD, .size = 12 },
             // Numbers that change in place, like the stats.
             .mono => .{ .mono = true, .size = 10.5 },
             // A dialog's title.
@@ -751,6 +756,9 @@ test {
     _ = widgets.PaneStrip;
     _ = widgets.Modal;
     _ = widgets.Popup;
+    _ = widgets.PaletteView;
+    _ = Palette;
+    _ = Scrollbar;
     _ = widgets.CaptionButton;
     _ = widgets.Tooltip;
     _ = Menu;

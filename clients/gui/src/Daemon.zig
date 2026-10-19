@@ -208,6 +208,8 @@ pub const WorkspaceInfo = struct {
 pub const ConfigUpdate = struct {
     /// init.lua's bindings, for `binding.Keymap`.
     keymap: []binding.Entry,
+    /// init.lua's actions, for the command palette.
+    actions: []ConfigAction,
     /// slime.config's table, as JSON, for `Config.loadFrom`.
     settings: []const u8,
     /// Why the file failed to load, if it did (what the rest describes
@@ -216,10 +218,19 @@ pub const ConfigUpdate = struct {
 
     pub fn deinit(self: *ConfigUpdate, alloc: Allocator) void {
         freeKeymap(alloc, self.keymap);
+        freeActions(alloc, self.actions);
         alloc.free(self.settings);
         for (self.errors) |e| alloc.free(e);
         alloc.free(self.errors);
     }
+};
+
+/// An action init.lua defined (slime.action), as the command palette
+/// lists it: its name, for `action.invoke`, and its title, or its name
+/// where it has none. Both owned.
+pub const ConfigAction = struct {
+    name: []const u8,
+    title: []const u16,
 };
 
 /// A window action a script asked the workspace's viewers to perform:
@@ -842,8 +853,10 @@ pub const Json = struct {
     const HostList = struct { hosts: []const Host = &.{} };
     const WorkspaceList = struct { workspaces: []const WorkspaceDesc = &.{} };
     /// rpc.ConfigDesc: `settings` is slime.config's table.
-    pub const Config = struct { path: []const u8 = "", settings: std.json.Value = .null, keymap: []const Binding = &.{}, errors: []const []const u8 = &.{} };
+    pub const Config = struct { path: []const u8 = "", settings: std.json.Value = .null, keymap: []const Binding = &.{}, actions: []const ActionDesc = &.{}, errors: []const []const u8 = &.{} };
     const Binding = struct { key: []const u8, action: []const u8 = "", args: std.json.Value = .null, lua: u32 = 0 };
+    /// rpc.ActionDesc, but for its args, which the palette passes none of.
+    pub const ActionDesc = struct { name: []const u8, title: []const u8 = "" };
     const WorkspaceDesc = struct { id: u32, name: []const u8 = "", attached: bool = false, viewers: usize = 0, detached_at: i64 = 0, active_tab: TabRef = .none, tabs: []const Tab = &.{} };
 };
 
@@ -955,6 +968,29 @@ pub fn keymapFromJson(alloc: Allocator, bindings: []const Json.Binding) ![]bindi
         made += 1;
     }
     return entries;
+}
+
+/// The actions of a config, owned, for the command palette.
+pub fn actionsFromJson(alloc: Allocator, descs: []const Json.ActionDesc) ![]ConfigAction {
+    const actions = try alloc.alloc(ConfigAction, descs.len);
+    var made: usize = 0;
+    errdefer freeActions(alloc, actions[0..made]);
+    for (actions, descs) |*a, d| {
+        const name = try alloc.dupe(u8, d.name);
+        errdefer alloc.free(name);
+        const title = try toUtf16(alloc, if (d.title.len > 0) d.title else d.name);
+        a.* = .{ .name = name, .title = title };
+        made += 1;
+    }
+    return actions;
+}
+
+pub fn freeActions(alloc: Allocator, actions: []ConfigAction) void {
+    for (actions) |a| {
+        alloc.free(a.name);
+        alloc.free(a.title);
+    }
+    alloc.free(actions);
 }
 
 pub fn freeKeymap(alloc: Allocator, entries: []binding.Entry) void {
@@ -1328,6 +1364,12 @@ pub fn invoke(self: *Daemon, lua: u32, pane: PaneRef) !void {
 /// or empty) for `pane`: a key was pressed.
 pub fn invokeAction(self: *Daemon, name: []const u8, args: []const u8, pane: PaneRef) !void {
     _ = try self.call("action.invoke", .{ .name = name, .args = RawJson{ .text = args }, .pane = pane, .origin = "key" });
+}
+
+/// Have the daemon evaluate init.lua again (config.reload): what it
+/// sets comes back as config.changed.
+pub fn reloadConfig(self: *Daemon) !void {
+    _ = try self.call("config.reload", no_params);
 }
 
 /// JSON already encoded, written as it is; `null` if empty.
@@ -1761,7 +1803,9 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
             errdefer self.alloc.free(settings);
             const keymap = try keymapFromJson(self.alloc, c.keymap);
             errdefer freeKeymap(self.alloc, keymap);
-            const update: ConfigUpdate = .{ .keymap = keymap, .settings = settings, .errors = try errors.toOwnedSlice(self.alloc) };
+            const actions = try actionsFromJson(self.alloc, c.actions);
+            errdefer freeActions(self.alloc, actions);
+            const update: ConfigUpdate = .{ .keymap = keymap, .actions = actions, .settings = settings, .errors = try errors.toOwnedSlice(self.alloc) };
             win32.AcquireSRWLockExclusive(&self.lock);
             defer win32.ReleaseSRWLockExclusive(&self.lock);
             if (self.config_update) |*old| old.deinit(self.alloc);

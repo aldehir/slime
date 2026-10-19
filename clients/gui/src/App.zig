@@ -32,6 +32,9 @@ const Rect = Ui.Rect;
 const TextField = Ui.TextField;
 const Dialog = Ui.Dialog;
 const Menu = Ui.Menu;
+const Palette = Ui.Palette;
+const PaletteView = @import("ui/widgets/PaletteView.zig");
+const Painter = @import("renderer/Painter.zig");
 const Tree = Ui.Tree;
 
 const log = std.log.scoped(.app);
@@ -57,6 +60,9 @@ config: *const Config,
 /// The key bindings in force: the defaults, with init.lua's over them,
 /// which follow the daemon's `config.changed`.
 keymap: binding.Keymap,
+/// init.lua's actions, which the command palette lists. Owned; they
+/// follow the daemon's `config.changed` too.
+actions: []Daemon.ConfigAction = &.{},
 /// What local sessions run, in CreateProcessW syntax; empty for the
 /// daemon's shell. Outlives the app.
 local_command: []const u16,
@@ -185,6 +191,8 @@ pane_drag: ?PaneDrag = null,
 /// The sidebar's edge being dragged, which has the mouse until the
 /// button's up.
 sidebar_drag: ?SidebarDrag = null,
+/// The palette's scrollbar thumb being dragged, likewise.
+palette_scroll: ?PaletteScroll = null,
 /// The tab a middle click went down on, to close it on release.
 middle_pressed: ?Id.Target = null,
 
@@ -209,6 +217,9 @@ pub const Mode = union(enum) {
     /// A context menu, over everything, until it's chosen from or
     /// dismissed.
     menu: Menu,
+    /// The command palette, over everything, until an entry is chosen
+    /// or it's dismissed.
+    palette: Palette,
 };
 
 /// A workspace's name being edited.
@@ -216,6 +227,12 @@ pub const Rename = struct {
     /// The workspace's key.
     ws: u32,
     field: TextField,
+};
+
+/// The palette's scrollbar thumb being dragged.
+const PaletteScroll = struct {
+    /// How far into the thumb the mouse took hold, in pixels.
+    grab: f32,
 };
 
 /// A browser pane's URL bar being typed in.
@@ -251,6 +268,7 @@ pub const Keyboard = union(enum) {
     url: *TextField,
     confirm: *Dialog,
     menu: *Menu,
+    palette: *Palette,
     login: *Login,
     /// The focused pane's page, whose browser takes the keys itself: the
     /// window gets only what its bindings take (`acceleratorKey`).
@@ -260,6 +278,7 @@ pub const Keyboard = union(enum) {
     pub fn field(self: Keyboard) ?*TextField {
         return switch (self) {
             .connect, .rename, .url => |f| f,
+            .palette => |p| &p.query,
             .login => |l| l.dialog.focused(),
             .terminal, .confirm, .menu, .browser => null,
         };
@@ -483,8 +502,11 @@ pub const Shell = struct {
         /// as (JSON) and apply it: the chrome, the font, every session's
         /// colors. `config` describes the new one after.
         reloadConfig: *const fn (*anyopaque, []const u8) void,
-        /// The frame stats the sidebar shows, if built with them.
+        /// The frame stats the sidebar shows, while they're shown.
         stats: *const fn (*anyopaque) []const u16,
+        /// Whether they're shown, and showing them or not.
+        statsShown: *const fn (*anyopaque) bool,
+        toggleStats: *const fn (*anyopaque) void,
         /// A mouse message (or WM_MOUSELEAVE) for a browser pane's page,
         /// at a client position.
         webMouse: *const fn (*anyopaque, *Session, u32, win32.WPARAM, win32.POINT) void,
@@ -578,6 +600,12 @@ pub const Shell = struct {
     pub fn stats(self: Shell) []const u16 {
         return self.vt.stats(self.ctx);
     }
+    pub fn statsShown(self: Shell) bool {
+        return self.vt.statsShown(self.ctx);
+    }
+    pub fn toggleStats(self: Shell) void {
+        self.vt.toggleStats(self.ctx);
+    }
     fn webMouse(self: Shell, s: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
         self.vt.webMouse(self.ctx, s, msg, wparam, pos);
     }
@@ -632,6 +660,8 @@ pub const Options = struct {
     config: *const Config,
     /// init.lua's bindings, from the daemon's config.
     keymap: []const binding.Entry = &.{},
+    /// init.lua's actions, from the same; copied.
+    actions: []const Daemon.ConfigAction = &.{},
     /// The connection the config came from, if one was made: the app
     /// owns it from here, and `start` goes on with it.
     daemon: ?*Daemon = null,
@@ -645,7 +675,7 @@ pub const Options = struct {
     /// event sessions' readers set when output comes.
     hwnd: win32.HWND,
     output_event: win32.HANDLE,
-    /// Counts the bytes sessions receive, when built with `-Dstats`.
+    /// Counts the bytes sessions receive, for the frame stats.
     stats_bytes: ?*std.atomic.Value(u64) = null,
 };
 
@@ -653,10 +683,13 @@ pub fn init(opts: Options) !App {
     var keymap: binding.Keymap = try .init(opts.alloc);
     errdefer keymap.deinit();
     try keymap.apply(opts.keymap);
+    const actions = try dupeActions(opts.alloc, opts.actions);
+    errdefer Daemon.freeActions(opts.alloc, actions);
     return .{
         .alloc = opts.alloc,
         .config = opts.config,
         .keymap = keymap,
+        .actions = actions,
         .pending_daemon = opts.daemon,
         .local_command = opts.local_command,
         .hosts = opts.hosts,
@@ -699,6 +732,11 @@ pub fn start(self: *App, command_line: []const u16) !void {
 /// the window does while its renderer is still up.
 pub fn deinit(self: *App) void {
     self.destroyTabs();
+    switch (self.mode) {
+        .palette => |*p| p.deinit(),
+        else => {},
+    }
+    Daemon.freeActions(self.alloc, self.actions);
     self.alloc.free(self.notice);
     // Hanging up detaches the workspaces; slime keeps them for the next
     // window.
@@ -826,6 +864,7 @@ fn sessionEvent(self: *App, id: u32, what: @FieldType(@FieldType(Msg, "session")
 fn captureLost(self: *App) void {
     if (self.drag != null) self.endDrag();
     if (self.sidebar_drag != null) self.endSidebarDrag();
+    if (self.palette_scroll != null) self.endPaletteScroll();
     // A pane drag that lost the mouse lands nowhere.
     self.cancelDrag();
     if (self.mouse_in_terminal) {
@@ -1109,7 +1148,8 @@ fn forgetWorkspace(self: *App, key: u32) void {
         .rename => |r| if (r.ws == key) self.cancelRename(),
         .confirm => |c| if (std.meta.eql(c.about, .{ .kill = key })) self.closeConfirm(),
         .menu => |m| if (std.meta.eql(m.target, Id.Target{ .workspace = key })) self.closeMenu(),
-        .terminal, .connect, .url => {},
+        // The palette lists what's there as it's drawn.
+        .terminal, .connect, .url, .palette => {},
     }
     if (self.activate_ws == key) self.activate_ws = null;
     for (self.workspaces.items, 0..) |w, k| {
@@ -1230,6 +1270,7 @@ fn askKillWorkspace(self: *App, key: u32) void {
     self.cancelConnect();
     self.cancelRename();
     self.closeConfirm();
+    self.closePalette();
     self.mode = .{ .confirm = .{ .about = .{ .kill = key }, .dialog = undefined } };
     const c = &self.mode.confirm;
     const prefix = std.unicode.utf8ToUtf16LeStringLiteral("Kill workspace \u{201c}");
@@ -1263,6 +1304,7 @@ pub fn askPermission(self: *App, s: *Session, site: []const u16, what: []const u
     self.cancelRename();
     self.cancelUrl();
     self.closeMenu();
+    self.closePalette();
     self.mode = .{ .confirm = .{ .about = .{ .permission = s.id }, .dialog = undefined } };
     const c = &self.mode.confirm;
     var title: std.ArrayList(u16) = .initBuffer(&c.title);
@@ -1343,6 +1385,7 @@ fn startRename(self: *App, key: u32) void {
     const entry = self.workspaceEntry(key) orelse return;
     self.cancelConnect();
     self.closeConfirm();
+    self.closePalette();
     self.mode = .{ .rename = .{ .ws = key, .field = .{} } };
     const field = &self.mode.rename.field;
     field.insert(entry.name);
@@ -1461,6 +1504,7 @@ fn openMenu(self: *App, target: Id.Target, anchor: Menu.Anchor) void {
     self.cancelConnect();
     self.cancelRename();
     self.closeConfirm();
+    self.closePalette();
     self.mode = .{ .menu = m };
     self.hideTip();
     _ = self.ui.setHover(.none);
@@ -2044,7 +2088,7 @@ fn daemonPosted(self: *App) void {
         if (conn.takeConfig()) |reloaded| {
             var r = reloaded;
             defer r.deinit(self.alloc);
-            self.configReloaded(r);
+            self.configReloaded(&r);
         }
         self.workspacesChanged(conn);
         self.daemonChanged(conn);
@@ -2080,10 +2124,15 @@ fn daemonPosted(self: *App) void {
 /// Take up the config init.lua reloaded as: the keys at once, and the
 /// settings through the window, which builds the config again and
 /// applies it; then the notice says what's wrong with it, if anything.
-fn configReloaded(self: *App, reloaded: Daemon.ConfigUpdate) void {
-    // An open menu names keys from the bindings being replaced.
+fn configReloaded(self: *App, reloaded: *Daemon.ConfigUpdate) void {
+    // An open menu names keys from the bindings being replaced, and the
+    // palette lists the actions.
     self.closeMenu();
+    self.closePalette();
     self.keymap.apply(reloaded.keymap) catch |err| log.err("applying the keymap failed: {}", .{err});
+    Daemon.freeActions(self.alloc, self.actions);
+    self.actions = reloaded.actions;
+    reloaded.actions = &.{};
     self.shell.reloadConfig(reloaded.settings);
     self.setNotice(reloaded.errors) catch |err| log.err("showing the config's errors failed: {}", .{err});
     self.markDirty();
@@ -2982,6 +3031,7 @@ fn runAction(self: *App, action: binding.Action) bool {
             self.invokeInDaemon(action);
             return true;
         },
+        .toggle_command_palette => return self.togglePalette(),
         else => {},
     }
     const s = self.focusedSession() orelse switch (action) {
@@ -3030,7 +3080,7 @@ fn runAction(self: *App, action: binding.Action) bool {
         }, r.amount),
         .equalize_splits => self.equalizePanes(),
         .toggle_split_zoom => if (self.activeTab().count() > 1 or self.activeTab().zoom != null) self.toggleZoom(s),
-        .lua, .invoke => unreachable,
+        .lua, .invoke, .toggle_command_palette => unreachable,
     }
     return true;
 }
@@ -3065,6 +3115,7 @@ fn setFocus(self: *App, focused: bool) void {
     // Menus go with the focus, as Windows' do, and a key sequence under
     // way.
     if (!focused) self.closeMenu();
+    if (!focused) self.closePalette();
     if (!focused) self.keymap.cancel();
     if (focused) {
         self.resetBlink();
@@ -3098,7 +3149,7 @@ fn blinkTick(self: *App) void {
         if (s.cursorBlinks()) self.markDirty();
     }
     switch (self.keyboard()) {
-        .connect, .rename, .url => self.markDirty(),
+        .connect, .rename, .url, .palette => self.markDirty(),
         .terminal, .confirm, .menu, .login, .browser => {},
     }
 }
@@ -3107,6 +3158,7 @@ fn blinkTick(self: *App) void {
 fn startConnect(self: *App) void {
     if (self.mode == .connect) return;
     self.closeConfirm();
+    self.closePalette();
     // Destinations go on the helper's command line unquoted.
     self.mode = .{ .connect = .{ .reject = std.unicode.utf8ToUtf16LeStringLiteral(" \t\"") } };
     self.resetBlink();
@@ -3119,12 +3171,16 @@ fn cancelConnect(self: *App) void {
     self.markDirty();
 }
 
-/// Connect to the host in the field, `ssh://` being implied, and close
-/// the field.
+/// Connect to the host in the field, and close the field.
 fn submitConnect(self: *App, field: *TextField) void {
+    self.connectTo(field.text());
+    self.cancelConnect();
+}
+
+/// Connect to `host`, `ssh://` being implied, and remember it.
+fn connectTo(self: *App, host: []const u16) void {
     const scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     var buf: [scheme.len + TextField.max_len]u16 = undefined;
-    const host = field.text();
     const dest = if (std.mem.startsWith(u16, host, scheme)) host else dest: {
         @memcpy(buf[0..scheme.len], scheme);
         @memcpy(buf[scheme.len..][0..host.len], host);
@@ -3134,7 +3190,325 @@ fn submitConnect(self: *App, field: *TextField) void {
         const h = self.hosts.add(dest) catch |err| break :connect log.err("connect failed: {}", .{err});
         self.openOnHost(h) catch |err| log.err("connect failed: {}", .{err});
     }
+}
+
+/// Open the command palette over everything, in place of whatever else
+/// had the keys.
+pub fn openPalette(self: *App) void {
+    if (self.mode == .palette) return;
+    self.closeMenu();
     self.cancelConnect();
+    self.cancelRename();
+    self.cancelUrl();
+    self.closeConfirm();
+    self.mode = .{ .palette = .init(self.alloc) };
+    self.hideTip();
+    _ = self.ui.setHover(.none);
+    self.resetBlink();
+    self.markDirty();
+}
+
+/// Open the palette, or close it if it's open. Returns false while a
+/// dialog has the keys, which keeps them.
+fn togglePalette(self: *App) bool {
+    if (self.mode == .palette) {
+        self.closePalette();
+        return true;
+    }
+    if (self.activeDialog() != null) return false;
+    self.openPalette();
+    return true;
+}
+
+pub fn closePalette(self: *App) void {
+    switch (self.mode) {
+        .palette => |*p| p.deinit(),
+        else => return,
+    }
+    if (self.palette_scroll != null) self.endPaletteScroll();
+    self.mode = .terminal;
+    _ = self.ui.setHover(.none);
+    self.setPressed(.none);
+    self.markDirty();
+}
+
+/// A key down for the command palette. Returns false for keys it
+/// doesn't take, which go on to the bindings.
+fn paletteKey(self: *App, p: *Palette, vk: u32) bool {
+    const ctrl = self.shell.keyDown(win32.VK_CONTROL);
+    switch (vk) {
+        win32.VK_DOWN => p.move(1),
+        win32.VK_UP => p.move(-1),
+        win32.VK_NEXT => p.page(PaletteView.visibleRows(self.ui, self.frame, p), true),
+        win32.VK_PRIOR => p.page(PaletteView.visibleRows(self.ui, self.frame, p), false),
+        // Home and End move the caret; with ctrl, the focus to the ends.
+        win32.VK_HOME, win32.VK_END => if (ctrl) p.focusEnd(vk == win32.VK_HOME) else if (!self.editKey(&p.query, vk, true)) return false,
+        win32.VK_RETURN => {
+            self.choosePalette(p.focus);
+            self.keyHandled();
+            return true;
+        },
+        // In the host step, back to the commands.
+        win32.VK_ESCAPE => {
+            if (p.step == .host) p.setStep(.commands) else self.closePalette();
+            self.keyHandled();
+            return true;
+        },
+        else => if (!self.editKey(&p.query, vk, true)) return false,
+    }
+    self.paletteScrolled();
+    self.keyHandled();
+    return true;
+}
+
+/// The mouse went down on the palette's scrollbar: on the thumb, it
+/// drags; off it, the list pages toward the mouse.
+fn startPaletteScroll(self: *App, pos: win32.POINT) void {
+    const p = switch (self.mode) {
+        .palette => |*p| p,
+        else => return,
+    };
+    const l = PaletteView.layoutIn(self.ui, self.frame, p);
+    const bar = l.bar orelse return;
+    const y: f32 = @floatFromInt(pos.y);
+    if (y >= bar.thumb.y and y < bar.thumb.bottom()) {
+        self.hideTip();
+        self.palette_scroll = .{ .grab = y - bar.thumb.y };
+        self.setPressed(.window(.scrollbar));
+        self.shell.captureMouse();
+        return;
+    }
+    const rows: isize = @intCast(@max(l.row_count, 1));
+    p.scrollBy(if (y < bar.thumb.y) -rows else rows, l.row_count);
+    self.markDirty();
+}
+
+/// Move the list with the thumb to the mouse.
+fn paletteScrollTo(self: *App, d: PaletteScroll, pos: win32.POINT) void {
+    const p = switch (self.mode) {
+        .palette => |*p| p,
+        else => return,
+    };
+    const l = PaletteView.layoutIn(self.ui, self.frame, p);
+    const bar = l.bar orelse return;
+    const row = Ui.Scrollbar.startAt(bar, l.metrics, @as(f32, @floatFromInt(pos.y)) - d.grab);
+    if (row == p.scroll) return;
+    p.scroll = row;
+    self.markDirty();
+}
+
+fn endPaletteScroll(self: *App) void {
+    // First: releasing the capture comes back as `capture_lost`.
+    self.palette_scroll = null;
+    self.setPressed(.none);
+    self.shell.releaseMouse();
+}
+
+/// Scroll the palette's list so the focus is among the rows drawn. How
+/// many fit depends on where the list starts (the captions), so it
+/// settles in a few goes.
+fn paletteScrolled(self: *App) void {
+    const p = switch (self.mode) {
+        .palette => |*p| p,
+        else => return,
+    };
+    for (0..4) |_| {
+        const before = p.scroll;
+        p.keepVisible(PaletteView.visibleRows(self.ui, self.frame, p));
+        if (p.scroll == before) break;
+    }
+}
+
+/// Act on the palette's result `i`: close the palette, then do what
+/// the entry says. "Connect to host…" keeps it open for its next step.
+fn choosePalette(self: *App, i: usize) void {
+    const p = switch (self.mode) {
+        .palette => |*p| p,
+        else => return,
+    };
+    const e = p.entryOf(i) orelse return;
+    switch (e.action) {
+        .connect => {
+            p.setStep(.host);
+            // Destinations go on the helper's command line unquoted.
+            p.query.reject = L(" \t\"");
+            self.resetBlink();
+            self.markDirty();
+            return;
+        },
+        .typed_host => {
+            var buf: [TextField.max_len]u16 = undefined;
+            const text = p.query.text();
+            @memcpy(buf[0..text.len], text);
+            self.closePalette();
+            self.connectTo(buf[0..text.len]);
+            return;
+        },
+        // The name lives in the palette: run it before closing.
+        .invoke => |name| {
+            self.invokeInDaemon(.{ .invoke = .{ .name = name } });
+            self.closePalette();
+            return;
+        },
+        else => {},
+    }
+    const action = e.action;
+    self.closePalette();
+    switch (action) {
+        .tab => |key| if (self.tabIndexOf(.{ .tab = key })) |t| self.activate(t),
+        .show_workspace => |key| self.showWorkspace(key),
+        .binding => |b| _ = self.runAction(b),
+        .part => |id| self.widgetClick(id),
+        .host => |h| self.openOnHost(h) catch |err| log.err("connect failed: {}", .{err}),
+        .toggle_stats => self.shell.toggleStats(),
+        .reload_config => if (self.daemon) |conn| conn.reloadConfig() catch |err| log.err("reloading the config failed: {}", .{err}),
+        .connect, .typed_host, .invoke => unreachable,
+    }
+}
+
+/// Fill the palette with what it's over now: in the commands step every
+/// tab, every hidden workspace, the window's commands, and init.lua's
+/// actions; in the host step the hosts. As the tree is built, so the
+/// list follows what's there.
+fn rebuildPalette(self: *App) Allocator.Error!void {
+    const p = &self.mode.palette;
+    p.beginRebuild();
+    switch (p.step) {
+        .commands => try self.paletteCommands(p),
+        .host => try self.paletteHosts(p),
+    }
+    try p.endRebuild();
+}
+
+fn paletteCommands(self: *App, p: *Palette) Allocator.Error!void {
+    var buf: [Palette.max_text]u16 = undefined;
+    for (self.tabs.items, 0..) |t, i| {
+        try p.add(.{
+            .label = t.focus.title(),
+            .detail = self.paletteTabDetail(&buf, t),
+            .right = if (i == self.active) L("shown") else &.{},
+            .icon = .panels_top_left,
+            .section = .tab,
+            .action = .{ .tab = t.key },
+        });
+    }
+    for (self.workspaces.items) |w| {
+        if (w.shown) continue;
+        try p.add(.{
+            .label = w.name,
+            .detail = if (w.conn.hostDest()) |d| Hosts.label(d) else L("local"),
+            .right = L("show"),
+            .icon = .layers,
+            .section = .workspace,
+            .action = .{ .show_workspace = w.key },
+        });
+    }
+
+    const Command = struct { label: []const u16, icon: ?Painter.Lucide, action: binding.Action };
+    const zoomed = self.hasTabs() and self.activeTab().zoom != null;
+    const commands = [_]Command{
+        .{ .label = L("New tab"), .icon = .plus, .action = .new_tab },
+        .{ .label = L("Close pane"), .icon = .x, .action = .close_surface },
+        .{ .label = L("Split right"), .icon = .columns_2, .action = .{ .new_split = .right } },
+        .{ .label = L("Split down"), .icon = .rows_2, .action = .{ .new_split = .down } },
+        .{ .label = if (zoomed) L("Unzoom pane") else L("Zoom pane"), .icon = if (zoomed) .minimize_2 else .maximize_2, .action = .toggle_split_zoom },
+        .{ .label = L("Equalize splits"), .icon = .columns_2, .action = .equalize_splits },
+        .{ .label = L("Next tab"), .icon = .arrow_right, .action = .next_tab },
+        .{ .label = L("Previous tab"), .icon = .arrow_left, .action = .previous_tab },
+        .{ .label = L("Increase font size"), .icon = null, .action = .{ .increase_font_size = 1 } },
+        .{ .label = L("Decrease font size"), .icon = null, .action = .{ .decrease_font_size = 1 } },
+        .{ .label = L("Reset font size"), .icon = .rotate_cw, .action = .reset_font_size },
+    };
+    for (commands) |c| {
+        const key = self.keymap.label(c.action);
+        try p.add(.{ .label = c.label, .right = key.slice(), .icon = c.icon, .section = .command, .action = .{ .binding = c.action } });
+    }
+    if (self.daemon) |conn| if (!conn.isLost()) {
+        try p.add(.{ .label = L("New workspace"), .icon = .layers, .section = .command, .action = .{ .part = .{ .target = .local, .part = .new_tab } } });
+    };
+    for (self.hosts.items.items, 0..) |dest, h| {
+        if (!self.hostLive(h)) continue;
+        var n = appendUnits(&buf, 0, L("New workspace on "));
+        n = appendUnits(&buf, n, Hosts.label(dest));
+        try p.add(.{ .label = buf[0..n], .icon = .layers, .section = .command, .action = .{ .part = .{ .target = .{ .host = @intCast(h) }, .part = .new_tab } } });
+    }
+    if (self.focusedSession()) |s| if (s.daemonPane() != null) {
+        try p.add(.{ .label = L("Open browser"), .icon = .globe, .section = .command, .action = .{ .part = .{ .target = .{ .pane = s.id }, .part = .open_browser } } });
+    };
+    try p.add(.{ .label = L("Connect to host…"), .icon = .plug, .section = .command, .action = .connect });
+    try p.add(.{
+        .label = if (self.ui.sidebar_shown) L("Hide sidebar") else L("Show sidebar"),
+        .icon = .panel_left,
+        .section = .command,
+        .action = .{ .part = Id.window(.toggle_sidebar) },
+    });
+    try p.add(.{
+        .label = if (self.shell.statsShown()) L("Hide frame stats") else L("Show frame stats"),
+        .icon = .activity,
+        .section = .command,
+        .action = .toggle_stats,
+    });
+    if (self.daemon) |conn| if (!conn.isLost()) {
+        try p.add(.{ .label = L("Reload config"), .icon = .rotate_cw, .section = .command, .action = .reload_config });
+    };
+    for (self.actions) |a| {
+        const key = self.keymap.label(.{ .invoke = .{ .name = a.name } });
+        try p.add(.{ .label = a.title, .detail = L("init.lua"), .right = key.slice(), .icon = .code, .section = .command, .action = .{ .invoke = a.name } });
+    }
+}
+
+/// The hosts: what's typed, if anything, then the remembered ones.
+fn paletteHosts(self: *App, p: *Palette) Allocator.Error!void {
+    var buf: [Palette.max_text]u16 = undefined;
+    const typed = p.queryText();
+    if (typed.len > 0) {
+        var n = appendUnits(&buf, 0, L("Connect to "));
+        n = appendUnits(&buf, n, typed);
+        try p.add(.{ .label = buf[0..n], .icon = .arrow_right, .section = .host, .action = .typed_host, .always = true });
+    }
+    for (self.hosts.items.items, 0..) |dest, h| {
+        try p.add(.{
+            .label = Hosts.label(dest),
+            .right = if (self.hostLive(h)) L("connected") else &.{},
+            .icon = .plug,
+            .section = .host,
+            .action = .{ .host = @intCast(h) },
+        });
+    }
+}
+
+/// Tab `t`'s workspace and host, for its palette entry: "name · host".
+fn paletteTabDetail(self: *App, buf: []u16, t: *const Tab) []const u16 {
+    var n: usize = 0;
+    if (t.conn) |conn| if (self.workspaceIn(conn, t.ws)) |w| {
+        n = appendUnits(buf, n, w.name);
+    };
+    if (t.focus.hostDest()) |d| {
+        if (n > 0) n = appendUnits(buf, n, L(" · "));
+        n = appendUnits(buf, n, Hosts.label(d));
+    }
+    return buf[0..n];
+}
+
+/// `text` into `buf` at `n`, as much as fits; returns the new length.
+fn appendUnits(buf: []u16, n: usize, text: []const u16) usize {
+    const len = @min(text.len, buf.len - n);
+    @memcpy(buf[n..][0..len], text[0..len]);
+    return n + len;
+}
+
+/// init.lua's actions, copied.
+fn dupeActions(alloc: Allocator, actions: []const Daemon.ConfigAction) Allocator.Error![]Daemon.ConfigAction {
+    const copy = try alloc.alloc(Daemon.ConfigAction, actions.len);
+    var made: usize = 0;
+    errdefer Daemon.freeActions(alloc, copy[0..made]);
+    for (copy, actions) |*c, a| {
+        const name = try alloc.dupe(u8, a.name);
+        errdefer alloc.free(name);
+        c.* = .{ .name = name, .title = try alloc.dupe(u16, a.title) };
+        made += 1;
+    }
+    return copy;
 }
 
 /// A key down while the host field is open. Returns false for keys it
@@ -3156,6 +3530,7 @@ fn startUrl(self: *App, s: *Session) void {
     if (self.mode == .url and self.mode.url.pane == s.id) return;
     self.focusPane(s);
     self.closeConfirm();
+    self.closePalette();
     self.mode = .{ .url = .{ .pane = s.id, .field = .{} } };
     const field = &self.mode.url.field;
     field.insert(url);
@@ -3267,6 +3642,7 @@ pub fn keyboard(self: *App) Keyboard {
         .url => |*u| return .{ .url = &u.field },
         .confirm => |*c| return .{ .confirm = &c.dialog },
         .menu => |*m| return .{ .menu = m },
+        .palette => |*p| return .{ .palette = p },
         .terminal => {},
     }
     const s = self.focusedSession() orelse return .terminal;
@@ -3388,6 +3764,8 @@ pub fn view(self: *App) *const Tree {
         self.mode = .terminal;
         _ = self.ui.setHover(.none);
     }
+    // The palette lists what's there now.
+    if (self.mode == .palette) self.rebuildPalette() catch |err| log.err("listing the palette failed: {}", .{err});
     // The builder reads the placement.
     _ = self.placed();
     _ = self.arena.reset(.retain_capacity);
@@ -3486,6 +3864,7 @@ fn setHover(self: *App, hit: Id) bool {
     if (!self.ui.setHover(hit)) return false;
     // The keyboard follows the mouse through a menu's entries.
     if (hit.target == .menu and self.mode == .menu) self.mode.menu.focus = hit.target.menu;
+    if (hit.target == .palette and self.mode == .palette) self.mode.palette.focus = hit.target.palette;
     self.markDirty();
     self.shell.killTimer(.tip);
     const now = self.shell.tickCount();
@@ -3533,6 +3912,11 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
         if (!held) self.endSidebarDrag();
         return;
     }
+    if (self.palette_scroll) |d| {
+        self.paletteScrollTo(d, pos);
+        if (!held) self.endPaletteScroll();
+        return;
+    }
 
     if (self.mouse_in_terminal) {
         if (self.focusedSession()) |s| self.paneMouse(s, msg, wparam, pos);
@@ -3555,6 +3939,8 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
     if (press) self.hideTip();
     // A press outside an open menu closes it, and goes no further.
     if (press and self.mode == .menu and hit.target != .menu and !hit.eql(.window(.menu))) return self.closeMenu();
+    // So does one outside the palette.
+    if (press and self.mode == .palette and hit.target != .palette and !hit.eql(.window(.palette)) and !hit.eql(.window(.field)) and !hit.eql(.window(.scrollbar))) return self.closePalette();
     // Clicking anywhere else closes the host field, and a rename.
     if (press and !hit.eql(.window(.connect))) self.cancelConnect();
     if (press and !(hit.part == .field and hit.target == .workspace)) self.cancelRename();
@@ -3586,6 +3972,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
             if (hit.target == .divider) return self.startDrag(hit.target.divider, pos);
             if (hit.target == .corner) return self.startCornerDrag(hit.target.corner, pos);
             if (hit.eql(.window(.sidebar_edge))) return self.startSidebarDrag(pos);
+            if (hit.eql(.window(.scrollbar))) return self.startPaletteScroll(pos);
             if (hit.part == .title) if (self.shownPane(hit.target)) |pane| {
                 // Double-clicking a pane's title zooms it, as its button
                 // does. The release may then land on the zoomed pane's
@@ -3623,6 +4010,20 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
 /// A wheel turned at a client position: the pane under it, or the one
 /// with the mouse, scrolls.
 fn wheelInput(self: *App, m: Msg.Mouse) void {
+    // Over the palette, its list scrolls.
+    if (self.mode == .palette and m.msg == win32.WM_MOUSEWHEEL) {
+        const hit = self.hitAt(m.pos);
+        if (hit.target == .palette or hit.eql(.window(.palette)) or hit.eql(.window(.field))) {
+            const p = &self.mode.palette;
+            const delta: i16 = @bitCast(@as(u16, @truncate(m.wparam >> 16)));
+            // Three rows a notch; a finer wheel's fraction of one, a row.
+            const notches: isize = @divTrunc(@as(isize, delta), 120);
+            const rows: isize = if (notches != 0) -notches * 3 else if (delta > 0) -1 else 1;
+            p.scrollBy(rows, PaletteView.visibleRows(self.ui, self.frame, p));
+            self.markDirty();
+            return;
+        }
+    }
     const pane = if (self.mouse_in_terminal) (self.focusedSession() orelse return) else pane: {
         const hit = self.hitAt(m.pos);
         if (hit.part != .terminal) return;
@@ -3662,6 +4063,7 @@ fn widgetClick(self: *App, hit: Id) void {
         },
         .body => switch (hit.target) {
             .menu => |i| self.chooseItem(i),
+            .palette => |i| self.choosePalette(i),
             else => if (self.workspaceOf(hit.target)) |ws| {
                 if (ws.shown) self.hideWorkspace(ws.key) else self.showWorkspace(ws.key);
             },
@@ -3735,10 +4137,17 @@ fn keyInput(self: *App, k: Msg.Key) Result {
                 .url => self.urlKey(owner, vk),
                 .confirm => self.confirmKey(owner, vk),
                 .menu => self.menuKey(owner, vk),
+                .palette => self.paletteKey(owner, vk),
                 .login => self.loginKey(owner, vk),
                 .terminal, .browser => unreachable,
             };
-            if (taken) return .handled;
+            if (taken) {
+                // Its release is kept from the terminal too, which has
+                // the keys by then if the key closed the owner (Escape
+                // on the palette): a release carries the key's character.
+                self.bound_key = vk;
+                return .handled;
+            }
             if (self.keyBinding(k)) return .handled;
             // Keep alt+F4; the session gets nothing.
             if (msg == win32.WM_SYSKEYDOWN and wparam == win32.VK_F4) return .default;
@@ -3879,6 +4288,7 @@ pub const TestShell = struct {
     font_size: f32 = 12,
     /// The last answer to a page's permission question.
     answer: ?Web.Answer = null,
+    stats_shown: bool = false,
 
     fn captureMouse(ctx: *anyopaque) void {
         self_(ctx).captured = true;
@@ -3944,6 +4354,12 @@ pub const TestShell = struct {
     fn stats(_: *anyopaque) []const u16 {
         return &.{};
     }
+    fn statsShown(ctx: *anyopaque) bool {
+        return self_(ctx).stats_shown;
+    }
+    fn toggleStats(ctx: *anyopaque) void {
+        self_(ctx).stats_shown = !self_(ctx).stats_shown;
+    }
     fn webMouse(_: *anyopaque, _: *Session, _: u32, _: win32.WPARAM, _: win32.POINT) void {}
     fn webGo(_: *anyopaque, _: *Session, _: Nav) void {}
     fn webFollow(_: *anyopaque, _: *Session) void {}
@@ -3985,6 +4401,8 @@ pub const TestShell = struct {
         .setFontSize = setFontSize,
         .relayout = relayout,
         .stats = stats,
+        .statsShown = statsShown,
+        .toggleStats = toggleStats,
         .webMouse = webMouse,
         .webGo = webGo,
         .webFollow = webFollow,
@@ -4454,4 +4872,153 @@ test "a mouse move builds the tree at most once, even with a frame pending" {
     _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = 0, .pos = pos } });
     _ = app.cursor(pos);
     try std.testing.expectEqual(before, app.views);
+}
+
+test "ctrl+shift+p opens the command palette, which takes the keys until an entry runs or Escape" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    shell.held = .{ .ctrl = true, .shift = true };
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'P', .lparam = 0 } }));
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYUP, .wparam = 'P', .lparam = 0 } });
+    shell.held = .{};
+    try std.testing.expect(app.mode == .palette);
+    try std.testing.expect(app.keyboard() == .palette);
+
+    // Text goes to the query; the results follow it once the tree is
+    // built, "sid" finding the sidebar's command first.
+    for ("sid") |c| _ = app.update(.{ .char = .{ .unit = c, .sys = false } });
+    try std.testing.expectEqualSlices(u16, L("sid"), app.mode.palette.query.text());
+    _ = app.view();
+    const pal = &app.mode.palette;
+    try std.testing.expect(pal.count() >= 1);
+    try std.testing.expectEqual(Palette.Action{ .part = Id.window(.toggle_sidebar) }, pal.focused().?.action);
+    // Enter runs the focused entry and closes the palette.
+    try std.testing.expect(app.ui.sidebar_shown);
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_RETURN, .lparam = 0 } }));
+    try std.testing.expect(!app.ui.sidebar_shown);
+    try std.testing.expect(app.mode == .terminal);
+
+    // Escape closes it, and its release is kept from the terminal, as
+    // a binding's is; then the key again closes it too.
+    app.openPalette();
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_ESCAPE, .lparam = 0 } }));
+    try std.testing.expect(app.mode == .terminal);
+    try std.testing.expectEqual(@as(?u32, win32.VK_ESCAPE), app.bound_key);
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYUP, .wparam = win32.VK_ESCAPE, .lparam = 0 } }));
+    try std.testing.expectEqual(@as(?u32, null), app.bound_key);
+    app.openPalette();
+    shell.held = .{ .ctrl = true, .shift = true };
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'P', .lparam = 0 } });
+    shell.held = .{};
+    try std.testing.expect(app.mode == .terminal);
+
+    // The stats command toggles them through the shell.
+    app.openPalette();
+    for ("stats") |c| _ = app.update(.{ .char = .{ .unit = c, .sys = false } });
+    _ = app.view();
+    try std.testing.expectEqual(Palette.Action.toggle_stats, app.mode.palette.focused().?.action);
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_RETURN, .lparam = 0 } });
+    try std.testing.expect(shell.stats_shown);
+}
+
+test "the palette's host step lists the hosts and what's typed, and Escape goes back" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    _ = try app.hosts.add(L("ssh://devbox"));
+    app.openPalette();
+    _ = app.view();
+    const pal = &app.mode.palette;
+    const connect = for (0..pal.count()) |i| {
+        if (pal.entryOf(i).?.action == .connect) break i;
+    } else return error.TestUnexpectedResult;
+    app.choosePalette(connect);
+    try std.testing.expect(app.mode == .palette);
+    try std.testing.expectEqual(Palette.Step.host, app.mode.palette.step);
+    _ = app.view();
+    try std.testing.expectEqual(@as(usize, 1), app.mode.palette.count());
+    try std.testing.expectEqual(Palette.Action{ .host = 0 }, app.mode.palette.entryOf(0).?.action);
+    // Typed, the destination comes first, and the hosts that match after.
+    for ("dev") |c| _ = app.update(.{ .char = .{ .unit = c, .sys = false } });
+    _ = app.view();
+    try std.testing.expectEqual(@as(usize, 2), app.mode.palette.count());
+    try std.testing.expectEqual(Palette.Action.typed_host, app.mode.palette.entryOf(0).?.action);
+    try std.testing.expectEqualSlices(u16, L("Connect to dev"), app.mode.palette.entryOf(0).?.label);
+    // Spaces aren't taken, as the host field doesn't take them.
+    _ = app.update(.{ .char = .{ .unit = ' ', .sys = false } });
+    try std.testing.expectEqualSlices(u16, L("dev"), app.mode.palette.query.text());
+    // Escape: back to the commands with the query cleared, then closed.
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_ESCAPE, .lparam = 0 } });
+    try std.testing.expect(app.mode == .palette);
+    try std.testing.expectEqual(Palette.Step.commands, app.mode.palette.step);
+    try std.testing.expectEqual(@as(usize, 0), app.mode.palette.query.len);
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_ESCAPE, .lparam = 0 } });
+    try std.testing.expect(app.mode == .terminal);
+}
+
+test "a click outside the palette closes it, and the mouse over a row moves the focus" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    app.openPalette();
+    const built = app.view();
+    const box = Ui.find(built, .window(.palette)).?;
+    // The second row: under the search row, the padding, and a caption.
+    const row_y: i32 = @intFromFloat(box.rect.y + 44 + 6 + 24 + 32 + 10);
+    const x: i32 = @intFromFloat(box.rect.x + 40);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = 0, .pos = .{ .x = x, .y = row_y } } });
+    try std.testing.expectEqual(@as(usize, 1), app.mode.palette.focus);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONDOWN, .wparam = 0, .pos = .{ .x = 5, .y = 5 } } });
+    try std.testing.expect(app.mode == .terminal);
+}
+
+test "the palette's scrollbar pages on a click off the thumb and drags the list with the thumb" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    // A window short enough that the commands don't fit.
+    t.frame = t.ui.frame(1000, 320);
+    app.openPalette();
+    _ = app.view();
+    const pal = &app.mode.palette;
+    const l = PaletteView.layoutIn(app.ui, app.frame, pal);
+    const bar = l.bar orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pal.count() > l.row_count);
+    try std.testing.expectEqual(bar.track.y, bar.thumb.y);
+    // A click below the thumb pages down.
+    const x: i32 = @intFromFloat(bar.thumb.x + 1);
+    const low: i32 = @intFromFloat(bar.track.bottom() - 2);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = 0, .pos = .{ .x = x, .y = low } } });
+    try std.testing.expectEqual(Id.window(.scrollbar), app.ui.hover);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONDOWN, .wparam = win32.MK_LBUTTON, .pos = .{ .x = x, .y = low } } });
+    try std.testing.expectEqual(l.row_count, pal.scroll);
+    try std.testing.expect(app.palette_scroll == null);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONUP, .wparam = 0, .pos = .{ .x = x, .y = low } } });
+    // Dragging the thumb to the end of its track scrolls to the last page.
+    pal.scroll = 0;
+    _ = app.view();
+    const top: i32 = @intFromFloat(bar.thumb.y + 2);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONDOWN, .wparam = win32.MK_LBUTTON, .pos = .{ .x = x, .y = top } } });
+    try std.testing.expect(app.palette_scroll != null);
+    try std.testing.expect(shell.captured);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_MOUSEMOVE, .wparam = win32.MK_LBUTTON, .pos = .{ .x = x, .y = top + 1000 } } });
+    try std.testing.expectEqual(pal.count() - PaletteView.layoutIn(app.ui, app.frame, pal).row_count, pal.scroll);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONUP, .wparam = 0, .pos = .{ .x = x, .y = top + 1000 } } });
+    try std.testing.expect(app.palette_scroll == null);
+    try std.testing.expect(!shell.captured);
+    // Closing the palette ends a drag too.
+    const again: i32 = @intFromFloat(PaletteView.layoutIn(app.ui, app.frame, pal).bar.?.thumb.y + 2);
+    _ = app.update(.{ .mouse = .{ .msg = win32.WM_LBUTTONDOWN, .wparam = win32.MK_LBUTTON, .pos = .{ .x = x, .y = again } } });
+    try std.testing.expect(app.palette_scroll != null);
+    app.closePalette();
+    try std.testing.expect(app.palette_scroll == null);
 }
