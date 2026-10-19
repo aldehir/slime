@@ -157,6 +157,9 @@ bound_key: ?u32 = null,
 /// A mouse button went down over the terminal, which then gets the mouse
 /// until every button is up.
 mouse_in_terminal: bool = false,
+/// The browser pane whose page the mouse was last sent to, by session
+/// id, to tell it when the mouse leaves.
+web_hover: ?u32 = null,
 /// A divider or corner being dragged, which has the mouse until the
 /// button's up.
 drag: ?Drag = null,
@@ -227,13 +230,16 @@ pub const Keyboard = union(enum) {
     confirm: *Dialog,
     menu: *Menu,
     login: *Login,
+    /// The focused pane's page, whose browser takes the keys itself: the
+    /// window gets only what its bindings take (`acceleratorKey`).
+    browser: *Session,
 
     /// The text field typed into, if one has the keyboard.
     pub fn field(self: Keyboard) ?*TextField {
         return switch (self) {
             .connect, .rename, .url => |f| f,
             .login => |l| l.dialog.focused(),
-            .terminal, .confirm, .menu => null,
+            .terminal, .confirm, .menu, .browser => null,
         };
     }
 };
@@ -400,6 +406,8 @@ pub const Cursor = union(enum) {
     size_all,
     /// A pane's, as its program set it (OSC 22).
     shape: ghostty_vt.MouseShape,
+    /// A browser pane's, as its page set it.
+    handle: win32.HCURSOR,
 };
 
 /// What the app asks of the window: every Win32 call it still needs.
@@ -448,6 +456,14 @@ pub const Shell = struct {
         relayout: *const fn (*anyopaque) void,
         /// The frame stats the sidebar shows, if built with them.
         stats: *const fn (*anyopaque) []const u16,
+        /// A mouse message (or WM_MOUSELEAVE) for a browser pane's page,
+        /// at a client position.
+        webMouse: *const fn (*anyopaque, *Session, u32, win32.WPARAM, win32.POINT) void,
+        /// A browser pane's history buttons.
+        webGo: *const fn (*anyopaque, *Session, Nav) void,
+        /// A browser pane's url changed in slime: its browser goes
+        /// there, unless it's there.
+        webFollow: *const fn (*anyopaque, *Session) void,
     };
 
     fn captureMouse(self: Shell) void {
@@ -519,7 +535,19 @@ pub const Shell = struct {
     pub fn stats(self: Shell) []const u16 {
         return self.vt.stats(self.ctx);
     }
+    fn webMouse(self: Shell, s: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
+        self.vt.webMouse(self.ctx, s, msg, wparam, pos);
+    }
+    fn webGo(self: Shell, s: *Session, nav: Nav) void {
+        self.vt.webGo(self.ctx, s, nav);
+    }
+    fn webFollow(self: Shell, s: *Session) void {
+        self.vt.webFollow(self.ctx, s);
+    }
 };
+
+/// Where a browser pane's history buttons send it.
+pub const Nav = enum { back, forward, reload, stop };
 
 /// Where the terminal area is and what fits in it, which the window
 /// works out from the UI's frame, its font grid, and DPI.
@@ -663,7 +691,10 @@ pub fn update(self: *App, msg: Msg) Result {
     switch (msg) {
         .mouse => |m| self.mouseInput(m),
         .wheel => |m| self.wheelInput(m),
-        .mouse_leave => _ = self.setHover(.none),
+        .mouse_leave => {
+            _ = self.setHover(.none);
+            if (!self.mouse_in_terminal) self.leaveWeb();
+        },
         .capture_lost => self.captureLost(),
         .caption => |c| switch (c.event) {
             .hover => _ = self.setHover(c.hit),
@@ -724,7 +755,7 @@ fn sessionEvent(self: *App, id: u32, what: @FieldType(@FieldType(Msg, "session")
             self.closePane(found.tab, s);
         },
         .title => {
-            s.titleUpdate();
+            if (s.titleUpdate()) self.shell.webFollow(s);
             if (s == self.activeSession()) self.showTitle();
             self.markDirty();
         },
@@ -2607,7 +2638,17 @@ fn outputArrived(self: *App) void {
 /// the key is consumed, which also holds for the release of a key that
 /// ran a binding.
 fn keyBinding(self: *App, msg: u32, wparam: win32.WPARAM) bool {
-    const vk: u32 = @truncate(wparam);
+    return self.runBinding(msg, @truncate(wparam), true);
+}
+
+/// `keyBinding` for a key on its way to a browser pane's page, which
+/// gets it unless this returns true. Its text was never ours to drop.
+pub fn acceleratorKey(self: *App, msg: u32, vk: u32) bool {
+    if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.hideTip();
+    return self.runBinding(msg, vk, false);
+}
+
+fn runBinding(self: *App, msg: u32, vk: u32, drop_chars: bool) bool {
     if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) {
         if (self.bound_key != vk) return false;
         self.bound_key = null;
@@ -2619,9 +2660,30 @@ fn keyBinding(self: *App, msg: u32, wparam: win32.WPARAM) bool {
 
     // Drop the text TranslateMessage posted for the key (ctrl+shift+c
     // gives 0x03).
-    self.shell.dropPendingChars();
+    if (drop_chars) self.shell.dropPendingChars();
     self.bound_key = vk;
     return true;
+}
+
+/// Browser pane `s`'s page, title, history, or browser changed.
+pub fn browserChanged(self: *App, s: *Session) void {
+    self.markDirty();
+    if (self.hasTabs() and s == self.activeSession()) self.showTitle();
+}
+
+/// Browser pane `s`'s page took the keyboard itself (`got`), or lost it:
+/// a page that takes it gets the pane focus too, if it's shown.
+pub fn browserFocused(self: *App, s: *Session, got: bool) void {
+    if (!got or !self.hasTabs() or !self.activeTab().shows(s)) return;
+    if (self.activeTab().focus != s) self.focusPane(s);
+}
+
+/// Tab (`next`) or shift+tab out of browser pane `s`'s page: to the next
+/// pane, or back to its URL bar, which a lone pane's tab goes to too.
+pub fn browserTabOut(self: *App, s: *Session, next: bool) void {
+    if (!self.hasTabs() or self.activeTab().focus != s) return;
+    if (next and self.activeTab().count() > 1) return self.gotoPane(.next);
+    self.startUrl(s);
 }
 
 /// Returns false if the action couldn't run: copy with no selection,
@@ -2660,9 +2722,10 @@ fn runAction(self: *App, action: binding.Action) bool {
         else => {},
     }
     switch (action) {
+        // A page copies and pastes for itself.
         .copy_to_clipboard => return s.copySelection(),
         .paste_from_clipboard => {
-            if (!self.shell.clipboardHasText()) return false;
+            if (s.content == .browser or !self.shell.clipboardHasText()) return false;
             s.paste();
         },
         .new_tab => self.newSession(),
@@ -2748,7 +2811,7 @@ fn blinkTick(self: *App) void {
     }
     switch (self.keyboard()) {
         .connect, .rename, .url => self.markDirty(),
-        .terminal, .confirm, .menu, .login => {},
+        .terminal, .confirm, .menu, .login, .browser => {},
     }
 }
 
@@ -2822,8 +2885,12 @@ fn cancelUrl(self: *App) void {
 /// Send the pane to the url in its bar, and close it.
 fn submitUrl(self: *App, edit: *UrlEdit) void {
     const text = std.mem.trim(u16, edit.field.text(), &.{ ' ', '\t' });
-    if (text.len > 0) if (self.findSession(edit.pane)) |found| {
-        found.s.navigate(text) catch |err| log.err("navigating failed: {}", .{err});
+    if (text.len > 0) if (self.findSession(edit.pane)) |found| go: {
+        const url = Session.typedUrl(self.alloc, text) catch break :go;
+        defer self.alloc.free(url);
+        // A browser that failed gets another go, there.
+        if (found.s.browser()) |b| b.failed = null;
+        found.s.navigate(url) catch |err| log.err("navigating failed: {}", .{err});
     };
     self.cancelUrl();
 }
@@ -2913,7 +2980,9 @@ pub fn keyboard(self: *App) Keyboard {
         .terminal => {},
     }
     const s = self.focusedSession() orelse return .terminal;
-    return if (s.login) |l| .{ .login = l } else .terminal;
+    if (s.login) |l| return .{ .login = l };
+    if (s.browser()) |b| if (b.live()) return .{ .browser = s };
+    return .terminal;
 }
 
 /// The active session's login dialog, while it has the keyboard.
@@ -3080,7 +3149,10 @@ pub fn cursor(self: *App, pos: win32.POINT) Cursor {
         cursor_ = .size_all;
     };
     const pane = if (self.mouse_in_terminal) self.focusedSession() else if (hit.part == .terminal) self.shownPane(hit.target) else null;
-    if (pane) |s| cursor_ = .{ .shape = s.mouseShape() };
+    if (pane) |s| cursor_ = if (s.browser()) |b|
+        (if (b.cursor) |c| .{ .handle = c } else .arrow)
+    else
+        .{ .shape = s.mouseShape() };
     return cursor_;
 }
 
@@ -3093,6 +3165,23 @@ fn dividerCursor(d: Tab.Divider) Cursor {
 fn toPane(self: *App, s: *const Session, pos: win32.POINT) win32.POINT {
     const p = self.placed().find(s) orelse return pos;
     return .{ .x = pos.x - @as(i32, @intFromFloat(p.rect.x)), .y = pos.y - @as(i32, @intFromFloat(p.rect.y)) };
+}
+
+/// A mouse message for pane `s` at client position `pos`: its terminal's,
+/// or its page's.
+fn paneMouse(self: *App, s: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
+    const b = s.browser() orelse return s.mouseInput(msg, wparam, self.toPane(s, pos));
+    if (!b.live()) return;
+    self.web_hover = s.id;
+    self.shell.webMouse(s, msg, wparam, pos);
+}
+
+/// Tell the page the mouse was last over that it left.
+fn leaveWeb(self: *App) void {
+    const id = self.web_hover orelse return;
+    self.web_hover = null;
+    const found = self.findSession(id) orelse return;
+    self.shell.webMouse(found.s, win32.WM_MOUSELEAVE, 0, .{ .x = 0, .y = 0 });
 }
 
 /// Track what the mouse is over, and time the tooltip of a button it
@@ -3151,7 +3240,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
     }
 
     if (self.mouse_in_terminal) {
-        if (self.focusedSession()) |s| s.mouseInput(msg, wparam, self.toPane(s, pos));
+        if (self.focusedSession()) |s| self.paneMouse(s, msg, wparam, pos);
         if (!held) {
             self.mouse_in_terminal = false;
             // After the session's handled the release, so a selection
@@ -3176,17 +3265,24 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
     if (press and !(hit.part == .field and hit.target == .workspace)) self.cancelRename();
     if (press and !(hit.part == .field and hit.target == .pane)) self.cancelUrl();
     if (hit.part == .terminal) {
-        const pane = self.shownPane(hit.target) orelse return;
+        const pane = self.shownPane(hit.target) orelse return self.leaveWeb();
+        if (self.web_hover != null and self.web_hover != pane.id) self.leaveWeb();
         if (press) {
             self.focusPane(pane);
             // Capture the mouse while a button is down, so a drag past
             // the edge still reports and the release comes back to us.
             self.mouse_in_terminal = true;
             self.shell.captureMouse();
+            // A browser that failed gets another go.
+            if (pane.browser()) |b| if (b.failed != null) {
+                b.failed = null;
+                self.markDirty();
+            };
         }
-        pane.mouseInput(msg, wparam, self.toPane(pane, pos));
+        self.paneMouse(pane, msg, wparam, pos);
         return;
     }
+    self.leaveWeb();
 
     switch (msg) {
         // A double click is a press too, so a quick second click on a
@@ -3237,6 +3333,10 @@ fn wheelInput(self: *App, m: Msg.Mouse) void {
         if (hit.part != .terminal) return;
         break :pane self.shownPane(hit.target) orelse return;
     };
+    if (pane.browser()) |b| {
+        if (b.live()) self.shell.webMouse(pane, m.msg, m.wparam, m.pos);
+        return;
+    }
     pane.mouseWheel(m.msg, m.wparam, self.toPane(pane, m.pos));
 }
 
@@ -3303,6 +3403,11 @@ fn widgetClick(self: *App, hit: Id) void {
         .split_right => if (self.shownPane(hit.target)) |s| self.splitPane(s, .right),
         .split_down => if (self.shownPane(hit.target)) |s| self.splitPane(s, .down),
         .zoom => if (self.shownPane(hit.target)) |s| self.toggleZoom(s),
+        .back => if (self.shownPane(hit.target)) |s| self.shell.webGo(s, .back),
+        .forward => if (self.shownPane(hit.target)) |s| self.shell.webGo(s, .forward),
+        .reload => if (self.shownPane(hit.target)) |s| if (s.browser()) |b| {
+            self.shell.webGo(s, if (b.loading) .stop else .reload);
+        },
         else => {},
     }
 }
@@ -3322,7 +3427,9 @@ fn keyInput(self: *App, k: Msg.Key) Result {
         return .handled;
     }
     switch (self.keyboard()) {
-        .terminal => {},
+        // A key the page's browser let through to the window: the
+        // pane's stand-in takes it as a terminal's would.
+        .terminal, .browser => {},
         inline else => |owner, tag| {
             const vk: u32 = @truncate(wparam);
             const taken = down and switch (tag) {
@@ -3332,7 +3439,7 @@ fn keyInput(self: *App, k: Msg.Key) Result {
                 .confirm => self.confirmKey(owner, vk),
                 .menu => self.menuKey(owner, vk),
                 .login => self.loginKey(owner, vk),
-                .terminal => unreachable,
+                .terminal, .browser => unreachable,
             };
             if (taken) return .handled;
             if (self.keyBinding(msg, wparam)) return .handled;
@@ -3380,7 +3487,7 @@ fn keyInput(self: *App, k: Msg.Key) Result {
 /// it, else the focused pane. A dialog without a field swallows it.
 fn charInput(self: *App, unit: u16, sys: bool) void {
     switch (self.keyboard()) {
-        .terminal => if (self.focusedSession()) |s| s.charInput(unit),
+        .terminal, .browser => if (self.focusedSession()) |s| s.charInput(unit),
         else => |owner| if (!sys) if (owner.field()) |f| {
             f.insert(&.{unit});
             self.resetBlink();
@@ -3532,6 +3639,9 @@ pub const TestShell = struct {
     fn stats(_: *anyopaque) []const u16 {
         return &.{};
     }
+    fn webMouse(_: *anyopaque, _: *Session, _: u32, _: win32.WPARAM, _: win32.POINT) void {}
+    fn webGo(_: *anyopaque, _: *Session, _: Nav) void {}
+    fn webFollow(_: *anyopaque, _: *Session) void {}
 
     fn self_(ctx: *anyopaque) *TestShell {
         return @ptrCast(@alignCast(ctx));
@@ -3561,6 +3671,9 @@ pub const TestShell = struct {
         .setFontSize = setFontSize,
         .relayout = relayout,
         .stats = stats,
+        .webMouse = webMouse,
+        .webGo = webGo,
+        .webFollow = webFollow,
     };
 
     fn shell(self: *TestShell) Shell {

@@ -34,6 +34,8 @@ const Id = Ui.Id;
 const build_options = @import("build_options");
 const Renderer = @import("renderer/D3D11.zig");
 const Painter = Renderer.Painter;
+const Web = @import("Web.zig");
+const PaneStrip = @import("ui/widgets/PaneStrip.zig");
 
 const log = std.log.scoped(.window);
 
@@ -82,6 +84,11 @@ renderer: ?Renderer = null,
 /// The state and what changes it. Points at `ui` and `frame`, and back
 /// here as its shell.
 app: App,
+
+/// Browser panes' browsers, which draw into the renderer's tree.
+web: Web,
+/// `syncKeyFocus` is moving the focus, which comes back here.
+syncing_focus: bool = false,
 
 /// Scratch for `render`.
 frame_panes: std.ArrayList(Renderer.Pane) = .empty,
@@ -136,6 +143,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []con
         .grid = undefined,
         .ui = undefined,
         .app = undefined,
+        .web = undefined,
     };
 
     // WS_EX_NOREDIRECTIONBITMAP: we present through a flip-model swap
@@ -156,6 +164,8 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []con
     ) orelse return win32.lastError("CreateWindowExW");
     const hwnd = self.hwnd.?;
     errdefer _ = win32.DestroyWindow(hwnd);
+    self.web = .init(alloc, hwnd, self.webEvents(), win32.GetDpiForWindow(hwnd));
+    errdefer self.web.deinit();
 
     // The chrome follows the terminal's colors, and the frame Windows
     // draws (border, system menu) follows the chrome.
@@ -193,6 +203,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []con
         self.renderer.?.deinit();
         self.renderer = null;
     }
+    self.web.renderer = &self.renderer.?;
     // Sessions hold GPU resources: gone before the renderer.
     errdefer self.app.destroyTabs();
 
@@ -215,8 +226,9 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []con
 /// loop has exited).
 pub fn destroy(self: *Window) void {
     if (self.renderer) |*r| {
-        // Sessions hold GPU resources.
+        // Sessions hold GPU resources, and their browsers visuals.
         self.app.destroyTabs();
+        self.web.deinit();
         r.deinit();
         self.ui.deinit();
         self.grid.deinit();
@@ -441,6 +453,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
             });
         }
     }
+    self.placeBrowsers();
     var shadows: [2]Renderer.BoxStyle.Shadow = undefined;
     try r.draw(self.alloc, .{
         .atlas = &self.grid.atlas,
@@ -458,6 +471,107 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         _ = self.stats.lap(.draw, t);
         self.stats.frames += 1;
     }
+}
+
+/// Show the active tab's browser panes' pages where they're placed, over
+/// their boxes inside the border, dimmed as a terminal without focus is;
+/// the others' are hidden.
+fn placeBrowsers(self: *Window) void {
+    const app = &self.app;
+    self.web.beginPlacing();
+    defer self.web.endPlacing();
+    if (!app.hasTabs()) return;
+    const tab = app.activeTab();
+    const several = tab.count() > 1;
+    const border = self.ui.stroke();
+    for (app.placed().panes.items) |p| {
+        if (p.session.content != .browser) continue;
+        self.web.show(p.session, .{
+            .bounds = Web.pageBounds(p.rect, border),
+            .radius = @max(0, self.frame.corner - border),
+            .opacity = if (several and p.session != tab.focus) 1 - PaneStrip.dim else 1,
+        });
+    }
+}
+
+/// Keep the keyboard focus where the app says the keys go: in the
+/// focused browser pane's page, or on the window. Left alone while
+/// another program has it.
+fn syncKeyFocus(self: *Window) void {
+    if (self.syncing_focus) return;
+    const hwnd = self.hwnd orelse return;
+    const focus = win32.GetFocus() orelse return;
+    self.syncing_focus = true;
+    defer self.syncing_focus = false;
+    switch (self.app.keyboard()) {
+        .browser => |s| self.web.focus(s, focus == hwnd),
+        else => {
+            self.web.dropFocusAsks();
+            if (focus != hwnd and win32.IsChild(hwnd, focus) != 0) _ = win32.SetFocus(hwnd);
+        },
+    }
+}
+
+/// Whether `other` is the window or one of its children: a browser's,
+/// which takes the keys for a page.
+fn ours(self: *const Window, other: ?win32.HWND) bool {
+    const hwnd = self.hwnd orelse return false;
+    const w = other orelse return false;
+    return w == hwnd or win32.IsChild(hwnd, w) != 0;
+}
+
+/// What browsers tell the window.
+fn webEvents(self: *Window) Web.Events {
+    return .{
+        .ctx = self,
+        .changed = webChanged,
+        .focus = webFocus,
+        .tab_out = webTabOut,
+        .key = webKey,
+        .cursor = webCursor,
+    };
+}
+
+fn webChanged(ctx: *anyopaque, s: *Session) void {
+    const self = fromCtx(ctx);
+    self.app.browserChanged(s);
+    self.syncKeyFocus();
+}
+
+fn webFocus(ctx: *anyopaque, s: *Session, got: bool) void {
+    const self = fromCtx(ctx);
+    if (got) {
+        _ = self.app.update(.{ .focus = true });
+    } else if (!self.ours(win32.GetFocus())) {
+        // To another program's window, not back to ours.
+        _ = self.app.update(.{ .focus = false });
+    }
+    self.app.browserFocused(s, got);
+    self.syncKeyFocus();
+}
+
+fn webTabOut(ctx: *anyopaque, s: *Session, next: bool) void {
+    const self = fromCtx(ctx);
+    self.app.browserTabOut(s, next);
+    self.syncKeyFocus();
+}
+
+fn webKey(ctx: *anyopaque, msg: u32, vk: u32) bool {
+    const self = fromCtx(ctx);
+    const taken = self.app.acceleratorKey(msg, vk);
+    self.syncKeyFocus();
+    return taken;
+}
+
+/// A page's cursor changed under a still mouse: show it.
+fn webCursor(ctx: *anyopaque) void {
+    const self = fromCtx(ctx);
+    const hwnd = self.hwnd orelse return;
+    if (self.app.web_hover == null) return;
+    var pos: win32.POINT = undefined;
+    _ = win32.GetCursorPos(&pos);
+    _ = win32.ScreenToClient(hwnd, &pos);
+    _ = win32.SetCursor(cursorHandle(self.app.cursor(pos)));
 }
 
 /// How the renderer draws each pane: rounded as the chrome's corners,
@@ -533,6 +647,9 @@ const shell_vtable: App.Shell.VTable = .{
     .setFontSize = shellSetFontSize,
     .relayout = shellRelayout,
     .stats = shellStats,
+    .webMouse = shellWebMouse,
+    .webGo = shellWebGo,
+    .webFollow = shellWebFollow,
 };
 
 fn fromCtx(ctx: *anyopaque) *Window {
@@ -649,6 +766,18 @@ fn shellStats(ctx: *anyopaque) []const u16 {
     return self.stats_text[0..self.stats_len];
 }
 
+fn shellWebMouse(ctx: *anyopaque, s: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {
+    fromCtx(ctx).web.mouse(s, msg, wparam, pos);
+}
+
+fn shellWebGo(ctx: *anyopaque, s: *Session, nav: App.Nav) void {
+    fromCtx(ctx).web.go(s, nav);
+}
+
+fn shellWebFollow(ctx: *anyopaque, s: *Session) void {
+    fromCtx(ctx).web.follow(s);
+}
+
 fn registerClass(instance: ?win32.HINSTANCE) !void {
     const Static = struct {
         var registered = false;
@@ -689,16 +818,19 @@ fn mouseCursor(shape: ghostty_vt.MouseShape) usize {
     };
 }
 
-/// The system cursor for what the app wants at a point.
-fn systemCursor(cursor: App.Cursor) usize {
-    return switch (cursor) {
+/// The cursor for what the app wants at a point: a page's own, or the
+/// system's.
+fn cursorHandle(cursor: App.Cursor) ?win32.HCURSOR {
+    const id: usize = switch (cursor) {
         .arrow => win32.IDC_ARROW,
         .ibeam => win32.IDC_IBEAM,
         .size_we => win32.IDC_SIZEWE,
         .size_ns => win32.IDC_SIZENS,
         .size_all => win32.IDC_SIZEALL,
         .shape => |shape| mouseCursor(shape),
+        .handle => |h| return h,
     };
+    return win32.LoadCursorW(null, id);
 }
 
 /// A key message, as the app takes it.
@@ -715,6 +847,17 @@ fn result(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM
 }
 
 fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+    const r = handle(hwnd, msg, wparam, lparam);
+    // Whatever the message changed, the keys go where the app now says.
+    const ptr = win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA);
+    if (ptr != 0) {
+        const self: *Window = @ptrFromInt(@as(usize, @bitCast(ptr)));
+        if (self.renderer != null) self.syncKeyFocus();
+    }
+    return r;
+}
+
+fn handle(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) win32.LRESULT {
     if (msg == win32.WM_NCCREATE) {
         const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
         const self: *Window = @ptrCast(@alignCast(cs.lpCreateParams.?));
@@ -830,8 +973,15 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             return 0;
         },
 
-        win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
-            _ = app.update(.{ .focus = msg == win32.WM_SETFOCUS });
+        win32.WM_SETFOCUS => {
+            _ = app.update(.{ .focus = true });
+            return 0;
+        },
+
+        // Focus going to a page's browser stays the window's.
+        win32.WM_KILLFOCUS => {
+            const to: ?win32.HWND = @ptrFromInt(wparam);
+            if (!self.ours(to)) _ = app.update(.{ .focus = false });
             return 0;
         },
 
@@ -921,7 +1071,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             var pos: win32.POINT = undefined;
             _ = win32.GetCursorPos(&pos);
             _ = win32.ScreenToClient(hwnd, &pos);
-            _ = win32.SetCursor(win32.LoadCursorW(null, systemCursor(app.cursor(pos))));
+            _ = win32.SetCursor(cursorHandle(app.cursor(pos)));
             return win32.TRUE;
         },
 
@@ -929,6 +1079,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
             const rect: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
             self.dpi = win32.hiword(wparam);
             self.grid.setDpi(self.dpi);
+            self.web.setDpi(self.dpi);
             self.ui.setDpi(self.dpi) catch |err| log.err("chrome DPI change failed: {}", .{err});
             _ = win32.SetWindowPos(
                 hwnd,

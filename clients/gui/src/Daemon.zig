@@ -2185,7 +2185,7 @@ fn pipeName(buf: *WideBuf) ![:0]const u16 {
 }
 
 /// SLIME_INSTANCE, if it's set: a daemon of its own, for tests.
-fn instance(buf: *[64]u16) ?[]const u16 {
+pub fn instance(buf: *[64]u16) ?[]const u16 {
     const len = win32.GetEnvironmentVariableW(L("SLIME_INSTANCE"), buf, buf.len);
     if (len == 0 or len >= buf.len) return null;
     return buf[0..len];

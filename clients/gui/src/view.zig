@@ -523,8 +523,9 @@ const Builder = struct {
     /// A pane's buttons: split right and down, and zoom while the tab
     /// has several panes, if it runs in slime and is wide enough to hold
     /// them with room for some title. A browser's back, forward, and
-    /// reload come first, unlit until a browser can use them; the strip
-    /// drops them where they'd leave its URL bar too narrow.
+    /// reload (stop while a page loads) come first, unlit while its
+    /// browser can't use them; the strip drops them where they'd leave its
+    /// URL bar too narrow.
     fn paneButtons(self: *const Builder, id: Id, s: *const Session, tab: *const Tab, frame_w: f32, several: bool) Allocator.Error!PaneButtons {
         if (s.daemonPane() == null) return .{};
         const nav: []const Id.Part = if (s.content == .browser) &.{ .back, .forward, .reload } else &.{};
@@ -535,16 +536,24 @@ const Builder = struct {
         const zoomed = tab.zoom == s;
         const buttons = try self.arena.alloc(Node, nav.len + parts.len);
         const off = self.ui.theme.text_strong;
+        const web: Session.Browser = switch (s.content) {
+            .browser => |br| br,
+            .terminal => .{},
+        };
+        const live = web.live();
         for (buttons[0..nav.len], nav) |*b, part| {
-            // The arrows span 14 of their 24 units and the circle 18:
-            // about 9 and 10 DIPs in these boxes.
-            const icon: Painter.Lucide, const size: f32 = switch (part) {
-                .back => .{ .arrow_left, 15 },
-                .forward => .{ .arrow_right, 15 },
-                .reload => .{ .rotate_cw, 13 },
+            // The arrows span 14 of their 24 units, the circle 18, and
+            // the cross 12: about 9, 10, and 8 DIPs in these boxes.
+            const icon: Painter.Lucide, const size: f32, const tip: []const u16, const lit = switch (part) {
+                .back => .{ .arrow_left, 15, L("Back"), web.can_go_back },
+                .forward => .{ .arrow_right, 15, L("Forward"), web.can_go_forward },
+                .reload => if (web.loading) .{ .x, 15, L("Stop"), true } else .{ .rotate_cw, 13, L("Reload"), true },
                 else => unreachable,
             };
-            b.* = .{ .id = id.with(part), .kind = .{ .icon = .{ .icon = icon, .size = size, .box = PaneStrip.button_size, .color = .{ off[0], off[1], off[2], 0.2 } } } };
+            b.* = if (live and lit)
+                .{ .id = id.with(part), .kind = .{ .icon_button = .{ .icon = icon, .size = size, .style = .faint, .tip = tip } } }
+            else
+                .{ .id = id.with(part), .kind = .{ .icon = .{ .icon = icon, .size = size, .box = PaneStrip.button_size, .color = .{ off[0], off[1], off[2], 0.2 } } } };
         }
         for (buttons[nav.len..], parts) |*b, part| {
             const none: []const u16 = &.{};
@@ -567,10 +576,12 @@ const Builder = struct {
         const url = s.pageUrl() orelse return null;
         const app = self.app;
         const editing = app.mode == .url and app.mode.url.pane == s.id;
+        const b = s.browser().?;
         var ended: []const u16 = &.{};
-        if (s.ended) {
-            const why = if (s.daemonLoss()) |loss| loss.text() else "ended";
-            const text = try std.fmt.allocPrint(self.arena, "[{s}. Press any key to close.]", .{why});
+        if (s.ended or b.failed != null) {
+            const text = if (s.ended) try std.fmt.allocPrint(self.arena, "[{s}. Press any key to close.]", .{
+                if (s.daemonLoss()) |loss| loss.text() else "ended",
+            }) else b.failed.?;
             ended = std.unicode.utf8ToUtf16LeAlloc(self.arena, text) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => &.{},
@@ -583,6 +594,7 @@ const Builder = struct {
             .page = page,
             .page_title = s.title(),
             .ended = ended,
+            .live = b.live(),
         };
     }
 

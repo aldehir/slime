@@ -1050,14 +1050,6 @@ pub fn removePaneVisual(self: *D3D11, key: u64) void {
     };
 }
 
-test {
-    // Nothing calls these until browser panes are drawn; keep them
-    // compiled.
-    _ = &setPaneVisual;
-    _ = &removePaneVisual;
-    _ = &commit;
-}
-
 /// A transparent chain over the panes' visuals, the window's size.
 const OverlayChain = struct {
     swap_chain: *dxgi.ISwapChain1,

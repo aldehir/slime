@@ -37,7 +37,9 @@ zig build test
   your own HWND. `scripts\smoke.ps1 -Out <dir>` launches and screenshots
   safely.
 - Win32/COM bindings are hand-written; take vtable slots from Zig's bundled
-  mingw headers (inherited methods count, IUnknown is 3).
+  mingw headers (inherited methods count, IUnknown is 3). WebView2's
+  (`win32/webview2.zig`) come from the NuGet package's `WebView2.h`, at
+  the version build.zig fetches, which mingw doesn't have.
 - The reader thread must never call anything that waits on the UI thread
   (SendMessage, SetWindowTextW); use PostMessage.
 - Check `deferred.md` before building adjacent features; keep it current.

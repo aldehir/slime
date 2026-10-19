@@ -1,0 +1,40 @@
+# Download the Microsoft.Web.WebView2 NuGet package and extract the x64
+# WebView2Loader.dll and its license. build.zig runs this when the files
+# are missing; the version and hash are pinned there.
+#
+#   .\scripts\fetch-webview2.ps1 -Version <ver> -Sha256 <hash> -Out <dir>
+#
+# Uses .NET directly rather than Get-FileHash/Expand-Archive: when
+# Windows PowerShell is started from pwsh it inherits pwsh's PSModulePath
+# and can't autoload those cmdlets.
+param(
+    [Parameter(Mandatory)][string]$Version,
+    [Parameter(Mandatory)][string]$Sha256,
+    [Parameter(Mandatory)][string]$Out
+)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$id = 'microsoft.web.webview2'
+$url = "https://api.nuget.org/v3-flatcontainer/$id/$Version/$id.$Version.nupkg"
+$tmp = Join-Path ([IO.Path]::GetTempPath()) "slime-webview2-$Version"
+$zip = "$tmp.zip"
+
+Write-Host "fetching $url"
+(New-Object Net.WebClient).DownloadFile($url, $zip)
+$sha = [Security.Cryptography.SHA256]::Create()
+$stream = [IO.File]::OpenRead($zip)
+$actual = -join ($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })
+$stream.Dispose()
+if ($actual -ne $Sha256) {
+    Remove-Item $zip
+    throw "webview2 package hash mismatch: expected $Sha256, got $actual"
+}
+
+if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+[IO.Compression.ZipFile]::ExtractToDirectory($zip, $tmp)
+New-Item -ItemType Directory -Force $Out | Out-Null
+Copy-Item (Join-Path $tmp 'build\native\x64\WebView2Loader.dll') $Out
+Copy-Item (Join-Path $tmp 'LICENSE.txt') $Out
+Remove-Item -Recurse -Force $tmp, $zip

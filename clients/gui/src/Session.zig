@@ -19,6 +19,7 @@ const ghostty_vt = @import("ghostty-vt");
 const win32 = @import("win32/win32.zig");
 const input = @import("input.zig");
 const Daemon = @import("Daemon.zig");
+const Web = @import("Web.zig");
 const Config = @import("Config.zig");
 const Login = @import("Login.zig");
 const Placement = @import("Placement.zig");
@@ -179,23 +180,39 @@ pub const Terminal = struct {
 
 /// A browser pane: where its page is. slime keeps the url and the page's
 /// title (the session's `title`); the page itself, its history, and the
-/// browser showing it will be the window's.
+/// browser showing it are the window's (`view`).
 pub const Browser = struct {
-    /// Where the page is: as slime last said (pane.url), or the URL bar
-    /// sent. Owned. UI thread only.
+    /// Where the page is: as slime last said (pane.url), the URL bar
+    /// sent, or the browser went. Owned. UI thread only.
     url: []u16 = &.{},
     /// The url slime last said, for `titleUpdate` to take. Owned.
     /// Guarded by `lock`.
     next_url: ?[]u16 = null,
-    /// What the strip's back, forward, and reload buttons go by, once a
+    /// What the strip's back, forward, and reload buttons go by, as the
     /// browser reports them.
     can_go_back: bool = false,
     can_go_forward: bool = false,
     loading: bool = false,
+    /// The browser showing the page, while the pane is in the window
+    /// and has one. UI thread only, as everything below.
+    view: ?*Web.View = null,
+    /// Why the pane has no browser, which its stand-in says, until a
+    /// click asks for one again.
+    failed: ?[]const u8 = null,
+    /// The page's pointer, a copy the pane owns.
+    cursor: ?win32.HCURSOR = null,
 
     fn deinit(self: *Browser, alloc: Allocator) void {
+        if (self.view) |v| v.detach();
+        if (self.cursor) |c| _ = win32.DestroyIcon(c);
         alloc.free(self.url);
         if (self.next_url) |u| alloc.free(u);
+    }
+
+    /// Its browser is up: the page draws over the stand-in.
+    pub fn live(self: *const Browser) bool {
+        const v = self.view orelse return false;
+        return v.state == .ready;
     }
 };
 
@@ -813,18 +830,42 @@ pub fn title(self: *const Session) []const u16 {
 
 /// Take the program's new title, and a browser's url. Clears the
 /// pending flag before reading, so a change made after the read posts
-/// again.
-pub fn titleUpdate(self: *Session) void {
+/// again. Returns true if a url came, which the browser goes to.
+pub fn titleUpdate(self: *Session) bool {
     self.title_pending.store(false, .release);
     self.lockTerminal();
     defer self.unlockTerminal();
     @memcpy(self.title_buf[0..self.next_title_len], self.next_title_buf[0..self.next_title_len]);
     self.title_len = self.next_title_len;
-    const b = self.browser() orelse return;
-    const url = b.next_url orelse return;
+    const b = self.browser() orelse return false;
+    const url = b.next_url orelse return false;
     b.next_url = null;
     self.alloc.free(b.url);
     b.url = url;
+    return true;
+}
+
+/// The pane's browser went to `url`, whose page is titled `title`: the
+/// pane shows them, and slime hears, for its other windows to follow.
+/// UI thread.
+pub fn visited(self: *Session, url: []const u16, page_title: []const u16) void {
+    const b = self.browser() orelse return;
+    const moved = !std.mem.eql(u16, b.url, url);
+    const retitled = !std.mem.eql(u16, self.title_buf[0..self.title_len], page_title[0..@min(page_title.len, max_title_len)]);
+    if (!moved and !retitled) return;
+    if (moved) {
+        const copy = self.alloc.dupe(u16, url) catch return;
+        self.alloc.free(b.url);
+        b.url = copy;
+    }
+    self.lockTerminal();
+    self.title_len = @min(page_title.len, max_title_len);
+    @memcpy(self.title_buf[0..self.title_len], page_title[0..self.title_len]);
+    @memcpy(self.next_title_buf[0..self.title_len], page_title[0..self.title_len]);
+    self.next_title_len = self.title_len;
+    self.unlockTerminal();
+    const s = self.live() orelse return;
+    s.conn.paneVisited(s.pane, url, page_title) catch |err| log.warn("telling slime where the browser went failed: {}", .{err});
 }
 
 /// Where a browser pane's page is; null for a terminal.
@@ -1164,6 +1205,40 @@ test urlHost {
     try std.testing.expectEqualSlices(u16, L("file:///C:/x"), urlHost(L("file:///C:/x")));
 }
 
+/// What the URL bar sends for `text`: a url as typed, or with no scheme
+/// a site, over https but on this machine (`localhost:3000`), where
+/// dev servers are plain http. Owned by the caller.
+pub fn typedUrl(alloc: Allocator, text: []const u16) ![]u16 {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const has_scheme = std.mem.indexOf(u16, text, L("://")) != null or for ([_][]const u16{
+        L("about:"), L("data:"), L("file:"), L("javascript:"), L("view-source:"), L("blob:"),
+    }) |scheme| {
+        if (std.mem.startsWith(u16, text, scheme)) break true;
+    } else false;
+    if (has_scheme) return alloc.dupe(u16, text);
+    const local = for ([_][]const u16{ L("localhost"), L("127.0.0.1"), L("[::1]") }) |host| {
+        if (std.mem.startsWith(u16, text, host) and (text.len == host.len or std.mem.indexOfScalar(u16, L(":/"), text[host.len]) != null)) break true;
+    } else false;
+    return std.mem.concat(alloc, u16, &.{ if (local) L("http://") else L("https://"), text });
+}
+
+test typedUrl {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const alloc = std.testing.allocator;
+    for ([_][2][]const u16{
+        .{ L("example.com"), L("https://example.com") },
+        .{ L("http://intranet/"), L("http://intranet/") },
+        .{ L("localhost:3000/a"), L("http://localhost:3000/a") },
+        .{ L("localhostess.com"), L("https://localhostess.com") },
+        .{ L("about:blank"), L("about:blank") },
+        .{ L("data:text/html,<p>hi"), L("data:text/html,<p>hi") },
+    }) |case| {
+        const got = try typedUrl(alloc, case[0]);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u16, case[1], got);
+    }
+}
+
 /// A browser session as `create` makes one from an arrival, without a
 /// connection, for the tests.
 fn testBrowser(alloc: Allocator, config: *const Config, url: []const u16) !Session {
@@ -1192,19 +1267,46 @@ test "a browser goes by its page's title, else its host, and takes slime's url" 
     // posted.)
     s.title_pending.store(true, .release);
     daemonNotice(&s, .{ .kind = .title, .text = "Example", .status = undefined });
-    s.titleUpdate();
+    try std.testing.expect(!s.titleUpdate());
     try std.testing.expectEqualSlices(u16, L("Example"), s.title());
     s.title_pending.store(true, .release);
     daemonUrl(&s, "https://example.org/x");
-    s.titleUpdate();
+    try std.testing.expect(s.titleUpdate());
     try std.testing.expectEqualSlices(u16, L("https://example.org/x"), s.pageUrl().?);
     try std.testing.expectEqualSlices(u16, L("example.org"), s.title());
     // An update with no url leaves the url.
     s.title_pending.store(true, .release);
     daemonNotice(&s, .{ .kind = .title, .text = "Hello", .status = undefined });
-    s.titleUpdate();
+    try std.testing.expect(!s.titleUpdate());
     try std.testing.expectEqualSlices(u16, L("https://example.org/x"), s.pageUrl().?);
     try std.testing.expectEqualSlices(u16, L("Hello"), s.title());
+
+    // Its own browser went somewhere: shown at once, with no connection
+    // to tell.
+    s.visited(L("https://example.net/"), L("Net"));
+    try std.testing.expectEqualSlices(u16, L("https://example.net/"), s.pageUrl().?);
+    try std.testing.expectEqualSlices(u16, L("Net"), s.title());
+    try std.testing.expect(!s.browser().?.live());
+}
+
+test "a browser's page is up only once its WebView is" {
+    const alloc = std.testing.allocator;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    var config: Config = .init(alloc);
+    defer config.deinit();
+    var s = try testBrowser(alloc, &config, L("https://example.com/"));
+    defer s.deinitContent();
+    const b = s.browser().?;
+    try std.testing.expect(!b.live());
+    // A view with no browser behind it, never shut: only its state is read.
+    var view: Web.View = .{ .web = undefined, .session = &s, .key = s.id };
+    b.view = &view;
+    defer b.view = null;
+    try std.testing.expect(!b.live());
+    view.state = .creating;
+    try std.testing.expect(!b.live());
+    view.state = .ready;
+    try std.testing.expect(b.live());
 }
 
 test "a terminal's methods do nothing for a browser" {

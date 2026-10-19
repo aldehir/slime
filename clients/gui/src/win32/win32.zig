@@ -11,6 +11,7 @@ pub const dwrite = @import("dwrite.zig");
 pub const d2d1 = @import("d2d1.zig");
 pub const dcomp = @import("dcomp.zig");
 pub const conpty = @import("conpty.zig");
+pub const webview2 = @import("webview2.zig");
 
 pub const BOOL = i32;
 pub const TRUE: BOOL = 1;
@@ -570,6 +571,17 @@ pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn ScreenToClient(HWND, *POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetCursorPos(*POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn SetCursor(?HCURSOR) callconv(.winapi) ?HCURSOR;
+/// CopyCursor is this, as a macro.
+pub extern "user32" fn CopyIcon(HCURSOR) callconv(.winapi) ?HCURSOR;
+/// DestroyCursor, for a copied cursor.
+pub extern "user32" fn DestroyIcon(HCURSOR) callconv(.winapi) BOOL;
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+pub extern "user32" fn SetFocus(?HWND) callconv(.winapi) ?HWND;
+pub extern "user32" fn IsChild(HWND, HWND) callconv(.winapi) BOOL;
+pub extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) HRESULT;
+pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+pub extern "ole32" fn CoTaskMemFree(?*anyopaque) callconv(.winapi) void;
+pub const COINIT_APARTMENTTHREADED = 0x2;
 pub extern "user32" fn SystemParametersInfoW(u32, u32, ?*anyopaque, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn GetMessageTime() callconv(.winapi) i32;
 pub extern "user32" fn GetDoubleClickTime() callconv(.winapi) u32;

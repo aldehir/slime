@@ -21,6 +21,11 @@ pub fn main(init: std.process.Init) !void {
     // This should eventually move to the application manifest.
     _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ghostty_vt.sys.decode_png = &decodePng;
+    // A single-threaded apartment, which WebView2 (browser panes) needs
+    // on the thread it calls back on, this one.
+    const com_ok = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED) >= 0;
+    if (!com_ok) std.log.err("CoInitializeEx failed: browser panes won't work", .{});
+    defer if (com_ok) win32.CoUninitialize();
 
     const config_dir = try Config.defaultDir(init.gpa, init.environ_map);
     defer if (config_dir) |d| init.gpa.free(d);
@@ -181,6 +186,8 @@ test {
     _ = @import("Shown.zig");
     _ = @import("Screen.zig");
     _ = @import("Session.zig");
+    _ = @import("Web.zig");
+    _ = @import("win32/webview2.zig");
     _ = @import("Daemon.zig");
     _ = @import("Tab.zig");
     _ = @import("Placement.zig");

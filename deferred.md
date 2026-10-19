@@ -340,15 +340,41 @@ so; the host's button reconnects, reattaches, and replaces them.
 ## Browser panes
 
 A pane is a terminal or a browser (`slime pane split --browser <url>`).
-The daemon keeps a browser's url and title; the window draws its strip
-with a URL bar (a click selects it all, Enter sends `pane.navigate`,
-Escape puts it back) and, for now, the page's title and url as text
-where the page goes (`.plans/browser-pane-plan.md`, stages 3 and 4).
+The daemon keeps a browser's url and title; the window fills the pane
+with WebView2 in visual mode (`Web.zig`), under a strip with back,
+forward, reload (stop while loading), and a URL bar (a click selects it
+all, Enter sends `pane.navigate`, Escape puts it back). The mouse is
+forwarded to the page, its keys go to it but for the app's bindings,
+and a pane without a browser (no runtime, or one that failed) shows its
+title and url and why (`.plans/browser-pane-plan.md`).
 
-- **Back, forward, and reload** are drawn unlit and do nothing until a
-  browser fills the pane and says what its history allows.
+- **Hosts' pages go through the local network**: every pane uses the
+  local environment until the SOCKS proxy and per-host environments
+  (stage 5) come.
+- **No favicon**: the strip's icon could be the site's
+  (`ICoreWebView2_15::FaviconChanged`).
+- **No find in page** (`ICoreWebView2Find`).
+- **A dragged browser pane's picture is its strip over an empty box**:
+  the page is in a visual of its own, not the frame the picture is
+  copied from. `CapturePreview` at drag start would give the page.
+- **A page opening a window opens it in its own pane**, not a split.
+- **Permission prompts** (camera, location, notifications) are
+  WebView2's defaults; `PermissionRequested` to a dialog of ours, with
+  camera and location denied by default, is the plan.
+- **Hidden browsers stay open**: a browser in a tab not shown keeps
+  its page and memory until the pane leaves the window; closing idle
+  ones after a while would cost a reload.
+- **A failed browser comes back on a click** in its stand-in or Enter
+  in its URL bar; a crash shows only the last page's title and url.
+- **Untried on a real display**: modifier chords into a page (posted
+  keys can't fake the modifier state; bindings reach the keymap through
+  `AcceleratorKeyPressed`, tried with an unmodified F-key), IME in a
+  page, the page's cursor, and a DPI change across monitors
+  (`RasterizationScale`) were checked only by reading the code.
 - **A narrow pane's URL bar** is cut short with an ellipsis; at rest it
-  drops `https://`, so the host comes first.
+  drops `https://`, so the host comes first; when the bar itself would
+  be under 140 DIPs the history buttons go (a half-width pane at 1300
+  px wide loses them; zoom the pane to get them back).
 
 ## Scripting
 

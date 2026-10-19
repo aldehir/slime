@@ -8,6 +8,13 @@ const conpty_version = "1.25.260930003";
 const conpty_sha256 = "02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee";
 const conpty_dir = "tools/conpty-" ++ conpty_version;
 
+/// WebView2's loader, which the window loads to make browser panes'
+/// browsers (the Evergreen runtime is the system's), and its license,
+/// fetched from the Microsoft.Web.WebView2 package the same way.
+const webview2_version = "1.0.4258.31";
+const webview2_sha256 = "56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9";
+const webview2_dir = "tools/webview2-" ++ webview2_version;
+
 /// Everything beside the exe: the daemon (slime.exe) with its ConPTY and
 /// its Linux builds for SSH hosts, and the window (slime-gui.exe), built
 /// as a path dependency (clients/gui) and installed beside it.
@@ -56,6 +63,7 @@ pub fn build(b: *std.Build) void {
     b.step("icons", "Render the app icon PNGs into zig-out/icons").dependOn(&gui.builder.top_level_steps.get("icons").?.step);
 
     installConpty(b);
+    installWebView2(b);
     const remote = b.option(bool, "remote", "Build slime and its builds for SSH hosts (need Go; default: if Go is found)");
     if (remote orelse true) installGoHelpers(b, remote != null);
 
@@ -214,5 +222,21 @@ fn installConpty(b: *std.Build) void {
         fetch.addArg(b.pathFromRoot(conpty_dir));
         dll.step.dependOn(&fetch.step);
         host.step.dependOn(&fetch.step);
+    };
+}
+
+/// WebView2's loader, next to the window.
+fn installWebView2(b: *std.Build) void {
+    const dll = b.addInstallBinFile(b.path(webview2_dir ++ "/WebView2Loader.dll"), "WebView2Loader.dll");
+    b.getInstallStep().dependOn(&dll.step);
+
+    b.build_root.handle.access(b.graph.io, webview2_dir ++ "/WebView2Loader.dll", .{}) catch {
+        const fetch = b.addSystemCommand(&.{
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        });
+        fetch.addFileArg(b.path("scripts/fetch-webview2.ps1"));
+        fetch.addArgs(&.{ "-Version", webview2_version, "-Sha256", webview2_sha256, "-Out" });
+        fetch.addArg(b.pathFromRoot(webview2_dir));
+        dll.step.dependOn(&fetch.step);
     };
 }

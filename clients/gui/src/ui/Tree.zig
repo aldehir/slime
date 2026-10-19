@@ -272,10 +272,12 @@ pub const BrowserPane = struct {
     /// The pane under its strip (`Placement.Pane.rect`), where the page
     /// goes.
     page: Rect,
-    /// What stands in for the page: its title, and why the pane ended,
-    /// if it did.
+    /// What stands in for the page: its title, and why the pane ended
+    /// or has no browser, if it did or hasn't.
     page_title: []const u16,
     ended: []const u16 = &.{},
+    /// Its browser draws the page, over the stand-in, which isn't drawn.
+    live: bool = false,
 };
 
 pub const DialogView = struct {

@@ -45,7 +45,7 @@ const drop_radius = 8;
 
 /// How much of a pane's background covers it while another has focus,
 /// as Ghostty's `unfocused-split-opacity` of 0.7 leaves.
-const dim = 0.3;
+pub const dim = 0.3;
 /// How much of the ground covers a pane being dragged.
 const lifted = 0.6;
 /// The picture of a dragged pane: its scale, at most this size.
@@ -134,7 +134,7 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
     }
     if (pane.browser) |b| {
         paintUrl(ui, p, urlRect(ui, node), b, pane.focused);
-        paintPage(ui, p, b);
+        if (!b.live) paintPage(ui, p, b);
     } else {
         const right = if (pane.buttons.len > 0) pane.buttons[0].rect.x - ui.px(6) else strip.right() - ui.px(title_pad);
         const r: Rect = .{ .x = x, .y = strip.y, .w = @max(0, right - x), .h = strip.h };
