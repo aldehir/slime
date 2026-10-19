@@ -870,12 +870,15 @@ fn createTargets(
     }, d2d_target), "ID2D1DeviceContext::CreateBitmapFromDxgiSurface");
 }
 
-/// A flip-model chain for a visual's content.
+/// A flip-model chain for a visual's content. A composition chain can't
+/// take the window's size the way one on the HWND did, and refuses an
+/// empty one: a client area a title bar high gets a 1 px chain, resized
+/// with the window.
 fn createChain(factory: *dxgi.IFactory2, device: *d3d11.IDevice, width: u32, height: u32, alpha_mode: u32, flags: u32) Error!*dxgi.ISwapChain1 {
     var chain: ?*dxgi.ISwapChain1 = null;
     try com.check(factory.createSwapChainForComposition(device, &.{
-        .Width = width,
-        .Height = height,
+        .Width = @max(1, width),
+        .Height = @max(1, height),
         .Format = buffer_format,
         .BufferUsage = dxgi.USAGE_RENDER_TARGET_OUTPUT,
         .BufferCount = buffer_count,
