@@ -209,8 +209,9 @@ one.
   shows it; `curl --proxy socks5h://127.0.0.1:<port> http://intranet/`
   reaches what the host reaches, names resolved there; `host.proxy =
   false` turns it off). A reconnect asks for the same port, remembered
-  only while the daemon lives. `-L` and `-R` forwards, the agent, and
-  SFTP are still to do.
+  only while the daemon lives. A host's browser panes browse through
+  it (Browser panes). `-L` and `-R` forwards, the agent, and SFTP are
+  still to do.
 - **Launching with an `ssh://` URL** attaches the local workspace too,
   since hosts are reached through the local daemon; the host opens
   beside it.
@@ -348,9 +349,44 @@ forwarded to the page, its keys go to it but for the app's bindings,
 and a pane without a browser (no runtime, or one that failed) shows its
 title and url and why (`.plans/browser-pane-plan.md`).
 
-- **Hosts' pages go through the local network**: every pane uses the
-  local environment until the SOCKS proxy and per-host environments
-  (stage 5) come.
+A browser pane in a host's workspace browses the host's network: its
+WebView2 environment is the host's
+(`%LOCALAPPDATA%\slime\webview\host-<hash of dest>`, cookies apart from
+local's and kept per destination), started with `--proxy-server=` the daemon's SOCKS proxy
+plus `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"` and
+`--proxy-bypass-list="<-loopback>"`, so every connection and name
+lookup happens on the host, localhost and 127.0.0.0/8 included (a dev
+server on the host is `http://localhost:3000`). With the proxy
+off (`host.proxy = false`) the folder is still the host's but pages go
+out locally. A browser keeps the arguments it started with, and a
+second environment on the folder silently joins it, so when a host is
+lost, disconnected, or comes back on another port, the window closes
+its views, waits for the browser process to exit
+(`BrowserProcessExited`), and the panes say "Reconnecting the host's
+browser…" until the next one starts by itself.
+
+- **A host's browser is untested against a real host.** The arguments
+  were tried in a throwaway WebView2 harness against `internal/socks`
+  on loopback: a name only the proxy knew loaded, example.com went
+  through it by name, a second environment on a running folder with
+  other arguments joined the old browser (pid 0, never navigated), and
+  after the views closed `BrowserProcessExited` came within 250 ms and
+  the next environment used its new proxy. The window's reconnect path
+  (`Web.hostChanged`, `retire`) ran only in unit tests of its decision.
+- **WebView2's own traffic goes through the host too**: SmartScreen,
+  `config.edge.skype.com`, and `edge.microsoft.com` lookups are dialed
+  through the proxy, so a host without internet makes them fail.
+- **No `browser.follow`**: two windows on one browser pane always
+  follow each other's navigation (the plan's open question).
+- **A host browser's pid is a guess while it starts**: the window learns
+  it from its first WebView; an environment retired before any (or
+  after a crash it hasn't heard of), or whose pid is no longer a
+  running `msedgewebview2.exe`, is dropped at once, not waited on.
+- **A browser that never exits** (another window with a WebView on the
+  same host's folder, or a hung one) leaves the panes saying
+  "Reconnecting…": a click there stops waiting, lets the old
+  environment go, and the next placement makes a new one, which may
+  join the old browser and its old proxy if it still runs.
 - **No favicon**: the strip's icon could be the site's
   (`ICoreWebView2_15::FaviconChanged`).
 - **No find in page** (`ICoreWebView2Find`).

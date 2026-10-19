@@ -51,6 +51,7 @@ pub fn releaseOpt(ptr: anytype) void {
 pub const S_OK: win32.HRESULT = 0;
 pub const E_NOINTERFACE: win32.HRESULT = @bitCast(@as(u32, 0x80004002));
 pub const E_OUTOFMEMORY: win32.HRESULT = @bitCast(@as(u32, 0x8007000E));
+pub const E_NOTIMPL: win32.HRESULT = @bitCast(@as(u32, 0x80004001));
 
 pub const IID_IUnknown: win32.GUID = .{
     .data1 = 0,

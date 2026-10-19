@@ -529,7 +529,17 @@ fn webEvents(self: *Window) Web.Events {
         .tab_out = webTabOut,
         .key = webKey,
         .cursor = webCursor,
+        .host = webHost,
+        .redraw = webRedraw,
     };
+}
+
+fn webHost(ctx: *anyopaque, id: u32) ?Web.Host {
+    return fromCtx(ctx).app.browserHost(id);
+}
+
+fn webRedraw(ctx: *anyopaque) void {
+    fromCtx(ctx).app.markDirty();
 }
 
 fn webChanged(ctx: *anyopaque, s: *Session) void {
@@ -650,6 +660,8 @@ const shell_vtable: App.Shell.VTable = .{
     .webMouse = shellWebMouse,
     .webGo = shellWebGo,
     .webFollow = shellWebFollow,
+    .webHost = shellWebHost,
+    .webRetry = shellWebRetry,
 };
 
 fn fromCtx(ctx: *anyopaque) *Window {
@@ -776,6 +788,14 @@ fn shellWebGo(ctx: *anyopaque, s: *Session, nav: App.Nav) void {
 
 fn shellWebFollow(ctx: *anyopaque, s: *Session) void {
     fromCtx(ctx).web.follow(s);
+}
+
+fn shellWebHost(ctx: *anyopaque, host: u32) void {
+    fromCtx(ctx).web.hostChanged(host);
+}
+
+fn shellWebRetry(ctx: *anyopaque, s: *Session) void {
+    fromCtx(ctx).web.retry(s);
 }
 
 fn registerClass(instance: ?win32.HINSTANCE) !void {

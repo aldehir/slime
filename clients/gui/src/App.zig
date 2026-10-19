@@ -16,6 +16,7 @@ const input = @import("input.zig");
 const binding = @import("binding.zig");
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
+const Web = @import("Web.zig");
 const Tab = @import("Tab.zig");
 const Daemon = @import("Daemon.zig");
 const Hosts = @import("Hosts.zig");
@@ -335,6 +336,9 @@ const HostEntry = struct {
     state: Daemon.HostStatus,
     /// A status line while connecting, or why it ended. Owned.
     text: []const u16,
+    /// Its daemon's SOCKS proxy while it's connected, which its browser
+    /// panes browse through; empty without one. Owned.
+    proxy: []const u16 = &.{},
     /// This window asked the daemon to connect it, so its prompts come
     /// here.
     ours: bool = false,
@@ -464,6 +468,12 @@ pub const Shell = struct {
         /// A browser pane's url changed in slime: its browser goes
         /// there, unless it's there.
         webFollow: *const fn (*anyopaque, *Session) void,
+        /// A host's state or proxy changed (`browserHost`): its browser
+        /// panes' browser may have to go.
+        webHost: *const fn (*anyopaque, u32) void,
+        /// A click on a browser pane's stand-in: its browser gets
+        /// another go.
+        webRetry: *const fn (*anyopaque, *Session) void,
     };
 
     fn captureMouse(self: Shell) void {
@@ -543,6 +553,12 @@ pub const Shell = struct {
     }
     fn webFollow(self: Shell, s: *Session) void {
         self.vt.webFollow(self.ctx, s);
+    }
+    fn webHost(self: Shell, host: u32) void {
+        self.vt.webHost(self.ctx, host);
+    }
+    fn webRetry(self: Shell, s: *Session) void {
+        self.vt.webRetry(self.ctx, s);
     }
 };
 
@@ -653,6 +669,7 @@ pub fn deinit(self: *App) void {
     for (self.host_states.items) |e| {
         self.alloc.free(e.dest);
         self.alloc.free(e.text);
+        self.alloc.free(e.proxy);
     }
     self.host_states.deinit(self.alloc);
     self.arena.deinit();
@@ -1738,6 +1755,13 @@ fn hostEntryById(self: *App, id: u32) ?*HostEntry {
     return null;
 }
 
+/// Host `id` as a browser on it needs it, while it's connected.
+pub fn browserHost(self: *App, id: u32) ?Web.Host {
+    const e = self.hostEntryById(id) orelse return null;
+    if (e.state != .connected) return null;
+    return .{ .dest = e.dest, .proxy = e.proxy };
+}
+
 /// The daemon holds a connection to remembered host `h`, or is making
 /// one.
 pub fn hostLive(self: *App, h: usize) bool {
@@ -2088,7 +2112,12 @@ fn hostState(self: *App, h: Daemon.HostInfo) void {
     self.alloc.free(e.text);
     e.text = text;
     e.state = h.state;
+    if (!std.mem.eql(u16, e.proxy, h.proxy)) if (self.alloc.dupe(u16, h.proxy)) |proxy| {
+        self.alloc.free(e.proxy);
+        e.proxy = proxy;
+    } else |_| {};
     self.markDirty();
+    self.shell.webHost(h.host);
 
     const connecting = h.state == .connecting;
     // A host the daemon is connecting (from a console, or another window)
@@ -3287,7 +3316,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
             self.shell.captureMouse();
             // A browser that failed gets another go.
             if (pane.browser()) |b| if (b.failed != null) {
-                b.failed = null;
+                self.shell.webRetry(pane);
                 self.markDirty();
             };
         }
@@ -3659,6 +3688,10 @@ pub const TestShell = struct {
     fn webMouse(_: *anyopaque, _: *Session, _: u32, _: win32.WPARAM, _: win32.POINT) void {}
     fn webGo(_: *anyopaque, _: *Session, _: Nav) void {}
     fn webFollow(_: *anyopaque, _: *Session) void {}
+    fn webHost(_: *anyopaque, _: u32) void {}
+    fn webRetry(_: *anyopaque, s: *Session) void {
+        if (s.browser()) |b| b.failed = null;
+    }
 
     fn self_(ctx: *anyopaque) *TestShell {
         return @ptrCast(@alignCast(ctx));
@@ -3691,6 +3724,8 @@ pub const TestShell = struct {
         .webMouse = webMouse,
         .webGo = webGo,
         .webFollow = webFollow,
+        .webHost = webHost,
+        .webRetry = webRetry,
     };
 
     fn shell(self: *TestShell) Shell {

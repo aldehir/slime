@@ -265,8 +265,9 @@ pub const HostStatus = enum(u8) {
     _,
 };
 
-/// A host as the daemon knows it: its id, destination, state, and a
-/// status line (what it's doing while connecting, or why it ended).
+/// A host as the daemon knows it: its id, destination, state, a status
+/// line (what it's doing while connecting, or why it ended), and its
+/// SOCKS proxy while it's connected.
 pub const HostInfo = struct {
     host: u32,
     /// Owned, in the connection's allocator.
@@ -274,23 +275,29 @@ pub const HostInfo = struct {
     state: HostStatus,
     /// Owned.
     text: []const u16,
+    /// `socks5://127.0.0.1:<port>`, or empty. Owned.
+    proxy: []const u16,
 
     fn fromJson(alloc: Allocator, h: Json.Host) !HostInfo {
         const dest = try toUtf16(alloc, h.dest);
         errdefer alloc.free(dest);
         const text = try toUtf16(alloc, h.text);
+        errdefer alloc.free(text);
+        const proxy = try toUtf16(alloc, h.proxy);
         return .{
             .host = h.id,
             .dest = dest,
             // A state this build doesn't know shows as unknown.
             .state = std.meta.stringToEnum(HostStatus, h.state) orelse @enumFromInt(0xff),
             .text = text,
+            .proxy = proxy,
         };
     }
 
     fn deinit(self: *HostInfo, alloc: Allocator) void {
         alloc.free(self.dest);
         alloc.free(self.text);
+        alloc.free(self.proxy);
     }
 };
 
@@ -802,7 +809,7 @@ pub const Json = struct {
     const WorkspaceCreated = struct { id: u32, name: []const u8 = "" };
     const WorkspaceDestroyed = struct { id: u32 };
     const WorkspaceViewers = struct { id: u32, viewers: usize = 0 };
-    const Host = struct { id: u32, dest: []const u8 = "", state: []const u8 = "", text: []const u8 = "" };
+    const Host = struct { id: u32, dest: []const u8 = "", state: []const u8 = "", text: []const u8 = "", proxy: []const u8 = "" };
     const HostPrompt = struct {
         host: u32,
         kind: []const u8 = "",
@@ -2740,6 +2747,15 @@ test "a host's state parses as the Go side sends it" {
     try std.testing.expectEqual(HostStatus.failed, info.state);
     try std.testing.expectEqualSlices(u16, L("dev2"), info.dest);
     try std.testing.expectEqualSlices(u16, L("Permission denied"), info.text);
+    try std.testing.expectEqual(@as(usize, 0), info.proxy.len);
+
+    var up = try std.json.parseFromSlice(Json.Host, alloc,
+        \\{"id":14,"dest":"ssh://dev4","state":"connected","proxy":"socks5://127.0.0.1:40123"}
+    , json_opts);
+    defer up.deinit();
+    var connected = try HostInfo.fromJson(alloc, up.value);
+    defer connected.deinit(alloc);
+    try std.testing.expectEqualSlices(u16, L("socks5://127.0.0.1:40123"), connected.proxy);
 
     var odd = try std.json.parseFromSlice(Json.Host, alloc,
         \\{"id":13,"dest":"dev3","state":"hibernating"}

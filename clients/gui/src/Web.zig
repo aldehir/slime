@@ -9,15 +9,18 @@
 //! pane placed; with it or the runtime missing, browser panes stand in
 //! with the reason. Views share an environment (a browser process group
 //! and a user data folder) per host they browse from, keyed by host id
-//! with 0 for local; only local has one yet. Everything here runs on the
+//! with 0 for local: a host's panes browse the host's network through
+//! its daemon's SOCKS proxy (`browserArgs`). Everything here runs on the
 //! UI thread, which is a COM single-threaded apartment (main.zig), and
 //! WebView2 calls back on it from the message loop.
 //!
 //! A view lives as long as its pane is in the window: shown while it's
 //! placed in the active tab, hidden in another tab or behind a zoom, and
-//! closed when its session goes (`detach`), its pane ends, or its browser
-//! fails. A failed view leaves the pane's stand-in saying why
-//! (`Session.Browser.failed`), and a click there makes a new one.
+//! closed when its session goes (`detach`), its pane ends, its browser
+//! fails, or its host's connection ends or comes back on another proxy
+//! (`hostChanged`). A failed view leaves the pane's stand-in saying why
+//! (`Session.Browser.failed`), and a click there makes a new one; one
+//! closed for its host makes a new one by itself once it can.
 
 const Web = @This();
 
@@ -42,6 +45,9 @@ const start_failed = "The browser couldn't start. Click to try again.";
 const browser_exited = "The browser closed. Click to reload.";
 const page_crashed = "The page crashed. Click to reload.";
 const page_hung = "The page stopped responding. Click to reload.";
+/// The pane's host is between connections, or its browser between
+/// proxies: the next placement after tries again.
+const reconnecting = "Reconnecting the host's browser…";
 
 alloc: Allocator,
 /// The window, which parents every WebView and takes their input.
@@ -74,6 +80,19 @@ pub const Events = struct {
     key: *const fn (*anyopaque, u32, win32.WPARAM, win32.LPARAM) bool,
     /// A page's cursor changed.
     cursor: *const fn (*anyopaque) void,
+    /// Host `id` (not 0) while it's connected; null while it isn't.
+    host: *const fn (*anyopaque, u32) ?Host,
+    /// Draw again: panes waiting on a host's browser may get one.
+    redraw: *const fn (*anyopaque) void,
+};
+
+/// A connected host, as a browser on it needs it. Borrowed.
+pub const Host = struct {
+    /// Its destination, which names its profile folder.
+    dest: []const u16,
+    /// Its daemon's SOCKS proxy, `socks5://127.0.0.1:<port>`; empty when
+    /// it has none.
+    proxy: []const u16,
 };
 
 const Loader = union(enum) {
@@ -91,7 +110,10 @@ pub fn init(alloc: Allocator, hwnd: win32.HWND, events: Events, dpi: u32) Web {
 pub fn deinit(self: *Web) void {
     while (self.views.items.len > 0) self.views.items[0].shut();
     self.views.deinit(self.alloc);
-    for (self.envs.items) |e| e.destroy();
+    for (self.envs.items) |e| {
+        e.letGo();
+        e.unhold();
+    }
     self.envs.deinit(self.alloc);
 }
 
@@ -134,58 +156,274 @@ fn load(self: *Web) ?wv.CreateEnvironmentWithOptions {
 }
 
 /// The browser processes for one host's panes: one user data folder,
-/// made when its first view wants it. Lives as long as the window.
+/// made when its first view wants it. Local's lives as long as the
+/// window; a host's until the host's proxy changes or its connection
+/// ends (`retire`). Counted: the list holds one reference, and its
+/// creation one until it's done.
 const Env = struct {
     web: *Web,
     host: u32,
+    refs: u32 = 1,
     state: union(enum) {
         creating,
         ready: *wv.IEnvironment,
         failed,
+        /// Let go, its browser process still running: no view is made on
+        /// its folder until that has exited (`exited`), since a browser
+        /// started with other arguments wouldn't take them. Holds the
+        /// environment until then.
+        closing: *wv.IEnvironment,
+        /// Let go while it was being made: `envCreated` drops it. Its
+        /// panes wait as they do on `closing`.
+        retired,
     } = .creating,
+    /// The proxy it was made with, which its browser keeps; empty for
+    /// none. Owned.
+    proxy: []u16 = &.{},
+    /// Its browser's arguments, from `proxy`, which `options` gives.
+    /// Owned.
+    args: ?[:0]u16 = null,
+    /// Its browser process, once a WebView has said.
+    pid: u32 = 0,
     /// Views waiting for it, each holding a reference.
     waiting: std.ArrayList(*View) = .empty,
     completed: Callback(wv.EnvironmentCompletedHandler, Env, "completed", envCreated) = .{},
+    exited: Callback(wv.BrowserProcessExitedEventHandler, Env, "exited", browserExited) = .{},
+    options: Options = .{},
 
-    fn destroy(self: *Env) void {
-        switch (self.state) {
-            .ready => |e| com.release(e),
-            .creating, .failed => {},
-        }
-        for (self.waiting.items) |v| _ = v.release();
-        self.waiting.deinit(self.web.alloc);
-        self.web.alloc.destroy(self);
+    fn hold(self: *Env) void {
+        self.refs += 1;
     }
 
-    // Lives as long as the window: WebView2's references are no-ops.
+    fn unhold(self: *Env) void {
+        self.refs -= 1;
+        if (self.refs == 0) self.destroy();
+    }
+
+    // WebView2's references aren't counted: the loader lets go of one
+    // on the creation handler that it never took. Ours keep it.
     fn retain(_: *Env) u32 {
         return 1;
     }
     fn release(_: *Env) u32 {
         return 1;
     }
+
+    fn destroy(self: *Env) void {
+        self.letGo();
+        for (self.waiting.items) |v| _ = v.release();
+        self.waiting.deinit(self.web.alloc);
+        self.web.alloc.free(self.proxy);
+        if (self.args) |a| self.web.alloc.free(a);
+        self.web.alloc.destroy(self);
+    }
+
+    /// Release the environment, if it holds one.
+    fn letGo(self: *Env) void {
+        switch (self.state) {
+            .ready, .closing => |e| com.release(e),
+            .creating, .failed, .retired => {},
+        }
+        self.state = .failed;
+    }
 };
 
-/// The environment for host `host` (0 for local), made if it isn't.
+/// What an environment is made with (ICoreWebView2EnvironmentOptions):
+/// its browser's arguments; the rest are what the SDK's own options
+/// default to. Lives in its `Env`, as long as its creation.
+const Options = struct {
+    iface: wv.EnvironmentOptions = .{ .vtable = &vtable },
+
+    const vtable: wv.EnvironmentOptions.VTable = .{
+        .QueryInterface = queryInterface,
+        .AddRef = addRef,
+        .Release = release,
+        .get_AdditionalBrowserArguments = getArgs,
+        .put_AdditionalBrowserArguments = put,
+        .get_Language = getNone,
+        .put_Language = put,
+        .get_TargetCompatibleBrowserVersion = getTarget,
+        .put_TargetCompatibleBrowserVersion = put,
+        .get_AllowSingleSignOnUsingOSPrimaryAccount = getSingleSignOn,
+        .put_AllowSingleSignOnUsingOSPrimaryAccount = putSingleSignOn,
+    };
+
+    fn outer(iface: *wv.EnvironmentOptions) *Env {
+        const self: *Options = @fieldParentPtr("iface", iface);
+        return @fieldParentPtr("options", self);
+    }
+
+    fn queryInterface(iface: *wv.EnvironmentOptions, iid: *const win32.GUID, out: *?*anyopaque) callconv(.winapi) win32.HRESULT {
+        // The later EnvironmentOptions2.. aren't ours: their defaults.
+        if (com.guidEql(iid, &com.IID_IUnknown) or com.guidEql(iid, &wv.EnvironmentOptions.iid)) {
+            _ = outer(iface).retain();
+            out.* = iface;
+            return com.S_OK;
+        }
+        out.* = null;
+        return com.E_NOINTERFACE;
+    }
+
+    fn addRef(iface: *wv.EnvironmentOptions) callconv(.winapi) u32 {
+        return outer(iface).retain();
+    }
+
+    fn release(iface: *wv.EnvironmentOptions) callconv(.winapi) u32 {
+        return outer(iface).release();
+    }
+
+    fn getArgs(iface: *wv.EnvironmentOptions, out: *?win32.LPWSTR) callconv(.winapi) win32.HRESULT {
+        return coString(if (outer(iface).args) |a| a else null, out);
+    }
+
+    fn getNone(_: *wv.EnvironmentOptions, out: *?win32.LPWSTR) callconv(.winapi) win32.HRESULT {
+        out.* = null;
+        return com.S_OK;
+    }
+
+    fn getTarget(_: *wv.EnvironmentOptions, out: *?win32.LPWSTR) callconv(.winapi) win32.HRESULT {
+        return coString(L(wv.target_browser_version), out);
+    }
+
+    fn put(_: *wv.EnvironmentOptions, _: ?win32.LPCWSTR) callconv(.winapi) win32.HRESULT {
+        return com.E_NOTIMPL;
+    }
+
+    fn getSingleSignOn(_: *wv.EnvironmentOptions, out: *win32.BOOL) callconv(.winapi) win32.HRESULT {
+        out.* = 0;
+        return com.S_OK;
+    }
+
+    fn putSingleSignOn(_: *wv.EnvironmentOptions, _: win32.BOOL) callconv(.winapi) win32.HRESULT {
+        return com.E_NOTIMPL;
+    }
+
+    /// `s` in memory the caller frees with CoTaskMemFree.
+    fn coString(s: ?[]const u16, out: *?win32.LPWSTR) win32.HRESULT {
+        const src = s orelse {
+            out.* = null;
+            return com.S_OK;
+        };
+        const mem = win32.CoTaskMemAlloc((src.len + 1) * 2) orelse return com.E_OUTOFMEMORY;
+        const dst: [*]u16 = @ptrCast(@alignCast(mem));
+        @memcpy(dst[0..src.len], src);
+        dst[src.len] = 0;
+        out.* = @ptrCast(dst);
+        return com.S_OK;
+    }
+};
+
+/// The environment for host `host` (0 for local), made if it isn't. A
+/// host's needs the host connected.
 fn env(self: *Web, host: u32) !*Env {
     for (self.envs.items) |e| if (e.host == host) return e;
     const create = self.load() orelse return error.RuntimeMissing;
+    var name: []const u16 = L("local");
+    var name_buf: [host_folder_len]u16 = undefined;
+    var proxy: []const u16 = &.{};
+    if (host != 0) {
+        const h = self.events.host(self.events.ctx, host) orelse return error.HostDown;
+        name_buf = hostFolder(h.dest);
+        name = &name_buf;
+        proxy = h.proxy;
+    }
     var folder: [512]u16 = undefined;
-    const path = try userDataFolder(&folder, host);
+    const path = try userDataFolder(&folder, name);
     try self.envs.ensureUnusedCapacity(self.alloc, 1);
     const e = try self.alloc.create(Env);
     e.* = .{ .web = self, .host = host };
-    try com.check(createEnvironment(create, path, null, &e.completed.iface), "CreateCoreWebView2EnvironmentWithOptions");
+    errdefer e.destroy();
+    e.proxy = try self.alloc.dupe(u16, proxy);
+    e.args = browserArgs(self.alloc, proxy) catch |err| {
+        log.err("host {d}'s proxy {f} isn't one a browser takes", .{ host, std.unicode.fmtUtf16Le(proxy) });
+        return err;
+    };
+    log.info("browser for host {d}: {f} {f}", .{ host, std.unicode.fmtUtf16Le(path), std.unicode.fmtUtf16Le(if (e.args) |a| a else &.{}) });
+    // Local's are the defaults.
+    const options: ?*wv.EnvironmentOptions = if (host == 0) null else &e.options.iface;
+    // Listed, and held until it's made, before: the loader may call back
+    // before it returns.
     self.envs.appendAssumeCapacity(e);
+    e.hold();
+    com.check(createEnvironment(create, path, options, &e.completed.iface), "CreateCoreWebView2EnvironmentWithOptions") catch |err| {
+        _ = self.envs.pop();
+        e.refs = 1;
+        return err;
+    };
     return e;
 }
 
+/// The arguments a browser browsing a host through its daemon's SOCKS
+/// proxy `proxy` (`socks5://127.0.0.1:<port>`) starts with: every
+/// connection through the proxy, which resolves names on the host, and
+/// no name resolved here but the proxy's own, which Chromium's
+/// prefetcher would otherwise look up past it. Loopback goes through
+/// too (`<-loopback>` undoes Chromium's implicit bypass): localhost is
+/// the host's. Null for no proxy.
+pub fn browserArgs(alloc: Allocator, proxy: []const u16) !?[:0]u16 {
+    if (proxy.len == 0) return null;
+    const scheme = L("socks5://");
+    if (!std.mem.startsWith(u16, proxy, scheme)) return error.BadProxy;
+    // It goes on a command line: nothing that would end or quote it.
+    for (proxy) |c| if (c <= ' ' or c == '"') return error.BadProxy;
+    const addr = proxy[scheme.len..];
+    const colon = std.mem.lastIndexOfScalar(u16, addr, ':') orelse return error.BadProxy;
+    if (colon == 0) return error.BadProxy;
+    return try std.mem.concatWithSentinel(alloc, u16, &.{
+        L("--proxy-server="),
+        proxy,
+        L(" --host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE "),
+        addr[0..colon],
+        L("\" --proxy-bypass-list=\"<-loopback>\""),
+    }, 0);
+}
+
+test browserArgs {
+    const alloc = std.testing.allocator;
+    const args = (try browserArgs(alloc, L("socks5://127.0.0.1:40123"))).?;
+    defer alloc.free(args);
+    try std.testing.expectEqualSlices(u16, L("--proxy-server=socks5://127.0.0.1:40123 --host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE 127.0.0.1\" --proxy-bypass-list=\"<-loopback>\""), args);
+    try std.testing.expectEqual(@as(?[:0]u16, null), try browserArgs(alloc, L("")));
+    try std.testing.expectError(error.BadProxy, browserArgs(alloc, L("http://127.0.0.1:8080")));
+    try std.testing.expectError(error.BadProxy, browserArgs(alloc, L("socks5://127.0.0.1:1\" --evil")));
+    try std.testing.expectError(error.BadProxy, browserArgs(alloc, L("socks5://:1080")));
+}
+
+const host_folder_len = "host-".len + 16;
+
+/// The profile folder's name for the host at `dest`: `host-` and the
+/// first 8 bytes of the SHA-256 of its UTF-8, in hex, so one destination
+/// keeps its cookies across runs and another's are apart.
+pub fn hostFolder(dest: []const u16) [host_folder_len]u16 {
+    var sha: std.crypto.hash.sha2.Sha256 = .init(.{});
+    var it: std.unicode.Utf16LeIterator = .init(dest);
+    while (true) {
+        const cp = it.nextCodepoint() catch std.unicode.replacement_character orelse break;
+        var utf8: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &utf8) catch unreachable;
+        sha.update(utf8[0..n]);
+    }
+    var digest: [32]u8 = undefined;
+    sha.final(&digest);
+    var name: [host_folder_len]u16 = undefined;
+    for ("host-", 0..) |c, i| name[i] = c;
+    const hex = std.fmt.bytesToHex(digest[0..8], .lower);
+    for (hex, 0..) |c, i| name[5 + i] = c;
+    return name;
+}
+
+test hostFolder {
+    // echo -n ssh://alde@pi:2222 | sha256sum
+    try std.testing.expectEqualSlices(u16, L("host-97729a595990bf71"), &hostFolder(L("ssh://alde@pi:2222")));
+    const a = hostFolder(L("ssh://devbox"));
+    try std.testing.expectEqualSlices(u16, &a, &hostFolder(L("ssh://devbox")));
+    try std.testing.expect(!std.mem.eql(u16, &a, &hostFolder(L("ssh://devbox2"))));
+}
+
 /// Where a host's browser keeps its profile: %LOCALAPPDATA%\slime\webview
-/// \local for local (local-<instance> under SLIME_INSTANCE, so a test
-/// window doesn't share a running browser's).
-fn userDataFolder(buf: *[512]u16, host: u32) ![:0]const u16 {
-    // Hosts come with stage 5.
-    std.debug.assert(host == 0);
+/// \<name>, `local` for local or `hostFolder`'s (with -<instance> under
+/// SLIME_INSTANCE, so a test window doesn't share a running browser's).
+fn userDataFolder(buf: *[512]u16, name: []const u16) ![:0]const u16 {
     const n = win32.GetEnvironmentVariableW(L("LOCALAPPDATA"), buf, buf.len);
     if (n == 0 or n >= buf.len) return error.NoAppData;
     var len: usize = n;
@@ -196,30 +434,38 @@ fn userDataFolder(buf: *[512]u16, host: u32) ![:0]const u16 {
             at.* += s.len;
         }
     }.f;
-    try put(buf, &len, L("\\slime\\webview\\local"));
+    try put(buf, &len, L("\\slime\\webview\\"));
+    try put(buf, &len, name);
     var inst: [64]u16 = undefined;
-    if (Daemon.instance(&inst)) |name| {
+    if (Daemon.instance(&inst)) |instance| {
         try put(buf, &len, L("-"));
-        try put(buf, &len, name);
+        try put(buf, &len, instance);
     }
     buf[len] = 0;
     return buf[0..len :0];
 }
 
 /// Make an environment: its browser process starts with its first
-/// WebView. `options` (null for the defaults) will carry a host's proxy
-/// arguments.
-fn createEnvironment(create: wv.CreateEnvironmentWithOptions, folder: [:0]const u16, options: ?*anyopaque, done: *wv.EnvironmentCompletedHandler) win32.HRESULT {
+/// WebView. `options` is null for the defaults.
+fn createEnvironment(create: wv.CreateEnvironmentWithOptions, folder: [:0]const u16, options: ?*wv.EnvironmentOptions, done: *wv.EnvironmentCompletedHandler) win32.HRESULT {
     return create(null, folder.ptr, options, done);
 }
 
 fn envCreated(e: *Env, hr: win32.HRESULT, result: ?*wv.IEnvironment) win32.HRESULT {
+    // Its creation's reference.
+    defer e.unhold();
     const waiting = e.waiting;
     e.waiting = .empty;
     defer {
         for (waiting.items) |v| _ = v.release();
         var list = waiting;
         list.deinit(e.web.alloc);
+    }
+    if (e.state != .creating) {
+        // Retired while it was made: its views went then. No WebView ran
+        // on it, so no browser process holds its folder.
+        e.web.drop(e);
+        return com.S_OK;
     }
     const environment = result orelse {
         log.err("making the browser environment failed: HRESULT=0x{X:0>8}", .{@as(u32, @bitCast(hr))});
@@ -231,6 +477,223 @@ fn envCreated(e: *Env, hr: win32.HRESULT, result: ?*wv.IEnvironment) win32.HRESU
     e.state = .{ .ready = environment };
     for (waiting.items) |v| v.create();
     return com.S_OK;
+}
+
+/// Whether a host's environment, made with proxy `made_with`, still
+/// serves the host, which is now `now` (null: not connected). Its
+/// browser keeps the arguments it started with, so a new proxy needs a
+/// new environment, and a host that's gone needs none.
+pub fn keepsEnv(made_with: []const u16, now: ?Host) bool {
+    const h = now orelse return false;
+    return std.mem.eql(u16, made_with, h.proxy);
+}
+
+test keepsEnv {
+    const proxy = L("socks5://127.0.0.1:40123");
+    try std.testing.expect(keepsEnv(proxy, .{ .dest = L("ssh://devbox"), .proxy = proxy }));
+    // Reconnected on another port.
+    try std.testing.expect(!keepsEnv(proxy, .{ .dest = L("ssh://devbox"), .proxy = L("socks5://127.0.0.1:40124") }));
+    // Lost, or disconnected.
+    try std.testing.expect(!keepsEnv(proxy, null));
+    // Proxy turned off, or on.
+    try std.testing.expect(!keepsEnv(proxy, .{ .dest = L("ssh://devbox"), .proxy = L("") }));
+    try std.testing.expect(!keepsEnv(L(""), .{ .dest = L("ssh://devbox"), .proxy = proxy }));
+    try std.testing.expect(keepsEnv(L(""), .{ .dest = L("ssh://devbox"), .proxy = L("") }));
+}
+
+/// Host `host`'s state or proxy changed: if its environment no longer
+/// serves it (`keepsEnv`), the environment goes, and its views with it.
+/// Either way its panes may try again: one waiting on the host may have
+/// it now.
+pub fn hostChanged(self: *Web, host: u32) void {
+    if (host == 0) return;
+    const now = self.events.host(self.events.ctx, host);
+    for (self.envs.items) |e| if (e.host == host) {
+        if (e.state != .closing and e.state != .retired and !keepsEnv(e.proxy, now)) self.retire(e);
+        break;
+    };
+    self.events.redraw(self.events.ctx);
+}
+
+/// Let host environment `e` go: close its views, their panes standing in
+/// until a new one is up, and drop it once its browser process has
+/// exited, so the next environment on its folder starts a browser with
+/// its own arguments.
+fn retire(self: *Web, e: *Env) void {
+    log.info("letting host {d}'s browser go", .{e.host});
+    var i: usize = self.views.items.len;
+    while (i > 0) {
+        i -= 1;
+        const v = self.views.items[i];
+        if (v.host == e.host) v.fail(reconnecting);
+    }
+    switch (e.state) {
+        .creating => e.state = .retired,
+        .failed => self.drop(e),
+        .ready => |environment| {
+            e.state = .{ .closing = environment };
+            if (browserRunning(e.pid)) if (com.query(environment, wv.IEnvironment5)) |e5| {
+                defer com.release(e5);
+                var token: wv.EventRegistrationToken = .{};
+                if (e5.addBrowserProcessExited(&e.exited.iface, &token) >= 0) return;
+            };
+            self.drop(e);
+        },
+        .closing, .retired => {},
+    }
+}
+
+/// Whether process `pid` (0 for none known) is still running, and is a
+/// WebView2 browser: a pid reused by another program since isn't.
+fn browserRunning(pid: u32) bool {
+    if (pid == 0) return false;
+    const h = win32.OpenProcess(win32.SYNCHRONIZE | win32.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return false;
+    defer _ = win32.CloseHandle(h);
+    if (win32.WaitForSingleObject(h, 0) != win32.WAIT_TIMEOUT) return false;
+    var path: [win32.MAX_PATH]u16 = undefined;
+    var len: u32 = path.len;
+    if (win32.QueryFullProcessImageNameW(h, 0, &path, &len) == 0) return false;
+    return isBrowserImage(path[0..len]);
+}
+
+/// Whether the exe at `path` is WebView2's browser.
+pub fn isBrowserImage(path: []const u16) bool {
+    const name = L("msedgewebview2.exe");
+    if (path.len < name.len) return false;
+    const base = path[path.len - name.len ..];
+    if (path.len > name.len and path[path.len - name.len - 1] != '\\') return false;
+    for (base, name) |a, b| if (std.ascii.toLower(@intCast(@min(a, 0x7f))) != b) return false;
+    return true;
+}
+
+test isBrowserImage {
+    try std.testing.expect(isBrowserImage(L("C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\155.0.4283.62\\msedgewebview2.exe")));
+    try std.testing.expect(isBrowserImage(L("C:\\X\\MSEdgeWebView2.EXE")));
+    try std.testing.expect(!isBrowserImage(L("C:\\Windows\\notepad.exe")));
+    try std.testing.expect(!isBrowserImage(L("C:\\X\\notmsedgewebview2.exe")));
+}
+
+fn browserExited(e: *Env, _: *wv.IEnvironment, _: *wv.IUnknown) win32.HRESULT {
+    log.info("host {d}'s browser exited", .{e.host});
+    if (e.state == .closing) e.web.drop(e);
+    return com.S_OK;
+}
+
+/// Take `e` out of the list and let it go; panes waiting on its host
+/// try again.
+fn drop(self: *Web, e: *Env) void {
+    const i = for (self.envs.items, 0..) |x, i| {
+        if (x == e) break i;
+    } else return;
+    _ = self.envs.swapRemove(i);
+    e.letGo();
+    e.unhold();
+    self.events.redraw(self.events.ctx);
+}
+
+/// Stop waiting for host environment `e`'s browser to exit: its views
+/// close, and it goes now, so the next placement makes a new one.
+fn forceDrop(self: *Web, e: *Env) void {
+    log.warn("not waiting for host {d}'s browser to exit", .{e.host});
+    var i: usize = self.views.items.len;
+    while (i > 0) {
+        i -= 1;
+        const v = self.views.items[i];
+        if (v.host == e.host) v.fail(reconnecting);
+    }
+    self.drop(e);
+}
+
+/// A click on browser pane `s`'s stand-in: its browser gets another go.
+/// One waiting on its host's old browser stops waiting (`forceDrop`).
+pub fn retry(self: *Web, s: *Session) void {
+    const b = s.browser() orelse return;
+    const was = b.failed orelse return;
+    b.failed = null;
+    if (was.ptr != reconnecting.ptr) return;
+    const host = hostOf(s);
+    for (self.envs.items) |e| if (e.host == host) {
+        switch (e.state) {
+            .closing, .retired => self.forceDrop(e),
+            .creating, .ready, .failed => {},
+        }
+        break;
+    };
+}
+
+const TestEvents = struct {
+    redraws: usize = 0,
+
+    fn events(self: *TestEvents) Events {
+        return .{
+            .ctx = self,
+            .changed = changed,
+            .focus = onFocus,
+            .tab_out = onFocus,
+            .key = key,
+            .cursor = redraw,
+            .host = host,
+            .redraw = redraw,
+        };
+    }
+    fn changed(_: *anyopaque, _: *Session) void {}
+    fn onFocus(_: *anyopaque, _: *Session, _: bool) void {}
+    fn key(_: *anyopaque, _: u32, _: win32.WPARAM, _: win32.LPARAM) bool {
+        return false;
+    }
+    fn host(_: *anyopaque, _: u32) ?Host {
+        return null;
+    }
+    fn redraw(ctx: *anyopaque) void {
+        const self: *TestEvents = @ptrCast(@alignCast(ctx));
+        self.redraws += 1;
+    }
+};
+
+test "drop takes a host's environment out past local's" {
+    const alloc = std.testing.allocator;
+    var events: TestEvents = .{};
+    var web: Web = .init(alloc, @ptrFromInt(0x1000), events.events(), 96);
+    defer web.deinit();
+    const local = try alloc.create(Env);
+    local.* = .{ .web = &web, .host = 0, .state = .failed };
+    try web.envs.append(alloc, local);
+    const host = try alloc.create(Env);
+    host.* = .{ .web = &web, .host = 7, .state = .failed };
+    try web.envs.append(alloc, host);
+
+    web.drop(host);
+    try std.testing.expectEqual(@as(usize, 1), web.envs.items.len);
+    try std.testing.expectEqual(local, web.envs.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), events.redraws);
+    // Once only: a second drop (envCreated after a retire) does nothing.
+    web.drop(host);
+    try std.testing.expectEqual(@as(usize, 1), events.redraws);
+}
+
+test "an environment retired while it's made waits, and a click drops it" {
+    const alloc = std.testing.allocator;
+    var events: TestEvents = .{};
+    var web: Web = .init(alloc, @ptrFromInt(0x1000), events.events(), 96);
+    defer web.deinit();
+    const e = try alloc.create(Env);
+    e.* = .{ .web = &web, .host = 7 };
+    try web.envs.append(alloc, e);
+    // Its creation's reference, which `envCreated` would let go.
+    e.hold();
+
+    web.retire(e);
+    try std.testing.expect(e.state == .retired);
+    // Not retired again while it waits.
+    web.hostChanged(7);
+    try std.testing.expect(e.state == .retired);
+    try std.testing.expectEqual(@as(usize, 1), web.envs.items.len);
+
+    web.forceDrop(e);
+    try std.testing.expectEqual(@as(usize, 0), web.envs.items.len);
+    // `envCreated` coming after finds it gone: drop does nothing.
+    web.drop(e);
+    e.unhold();
 }
 
 /// A COM object WebView2 calls back, embedded in `Outer` as `field`:
@@ -289,6 +752,8 @@ pub const View = struct {
     session: ?*Session,
     /// The renderer's key for the pane's container visual.
     key: u64,
+    /// The host whose environment it's made in (`hostOf`).
+    host: u32 = 0,
     refs: u32 = 1,
     state: enum { waiting, creating, ready, closed } = .waiting,
     comp: ?*wv.ICompositionController = null,
@@ -341,7 +806,7 @@ pub const View = struct {
     /// Make the WebView, now that the environment is ready.
     fn create(self: *View) void {
         if (self.state != .waiting) return;
-        const e = self.web.readyEnv(0) orelse return self.fail(start_failed);
+        const e = self.web.readyEnv(self.host) orelse return self.fail(start_failed);
         const env3 = com.query(e, wv.IEnvironment3) orelse {
             log.err("the WebView2 runtime is too old: no ICoreWebView2Environment3", .{});
             return self.fail(start_failed);
@@ -510,6 +975,10 @@ fn setUp(self: *View, comp: *wv.ICompositionController) !void {
     try com.check(controller.getCoreWebView2(&webview), "ICoreWebView2Controller::get_CoreWebView2");
     self.webview = webview.?;
     const w = webview.?;
+    // Its browser's, which a new one after a crash replaces.
+    for (web.envs.items) |e| if (e.host == self.host) {
+        _ = w.getBrowserProcessId(&e.pid);
+    };
 
     var visual: ?*dcomp.IVisual = null;
     try com.check(r.comp.device.createVisual(&visual), "IDCompositionDevice2::CreateVisual");
@@ -692,7 +1161,7 @@ pub fn beginPlacing(self: *Web) void {
 /// none. A pane that ended, or whose browser failed, keeps its stand-in.
 pub fn show(self: *Web, s: *Session, p: Place) void {
     const b = s.browser() orelse return;
-    if (s.ended or b.failed != null) {
+    if (s.ended or (b.failed != null and b.failed.?.ptr != reconnecting.ptr)) {
         if (b.view) |v| v.shut();
         return;
     }
@@ -722,19 +1191,30 @@ pub fn endPlacing(self: *Web) void {
 /// the pane saying why, if there's no browser to make one with.
 fn open(self: *Web, s: *Session) ?*View {
     const b = s.browser() orelse return null;
-    const e = self.env(0) catch |err| {
-        b.failed = if (err == error.RuntimeMissing) self.loader.missing else start_failed;
-        self.events.changed(self.events.ctx, s);
+    const host = hostOf(s);
+    const e = self.env(host) catch |err| {
+        self.standIn(s, switch (err) {
+            error.RuntimeMissing => self.loader.missing,
+            error.HostDown => reconnecting,
+            else => start_failed,
+        });
         return null;
     };
-    if (e.state == .failed) {
-        b.failed = start_failed;
-        return null;
+    switch (e.state) {
+        .failed => {
+            b.failed = start_failed;
+            return null;
+        },
+        .closing, .retired => {
+            self.standIn(s, reconnecting);
+            return null;
+        },
+        .creating, .ready => {},
     }
     self.views.ensureUnusedCapacity(self.alloc, 1) catch return null;
     e.waiting.ensureUnusedCapacity(self.alloc, 1) catch return null;
     const v = self.alloc.create(View) catch return null;
-    v.* = .{ .web = self, .session = s, .key = s.id };
+    v.* = .{ .web = self, .session = s, .key = s.id, .host = host };
     self.views.appendAssumeCapacity(v);
     b.view = v;
     b.failed = null;
@@ -744,9 +1224,27 @@ fn open(self: *Web, s: *Session) ?*View {
             _ = v.retain();
             e.waiting.appendAssumeCapacity(v);
         },
-        .failed => unreachable,
+        .failed, .closing, .retired => unreachable,
     }
     return b.view;
+}
+
+/// The host whose network browser pane `s` browses: its workspace's
+/// connection's, 0 for the local daemon's.
+fn hostOf(s: *const Session) u32 {
+    return switch (s.transport orelse return 0) {
+        .daemon => |p| p.conn.host() orelse 0,
+        .waiting => 0,
+    };
+}
+
+/// Leave pane `s` standing in, saying `why`; drawn again once for it, as
+/// placing asks again each frame.
+fn standIn(self: *Web, s: *Session, why: []const u8) void {
+    const b = s.browser() orelse return;
+    if (b.failed) |f| if (f.ptr == why.ptr) return;
+    b.failed = why;
+    self.events.changed(self.events.ctx, s);
 }
 
 /// The pane's url changed in slime (pane.url, or the URL bar's echo):

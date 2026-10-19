@@ -89,6 +89,34 @@ pub const CursorChangedEventHandler = Handler("9da43ccc-26e1-4dad-b56c-d8961c94c
 pub const FocusChangedEventHandler = Handler("05ea24bd-6452-4926-9014-4b82b498135d", *IController, ?*IUnknown);
 pub const MoveFocusRequestedEventHandler = Handler("69035451-6dc7-4cb8-9bce-b2bd70ad289f", *IController, *IMoveFocusRequestedEventArgs);
 pub const AcceleratorKeyPressedEventHandler = Handler("b29c7e28-fa79-41a8-8e44-65811c76dcb2", *IController, *IAcceleratorKeyPressedEventArgs);
+pub const BrowserProcessExitedEventHandler = Handler("fa504257-a216-4911-a860-fe8825712861", *IEnvironment, *IUnknown);
+
+/// ICoreWebView2EnvironmentOptions, which we implement: what
+/// `CreateEnvironmentWithOptions` reads the browser's arguments from.
+/// Strings out are CoTaskMemAlloc'd, for the caller to free.
+pub const EnvironmentOptions = extern struct {
+    vtable: *const VTable,
+
+    pub const iid: GUID = guid("2fde08a8-1e9a-4766-8c05-95a9ceb9d1c5");
+
+    pub const VTable = extern struct {
+        QueryInterface: *const fn (*EnvironmentOptions, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (*EnvironmentOptions) callconv(.winapi) u32,
+        Release: *const fn (*EnvironmentOptions) callconv(.winapi) u32,
+        get_AdditionalBrowserArguments: *const fn (*EnvironmentOptions, *?win32.LPWSTR) callconv(.winapi) HRESULT,
+        put_AdditionalBrowserArguments: *const fn (*EnvironmentOptions, ?win32.LPCWSTR) callconv(.winapi) HRESULT,
+        get_Language: *const fn (*EnvironmentOptions, *?win32.LPWSTR) callconv(.winapi) HRESULT,
+        put_Language: *const fn (*EnvironmentOptions, ?win32.LPCWSTR) callconv(.winapi) HRESULT,
+        get_TargetCompatibleBrowserVersion: *const fn (*EnvironmentOptions, *?win32.LPWSTR) callconv(.winapi) HRESULT,
+        put_TargetCompatibleBrowserVersion: *const fn (*EnvironmentOptions, ?win32.LPCWSTR) callconv(.winapi) HRESULT,
+        get_AllowSingleSignOnUsingOSPrimaryAccount: *const fn (*EnvironmentOptions, *BOOL) callconv(.winapi) HRESULT,
+        put_AllowSingleSignOnUsingOSPrimaryAccount: *const fn (*EnvironmentOptions, BOOL) callconv(.winapi) HRESULT,
+    };
+};
+
+/// What the SDK's own options say for TargetCompatibleBrowserVersion
+/// (WebView2EnvironmentOptions.h): the runtime this SDK goes with.
+pub const target_browser_version = "154.0.4258.31";
 
 /// Event arguments we don't read.
 pub const IUnknown = extern struct {
@@ -112,6 +140,19 @@ pub const IEnvironment3 = extern struct {
     /// putRootVisualTarget`), with `parent` taking its focus and input.
     pub fn createCompositionController(self: *IEnvironment3, parent: win32.HWND, handler: *CompositionControllerCompletedHandler) HRESULT {
         return com.call(self, 9, fn (win32.HWND, *CompositionControllerCompletedHandler) HRESULT, .{ parent, handler });
+    }
+};
+
+/// ICoreWebView2Environment5, through Environment4.
+pub const IEnvironment5 = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = guid("319e423d-e0d7-4b8d-9254-ae9475de9b17");
+
+    /// Once the browser process and its helpers have all exited, the user
+    /// data folder let go.
+    pub fn addBrowserProcessExited(self: *IEnvironment5, h: *BrowserProcessExitedEventHandler, token: *EventRegistrationToken) HRESULT {
+        return com.call(self, 12, fn (*BrowserProcessExitedEventHandler, *EventRegistrationToken) HRESULT, .{ h, token });
     }
 };
 
@@ -271,6 +312,10 @@ pub const IWebView = extern struct {
         return com.call(self, 31, fn () HRESULT, .{});
     }
 
+    pub fn getBrowserProcessId(self: *IWebView, out: *u32) HRESULT {
+        return com.call(self, 37, fn (*u32) HRESULT, .{out});
+    }
+
     pub fn getCanGoBack(self: *IWebView, out: *BOOL) HRESULT {
         return com.call(self, 38, fn (*BOOL) HRESULT, .{out});
     }
@@ -394,6 +439,7 @@ test "handlers are IUnknown and Invoke" {
     try std.testing.expectEqual(4 * @sizeOf(usize), @sizeOf(EnvironmentCompletedHandler.VTable));
     try std.testing.expectEqual(@sizeOf(usize), @sizeOf(FocusChangedEventHandler));
     try std.testing.expectEqual(@as(usize, 3), @offsetOf(MoveFocusRequestedEventHandler.VTable, "Invoke") / @sizeOf(usize));
+    try std.testing.expectEqual(@as(usize, 10), @offsetOf(EnvironmentOptions.VTable, "put_AllowSingleSignOnUsingOSPrimaryAccount") / @sizeOf(usize));
 }
 
 test "mouse kinds are the window messages" {
