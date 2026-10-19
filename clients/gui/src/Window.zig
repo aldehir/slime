@@ -620,6 +620,9 @@ fn registerClass(instance: ?win32.HINSTANCE) !void {
     if (Static.registered) return;
 
     const wc: win32.WNDCLASSEXW = .{
+        // A second click within the system's time and distance arrives
+        // as a WM_*BUTTONDBLCLK instead of a WM_*BUTTONDOWN.
+        .style = win32.CS_DBLCLKS,
         .lpfnWndProc = wndProc,
         .hInstance = instance,
         // Windows picks the small icon from the same resource.
@@ -830,9 +833,12 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         win32.WM_MOUSEMOVE,
         win32.WM_LBUTTONDOWN,
         win32.WM_LBUTTONUP,
+        win32.WM_LBUTTONDBLCLK,
         win32.WM_RBUTTONDOWN,
+        win32.WM_RBUTTONDBLCLK,
         win32.WM_MBUTTONDOWN,
         win32.WM_MBUTTONUP,
+        win32.WM_MBUTTONDBLCLK,
         => {
             self.mouseInput(msg, wparam, lparam);
             return 0;
@@ -847,7 +853,7 @@ fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARA
         },
 
         // These alone return TRUE when handled.
-        win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP => {
+        win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP, win32.WM_XBUTTONDBLCLK => {
             self.mouseInput(msg, wparam, lparam);
             return win32.TRUE;
         },

@@ -2057,6 +2057,14 @@ fn splitPane(self: *App, s: *Session, dir: Daemon.Direction) void {
     self.markDirty();
 }
 
+/// A double click on the title of pane `s`: toggle its zoom when the
+/// tab has several slime panes, the cases its title shows a zoom button.
+fn zoomFromTitle(self: *App, s: *Session) void {
+    const t = self.activeTab();
+    if (t.conn == null or s.daemonPane() == null) return;
+    if (t.count() > 1 or t.zoom != null) self.toggleZoom(s);
+}
+
 /// Zoom the active tab's pane `s` to fill the tab, or unzoom it.
 fn toggleZoom(self: *App, s: *Session) void {
     const t = self.activeTab();
@@ -3021,11 +3029,19 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
     }
 
     switch (msg) {
-        win32.WM_LBUTTONDOWN => {
+        // A double click is a press too, so a quick second click on a
+        // button or row counts.
+        win32.WM_LBUTTONDOWN, win32.WM_LBUTTONDBLCLK => {
             if (hit.target == .divider) return self.startDrag(hit.target.divider, pos);
             if (hit.target == .corner) return self.startCornerDrag(hit.target.corner, pos);
             if (hit.eql(.window(.sidebar_edge))) return self.startSidebarDrag(pos);
-            if (hit.part == .title) if (self.shownPane(hit.target)) |pane| return self.startPaneDrag(pane, pos);
+            if (hit.part == .title) if (self.shownPane(hit.target)) |pane| {
+                // Double-clicking a pane's title zooms it, as its button
+                // does. The release may then land on the zoomed pane's
+                // cells; slime ignores a release without a press.
+                if (msg == win32.WM_LBUTTONDBLCLK) return self.zoomFromTitle(pane);
+                return self.startPaneDrag(pane, pos);
+            };
             self.setPressed(hit);
             self.shell.captureMouse();
             // Rows switch on press, as tabs do.
@@ -3042,7 +3058,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
             if (pressed.eql(hit)) self.widgetClick(hit);
         },
         // A tab's row, or its close button.
-        win32.WM_MBUTTONDOWN => self.middle_pressed = if (hit.target == .tab and (hit.part == .body or hit.part == .close)) hit.target else null,
+        win32.WM_MBUTTONDOWN, win32.WM_MBUTTONDBLCLK => self.middle_pressed = if (hit.target == .tab and (hit.part == .body or hit.part == .close)) hit.target else null,
         win32.WM_MBUTTONUP => {
             const pressed = self.middle_pressed orelse return;
             self.middle_pressed = null;

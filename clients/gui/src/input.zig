@@ -53,20 +53,22 @@ pub fn isModifier(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
     return keyFromScancode(@truncate(flags >> 16), flags & (1 << 24) != 0, @truncate(wparam)).modifier();
 }
 
-/// The button a WM_*BUTTONDOWN/UP message is about, and whether it was
-/// pressed. Null for other messages.
+/// The button a WM_*BUTTONDOWN/UP/DBLCLK message is about, and whether
+/// it was pressed. Null for other messages. A double click is the
+/// second press: slime counts the clicks on the terminal itself, from
+/// their times.
 pub fn mouseButton(msg: u32, wparam: win32.WPARAM) ?struct { MouseButton, bool } {
     return switch (msg) {
-        win32.WM_LBUTTONDOWN => .{ .left, true },
+        win32.WM_LBUTTONDOWN, win32.WM_LBUTTONDBLCLK => .{ .left, true },
         win32.WM_LBUTTONUP => .{ .left, false },
-        win32.WM_RBUTTONDOWN => .{ .right, true },
+        win32.WM_RBUTTONDOWN, win32.WM_RBUTTONDBLCLK => .{ .right, true },
         win32.WM_RBUTTONUP => .{ .right, false },
-        win32.WM_MBUTTONDOWN => .{ .middle, true },
+        win32.WM_MBUTTONDOWN, win32.WM_MBUTTONDBLCLK => .{ .middle, true },
         win32.WM_MBUTTONUP => .{ .middle, false },
         // Back and forward, which xterm numbers 8 and 9.
-        win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP => .{
+        win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP, win32.WM_XBUTTONDBLCLK => .{
             if (win32.hiword(wparam) == win32.XBUTTON1) .eight else .nine,
-            msg == win32.WM_XBUTTONDOWN,
+            msg != win32.WM_XBUTTONUP,
         },
         else => null,
     };
@@ -342,4 +344,18 @@ test Win32Key {
         .control_state = win32.LEFT_CTRL_PRESSED,
     }).encode(&w);
     try std.testing.expectEqualStrings("\x1b[219;26;27;1;8;1_", w.buffered());
+}
+
+test mouseButton {
+    const expectEqual = std.testing.expectEqual;
+    // A double click is the second press of its button.
+    try expectEqual(.{ MouseButton.left, true }, mouseButton(win32.WM_LBUTTONDOWN, 0).?);
+    try expectEqual(.{ MouseButton.left, true }, mouseButton(win32.WM_LBUTTONDBLCLK, 0).?);
+    try expectEqual(.{ MouseButton.left, false }, mouseButton(win32.WM_LBUTTONUP, 0).?);
+    try expectEqual(.{ MouseButton.right, true }, mouseButton(win32.WM_RBUTTONDBLCLK, 0).?);
+    try expectEqual(.{ MouseButton.middle, true }, mouseButton(win32.WM_MBUTTONDBLCLK, 0).?);
+    const x2: win32.WPARAM = @as(win32.WPARAM, win32.XBUTTON2) << 16;
+    try expectEqual(.{ MouseButton.nine, true }, mouseButton(win32.WM_XBUTTONDBLCLK, x2).?);
+    try expectEqual(.{ MouseButton.nine, false }, mouseButton(win32.WM_XBUTTONUP, x2).?);
+    try expectEqual(null, mouseButton(win32.WM_MOUSEMOVE, 0));
 }
