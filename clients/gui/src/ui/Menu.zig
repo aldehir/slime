@@ -23,6 +23,8 @@ count: usize = 0,
 /// The entry the keyboard is on: Up and Down move it, and the mouse
 /// over an entry puts it there. Null until either does.
 focus: ?usize = null,
+/// The bindings in force, which name the entries' keys.
+keys: []const binding.Binding = &binding.defaults,
 
 pub const Anchor = union(enum) {
     /// The mouse, in client pixels: the box's top-left corner, flipped
@@ -45,16 +47,16 @@ pub const Entry = struct {
     danger: bool = false,
     /// Shown, but can't be chosen: Copy with no selection.
     disabled: bool = false,
-
-    /// The key that does the same, named, for a binding's action; empty
-    /// for a control.
-    pub fn key(self: Entry) binding.Label {
-        return switch (self.action) {
-            .binding => |a| binding.label(&binding.defaults, a),
-            .part => .{},
-        };
-    }
 };
+
+/// The key that does the same as entry `e`, named, for a binding's
+/// action; empty for a control.
+pub fn keyOf(self: *const Menu, e: Entry) binding.Label {
+    return switch (e.action) {
+        .binding => |a| binding.labelIn(self.keys, a),
+        .part => .{},
+    };
+}
 
 /// What choosing an entry does.
 pub const Action = union(enum) {
@@ -143,9 +145,9 @@ test "the focus skips separators and disabled entries, around the ends" {
     try std.testing.expectEqual(@as(?usize, 3), m.focus);
 
     // A binding's entry names its key; a control's doesn't.
-    const copy_key = m.entry(2).?.key();
+    const copy_key = m.keyOf(m.entry(2).?);
     try std.testing.expectEqualSlices(u16, L("Ctrl+Shift+C"), copy_key.slice());
-    try std.testing.expectEqual(@as(usize, 0), m.entry(0).?.key().len);
+    try std.testing.expectEqual(@as(usize, 0), m.keyOf(m.entry(0).?).len);
 
     // Nothing to focus: it stays off.
     var empty: Menu = .{ .target = .none, .anchor = .{ .point = .{ .x = 0, .y = 0 } } };

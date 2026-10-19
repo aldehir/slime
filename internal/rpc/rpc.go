@@ -100,6 +100,10 @@ const (
 	ScriptRun       = "script.run"
 	ScriptCancel    = "script.cancel"
 	ScriptList      = "script.list"
+	ConfigGet       = "config.get"
+	ConfigReload    = "config.reload"
+	ConfigCheck     = "config.check"
+	ActionInvoke    = "action.invoke"
 )
 
 // Notifications. A workspace's viewers get their workspace's without
@@ -124,6 +128,7 @@ const (
 	EvHostPrompt            = "host.prompt"
 	EvScriptOutput          = "script.output"
 	EvScriptDone            = "script.done"
+	EvConfigChanged         = "config.changed"
 )
 
 // Size is a terminal's grid and, if known, its cell size in pixels.
@@ -941,4 +946,65 @@ type ScriptDoneParams struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  string          `json:"error,omitempty"`
+}
+
+// Config: the daemon's init.lua (internal/config), evaluated at start
+// and on config.reload. What it set is described to clients, which
+// take the settings they understand and the key bindings; its actions
+// run in the daemon.
+
+// ConfigDesc answers config.get and config.check, and config.changed
+// carries it after a reload. Path is the file (evaluated or not).
+// Settings is the one table slime.config was given, merged, as JSON:
+// the daemon takes shell.command, a window the rest. Keymap lists the
+// bindings in the order made; Actions the actions. Errors is why the
+// last evaluation failed, if it did (what's described is then the last
+// good config, or nothing): a missing file isn't an error.
+type ConfigDesc struct {
+	Path     string          `json:"path"`
+	Settings json.RawMessage `json:"settings"`
+	Keymap   []Binding       `json:"keymap"`
+	Actions  []ActionDesc    `json:"actions"`
+	Errors   []string        `json:"errors,omitempty"`
+}
+
+// Binding is one slime.bind: Key as it was written (a chord such as
+// "ctrl+shift+d", which the window parses), and what it runs: Action
+// with Args, a window action by name (new_split, copy_to_clipboard,
+// ...) or else a config action to invoke; or Lua, a function the config
+// file gave, which the window runs with action.invoke{lua}. Neither is
+// an unbind: the key does nothing, even if the window had a default.
+type Binding struct {
+	Key    string          `json:"key"`
+	Action string          `json:"action,omitempty"`
+	Args   json.RawMessage `json:"args,omitempty"`
+	Lua    uint32          `json:"lua,omitempty"`
+}
+
+// ActionDesc is one slime.action: Args is its argument spec as given
+// ({file = "string"}), for listing.
+type ActionDesc struct {
+	Name  string          `json:"name"`
+	Title string          `json:"title,omitempty"`
+	Args  json.RawMessage `json:"args,omitempty"`
+}
+
+// ConfigCheckParams evaluates Path (the daemon's own file if empty)
+// without applying it, answering with what it would set, or the errors.
+type ConfigCheckParams struct {
+	Path string `json:"path,omitempty"`
+}
+
+// ActionInvokeParams runs a config action, Name with Args, or the
+// function binding Lua, for Pane (none if zero): the ids its calls fill
+// in, and its ctx. Origin says who asked: key (a window), cli (slime
+// do), script (slime.invoke), or api. Like script.run, it answers at
+// once with a script id, and the run's output and end come as
+// script.output and script.done.
+type ActionInvokeParams struct {
+	Name   string          `json:"name,omitempty"`
+	Lua    uint32          `json:"lua,omitempty"`
+	Args   json.RawMessage `json:"args,omitempty"`
+	Pane   PaneID          `json:"pane,omitzero"`
+	Origin string          `json:"origin,omitempty"`
 }

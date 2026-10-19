@@ -4,8 +4,10 @@ const wuffs = @import("wuffs");
 const win32 = @import("win32/win32.zig");
 const Window = @import("Window.zig");
 const Config = @import("Config.zig");
+const Daemon = @import("Daemon.zig");
 const Hosts = @import("Hosts.zig");
 const Shown = @import("Shown.zig");
+const binding = @import("binding.zig");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
@@ -22,23 +24,45 @@ pub fn main(init: std.process.Init) !void {
 
     const config_dir = try Config.defaultDir(init.gpa, init.environ_map);
     defer if (config_dir) |d| init.gpa.free(d);
-    var config = try loadConfig(init, config_dir);
-    defer config.deinit();
     var hosts: Hosts = try .load(init.gpa, init.io, config_dir);
     defer hosts.deinit();
     var shown: Shown = try .load(init.gpa, init.io, config_dir);
     defer shown.deinit();
 
-    const command_line = try shellCommand(init.gpa, config.command);
+    // The settings and key bindings are the daemon's (init.lua), so it
+    // comes before the window; one that can't be reached leaves the
+    // defaults, and the window's tab says why.
+    const daemon = Daemon.open(init.gpa) catch |err| blk: {
+        std.log.err("connecting to slime failed: {}", .{err});
+        break :blk null;
+    };
+    var config: Config = undefined;
+    var keymap: []binding.Entry = &.{};
+    defer Daemon.freeKeymap(init.gpa, keymap);
+    if (daemon) |conn| {
+        var result = conn.config() catch |err| blk: {
+            std.log.err("asking slime for its config failed: {}", .{err});
+            break :blk null;
+        };
+        defer if (result) |*r| r.deinit();
+        const desc: Daemon.Json.Config = if (result) |r| r.value else .{};
+        for (desc.errors) |e| std.log.err("init.lua: {s}", .{e});
+        config = try loadConfig(init, config_dir, desc);
+        keymap = try Daemon.keymapFromJson(init.gpa, desc.keymap);
+    } else {
+        config = .init(init.gpa);
+    }
+    defer config.deinit();
+
+    const command_line = try shellCommand(init.gpa);
     defer init.gpa.free(command_line);
-    // What the sidebar's "Local" runs when the command is an ssh:// URL.
-    const local_command = if (isSshUrl(command_line))
-        try localShell(init.gpa, config.command)
-    else
-        try init.gpa.dupeZ(u16, command_line);
+    // What the sidebar's "Local" runs when the command is an ssh:// URL:
+    // slime's shell.
+    const local_command = if (isSshUrl(command_line)) try init.gpa.dupeZ(u16, &.{}) else try init.gpa.dupeZ(u16, command_line);
     defer init.gpa.free(local_command);
 
-    const window = try Window.create(init.gpa, init.io, &config, &hosts, &shown, command_line, local_command);
+    // The window owns the connection from here, failing or not.
+    const window = try Window.create(init.gpa, init.io, &config, keymap, &hosts, &shown, command_line, local_command, daemon);
     defer window.destroy();
 
     // Handle every pending message (input first) before drawing, so a
@@ -83,14 +107,16 @@ fn decodePng(alloc: std.mem.Allocator, data: []const u8) ghostty_vt.sys.DecodeEr
     return .{ .width = img.width, .height = img.height, .data = img.data };
 }
 
-/// Load the config from the default directory, with the bundled themes
-/// in `themes` next to the executable.
-fn loadConfig(init: std.process.Init, dir: ?[]const u8) !Config {
+/// Build the config from the daemon's settings, with user themes in
+/// `themes` next to init.lua (else in the config directory) and the
+/// bundled ones in `themes` next to the executable.
+fn loadConfig(init: std.process.Init, dir: ?[]const u8, desc: Daemon.Json.Config) !Config {
     const alloc = init.gpa;
     const exe_dir = std.process.executableDirPathAlloc(init.io, alloc) catch null;
     defer if (exe_dir) |d| alloc.free(d);
-    return Config.load(alloc, init.io, .{
-        .dir = dir,
+    const init_dir: ?[]const u8 = if (desc.path.len > 0) std.fs.path.dirname(desc.path) else null;
+    return Config.load(alloc, init.io, desc.settings, .{
+        .dir = init_dir orelse dir,
         .resources_dir = exe_dir,
         .light = appsUseLightTheme(),
     });
@@ -114,41 +140,14 @@ fn appsUseLightTheme() bool {
 }
 
 /// The command to run in the terminal: our own command line after the
-/// program name, verbatim (`slime-gui pwsh -NoLogo`), else the
-/// configured `command`, else %COMSPEC%.
-fn shellCommand(alloc: std.mem.Allocator, configured: ?[]const u8) ![:0]u16 {
-    const args = argsAfterProgram(std.mem.span(win32.GetCommandLineW()));
-    if (args.len > 0) return alloc.dupeZ(u16, args);
-    if (configured) |command| {
-        if (std.unicode.utf8ToUtf16LeAllocZ(alloc, command)) |cmd| return cmd else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => std.log.warn("command isn't valid UTF-8", .{}),
-        }
-    }
-    return comspec(alloc);
-}
-
-/// A shell on this machine: the configured `command` unless it's an
-/// ssh:// URL, else %COMSPEC%.
-fn localShell(alloc: std.mem.Allocator, configured: ?[]const u8) ![:0]u16 {
-    if (configured) |command| if (!std.mem.startsWith(u8, command, "ssh://")) {
-        if (std.unicode.utf8ToUtf16LeAllocZ(alloc, command)) |cmd| return cmd else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {},
-        }
-    };
-    return comspec(alloc);
+/// program name, verbatim (`slime-gui pwsh -NoLogo`), else empty for
+/// slime's shell (init.lua's shell.command, else %COMSPEC%).
+fn shellCommand(alloc: std.mem.Allocator) ![:0]u16 {
+    return alloc.dupeZ(u16, argsAfterProgram(std.mem.span(win32.GetCommandLineW())));
 }
 
 fn isSshUrl(command_line: []const u16) bool {
     return std.mem.startsWith(u16, command_line, std.unicode.utf8ToUtf16LeStringLiteral("ssh://"));
-}
-
-fn comspec(alloc: std.mem.Allocator) ![:0]u16 {
-    var buf: [260]u16 = undefined;
-    const n = win32.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("COMSPEC"), &buf, buf.len);
-    if (n > 0 and n < buf.len) return alloc.dupeZ(u16, buf[0..n]);
-    return alloc.dupeZ(u16, std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe"));
 }
 
 /// Skip the program name the way the CRT does: up to the closing quote

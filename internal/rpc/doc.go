@@ -46,6 +46,12 @@ var MethodDocs = []MethodDoc{
 		"returns at once; the script's output and end arrive as script.output and script.done"},
 	{ScriptCancel, "{id}", "{}", ""},
 	{ScriptList, "none", "{scripts: [{id, name, pane, started, detached}]}", ""},
+	{ActionInvoke, "{name?, args?: object, lua?, pane?, origin?: key|cli|script|api}", "{id}",
+		"runs an action init.lua defined (name) or a function it bound (lua) for pane; answers as script.run does, with script.output and script.done following"},
+	{ConfigGet, "none", "Config", "the daemon's init.lua as last evaluated"},
+	{ConfigReload, "none", "Config",
+		"evaluates init.lua again: on success it replaces the settings, keymap, and actions and config.changed goes out; on failure the last good ones stay and errors says why (to config.changed too)"},
+	{ConfigCheck, "{path?}", "Config", "evaluates init.lua (or path) without applying it"},
 	{Subscribe, "{events: [\"pane.exited\", \"host.*\", \"*\"]}", "{}", "needs a connection (not from Lua)"},
 	{HostConnect, "{dest}", "Host", "prompts arrive as host.prompt, answered with host.answer"},
 	{HostAnswer, "{host, choice: accept|cancel|skip, answers?}", "{}", ""},
@@ -68,7 +74,14 @@ const ShapesDoc = `A workspace id is an integer; a tab id is the string "w.t" an
   PaneDesc       {id: "w.t.p", command, title?, pwd?, cols, rows, created, pid,
                   status?: [{id, state, progress}]}
   Created        {pane: "w.t.p"}
-  Host           {id, dest, state: connecting|connected|failed|lost|gone, text?}`
+  Host           {id, dest, state: connecting|connected|failed|lost|gone, text?}
+  Config         {path, settings: object, keymap: [Binding], actions: [{name, title?, args?}],
+                  errors?: [string]}
+                 settings is slime.config's table (see slime help lua); errors is why
+                 the last evaluation failed, the rest then being the last good config
+  Binding        {key, action?, args?, lua?}: a chord ("ctrl+shift+d"), and a window
+                 action by name with args, a config action to invoke, or lua, a
+                 function the window runs with action.invoke{lua}; neither unbinds`
 
 // EventDoc is one notification and its params.
 type EventDoc struct {
@@ -99,6 +112,7 @@ var EventDocs = []EventDoc{
 	{EvScriptDone, "{id, ok, result?, error?}"},
 	{EvHostChanged, "Host"},
 	{EvHostPrompt, "{host, kind, title?, text?, detail?, error?, questions?}"},
+	{EvConfigChanged, "Config: after config.reload, whether it succeeded (errors says)"},
 }
 
 // CodeDoc is one error code.

@@ -5,9 +5,10 @@
 // the wire dispatches on, so a method that exists for one exists for
 // all. Values cross as JSON (value.go).
 //
-// The config file (later) is one Runner that lives as long as the
-// daemon; each `slime do` is another that ends when its chunk returns,
-// when it's cancelled, or when it calls slime.stop.
+// The config file (internal/config) is one Runner that lives as long
+// as the daemon, whose functions are called again for each action and
+// key binding; each `slime do` is another that ends when its chunk
+// returns, when it's cancelled, or when it calls slime.stop.
 package lua
 
 import (
@@ -32,6 +33,10 @@ type Host interface {
 	Output(stream Stream, text string)
 	// Log is slime.log: a line for the daemon's log.
 	Log(text string)
+	// Invoke is slime.invoke(name, args): runs an action the config
+	// file defined and returns what it returned, or the error a Reply
+	// would carry.
+	Invoke(name string, args json.RawMessage) (json.RawMessage, error)
 }
 
 // Stream names an output stream.
@@ -115,21 +120,40 @@ func New(host Host, ctx Context) *Runner {
 // Run compiles source as chunk name and runs it to the end, returning
 // what it returned (its first value, as JSON; nil for none) or why it
 // stopped: a syntax or runtime error with its stack trace, or
-// ErrCancelled once ctx is done. The state can't be used after.
-func (r *Runner) Run(ctx context.Context, name, source string) (result json.RawMessage, err error) {
+// ErrCancelled once ctx is done.
+func (r *Runner) Run(ctx context.Context, name, source string) (json.RawMessage, error) {
+	fn, err := r.L.Load(strings.NewReader(source), name)
+	if err != nil {
+		return nil, errors.New(errorText(err))
+	}
+	return r.Call(ctx, fn)
+}
+
+// Call runs fn with args to its end, as Run runs a chunk: its first
+// return value comes back as JSON (nil for none), or why it stopped.
+// The state is left as it was, so the config file's functions are
+// called again and again.
+func (r *Runner) Call(ctx context.Context, fn glua.LValue, args ...glua.LValue) (result json.RawMessage, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("panic: %v", rec)
 		}
 	}()
 	L := r.L
-	L.SetContext(ctx)
-	fn, err := L.Load(strings.NewReader(source), name)
-	if err != nil {
-		return nil, errors.New(errorText(err))
+	// One context at a time: a nested call (an action invoking another)
+	// keeps the outer's.
+	if L.Context() == nil {
+		L.SetContext(ctx)
+		defer L.RemoveContext()
 	}
+	top := L.GetTop()
+	defer L.SetTop(top)
+	r.stopResult = nil
 	L.Push(fn)
-	err = L.PCall(0, glua.MultRet, L.NewFunction(r.onError))
+	for _, a := range args {
+		L.Push(a)
+	}
+	err = L.PCall(len(args), 1, L.NewFunction(r.onError))
 	if ctx.Err() != nil {
 		return nil, ErrCancelled
 	}
@@ -143,14 +167,50 @@ func (r *Runner) Run(ctx context.Context, name, source string) (result json.RawM
 		}
 		return nil, errors.New(errorText(err))
 	}
-	if L.GetTop() == 0 || L.Get(1) == glua.LNil {
-		return nil, nil
+	if v := L.Get(-1); v != glua.LNil {
+		return toJSON(v)
 	}
-	return toJSON(L.Get(1))
+	return nil, nil
 }
 
 // Close frees the state.
 func (r *Runner) Close() { r.L.Close() }
+
+// Define sets slime.<name> to fn: what a host adds to the table beyond
+// what every script gets (the config file's slime.config and the rest).
+func (r *Runner) Define(name string, fn glua.LGFunction) {
+	r.slime.RawSetString(name, r.L.NewFunction(fn))
+}
+
+// IDs is what the script runs for, as slime.workspace_id, tab_id, and
+// pane_id hold it now (a script may have changed them).
+type IDs struct{ Workspace, Tab, Pane glua.LValue }
+
+func (r *Runner) IDs() IDs {
+	return IDs{r.slime.RawGetString("workspace_id"), r.slime.RawGetString("tab_id"), r.slime.RawGetString("pane_id")}
+}
+
+func (r *Runner) SetIDs(ids IDs) {
+	r.slime.RawSetString("workspace_id", ids.Workspace)
+	r.slime.RawSetString("tab_id", ids.Tab)
+	r.slime.RawSetString("pane_id", ids.Pane)
+}
+
+// SetPane makes the script run for pane, or for nothing if it's zero:
+// the ids its calls fill in. An invocation of the config file's
+// functions sets them for its duration.
+func (r *Runner) SetPane(pane rpc.PaneID) {
+	if pane.IsZero() {
+		r.SetIDs(IDs{glua.LNil, glua.LNil, glua.LNil})
+		return
+	}
+	r.SetIDs(IDs{glua.LNumber(pane.WS), glua.LString(pane.TabID().String()), glua.LString(pane.String())})
+}
+
+// ToJSON and FromJSON cross values for a host, by value.go's rules.
+func ToJSON(v glua.LValue) (json.RawMessage, error) { return toJSON(v) }
+
+func FromJSON(L *glua.LState, b []byte) (glua.LValue, error) { return fromJSON(L, b) }
 
 // onError is the run's error handler: it adds the stack trace to an
 // error's message where the error happened, before the stack unwinds,

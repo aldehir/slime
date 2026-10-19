@@ -19,7 +19,8 @@ import (
 // runs. What it prints and how it ended go to the connection that
 // started it, and to anyone subscribed to script.*.
 
-// script is one run.
+// script is one run: a script's, or an action's (action.invoke), which
+// runs in the config's state but is a script to everyone watching.
 type script struct {
 	id      uint32
 	name    string
@@ -29,6 +30,7 @@ type script struct {
 	// Unless detached, the owner hanging up cancels the script.
 	owner    *conn
 	detached bool
+	ctx      context.Context
 	cancel   context.CancelFunc
 }
 
@@ -54,38 +56,48 @@ func (s *Server) scriptRun(cl *callCtx, p rpc.ScriptRunParams) (*rpc.ScriptRunRe
 	if name == "" {
 		name = "script"
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	lctx := lua.Context{Args: p.Args}
-
 	s.mu.Lock()
-	if !p.Pane.IsZero() {
-		// The pane as it's named now, if it moved.
-		pane := s.paneLocked(p.Pane)
-		if pane == nil || pane.tab == nil {
-			s.mu.Unlock()
-			cancel()
-			return nil, errNoPane
-		}
-		lctx.Pane = pane.id
-	}
-	s.nextScript++
-	sc := &script{id: s.nextScript, name: name, pane: lctx.Pane, started: time.Now(), owner: cl.c, detached: p.Detach || cl.c == nil, cancel: cancel}
-	s.scripts[sc.id] = sc
-	s.checkIdleLocked()
+	sc, err := s.startScriptLocked(cl, name, p.Pane, p.Detach)
 	s.mu.Unlock()
-	s.log.Info("script started", "script", sc.id, "name", sc.name, "pane", sc.pane)
-
-	go s.runScript(ctx, sc, lctx, p.Source)
+	if err != nil {
+		return nil, err
+	}
+	go s.runScript(sc, lua.Context{Args: p.Args, Pane: sc.pane}, p.Source)
 	return &rpc.ScriptRunResult{ID: sc.id}, nil
 }
 
-// runScript drives a script to its end and reports it.
-func (s *Server) runScript(ctx context.Context, sc *script, lctx lua.Context, source string) {
-	r := lua.New(&scriptHost{s: s, sc: sc}, lctx)
-	result, err := r.Run(ctx, sc.name, source)
-	r.Close()
-	sc.cancel()
+// startScriptLocked registers a run for cl, for pane (none if zero),
+// and counts it against idle. The caller drives it and ends it with
+// scriptEnded.
+func (s *Server) startScriptLocked(cl *callCtx, name string, pane PaneID, detach bool) (*script, error) {
+	if !pane.IsZero() {
+		// The pane as it's named now, if it moved.
+		p := s.paneLocked(pane)
+		if p == nil || p.tab == nil {
+			return nil, errNoPane
+		}
+		pane = p.id
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.nextScript++
+	sc := &script{id: s.nextScript, name: name, pane: pane, started: time.Now(), owner: cl.c, detached: detach || cl.c == nil, ctx: ctx, cancel: cancel}
+	s.scripts[sc.id] = sc
+	s.checkIdleLocked()
+	s.log.Info("script started", "script", sc.id, "name", sc.name, "pane", sc.pane)
+	return sc, nil
+}
 
+// runScript drives a script to its end and reports it.
+func (s *Server) runScript(sc *script, lctx lua.Context, source string) {
+	r := lua.New(&scriptHost{s: s, sc: sc}, lctx)
+	result, err := r.Run(sc.ctx, sc.name, source)
+	r.Close()
+	s.scriptEnded(sc, result, err)
+}
+
+// scriptEnded forgets a run and reports how it went.
+func (s *Server) scriptEnded(sc *script, result json.RawMessage, err error) {
+	sc.cancel()
 	s.mu.Lock()
 	delete(s.scripts, sc.id)
 	s.checkIdleLocked()
@@ -172,6 +184,12 @@ func (h *scriptHost) Output(stream lua.Stream, text string) {
 func (h *scriptHost) Log(text string) {
 	h.s.log.Info("script", "script", h.sc.id, "name", h.sc.name, "msg", text)
 	h.Output(lua.Stderr, text+"\n")
+}
+
+// Invoke is slime.invoke: a config action, run for the script's pane,
+// printing as the script does.
+func (h *scriptHost) Invoke(name string, args json.RawMessage) (json.RawMessage, error) {
+	return h.s.invokeFor(h.sc.ctx, h.sc, name, args, h.Output)
 }
 
 func firstLine(s string) string {

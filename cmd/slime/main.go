@@ -24,6 +24,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/aldehir/slime/internal/config"
 	"github.com/aldehir/slime/internal/daemon"
 	"github.com/aldehir/slime/internal/pty"
 	"github.com/aldehir/slime/internal/rpc"
@@ -37,7 +38,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("slime: ")
 	if err := newCommand().Execute(); err != nil {
-		if errors.Is(err, errScriptFailed) {
+		if errors.Is(err, errScriptFailed) || errors.Is(err, errConfigFailed) {
 			os.Exit(1)
 		}
 		var rerr *rpc.Error
@@ -59,7 +60,7 @@ func newCommand() *cobra.Command {
 	}
 	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "print results as JSON, as the daemon replies")
 	root.AddCommand(serveCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
-		paneCommand(), doCommand(), scriptsCommand(), callCommand(), skillCommand())
+		paneCommand(), doCommand(), actionsCommand(), scriptsCommand(), configCommand(), callCommand(), skillCommand())
 	root.AddCommand(hostCommands()...)
 	root.AddCommand(topicCommands()...)
 	root.SetHelpCommand(helpCommand(root))
@@ -132,11 +133,11 @@ func serve(logger *slog.Logger, idle time.Duration, hosts daemon.HostOptions) er
 		return err
 	}
 	defer rt.Close(ctx)
-	srv, err := daemon.NewServer(rt, daemon.Options{Log: logger, Idle: idle, Hosts: hosts})
+	srv, err := daemon.NewServer(rt, daemon.Options{Log: logger, Idle: idle, Hosts: hosts, Config: config.Path()})
 	if err != nil {
 		return err
 	}
-	logger.Info("serving", "pipe", name, "pid", os.Getpid())
+	logger.Info("serving", "pipe", name, "pid", os.Getpid(), "config", config.Path())
 	return srv.Serve(l)
 }
 

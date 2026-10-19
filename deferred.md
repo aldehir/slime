@@ -56,8 +56,9 @@ than being piecemealed with MessageBox and the like.
   commands: unbracketed text with a newline, or any paste containing the
   bracketed-paste terminator `ESC [201~`. We paste without asking. The
   control-byte stripping in `encodePaste` still applies.
-- **Config errors on screen.** Unknown keys and bad values only go to
-  the log (Ghostty shows them in a banner).
+- **Config errors on screen.** Unknown keys and bad values, and an
+  `init.lua` that failed to load, only go to the log and `slime config
+  show` (Ghostty shows them in a banner).
 - **Select all** in a pane's context menu: slime has no event for it.
 - **A field's context menu** (cut, copy, paste) on the host field and a
   workspace's name being edited; a right click there does nothing.
@@ -326,8 +327,26 @@ so; the host's button reconnects, reattaches, and replaces them.
 `slime do` runs Lua in the daemon (internal/lua, gopher-lua): the
 `slime` table calls any method of the control plane in process, with
 the pane, tab, and workspace the script runs for filled into the ids
-it leaves out. Hooks, waiting, timers, exec, bindings, and actions wait
-on the rearchitect plan's stages 7 and 8.
+it leaves out. `init.lua` (internal/config) is a state of its own that
+lives as long as the daemon: `slime.config` sets the settings, `slime.bind`
+the keys, and `slime.action` the actions that `slime do <name>`, bound
+keys, and `slime.invoke` run (`action.invoke`, which runs as a script).
+Hooks, waiting, timers, and exec wait on the rearchitect plan's stage 8.
+
+- **`ctx.client_id`** isn't filled in: connections have no ids, so an
+  action can't tell which window pressed its key.
+- **A key's action runs for the local daemon only.** A function binding
+  pressed while a host's pane is focused runs with no pane, since the
+  local `init.lua` doesn't know the host's panes; the host's `init.lua`
+  governs only what runs there.
+- **Bound keys can't fall through** to the program: a function binding
+  or an action binding always consumes its key, since the key has left
+  the window by the time Lua runs.
+- **A failed `init.lua` is reported in the log and by `slime config
+  show`** only; a window started under one shows the defaults with no
+  banner (see Needs app chrome).
+- **Lists come back as objects when empty**: an action returning
+  `slime.workspace.list{}.workspaces` with no workspaces prints `{}`.
 
 - **No `io` library.** `print` is a script's stdout and `slime.log` its
   stderr, one `script.output` each; there's no `io.write`, `io.read`,
@@ -346,19 +365,28 @@ on the rearchitect plan's stages 7 and 8.
 
 ## Configuration
 
-`Config.zig` covers fonts, colors, themes, padding, word characters, and
-the command, loaded once at startup.
+The daemon's `init.lua` (`slime config path`) is the configuration:
+`slime.config{...}` is one table the daemon hands every window
+(`config.get`), which `Config.zig` maps onto its fields (fonts, colors,
+themes, padding, word characters, clipboard, ssh) once at startup; the
+daemon keeps `shell.command`. Themes stay Ghostty theme files, looked
+up beside `init.lua` and beside the exe. `slime.bind` lays bindings
+over `binding.zig`'s defaults, which every window takes up again on
+`slime config reload`.
 
-- **Reloading** while running. Colors can be swapped under the lock;
-  font changes need a new `Grid` and atlas.
+- **Reloading the settings** while running: a reload changes the keys
+  at once, but the fonts, colors, and the rest wait for the next window.
+  Colors can be swapped under the lock; font changes need a new `Grid`
+  and atlas.
 - **Following light/dark changes** live (`WM_SETTINGCHANGE` with
   "ImmersiveColorSet"), and reporting them with mode 2031
   (`CSI ?997;1n`/`2n`). The mode is read once at startup.
-- **Font fallback families.** Ghostty uses every `font-family` after the
+- **Font fallback families.** Ghostty uses every `font.family` after the
   first as a fallback ahead of the system's; we use the first one that's
   installed and fall back through DirectWrite.
-- **Key binding config** (`keybind`). `binding.zig` has the actions,
-  under Ghostty's names, and the default table a parsed `keybind` would
-  extend or override. Triggers are virtual keys only, not Ghostty's
-  physical keys, and there are no sequences (`a>b`) or `unbind`.
+- **Key sequences and modes** (`ctrl+b>c`), and Ghostty's physical-key
+  triggers: chords are virtual keys with modifiers only.
+- **`chrome.layout`** (sidebar or tabs) waits on the tabs layout.
+- **A window attached to a host keeps the local settings**; a host's
+  `init.lua` can't restyle the panes drawn from it.
 - **CLI overrides** (`--key=value`) and `+list-themes`.

@@ -56,6 +56,10 @@ Don't guess flags, methods, or fields: read them from `slime help`.
   where a carriage return presses enter.
 - A pane's program ending ends the pane. To keep a result on screen,
   run a shell and write the command to it.
+- `slime do <file.lua>` runs Lua in the daemon; `slime do <action>` runs
+  an action the user's `init.lua` defined (`slime actions` lists them,
+  `slime config show` the rest of the config). Don't edit `init.lua`
+  unless asked.
 
 ## Manners
 

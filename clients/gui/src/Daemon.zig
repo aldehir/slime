@@ -34,6 +34,7 @@ const Allocator = std.mem.Allocator;
 const win32 = @import("win32/win32.zig");
 const Screen = @import("Screen.zig");
 const Hosts = @import("Hosts.zig");
+const binding = @import("binding.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -139,6 +140,9 @@ focus_calls: std.ArrayList(u32) = .empty,
 attach_calls: std.ArrayList(AttachCall) = .empty,
 /// Ids of our `hostList` calls, whose replies become `hosts` events.
 host_lists: std.ArrayList(u32) = .empty,
+/// The keymap init.lua last set (`config.changed`), until the UI thread
+/// takes it (`takeKeymap`); only the latest matters.
+keymap: ?[]binding.Entry = null,
 /// The connection ended; every live pane was told why.
 lost: bool = false,
 /// `deinit` is hanging up, so the reader's end isn't a loss.
@@ -727,7 +731,7 @@ pub const Taken = struct {
 
 /// The control plane's objects as std.json reads them (internal/rpc).
 /// Strings point into the parse's arena.
-const Json = struct {
+pub const Json = struct {
     /// A Reply or Notify: whichever fields it has.
     const Envelope = struct {
         id: ?u32 = null,
@@ -762,6 +766,9 @@ const Json = struct {
     const Question = struct { label: []const u8 = "", echo: bool = false };
     const HostList = struct { hosts: []const Host = &.{} };
     const WorkspaceList = struct { workspaces: []const WorkspaceDesc = &.{} };
+    /// rpc.ConfigDesc: `settings` is slime.config's table.
+    pub const Config = struct { path: []const u8 = "", settings: std.json.Value = .null, keymap: []const Binding = &.{}, errors: []const []const u8 = &.{} };
+    const Binding = struct { key: []const u8, action: []const u8 = "", args: std.json.Value = .null, lua: u32 = 0 };
     const WorkspaceDesc = struct { id: u32, name: []const u8 = "", attached: bool = false, viewers: usize = 0, detached_at: i64 = 0, active_tab: TabRef = .none, tabs: []const Tab = &.{} };
 };
 
@@ -812,25 +819,78 @@ const Pending = struct {
     }
 };
 
-/// Connect, starting the daemon if it isn't running, list its workspaces
-/// (a `WorkspaceEvent.list`), and attach the ones to show: the one
-/// SLIME_WORKSPACE names, else those `want` remembers if this is the
-/// daemon it remembers them from, else every one there is; with none, a
-/// new one with a tab running `command`. Panes' frames come at most every
-/// `frame_interval` µs. The panes wait in `arrivals`; `start` the reader
-/// after adopting them. UI thread.
-pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16, want: Wanted) !*Daemon {
+/// Connect, starting the daemon if it isn't running, and say hello:
+/// `open` then `begin`, for a window that asks the daemon for its config
+/// (`config`) before it has a window to show anything in. Nothing is
+/// read in between but what `config` reads. UI thread.
+pub fn open(alloc: Allocator) !*Daemon {
     var pipe: Pipe = try .open(true);
     errdefer pipe.close();
-    const buf = try alloc.alloc(u8, max_frame);
-    defer alloc.free(buf);
-
     const self = try alloc.create(Daemon);
     errdefer alloc.destroy(self);
-    self.* = .{ .alloc = alloc, .pipe = pipe, .notify = notify, .frame_interval = frame_interval };
+    self.* = .{ .alloc = alloc, .pipe = pipe, .notify = undefined };
     errdefer self.freeState();
-    try self.attachFirst(buf, area, size, command, want);
+    const buf = try alloc.alloc(u8, max_frame);
+    defer alloc.free(buf);
+    try self.handshake(buf);
     return self;
+}
+
+/// The daemon's config (config.get): init.lua's settings for `Config`,
+/// and its keymap. Before `begin`; the result's arena is the caller's
+/// to free.
+pub fn config(self: *Daemon) !Result(Json.Config) {
+    const buf = try self.alloc.alloc(u8, max_frame);
+    defer self.alloc.free(buf);
+    return self.awaitReply(buf, try self.call("config.get", no_params), Json.Config);
+}
+
+/// The keymap of a config, as owned entries for `binding.Keymap`.
+pub fn keymapFromJson(alloc: Allocator, bindings: []const Json.Binding) ![]binding.Entry {
+    const entries = try alloc.alloc(binding.Entry, bindings.len);
+    var made: usize = 0;
+    errdefer freeKeymap(alloc, entries[0..made]);
+    for (entries, bindings) |*e, b| {
+        const key = try alloc.dupe(u8, b.key);
+        errdefer alloc.free(key);
+        const action = try alloc.dupe(u8, b.action);
+        errdefer alloc.free(action);
+        const args: []const u8 = if (b.args == .null) "" else try std.json.Stringify.valueAlloc(alloc, b.args, .{});
+        e.* = .{ .key = key, .action = action, .args = args, .lua = b.lua };
+        made += 1;
+    }
+    return entries;
+}
+
+pub fn freeKeymap(alloc: Allocator, entries: []binding.Entry) void {
+    for (entries) |e| {
+        alloc.free(e.key);
+        alloc.free(e.action);
+        if (e.args.len > 0) alloc.free(e.args);
+    }
+    alloc.free(entries);
+}
+
+/// Connect (`open`) and `begin`.
+pub fn connect(alloc: Allocator, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16, want: Wanted) !*Daemon {
+    const self = try open(alloc);
+    errdefer self.deinit();
+    try self.begin(notify, frame_interval, area, size, command, want);
+    return self;
+}
+
+/// List the daemon's workspaces (a `WorkspaceEvent.list`) and attach the
+/// ones to show: the one SLIME_WORKSPACE names, else those `want`
+/// remembers if this is the daemon it remembers them from, else every
+/// one there is; with none, a new one with a tab running `command`.
+/// Panes' frames come at most every `frame_interval` µs. The panes wait
+/// in `arrivals`; `start` the reader after adopting them. UI thread.
+pub fn begin(self: *Daemon, notify: Notify, frame_interval: u32, area: Area, size: Size, command: []const u16, want: Wanted) !void {
+    self.notify = notify;
+    self.frame_interval = frame_interval;
+    const buf = try self.alloc.alloc(u8, max_frame);
+    defer self.alloc.free(buf);
+    try self.attachFirst(buf, area, size, command, want);
 }
 
 /// Connect to the slime on host `host` (the daemon's id for it, which it
@@ -874,12 +934,12 @@ pub fn connectRemote(alloc: Allocator, notify: Notify, frame_interval: u32, host
 /// for a pane: with none left, a new workspace, and a tab running
 /// `command` if no attached one has a pane.
 fn attachFirst(self: *Daemon, buf: []u8, area: Area, size: Size, command: []const u16, want: Wanted) !void {
-    try self.handshake(buf);
+    if (self.remote != null) try self.handshake(buf);
 
-    // A host's state changes reach every window; a bridged daemon has
-    // none to tell of.
+    // A host's state changes reach every window, as does the local
+    // config's keymap; a bridged daemon has neither to tell of.
     if (self.remote == null) {
-        var sub = try self.awaitReply(buf, try self.call("subscribe", .{ .events = .{ "host.*", "workspace.*" } }), struct {});
+        var sub = try self.awaitReply(buf, try self.call("subscribe", .{ .events = .{ "host.*", "workspace.*", "config.*" } }), struct {});
         sub.deinit();
     } else {
         var sub = try self.awaitReply(buf, try self.call("subscribe", .{ .events = .{"workspace.*"} }), struct {});
@@ -1067,6 +1127,7 @@ fn freeState(self: *Daemon) void {
     self.host_events.deinit(self.alloc);
     for (self.workspace_events.items) |*e| e.deinit(self.alloc);
     self.workspace_events.deinit(self.alloc);
+    if (self.keymap) |k| freeKeymap(self.alloc, k);
     if (self.remote) |r| {
         self.alloc.free(r.dest);
         self.alloc.free(r.term);
@@ -1150,6 +1211,37 @@ pub fn take(self: *Daemon) Taken {
         .structures = self.structures.toOwnedSlice(self.alloc) catch &.{},
     };
 }
+
+/// Take the keymap init.lua last set, if it changed since the last
+/// take. The caller frees it (`freeKeymap`). UI thread.
+pub fn takeKeymap(self: *Daemon) ?[]binding.Entry {
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    defer self.keymap = null;
+    return self.keymap;
+}
+
+/// Run the function init.lua bound as `lua`, for `pane` (none for no
+/// pane): a key was pressed. The daemon runs it; the reply is dropped.
+pub fn invoke(self: *Daemon, lua: u32, pane: PaneRef) !void {
+    _ = try self.call("action.invoke", .{ .lua = lua, .pane = pane, .origin = "key" });
+}
+
+/// Run the action init.lua defined as `name` with `args` (a JSON object,
+/// or empty) for `pane`: a key was pressed.
+pub fn invokeAction(self: *Daemon, name: []const u8, args: []const u8, pane: PaneRef) !void {
+    _ = try self.call("action.invoke", .{ .name = name, .args = RawJson{ .text = args }, .pane = pane, .origin = "key" });
+}
+
+/// JSON already encoded, written as it is; `null` if empty.
+const RawJson = struct {
+    text: []const u8,
+
+    pub fn jsonStringify(self: RawJson, jw: anytype) !void {
+        if (self.text.len == 0) return jw.write(null);
+        try jw.print("{s}", .{self.text});
+    }
+};
 
 /// Take the workspaces the daemon said to open here, in order. The
 /// caller owns the slice. UI thread.
@@ -1393,12 +1485,12 @@ fn send(self: *Daemon, msg: MsgType, id: PaneRef, payload: []const u8) !void {
 }
 
 /// A call's result, parsed as `R` into an arena of its own.
-fn Result(comptime R: type) type {
+pub fn Result(comptime R: type) type {
     return struct {
         arena: std.heap.ArenaAllocator,
         value: R,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.arena.deinit();
         }
     };
@@ -1506,9 +1598,20 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
         @"workspace.viewer_left",
         @"host.changed",
         @"host.prompt",
+        @"config.changed",
     };
     const ev = std.meta.stringToEnum(Event, method) orelse return;
     switch (ev) {
+        .@"config.changed" => {
+            const c = try std.json.parseFromValueLeaky(Json.Config, a, params, json_opts);
+            for (c.errors) |e| log.warn("init.lua: {s}", .{e});
+            const entries = try keymapFromJson(self.alloc, c.keymap);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            if (self.keymap) |old| freeKeymap(self.alloc, old);
+            self.keymap = entries;
+            if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
+        },
         .@"pane.attached" => {
             const p = try std.json.parseFromValueLeaky(Json.PaneAttached, a, params, json_opts);
             const command = try toUtf16(self.alloc, p.command);
@@ -2433,12 +2536,12 @@ test "pane and workspace events parse as the daemon sends them" {
     defer det.deinit();
     try std.testing.expectEqualStrings("attached elsewhere", det.value.reason);
 
-    var open = try std.json.parseFromSlice(Json.WorkspaceOpen, alloc,
+    var opened = try std.json.parseFromSlice(Json.WorkspaceOpen, alloc,
         \\{"id":14,"name":"dev"}
     , json_opts);
-    defer open.deinit();
-    try std.testing.expectEqual(@as(u32, 14), open.value.id);
-    try std.testing.expectEqualStrings("dev", open.value.name);
+    defer opened.deinit();
+    try std.testing.expectEqual(@as(u32, 14), opened.value.id);
+    try std.testing.expectEqualStrings("dev", opened.value.name);
 
     var created = try std.json.parseFromSlice(Json.Created, alloc,
         \\{"pane":"9.2.3"}

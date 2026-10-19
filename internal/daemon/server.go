@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aldehir/slime/internal/config"
 	"github.com/aldehir/slime/internal/pty"
 	"github.com/aldehir/slime/internal/rpc"
 	"github.com/aldehir/slime/internal/vt"
@@ -57,6 +58,12 @@ type Server struct {
 	hosts   hostTable
 	idleT   *time.Timer
 	idleC   chan struct{} // closed when the idle timer fires
+
+	// The config (config.go): the file, what it last loaded as (nil
+	// until one loads), and why the last evaluation failed, if it did.
+	configPath   string
+	config       *config.Config
+	configErrors []string
 }
 
 // Options configure a Server.
@@ -69,6 +76,9 @@ type Options struct {
 	Idle time.Duration
 	// Hosts configures connecting to SSH hosts (Windows).
 	Hosts HostOptions
+	// Config is the init.lua to evaluate at start (config.Path());
+	// empty evaluates nothing, and config.reload stays empty.
+	Config string
 }
 
 // defaultSize is a pane's size when nothing says otherwise.
@@ -94,6 +104,10 @@ func NewServer(rt *vt.Runtime, opts Options) (*Server, error) {
 		scripts:    map[uint32]*script{},
 		hosts:      newHostTable(opts.Hosts),
 		idleC:      make(chan struct{}),
+		configPath: opts.Config,
+	}
+	if opts.Config != "" {
+		s.loadConfig()
 	}
 	return s, nil
 }
@@ -287,7 +301,13 @@ func (s *Server) paneLocked(id PaneID) *Pane {
 // server's lock: spawning takes a while. The caller registers it
 // (addPaneLocked), or closes it if what it was for is gone by then.
 func (s *Server) startPane(id PaneID, spec *rpc.PaneSpec, size Size) (*started, error) {
+	// The config's shell, if it names one, is run as given; the
+	// platform's default is the pty's to pick, and named for the pane.
 	command := spec.Command
+	if command == "" {
+		command = s.shellCommand()
+	}
+	run := command
 	if command == "" {
 		command = pty.DefaultCommand()
 	}
@@ -303,7 +323,7 @@ func (s *Server) startPane(id PaneID, spec *rpc.PaneSpec, size Size) (*started, 
 		return nil, err
 	}
 	p, err := s.spawn(pty.Options{
-		Command: spec.Command,
+		Command: run,
 		Dir:     spec.Cwd,
 		Env:     paneEnv(id, spec),
 		Cols:    size.Cols,

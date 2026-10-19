@@ -42,6 +42,10 @@ Commands that make things (do, tab new, ws new, host connect) start the
 daemon if none is running; the others say "slime isn't running".
 --json on any command prints the daemon's reply as it came.
 
+init.lua (slime config path) configures the daemon and its windows in
+Lua: settings, key bindings, and actions, which slime do runs by name
+(slime help lua, slime config).
+
 slime help prints the whole manual: every command and the topics env,
 ids, lua, methods, and events.`
 

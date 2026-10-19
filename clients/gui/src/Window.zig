@@ -25,6 +25,8 @@ const Session = @import("Session.zig");
 const Tab = @import("Tab.zig");
 const Hosts = @import("Hosts.zig");
 const Shown = @import("Shown.zig");
+const Daemon = @import("Daemon.zig");
+const binding = @import("binding.zig");
 const Placement = @import("Placement.zig");
 const messages = @import("messages.zig");
 const Ui = @import("ui/Ui.zig");
@@ -101,9 +103,16 @@ stats: Stats = .{},
 
 /// Create the window, showing the workspaces the last window did (or
 /// what slime has, or a new one running `command_line`, CreateProcessW
-/// syntax). An `ssh://` URL opens that host too, and is remembered in
-/// `hosts`. Local sessions opened later run `local_command`.
-pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts, shown: *Shown, command_line: []const u16, local_command: []const u16) !*Window {
+/// syntax; empty for slime's shell). An `ssh://` URL opens that host
+/// too, and is remembered in `hosts`. Local sessions opened later run
+/// `local_command`. `daemon` is the connection `config` and `keymap`
+/// came from, if one was made; the window owns it from here and goes
+/// on with it.
+pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []const binding.Entry, hosts: *Hosts, shown: *Shown, command_line: []const u16, local_command: []const u16, daemon: ?*Daemon) !*Window {
+    // Ours until the app has it.
+    var pending = daemon;
+    errdefer if (pending) |conn| conn.deinit();
+
     const instance = win32.GetModuleHandleW(null);
     try registerClass(instance);
 
@@ -158,6 +167,8 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
     self.app = try App.init(.{
         .alloc = alloc,
         .config = config,
+        .keymap = keymap,
+        .daemon = pending,
         .local_command = local_command,
         .hosts = hosts,
         .shown = shown,
@@ -168,6 +179,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, hosts: *Hosts
         .output_event = output_event,
         .stats_bytes = if (build_options.stats) &self.stats.bytes else null,
     });
+    pending = null;
     errdefer self.app.deinit();
     self.renderer = try Renderer.init(hwnd, size.width, size.height, config.@"font-antialias");
     errdefer {

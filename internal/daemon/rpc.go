@@ -90,6 +90,10 @@ var methods = map[string]handler{
 	rpc.ScriptRun:       method((*Server).scriptRun),
 	rpc.ScriptCancel:    method((*Server).scriptCancel),
 	rpc.ScriptList:      method((*Server).scriptList),
+	rpc.ConfigGet:       method((*Server).configGet),
+	rpc.ConfigReload:    method((*Server).configReload),
+	rpc.ConfigCheck:     method((*Server).configCheck),
+	rpc.ActionInvoke:    method((*Server).actionInvoke),
 }
 
 // Methods lists the control plane's methods.

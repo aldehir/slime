@@ -39,6 +39,9 @@ func (h *fakeHost) Call(method string, params json.RawMessage) (json.RawMessage,
 
 func (h *fakeHost) Output(stream Stream, text string) { h.out = append(h.out, string(stream)+":"+text) }
 func (h *fakeHost) Log(text string)                   { h.logs = append(h.logs, text) }
+func (h *fakeHost) Invoke(name string, args json.RawMessage) (json.RawMessage, error) {
+	return h.Call("invoke "+name, args)
+}
 
 func run(t *testing.T, h *fakeHost, ctx Context, src string) (json.RawMessage, error) {
 	t.Helper()

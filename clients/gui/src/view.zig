@@ -32,11 +32,25 @@ const Color = Ui.Color;
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
 /// The keys tooltips name.
-const new_tab_key = binding.label(&binding.defaults, .new_tab);
-const close_tab_key = binding.label(&binding.defaults, .close_surface);
-const split_right_key = binding.label(&binding.defaults, .{ .new_split = .right });
-const split_down_key = binding.label(&binding.defaults, .{ .new_split = .down });
-const zoom_key = binding.label(&binding.defaults, .toggle_split_zoom);
+/// The keys the buttons' tooltips name, from the bindings in force,
+/// kept in the tree's arena since the nodes point into them.
+const Labels = struct {
+    new_tab: binding.Label,
+    close_tab: binding.Label,
+    split_right: binding.Label,
+    split_down: binding.Label,
+    zoom: binding.Label,
+
+    fn of(keymap: *const binding.Keymap) Labels {
+        return .{
+            .new_tab = keymap.label(.new_tab),
+            .close_tab = keymap.label(.close_surface),
+            .split_right = keymap.label(.{ .new_split = .right }),
+            .split_down = keymap.label(.{ .new_split = .down }),
+            .zoom = keymap.label(.toggle_split_zoom),
+        };
+    }
+};
 
 // Sizes in DIPs.
 const sidebar_pad_x = 12;
@@ -61,7 +75,9 @@ const label_gap = 4;
 
 /// The tree for the app's state now.
 pub fn build(app: *App, arena: Allocator) Allocator.Error!Tree {
-    var b: Builder = .{ .arena = arena, .app = app, .ui = app.ui, .frame = app.frame.* };
+    const labels = try arena.create(Labels);
+    labels.* = .of(&app.keymap);
+    var b: Builder = .{ .arena = arena, .app = app, .ui = app.ui, .frame = app.frame.*, .keys = labels };
     return b.build();
 }
 
@@ -70,6 +86,7 @@ const Builder = struct {
     app: *App,
     ui: *const Ui,
     frame: Ui.Frame,
+    keys: *const Labels,
 
     fn nodes(self: *const Builder, items: []const Node) Allocator.Error![]Node {
         return self.arena.dupe(Node, items);
@@ -235,7 +252,7 @@ const Builder = struct {
             .local => if (app.sectionCount(0) > 0)
                 .{ L("New workspace"), none }
             else
-                .{ L("New tab"), if (self.activeGroupIs(target)) new_tab_key.slice() else none },
+                .{ L("New tab"), if (self.activeGroupIs(target)) self.keys.new_tab.slice() else none },
             .disconnected => .{ L("Connect"), none },
             .connected => .{ L("New workspace"), none },
         };
@@ -316,7 +333,7 @@ const Builder = struct {
             try items.append(self.arena, .{ .kind = .{ .icon = .{ .icon = .eye, .size = 17, .box = 20, .color = t.text_muted } } });
             try items.append(self.arena, .{ .kind = .{ .spacer = button_gap } });
         }
-        const key: []const u16 = if (self.activeGroupIs(target)) new_tab_key.slice() else &.{};
+        const key: []const u16 = if (self.activeGroupIs(target)) self.keys.new_tab.slice() else &.{};
         try items.append(self.arena, .{ .id = id.with(.new_tab), .kind = .{ .icon_button = .{ .icon = .plus, .size = 17, .tip = L("New tab"), .key = key } } });
         try items.append(self.arena, .{ .kind = .{ .spacer = button_margin } });
         return .{
@@ -384,7 +401,7 @@ const Builder = struct {
                 .icon = .x,
                 .size = 16,
                 .tip = L("Close tab"),
-                .key = if (active) close_tab_key.slice() else &.{},
+                .key = if (active) self.keys.close_tab.slice() else &.{},
             } } });
             try items.append(self.arena, .{ .kind = .{ .spacer = button_margin } });
         } else if (folded_status) |status| {
@@ -503,9 +520,9 @@ const Builder = struct {
         for (buttons, parts) |*b, part| {
             const none: []const u16 = &.{};
             const icon: Painter.Lucide, const tip: []const u16, const key: []const u16 = switch (part) {
-                .split_right => .{ .columns_2, L("Split right"), if (focused) split_right_key.slice() else none },
-                .split_down => .{ .rows_2, L("Split down"), if (focused) split_down_key.slice() else none },
-                .zoom => .{ if (zoomed) .minimize_2 else .maximize_2, if (zoomed) L("Unzoom") else L("Zoom"), if (focused) zoom_key.slice() else none },
+                .split_right => .{ .columns_2, L("Split right"), if (focused) self.keys.split_right.slice() else none },
+                .split_down => .{ .rows_2, L("Split down"), if (focused) self.keys.split_down.slice() else none },
+                .zoom => .{ if (zoomed) .minimize_2 else .maximize_2, if (zoomed) L("Unzoom") else L("Zoom"), if (focused) self.keys.zoom.slice() else none },
                 else => unreachable,
             };
             // Each spans 18 of its 24 units: 10 DIPs in this box, whose

@@ -49,7 +49,11 @@ const resize_quiet_ms = 500;
 alloc: Allocator,
 /// Outlives the app.
 config: *const Config,
-/// What local sessions run, in CreateProcessW syntax. Outlives the app.
+/// The key bindings in force: the defaults, with init.lua's over them,
+/// which follow the daemon's `config.changed`.
+keymap: binding.Keymap,
+/// What local sessions run, in CreateProcessW syntax; empty for the
+/// daemon's shell. Outlives the app.
 local_command: []const u16,
 /// The SSH hosts the sidebar lists. Outlives the app.
 hosts: *Hosts,
@@ -114,6 +118,9 @@ mode: Mode = .terminal,
 /// The connection to slime: local sessions are panes of the workspaces
 /// it holds, those shown here. Null if it couldn't be reached.
 daemon: ?*Daemon = null,
+/// A connection the window opened for its config before the app
+/// existed, for `start` to go on with; owned until then.
+pending_daemon: ?*Daemon = null,
 /// The workspaces every connection lists, the local daemon's and each
 /// host's, each daemon's in its order. The shown ones are attached on
 /// their connection, their tabs in `tabs`; the rest are a row each in
@@ -527,6 +534,11 @@ const GridSize = struct { cols: u16, rows: u16 };
 pub const Options = struct {
     alloc: Allocator,
     config: *const Config,
+    /// init.lua's bindings, from the daemon's config.
+    keymap: []const binding.Entry = &.{},
+    /// The connection the config came from, if one was made: the app
+    /// owns it from here, and `start` goes on with it.
+    daemon: ?*Daemon = null,
     local_command: []const u16,
     hosts: *Hosts,
     shown: *Shown,
@@ -542,9 +554,14 @@ pub const Options = struct {
 };
 
 pub fn init(opts: Options) !App {
+    var keymap: binding.Keymap = try .init(opts.alloc);
+    errdefer keymap.deinit();
+    try keymap.apply(opts.keymap);
     return .{
         .alloc = opts.alloc,
         .config = opts.config,
+        .keymap = keymap,
+        .pending_daemon = opts.daemon,
         .local_command = opts.local_command,
         .hosts = opts.hosts,
         .shown = opts.shown,
@@ -562,16 +579,20 @@ pub fn init(opts: Options) !App {
     };
 }
 
-/// Connect to slime and show the workspaces the last window did (or
-/// what slime has, or a new one running `command_line`, CreateProcessW
-/// syntax). An `ssh://` URL opens that host too, and is remembered in
-/// `hosts`. After `layout`, so the panes get their sizes.
+/// Connect to slime (or go on with the connection the window opened for
+/// its config, `Options.daemon`) and show the workspaces the last window
+/// did (or what slime has, or a new one running `command_line`,
+/// CreateProcessW syntax; empty for slime's shell). An `ssh://` URL
+/// opens that host too, and is remembered in `hosts`. After `layout`,
+/// so the panes get their sizes.
 pub fn start(self: *App, command_line: []const u16) !void {
     // Hosts are reached through the local daemon too, so a host URL still
     // shows the local workspaces, and opens the host beside them.
     const ssh_scheme = std.unicode.utf8ToUtf16LeStringLiteral("ssh://");
     const on_host = std.mem.startsWith(u16, command_line, ssh_scheme);
-    try self.connectDaemon(if (on_host) self.local_command else command_line);
+    const opened = self.pending_daemon;
+    self.pending_daemon = null;
+    try self.connectDaemon(if (on_host) self.local_command else command_line, opened);
     errdefer self.destroyTabs();
     if (self.daemon) |conn| conn.hostList();
     if (on_host) try self.openOnHost(try self.hosts.add(command_line));
@@ -585,6 +606,7 @@ pub fn deinit(self: *App) void {
     // Hanging up detaches the workspaces; slime keeps them for the next
     // window.
     if (self.daemon) |conn| conn.deinit();
+    if (self.pending_daemon) |conn| conn.deinit();
     for (self.workspaces.items) |w| self.alloc.free(w.name);
     self.workspaces.deinit(self.alloc);
     for (self.remotes.items) |r| r.conn.deinit();
@@ -596,6 +618,7 @@ pub fn deinit(self: *App) void {
     self.host_states.deinit(self.alloc);
     self.arena.deinit();
     self.placement.deinit(self.alloc);
+    self.keymap.deinit();
     self.* = undefined;
 }
 
@@ -805,11 +828,19 @@ const Target = union(enum) {
     failed: struct { title: []const u16, why: []const u8 },
 };
 
-/// Connect to slime and show the workspaces the last window did (else
-/// what slime has, else a new one running `command`), making a tab of
-/// each of their tabs. If that fails, a tab says why.
-fn connectDaemon(self: *App, command: []const u16) !void {
-    const conn = Daemon.connect(self.alloc, self.notify, self.shell.frameInterval(), self.daemonArea(), self.daemonSize(), command, self.shown.wanted(null)) catch |err| {
+/// Connect to slime (or go on with `opened`) and show the workspaces the
+/// last window did (else what slime has, else a new one running
+/// `command`), making a tab of each of their tabs. If that fails, a tab
+/// says why.
+fn connectDaemon(self: *App, command: []const u16, opened: ?*Daemon) !void {
+    const conn = if (opened) |c| begin: {
+        c.begin(self.notify, self.shell.frameInterval(), self.daemonArea(), self.daemonSize(), command, self.shown.wanted(null)) catch |err| {
+            log.err("attaching to slime failed: {}", .{err});
+            c.deinit();
+            return self.spawnFailed("couldn't attach to slime", err);
+        };
+        break :begin c;
+    } else Daemon.connect(self.alloc, self.notify, self.shell.frameInterval(), self.daemonArea(), self.daemonSize(), command, self.shown.wanted(null)) catch |err| {
         log.err("connecting to slime failed: {}", .{err});
         return self.spawnFailed("couldn't start slime", err);
     };
@@ -1189,7 +1220,7 @@ fn confirmKey(self: *App, d: *Dialog, vk: u32) bool {
 /// Open `target`'s context menu at `anchor`, with the entries for what
 /// it is now. Takes the keyboard from a field or dialog.
 fn openMenu(self: *App, target: Id.Target, anchor: Menu.Anchor) void {
-    var m: Menu = .{ .target = target, .anchor = anchor };
+    var m: Menu = .{ .target = target, .anchor = anchor, .keys = self.keymap.bindings.items };
     switch (target) {
         // Local's header makes a workspace, or a tab with no daemon to
         // list workspaces, as its button does.
@@ -1706,7 +1737,7 @@ fn newSession(self: *App) void {
 /// it can't be had.
 fn localDaemon(self: *App) ?*Daemon {
     const conn = self.daemon orelse {
-        self.connectDaemon(self.local_command) catch |err| log.err("new session failed: {}", .{err});
+        self.connectDaemon(self.local_command, null) catch |err| log.err("new session failed: {}", .{err});
         return null;
     };
     if (conn.isLost()) {
@@ -1815,6 +1846,13 @@ fn bridgeHost(self: *App, e: *HostEntry, make: bool) !void {
 /// connections lost.
 fn daemonPosted(self: *App) void {
     if (self.daemon) |conn| {
+        if (conn.takeKeymap()) |entries| {
+            defer Daemon.freeKeymap(self.alloc, entries);
+            // An open menu names keys from the bindings being replaced.
+            self.closeMenu();
+            self.keymap.apply(entries) catch |err| log.err("applying the keymap failed: {}", .{err});
+            self.markDirty();
+        }
         self.workspacesChanged(conn);
         self.daemonChanged(conn);
         self.hostsChanged(conn);
@@ -2525,9 +2563,9 @@ fn outputArrived(self: *App) void {
     }
 }
 
-/// Run the key binding a key press triggers (see `binding.defaults`).
-/// Returns true if the key is consumed, which also holds for the release
-/// of a key that ran a binding.
+/// Run the key binding a key press triggers (`keymap`). Returns true if
+/// the key is consumed, which also holds for the release of a key that
+/// ran a binding.
 fn keyBinding(self: *App, msg: u32, wparam: win32.WPARAM) bool {
     const vk: u32 = @truncate(wparam);
     if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) {
@@ -2536,7 +2574,7 @@ fn keyBinding(self: *App, msg: u32, wparam: win32.WPARAM) bool {
         return true;
     }
 
-    const b = binding.find(&binding.defaults, vk, self.shell.mods()) orelse return false;
+    const b = self.keymap.find(vk, self.shell.mods()) orelse return false;
     if (!self.runAction(b.action) and b.performable) return false;
 
     // Drop the text TranslateMessage posted for the key (ctrl+shift+c
@@ -2548,8 +2586,16 @@ fn keyBinding(self: *App, msg: u32, wparam: win32.WPARAM) bool {
 
 /// Returns false if the action couldn't run: copy with no selection,
 /// paste with no text on the clipboard, a pane action in a tab slime
-/// doesn't run, or with nothing shown.
+/// doesn't run, or with nothing shown. init.lua's actions always run,
+/// in the daemon, for the focused pane if it's the local daemon's.
 fn runAction(self: *App, action: binding.Action) bool {
+    switch (action) {
+        .lua, .invoke => {
+            self.invokeInDaemon(action);
+            return true;
+        },
+        else => {},
+    }
     const s = self.focusedSession() orelse switch (action) {
         .new_tab => {
             self.newSession();
@@ -2595,8 +2641,29 @@ fn runAction(self: *App, action: binding.Action) bool {
         }, r.amount),
         .equalize_splits => self.equalizePanes(),
         .toggle_split_zoom => if (self.activeTab().count() > 1 or self.activeTab().zoom != null) self.toggleZoom(s),
+        .lua, .invoke => unreachable,
     }
     return true;
+}
+
+/// Ask the local daemon to run one of init.lua's actions or functions,
+/// for the focused pane if it's one of the daemon's own (a host's pane
+/// isn't known there).
+fn invokeInDaemon(self: *App, action: binding.Action) void {
+    const conn = self.daemon orelse return;
+    if (conn.isLost()) return;
+    var pane: Daemon.PaneRef = .none;
+    if (self.hasTabs()) {
+        const t = self.activeTab();
+        if (t.conn == conn) if (self.focusedSession()) |s| if (s.daemonPane()) |p| {
+            pane = p;
+        };
+    }
+    switch (action) {
+        .lua => |id| conn.invoke(id, pane) catch |err| log.err("running binding {d} failed: {}", .{ id, err }),
+        .invoke => |inv| conn.invokeAction(inv.name, inv.args, pane) catch |err| log.err("running action {s} failed: {}", .{ inv.name, err }),
+        else => unreachable,
+    }
 }
 
 /// Track keyboard focus: the cursor blinks only while focused and is a
@@ -3410,7 +3477,7 @@ pub const TestShell = struct {
 
 /// An app with no window, daemon, or tabs, on `shell`.
 pub const TestApp = struct {
-    config: Config = .{ ._arena = .init(std.testing.allocator) },
+    config: Config = .init(std.testing.allocator),
     hosts: Hosts,
     shown: Shown,
     ui: Ui,

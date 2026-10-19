@@ -33,29 +33,30 @@ func doCommand() *cobra.Command {
 		detach bool
 	)
 	cmd := &cobra.Command{
-		Use:   "do <file.lua | -> [key=value...]",
-		Short: "Run a Lua script in the daemon",
+		Use:   "do <file.lua | - | action> [key=value...]",
+		Short: "Run a Lua script, or an action init.lua defined, in the daemon",
 		Long: "Runs Lua in the daemon, against its workspaces (slime help lua has the slime\n" +
-			"table): a file, code given with -e, or stdin as -. Arguments are key=value pairs,\n" +
-			"strings in slime.args. Inside a pane, the script runs for that pane (SLIME_PANE),\n" +
-			"so calls that take a pane, tab, or workspace id default to it. What the script\n" +
-			"prints comes here; its return value prints at the end; an error exits 1.\n" +
-			"Ctrl+C cancels it, unless it was started with --detach.",
+			"table): a file, code given with -e, stdin as -, or an action init.lua defined\n" +
+			"(slime actions lists them), named by a bare word that isn't a file. Arguments\n" +
+			"are key=value pairs, strings in slime.args (an action's args, converted as its\n" +
+			"spec says). Inside a pane, the script runs for that pane (SLIME_PANE), so calls\n" +
+			"that take a pane, tab, or workspace id default to it. What the script prints\n" +
+			"comes here; its return value prints at the end; an error exits 1. Ctrl+C\n" +
+			"cancels it, unless it was started with --detach.",
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name, source, rest, err := scriptSource(code, args)
 			if err != nil {
 				return err
 			}
-			params := rpc.ScriptRunParams{Source: source, Name: name, Detach: detach}
+			id := envPane()
 			if pane != "" {
-				if params.Pane, err = rpc.ParsePaneID(pane); err != nil {
+				if id, err = rpc.ParsePaneID(pane); err != nil {
 					return err
 				}
-			} else {
-				params.Pane = envPane()
 			}
-			if params.Args, err = scriptArgs(rest); err != nil {
+			scriptArgs, err := scriptArgs(rest)
+			if err != nil {
 				return err
 			}
 			c, err := connect(true)
@@ -64,8 +65,17 @@ func doCommand() *cobra.Command {
 			}
 			defer c.Close()
 			var started rpc.ScriptRunResult
-			if err := c.Call(rpc.ScriptRun, params, &started); err != nil {
-				return err
+			if source == "" {
+				// A bare word: an action.
+				p := rpc.ActionInvokeParams{Name: name, Args: scriptArgs, Pane: id, Origin: "cli"}
+				if err := c.Call(rpc.ActionInvoke, p, &started); err != nil {
+					return err
+				}
+			} else {
+				params := rpc.ScriptRunParams{Source: source, Name: name, Args: scriptArgs, Pane: id, Detach: detach}
+				if err := c.Call(rpc.ScriptRun, params, &started); err != nil {
+					return err
+				}
 			}
 			if detach {
 				if jsonOut {
@@ -104,14 +114,15 @@ func envWorkspace() uint32 {
 }
 
 // scriptSource picks the script: code, else the first argument as a
-// file (- for stdin). It returns the chunk name, the source, and the
-// arguments left.
+// file (- for stdin), else, for a bare word that isn't a file, an
+// action by that name, with no source. It returns the chunk or action
+// name, the source, and the arguments left.
 func scriptSource(code string, args []string) (name, source string, rest []string, err error) {
 	if code != "" {
 		return "(command line)", code, args, nil
 	}
 	if len(args) == 0 {
-		return "", "", nil, errors.New("a script file, -, or -e code is needed")
+		return "", "", nil, errors.New("a script file, -, -e code, or an action's name is needed")
 	}
 	path, rest := args[0], args[1:]
 	if path == "-" {
@@ -124,7 +135,7 @@ func scriptSource(code string, args []string) (name, source string, rest []strin
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && !strings.ContainsAny(path, `/\.`) {
-			return "", "", nil, fmt.Errorf("no file %q (actions by name come with init.lua)", path)
+			return path, "", rest, nil
 		}
 		return "", "", nil, err
 	}

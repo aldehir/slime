@@ -51,7 +51,7 @@ pub fn size(ui: *const Ui, m: *const Menu) Size {
         .entry => |e| {
             h += ui.px(entry_height);
             var ew = 2 * ui.px(entry_pad_x) + ui.px(icon_column) + @ceil(f.measure(e.label, f.get(.body)));
-            const key = e.key();
+            const key = m.keyOf(e);
             if (key.len > 0) ew += ui.px(key_gap) + @ceil(f.measure(key.slice(), f.get(.tip)));
             w = @max(w, ew);
         },
@@ -166,7 +166,7 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
         }
         const label_x = inner.x + ui.px(icon_column);
         var label_w = inner.right() - label_x;
-        const key = e.key();
+        const key = m.keyOf(e);
         if (key.len > 0) {
             const key_w = @ceil(f.measure(key.slice(), f.get(.tip)));
             p.text(key.slice(), f.get(.tip), .{ .x = inner.right() - key_w, .y = inner.y, .w = key_w, .h = inner.h }, if (e.disabled) t.text_inactive else t.text_muted);

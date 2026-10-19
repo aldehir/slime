@@ -56,11 +56,75 @@ THE SLIME TABLE
                              arguments joined by tabs like print
   slime.stop([result])       ends the run successfully, with result as its
                              return value
+  slime.invoke(name, args)   runs an action init.lua defined (below), for this
+                             script's pane, and returns what it returned, or
+                             nil, message, code; its output is the script's
 
 Calls return the result table, or nil, message, code (see slime help
 methods for the codes). Wrap in assert(...) when failure should end the
 script. The namespaces are metatables: any method the daemon has works,
 including ones added later, without a Lua-side list.
+
+INIT.LUA
+
+The daemon evaluates init.lua (slime config path; SLIME_CONFIG overrides)
+when it starts and on slime config reload, in a state of its own that
+lives as long as the config: the functions the file hands to bind and
+action are called again from it for every key press and slime do. It
+has the slime table above (ids are nil at the top level) and these,
+which are for the top level only:
+
+  slime.config{...}          the settings, one table, merged over earlier
+                             calls key by key (lists replace). The daemon takes
+                             shell.command (what a pane runs when nothing says);
+                             each window takes what it understands and ignores
+                             the rest (slime-gui: font, theme, colors, window,
+                             chrome, selection, clipboard, ssh). Values must be
+                             JSON: no functions.
+  slime.bind(key, action[, args])
+                             key (a chord: "ctrl+shift+d"; modifiers ctrl,
+                             shift, alt, super/win, then a key name) runs a
+                             window action by name with args (slime-gui's:
+                             new_tab, new_split {direction}, close_surface,
+                             next_tab, previous_tab, goto_split {direction},
+                             resize_split {direction, amount}, equalize_splits,
+                             toggle_split_zoom, copy_to_clipboard,
+                             paste_from_clipboard, increase_font_size {amount},
+                             decrease_font_size {amount}, reset_font_size), or
+                             else an action of this file by name. A later bind
+                             of the key replaces the earlier, and the window's
+                             default for it.
+  slime.bind(key, fn)        key runs fn(ctx, args) in the daemon; a function
+                             binding always consumes its key
+  slime.unbind(key)          key does nothing, even if the window binds it
+  slime.action{name, title, args, run}
+                             an action: slime do <name> key=value..., a bound
+                             key, and slime.invoke run run(ctx, args), and print
+                             what it returns. args is a spec for listing and
+                             for converting the CLI's strings: {n = "number",
+                             on = "boolean", file = "string"}.
+
+ctx is {workspace_id, tab_id, pane_id, origin}: the pane the action runs
+for (a window's focused pane, slime do's SLIME_PANE, a script's own),
+also filled into slime.pane_id and the rest while it runs; origin is key,
+cli, script, or api. require, dofile, and loadfile find files beside
+init.lua. A file that fails leaves the last good config in place (the
+daemon's log and slime config show say why); slime config check tries
+one without applying it.
+
+  slime.config{
+    font = { family = { "Cascadia Code", "Consolas" }, size = 12, antialias = "grayscale" },
+    theme = "Catppuccin Mocha",      -- a Ghostty theme file under themes/ (its file name)
+    colors = { background = "#282c34", cursor = "#ffcc00" },
+    window = { padding = { x = 3, y = 3 } },
+    chrome = { scale = 1 },
+    shell = { command = "pwsh -NoLogo" },
+  }
+  slime.bind("ctrl+shift+d", "new_split", { direction = "right" })
+  slime.bind("ctrl+shift+t", "new_tab")
+  slime.bind("ctrl+alt+l", function(ctx, args) slime.invoke("dev", { file = "app.log" }) end)
+  slime.action{ name = "dev", title = "Dev layout", args = { file = "string" },
+    run = function(ctx, args) return dofile("dev.lua") end }
 
 Values cross as JSON. Numbers are doubles; workspace ids are numbers,
 tab and pane ids strings, compared with ==. A table whose keys are
@@ -74,7 +138,7 @@ script is never a viewer: slime.workspace.new needs tabs; run from a
 pane, the windows on that pane's workspace open the new one, otherwise
 it starts detached. A script's split, tab.new, and move don't take the
 focus (a window's own do). subscribe, hooks, wait, timers, and exec are
-not available yet.
+not available yet; slime.config, bind, unbind, and action are init.lua's.
 
 EXAMPLES
 
@@ -139,12 +203,9 @@ func (r *Runner) install(ctx Context) {
 		}
 	}
 	slime.RawSetString("args", args)
-	if !ctx.Pane.IsZero() {
-		slime.RawSetString("workspace_id", glua.LNumber(ctx.Pane.WS))
-		slime.RawSetString("tab_id", glua.LString(ctx.Pane.TabID().String()))
-		slime.RawSetString("pane_id", glua.LString(ctx.Pane.String()))
-	}
+	r.SetPane(ctx.Pane)
 	slime.RawSetString("call", L.NewFunction(r.luaCall))
+	slime.RawSetString("invoke", L.NewFunction(r.luaInvoke))
 	for _, group := range []string{"workspace", "tab", "pane"} {
 		slime.RawSetString(group, r.namespace(group))
 	}
@@ -265,6 +326,28 @@ func (r *Runner) call(L *glua.LState, method string, params *glua.LTable) int {
 		raw = b
 	}
 	result, err := r.host.Call(method, raw)
+	return pushResult(L, method, result, err)
+}
+
+// luaInvoke is slime.invoke(name, args): an action of the config file,
+// run by the daemon, with what it returned.
+func (r *Runner) luaInvoke(L *glua.LState) int {
+	name := L.CheckString(1)
+	var raw json.RawMessage
+	if args := L.OptTable(2, nil); args != nil {
+		b, err := toJSON(args)
+		if err != nil {
+			return pushError(L, fmt.Sprintf("invoke %s: args: %v", name, err), 0)
+		}
+		raw = b
+	}
+	result, err := r.host.Invoke(name, raw)
+	return pushResult(L, "invoke "+name, result, err)
+}
+
+// pushResult pushes what a call to the host returned: its result as a
+// Lua value, or nil, the error's message, and its code.
+func pushResult(L *glua.LState, what string, result json.RawMessage, err error) int {
 	if err != nil {
 		var rerr *rpc.Error
 		if errors.As(err, &rerr) {
@@ -272,9 +355,13 @@ func (r *Runner) call(L *glua.LState, method string, params *glua.LTable) int {
 		}
 		return pushError(L, err.Error(), 0)
 	}
+	if len(result) == 0 {
+		L.Push(glua.LNil)
+		return 1
+	}
 	v, err := fromJSON(L, result)
 	if err != nil {
-		return pushError(L, fmt.Sprintf("%s: result: %v", method, err), 0)
+		return pushError(L, fmt.Sprintf("%s: result: %v", what, err), 0)
 	}
 	L.Push(v)
 	return 1
