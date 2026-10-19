@@ -100,10 +100,6 @@ pub const IVisual3 = extern struct {
         return com.call(self, 30, fn (f32) HRESULT, .{opacity});
     }
 
-    pub fn setVisible(self: *IVisual3, visible: bool) HRESULT {
-        return com.call(self, 33, fn (win32.BOOL) HRESULT, .{if (visible) win32.TRUE else win32.FALSE});
-    }
-
     pub fn visual(self: *IVisual3) *IVisual {
         return @ptrCast(self);
     }

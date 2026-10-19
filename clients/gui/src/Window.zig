@@ -113,6 +113,8 @@ output_event: win32.HANDLE,
 /// for leaving the caption buttons.
 tracking_mouse: bool = false,
 tracking_nc_mouse: bool = false,
+/// The idle timer (`armIdle`) is set.
+idle_armed: bool = false,
 
 /// Only used with `-Dstats`.
 stats: Stats = .{},
@@ -505,12 +507,14 @@ fn idleMs(self: *const Window) u64 {
 /// Wake when the next hidden browser has been hidden `browser.idle`.
 fn armIdle(self: *Window) void {
     const hwnd = self.hwnd orelse return;
+    // Called every frame, so the timer is only killed when it's set.
     const left = self.web.nextIdle(win32.GetTickCount64(), self.idleMs()) orelse {
-        _ = win32.KillTimer(hwnd, idle_timer_id);
+        if (self.idle_armed) _ = win32.KillTimer(hwnd, idle_timer_id);
+        self.idle_armed = false;
         return;
     };
     // USER_TIMER_MINIMUM is 10 ms.
-    _ = win32.SetTimer(hwnd, idle_timer_id, @intCast(@max(10, @min(left, std.math.maxInt(u31)))), null);
+    self.idle_armed = win32.SetTimer(hwnd, idle_timer_id, @intCast(@max(10, @min(left, std.math.maxInt(u31)))), null) != 0;
 }
 
 /// Keep the keyboard focus where the app says the keys go: in the
@@ -1171,6 +1175,8 @@ fn handle(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM
             self.hwnd = null;
             win32.PostQuitMessage(0);
             return 0;
+            // Its timers went with it.
+            self.idle_armed = false;
         },
 
         else => return win32.DefWindowProcW(hwnd, msg, wparam, lparam),

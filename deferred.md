@@ -104,10 +104,12 @@ than being piecemealed with MessageBox and the like.
 - **The system's font smoothing setting** isn't followed:
   `font-antialias` defaults to grayscale whatever Windows uses.
 - **Gamma and contrast** tuning for text.
-- **ClearType over browser panes.** While the window has one (shown or
-  hidden by a zoom), menus, dialogs, and tooltips draw into a
-  transparent overlay chain, where Direct2D can't blend ClearType, so
-  their text is grayscale.
+- **ClearType over browser panes.** While a browser pane is placed,
+  menus, dialogs, and tooltips draw into a transparent overlay chain,
+  where Direct2D can't blend ClearType, so their text is grayscale. A
+  tab or zoom that hides every browser pane removes the overlay, so its
+  UI draws with ClearType again; the cost is that hiding and showing
+  tears the overlay chain down and recreates it (two clear presents).
 - **Independent flip for the composition chain.** Its `Present` takes
   `ALLOW_TEARING`, but whether DWM still promotes it to an independent
   flip (maximized, VRR) is unmeasured; it needs a display, not a remote

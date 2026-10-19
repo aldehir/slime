@@ -987,9 +987,6 @@ pub const PaneVisual = struct {
     radius: f32,
     /// Below 1, the ground under it shows through: an unfocused pane.
     opacity: f32 = 1,
-    /// False hides it and stops its content rendering, as zoom does to
-    /// the other panes.
-    visible: bool = true,
 };
 
 const PaneVisualEntry = struct {
@@ -1018,7 +1015,6 @@ const PaneVisualEntry = struct {
         try com.check(c.setBottomRightRadiusX(p.radius), "IDCompositionRectangleClip::SetBottomRightRadiusX");
         try com.check(c.setBottomRightRadiusY(p.radius), "IDCompositionRectangleClip::SetBottomRightRadiusY");
         try com.check(self.visual.setOpacity(p.opacity), "IDCompositionVisual3::SetOpacity");
-        try com.check(self.visual.setVisible(p.visible), "IDCompositionVisual3::SetVisible");
         self.props = p;
     }
 };
@@ -1028,8 +1024,10 @@ const PaneVisualEntry = struct {
 /// the overlay chain, so the UI over panes is drawn over it from the next
 /// frame. The caller hangs the pane's own visual under the one returned,
 /// which stays the same until `removePaneVisual`. Call again whenever the
-/// layout, focus, or zoom changes; the tree is committed with the next
-/// `draw` or `commit`.
+/// layout or focus changes; the tree is committed with the next `draw`
+/// or `commit`. A pane a tab switch or a zoom hides is removed, not
+/// hidden, so a window showing none has no overlay and its UI gets
+/// ClearType back.
 pub fn setPaneVisual(self: *D3D11, key: u64, props: PaneVisual) Error!*dcomp.IVisual {
     for (self.pane_visuals.items) |*e| if (e.key == key) {
         if (!std.meta.eql(e.props, props)) {
