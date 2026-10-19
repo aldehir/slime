@@ -3249,9 +3249,10 @@ fn layoutTab(self: *App, t: *Tab) void {
 /// Place tab `t`'s panes in the terminal area, into `into`, and fit
 /// their grids to them. Each pane's terminal is under its title strip,
 /// padded by the geometry's padding (but for the chrome's inset at the
-/// top, which the strip stands in for), and the grid is centered in
-/// what's left, so the part of a cell that doesn't fit is split between
-/// opposite edges rather than all at the right and bottom.
+/// top, which the strip stands in for), and the grid is anchored at the
+/// top left of what's left, with the part of a cell that doesn't fit
+/// all at the right and bottom, so a resize never moves the text that
+/// stays.
 fn placeTab(self: *App, t: *Tab, into: *Placement) void {
     const g = &self.geometry;
     t.place(self.alloc, into, g.pane_area, g.gap) catch |err| {
@@ -3269,13 +3270,11 @@ fn placeTab(self: *App, t: *Tab, into: *Placement) void {
         const h = @as(u32, @intFromFloat(p.rect.h)) -| pad.top -| pad.bottom;
         p.cols = @intCast(std.math.clamp(w / m.width, 1, std.math.maxInt(u16)));
         p.rows = @intCast(std.math.clamp(h / m.height, 1, std.math.maxInt(u16)));
-        const spare_x = w -| @as(u32, p.cols) * m.width;
-        const spare_y = h -| @as(u32, p.rows) * m.height;
         p.pad = .{
-            .left = pad.left + spare_x / 2,
-            .right = pad.right + spare_x - spare_x / 2,
-            .top = pad.top + spare_y / 2,
-            .bottom = pad.bottom + spare_y - spare_y / 2,
+            .left = pad.left,
+            .right = pad.right + (w -| @as(u32, p.cols) * m.width),
+            .top = pad.top,
+            .bottom = pad.bottom + (h -| @as(u32, p.rows) * m.height),
         };
         p.session.resize(p.*);
     }

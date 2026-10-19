@@ -31,8 +31,8 @@ pub const Pane = struct {
     /// Its terminal, under the strip. Filled in after `Tab.place`, with
     /// the rest.
     rect: Rect = .{},
-    /// The space around the grid in `rect`: the configured padding plus
-    /// what's left over of a cell, split between opposite edges.
+    /// The space around the grid in `rect`: the configured padding, plus
+    /// what's left over of a cell at the right and bottom.
     pad: Padding = .{},
     /// The grid that fits.
     cols: u16 = 0,
