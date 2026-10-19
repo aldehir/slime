@@ -89,8 +89,9 @@ func hostCommands() []*cobra.Command {
 				return err
 			}
 			var id uint32
+			dest := rpc.NormalizeDest(args[0])
 			for _, h := range hosts.Hosts {
-				if strconv.FormatUint(uint64(h.ID), 10) == args[0] || h.Dest == args[0] {
+				if strconv.FormatUint(uint64(h.ID), 10) == args[0] || h.Dest == dest {
 					id = h.ID
 				}
 			}

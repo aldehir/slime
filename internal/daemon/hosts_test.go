@@ -161,7 +161,8 @@ func newHostHarness(t *testing.T, sshOpts sshtest.Options, idle time.Duration) *
 		Spawn: func(o pty.Options) (pty.Pty, error) { return newFakePty(o), nil },
 		Idle:  idle,
 		Hosts: HostOptions{Resolve: func(dest string) (sshbridge.Options, error) {
-			if !strings.HasPrefix(dest, "dev") {
+			// Named as the daemon names hosts (rpc.NormalizeDest).
+			if !strings.HasPrefix(dest, "ssh://dev") {
 				return sshbridge.Options{}, fmt.Errorf("no such host %q", dest)
 			}
 			return sshbridge.Options{
@@ -230,7 +231,7 @@ func subscribeHosts(t *testing.T, c *Client) {
 }
 
 // hostConnect asks for dest, subscribed to what follows, and returns
-// the host's id from the reply.
+// the host's id from the reply, which names the host as ssh://.
 func hostConnect(t *testing.T, c *Client, dest string) uint32 {
 	t.Helper()
 	subscribeHosts(t, c)
@@ -238,8 +239,8 @@ func hostConnect(t *testing.T, c *Client, dest string) uint32 {
 	if err := c.Call(rpc.HostConnect, rpc.HostConnectParams{Dest: dest}, &h); err != nil {
 		t.Fatal(err)
 	}
-	if h.Dest != dest {
-		t.Fatalf("host.connect answered for %q, want %q", h.Dest, dest)
+	if want := rpc.NormalizeDest(dest); h.Dest != want {
+		t.Fatalf("host.connect answered for %q, want %q", h.Dest, want)
 	}
 	return h.ID
 }
@@ -553,8 +554,8 @@ func TestHostDisconnect(t *testing.T) {
 		t.Errorf("gone with %q", st.Text)
 	}
 	expectBridgeClosed(t, b)
-	// Connecting again keeps the id.
-	if again := h.login(c, "dev1"); again != id {
+	// Connecting again keeps the id, however the destination is spelled.
+	if again := h.login(c, "ssh://dev1"); again != id {
 		t.Errorf("reconnected as host %d, want %d", again, id)
 	}
 }

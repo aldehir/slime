@@ -98,6 +98,8 @@ func (s *Server) hostConnect(cl *callCtx, m rpc.HostConnectParams) (*rpc.Host, e
 	if m.Dest == "" {
 		return nil, rpc.Errorf(rpc.CodeInvalidParams, "host.connect needs a destination")
 	}
+	// One host however it's spelled: hosts are matched by destination.
+	m.Dest = rpc.NormalizeDest(m.Dest)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var h *host

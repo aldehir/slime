@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Request is a Call's payload. ID is the caller's; a Reply echoes it.
@@ -802,6 +803,15 @@ type Host struct {
 // logging in is cancelled.
 type HostConnectParams struct {
 	Dest string `json:"dest"`
+}
+
+// NormalizeDest is a destination as the daemon names hosts: with its
+// ssh:// scheme, so one spelled bare is the same host.
+func NormalizeDest(dest string) string {
+	if strings.Contains(dest, "://") {
+		return dest
+	}
+	return "ssh://" + dest
 }
 
 // HostParams names a host: disconnect.
