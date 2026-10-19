@@ -34,8 +34,8 @@ pub fn build(b: *std.Build) void {
     options.addOption(u32, "max_fps", b.option(
         u32,
         "max-fps",
-        "Frame rate cap (default: 0, the display's refresh rate)",
-    ) orelse 0);
+        "Frame rate cap (default: 300; 0 paces to the display's refresh rate)",
+    ) orelse 300);
     exe_mod.addOptions("build_options", options);
 
     for ([_][]const u8{ "user32", "advapi32", "d3d11", "dxgi", "dwmapi", "dwrite", "d3dcompiler", "d2d1", "dcomp", "shlwapi", "ole32" }) |lib| {

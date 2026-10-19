@@ -4,11 +4,12 @@
 //! chrome is drawn over the grid with Direct2D, on the same device.
 //!
 //! Frames are presented without vsync and gated twice (see `frameGate`):
-//! by a timer, so we draw at most once per display refresh, and by the
-//! swap chain's frame latency waitable object with a maximum latency of 1,
-//! so nothing queues up behind the display. Input latency stays about one
-//! refresh, and an idle terminal draws the next change immediately. The
-//! timer matters where DWM doesn't pace presents at all, e.g. over Remote
+//! by a timer, so we draw at most once per refresh period (`-Dmax-fps`,
+//! 300 by default; 0 paces to the display), and by the swap chain's
+//! frame latency waitable object with a maximum latency of 1, so nothing
+//! queues up behind the display. Input latency stays about one refresh,
+//! and an idle terminal draws the next change immediately. The timer
+//! matters where DWM doesn't pace presents at all, e.g. over Remote
 //! Desktop, where even vsync'd presents run at thousands of fps.
 //!
 //! The swap chain is the content of a DirectComposition visual, the root
@@ -360,9 +361,9 @@ fn tearingSupported(factory: *dxgi.IFactory2) bool {
     return hr >= 0 and allowed != win32.FALSE;
 }
 
-/// Re-read DWM's composition refresh rate, unless `-Dmax-fps` fixes the
-/// rate. Call when the window may have moved to another display or
-/// display settings changed.
+/// Re-read DWM's composition refresh rate, unless `-Dmax-fps` (300 by
+/// default) fixes the rate. Call when the window may have moved to
+/// another display or display settings changed.
 pub fn updateRefreshRate(self: *D3D11) void {
     if (build_options.max_fps > 0) {
         self.refresh_period = 10_000_000 / build_options.max_fps;

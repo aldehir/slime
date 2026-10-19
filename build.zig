@@ -44,8 +44,8 @@ pub fn build(b: *std.Build) void {
         .@"max-fps" = b.option(
             u32,
             "max-fps",
-            "Frame rate cap (default: 0, the display's refresh rate)",
-        ) orelse 0,
+            "Frame rate cap (default: 300; 0 paces to the display's refresh rate)",
+        ) orelse 300,
     });
     // A dependency installs into a prefix of its own under .zig-cache, so
     // the window and its themes are installed here, into ours, the way

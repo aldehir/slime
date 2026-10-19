@@ -46,6 +46,7 @@ jobs:
           path: |
             zig-pkg
             tools/conpty-*
+            tools/webview2-*
           key: deps-${{ hashFiles('build.zig', 'build.zig.zon', 'clients/gui/build.zig.zon', 'ghostty/build.zig.zon') }}
 
       - name: Check tag matches build.zig.zon

@@ -252,9 +252,10 @@ so; the host's button reconnects, reattaches, and replaces them.
 
 - **Losing the local slime** leaves its panes saying so, and new local
   tabs say so too until the next window, which starts a new daemon.
-- **Frames pace to the display the window started on.** The refresh period
-  goes to slime when connecting, not when the window moves to another
-  display.
+- **Frames pace to the display the window started on**, when built with
+  `-Dmax-fps=0` (the default caps at 300 fps regardless of display). The
+  refresh period goes to slime when connecting, not when the window moves
+  to another display.
 - **A frame that fails to apply** (out of memory, or a bad one) leaves
   the pane wrong until the next full frame, which nothing asks for.
 - **The pwd (OSC 7) and the bell** come from slime but aren't used: a
