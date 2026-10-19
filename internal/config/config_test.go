@@ -70,7 +70,7 @@ func TestMissingFileIsEmpty(t *testing.T) {
 	}
 	defer c.Close()
 	d := c.Desc()
-	if string(d.Settings) != "{}" || len(d.Keymap) != 0 || len(d.Actions) != 0 || c.Shell() != "" {
+	if string(d.Settings) != "{}" || len(d.Keymap) != 0 || len(d.Actions) != 0 || c.Shell() != "" || !c.HostProxy() {
 		t.Errorf("desc %+v", d)
 	}
 	b, _ := json.Marshal(d)
@@ -101,6 +101,9 @@ func TestSettingsAndBindings(t *testing.T) {
 	}
 	if c.Shell() != "pwsh" {
 		t.Errorf("shell %q", c.Shell())
+	}
+	if !c.HostProxy() {
+		t.Error("host.proxy off by default")
 	}
 	want := []rpc.Binding{
 		{Key: "ctrl+shift+d", Action: "new_split", Args: json.RawMessage(`{"direction":"right"}`)},
@@ -280,5 +283,18 @@ func TestSiblingsAndErrors(t *testing.T) {
 	h = &fakeHost{}
 	if _, errs := Load(h, write(t, map[string]string{"init.lua": "print('hi') error('x')"}), nil); errs == nil || len(h.logs) != 1 || h.logs[0] != "hi" {
 		t.Errorf("errs %q, logs %q", errs, h.logs)
+	}
+}
+
+func TestHostProxy(t *testing.T) {
+	for source, want := range map[string]bool{
+		`slime.config{ host = { proxy = false } }`: false,
+		`slime.config{ host = { proxy = true } }`:  true,
+		`slime.config{ host = {} }`:                true,
+	} {
+		c := load(t, &fakeHost{}, map[string]string{"init.lua": source})
+		if c.HostProxy() != want {
+			t.Errorf("%s: proxy %v", source, c.HostProxy())
+		}
 	}
 }

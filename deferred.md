@@ -195,7 +195,14 @@ one.
   never apply, `ProxyCommand` is refused rather than bypassed, and a
   jump host's own `ProxyJump` isn't followed. Certificates
   (`CertificateFile`) and `HostKeyAlias` are ignored.
-- **Agent forwarding, port forwarding, SFTP.**
+- **Agent forwarding, port forwarding, SFTP.** Only the `ssh -D`
+  piece exists: while a host is connected the daemon runs a SOCKS5
+  proxy over its connection, on loopback with no auth (`slime host ls`
+  shows it; `curl --proxy socks5h://127.0.0.1:<port> http://intranet/`
+  reaches what the host reaches, names resolved there; `host.proxy =
+  false` turns it off). A reconnect asks for the same port, remembered
+  only while the daemon lives. `-L` and `-R` forwards, the agent, and
+  SFTP are still to do.
 - **Launching with an `ssh://` URL** attaches the local workspace too,
   since hosts are reached through the local daemon; the host opens
   beside it.

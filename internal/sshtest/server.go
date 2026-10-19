@@ -317,11 +317,16 @@ func (s *Server) forward(nc ssh.NewChannel) {
 		return
 	}
 	go ssh.DiscardRequests(reqs)
+	done := make(chan struct{})
 	go func() {
 		io.Copy(ch, conn)
 		ch.CloseWrite()
+		close(done)
 	}()
 	io.Copy(conn, ch)
+	// A half-close, as sshd passes it on: the far end may still answer.
+	conn.(*net.TCPConn).CloseWrite()
+	<-done
 	conn.Close()
 	ch.Close()
 }

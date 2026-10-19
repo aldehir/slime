@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/aldehir/slime/internal/remote"
 	"github.com/aldehir/slime/internal/rpc"
+	"github.com/aldehir/slime/internal/socks"
 	"github.com/aldehir/slime/internal/sshbridge"
 )
 
@@ -23,7 +26,9 @@ import (
 // spliced to `slime connect` on the host. The connection lives until
 // the host hangs up or a client asks (host.disconnect), whatever
 // windows come and go. Every change of state goes to the connections
-// subscribed to host.changed.
+// subscribed to host.changed. While connected, a host also has a SOCKS
+// proxy over its connection (rpc.Host.Proxy), for the browser and any
+// local program to reach the host's network.
 
 // HostOptions configures connecting to SSH hosts.
 type HostOptions struct {
@@ -41,13 +46,18 @@ type hostTable struct {
 	opts   HostOptions
 	byID   map[uint32]*host
 	nextID uint32
+	// ports is the port each destination's proxy last listened on,
+	// which its next connection asks for again, so a browser started
+	// with the old address still reaches it. Kept while the daemon
+	// lives.
+	ports map[string]int
 }
 
 func newHostTable(opts HostOptions) hostTable {
 	if opts.Resolve == nil {
 		opts.Resolve = sshbridge.ResolveDestination
 	}
-	return hostTable{opts: opts, byID: map[uint32]*host{}}
+	return hostTable{opts: opts, byID: map[uint32]*host{}, ports: map[string]int{}}
 }
 
 // host is one destination, with the connection to it when there is one.
@@ -72,12 +82,15 @@ type host struct {
 	// the failure that follows is reported as gone.
 	disconnecting bool
 
-	// Once connected.
-	conn *sshbridge.Conn
+	// Once connected; proxy and proxyURL unless the config turned the
+	// proxy off or it couldn't listen.
+	conn     *sshbridge.Conn
+	proxy    *socks.Server
+	proxyURL string
 }
 
 func (h *host) info() rpc.Host {
-	return rpc.Host{ID: h.id, Dest: h.dest, State: h.state, Text: h.text}
+	return rpc.Host{ID: h.id, Dest: h.dest, State: h.state, Text: h.text, Proxy: h.proxyURL}
 }
 
 // hostsActiveLocked counts the hosts that keep the daemon alive: those
@@ -164,13 +177,21 @@ func (s *Server) hostLogin(h *host, gen int, ctx context.Context) {
 	h.conn = conn
 	h.cancel, h.client, h.answers = nil, nil, nil
 	h.state, h.text = HostConnected, ""
+	s.log.Info("host connected", "dest", h.dest, "addr", opts.Dest.Addr())
+	proxy := s.startProxyLocked(h, conn)
 	s.hostChangedLocked(h)
 	s.mu.Unlock()
-	s.log.Info("host connected", "dest", h.dest, "addr", opts.Dest.Addr())
 
 	err = conn.Wait()
+	if proxy != nil {
+		proxy.Close()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if h.proxy == proxy && proxy != nil {
+		s.log.Info("host proxy stopped", "dest", h.dest, "proxy", h.proxyURL)
+		h.proxy, h.proxyURL = nil, ""
+	}
 	if h.gen != gen {
 		return
 	}
@@ -183,6 +204,47 @@ func (s *Server) hostLogin(h *host, gen int, ctx context.Context) {
 	s.log.Info("host ended", "dest", h.dest, "state", h.state, "text", h.text)
 	s.checkIdleLocked()
 	s.hostChangedLocked(h)
+}
+
+// startProxyLocked starts h's SOCKS proxy over conn, on the port its
+// destination had last if that's free, else any. Each CONNECT is a
+// direct-tcpip channel, with names resolved by the host.
+//
+// The listener is loopback-only and unauthenticated, as ssh -D's is:
+// while the host is connected, any local process can tunnel into the
+// host's network through it. Chromium's SOCKS5 client has no
+// username/password support, so nothing stricter would still serve the
+// browser pane; host.proxy = false in the config turns it off.
+func (s *Server) startProxyLocked(h *host, conn *sshbridge.Conn) *socks.Server {
+	if s.config != nil && !s.config.HostProxy() {
+		return nil
+	}
+	var l net.Listener
+	var err error
+	if port := s.hosts.ports[h.dest]; port != 0 {
+		l, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			s.log.Info("host proxy port taken", "dest", h.dest, "port", port, "err", err)
+		}
+	}
+	if l == nil {
+		l, err = net.Listen("tcp", "127.0.0.1:0")
+	}
+	if err != nil {
+		s.log.Warn("host proxy", "dest", h.dest, "err", err)
+		return nil
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	s.hosts.ports[h.dest] = port
+	srv := socks.New(conn.Client().Dial)
+	go func() {
+		if err := srv.Serve(l); err != nil {
+			s.log.Warn("host proxy", "dest", h.dest, "err", err)
+		}
+	}()
+	h.proxy, h.proxyURL = srv, "socks5://"+l.Addr().String()
+	s.log.Info("host proxy started", "dest", h.dest, "proxy", h.proxyURL)
+	return srv
 }
 
 // hostFailed ends attempt gen as failed, saying why, or as gone if a

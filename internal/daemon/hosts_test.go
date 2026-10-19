@@ -141,6 +141,20 @@ func (h *hostHarness) dial() net.Conn {
 
 func newHostHarness(t *testing.T, sshOpts sshtest.Options, idle time.Duration) *hostHarness {
 	t.Helper()
+	return newHostHarnessConfig(t, sshOpts, idle, "")
+}
+
+// newHostHarnessConfig is newHostHarness whose local daemon has
+// init.lua holding config.
+func newHostHarnessConfig(t *testing.T, sshOpts sshtest.Options, idle time.Duration, config string) *hostHarness {
+	t.Helper()
+	var configPath string
+	if config != "" {
+		configPath = filepath.Join(t.TempDir(), "init.lua")
+		if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	remoteH := newHarness(t)
 	host := &fakeHost{daemon: remoteH.srv}
 	sshOpts.Exec = host.exec
@@ -160,8 +174,9 @@ func newHostHarness(t *testing.T, sshOpts sshtest.Options, idle time.Duration) *
 
 	h := &harness{t: t}
 	local, err := NewServer(runtime(t), Options{
-		Spawn: func(o pty.Options) (pty.Pty, error) { return newFakePty(o), nil },
-		Idle:  idle,
+		Spawn:  func(o pty.Options) (pty.Pty, error) { return newFakePty(o), nil },
+		Idle:   idle,
+		Config: configPath,
 		Hosts: HostOptions{Resolve: func(dest string) (sshbridge.Options, error) {
 			// Named as the daemon names hosts (rpc.NormalizeDest).
 			if !strings.HasPrefix(dest, "ssh://dev") {
@@ -319,6 +334,13 @@ func answer(c *Client, id uint32, choice rpc.Choice, answers ...string) error {
 // login connects dest with the password and returns the host's id.
 func (h *hostHarness) login(c *Client, dest string) uint32 {
 	h.t.Helper()
+	return h.loginState(c, dest).ID
+}
+
+// loginState is login, returning the host as host.changed said it
+// connected.
+func (h *hostHarness) loginState(c *Client, dest string) *rpc.Host {
+	h.t.Helper()
 	id := hostConnect(h.t, c, dest)
 	p := awaitPrompt(h.t, c, id)
 	if p.Kind != rpc.PromptPassword {
@@ -327,8 +349,8 @@ func (h *hostHarness) login(c *Client, dest string) uint32 {
 	if err := answer(c, id, rpc.ChoiceAccept, hostPassword); err != nil {
 		h.t.Fatal(err)
 	}
-	awaitState(h.t, c, id, HostConnected)
-	return id
+	_, st := awaitState(h.t, c, id, HostConnected)
+	return st
 }
 
 // bridge opens a second connection bridged to host id and says hello
@@ -645,5 +667,140 @@ func TestHostKeepsDaemonAlive(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("didn't exit once the host was gone")
+	}
+}
+
+// socksConnect asks the SOCKS5 proxy at url (socks5://host:port) to
+// connect to name:port, and returns the tunnel and the reply code.
+func socksConnect(t *testing.T, url, name string, port int) (net.Conn, byte) {
+	t.Helper()
+	c, err := net.Dial("tcp", strings.TrimPrefix(url, "socks5://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	req := []byte{5, 1, 0, 5, 1, 0, 3, byte(len(name))}
+	req = append(req, name...)
+	req = append(req, byte(port>>8), byte(port))
+	if _, err := c.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	// The method chosen, then the reply with an IPv4 address.
+	var rep [2 + 10]byte
+	if _, err := io.ReadFull(c, rep[:]); err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if rep[0] != 5 || rep[1] != 0 {
+		t.Fatalf("method %v", rep[:2])
+	}
+	c.SetDeadline(time.Time{})
+	return c, rep[3]
+}
+
+// A connected host has a proxy, through which a CONNECT reaches what the
+// host reaches, by a name the host resolves; it's gone with the
+// connection.
+func TestHostProxy(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{Forwarding: true}, 0)
+	c := h.connect()
+	st := h.loginState(c, "dev1")
+	if !strings.HasPrefix(st.Proxy, "socks5://127.0.0.1:") {
+		t.Fatalf("connected with proxy %q", st.Proxy)
+	}
+	if hosts := hostList(t, c); len(hosts) != 1 || hosts[0].Proxy != st.Proxy {
+		t.Errorf("hosts = %+v", hosts)
+	}
+
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	go func() {
+		conn, err := target.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.Write([]byte("from the host's network:"))
+		io.Copy(conn, conn)
+	}()
+	tunnel, rep := socksConnect(t, st.Proxy, "localhost", target.Addr().(*net.TCPAddr).Port)
+	if rep != 0 {
+		t.Fatalf("CONNECT replied %d", rep)
+	}
+	tunnel.Write([]byte("hi"))
+	tunnel.(*net.TCPConn).CloseWrite()
+	if got, _ := io.ReadAll(tunnel); string(got) != "from the host's network:hi" {
+		t.Errorf("tunnel read %q", got)
+	}
+	tunnel.Close()
+
+	if err := c.Call(rpc.HostDisconnect, rpc.HostParams{Host: st.ID}, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, gone := awaitState(t, c, st.ID, HostGone)
+	if gone.Proxy != "" {
+		t.Errorf("gone with proxy %q", gone.Proxy)
+	}
+	if conn, err := net.Dial("tcp", strings.TrimPrefix(st.Proxy, "socks5://")); err == nil {
+		conn.Close()
+		t.Error("proxy still listening after disconnect")
+	}
+}
+
+// The tunnel is the host's: one that refuses forwarding refuses the
+// CONNECT.
+func TestHostProxyForwardingRefused(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{}, 0)
+	c := h.connect()
+	st := h.loginState(c, "dev1")
+	if _, rep := socksConnect(t, st.Proxy, "localhost", 80); rep == 0 {
+		t.Error("CONNECT succeeded through a host that forwards nothing")
+	}
+}
+
+// A reconnect asks for the port the destination had, and takes another
+// when that one is taken.
+func TestHostProxyPortKept(t *testing.T) {
+	h := newHostHarness(t, sshtest.Options{Forwarding: true}, 0)
+	c := h.connect()
+	disconnect := func(id uint32) {
+		t.Helper()
+		if err := c.Call(rpc.HostDisconnect, rpc.HostParams{Host: id}, nil); err != nil {
+			t.Fatal(err)
+		}
+		awaitState(t, c, id, HostGone)
+	}
+	first := h.loginState(c, "dev1")
+	disconnect(first.ID)
+	second := h.loginState(c, "dev1")
+	if second.Proxy != first.Proxy {
+		t.Errorf("reconnected with proxy %q, had %q", second.Proxy, first.Proxy)
+	}
+	disconnect(second.ID)
+
+	taken, err := net.Listen("tcp", strings.TrimPrefix(first.Proxy, "socks5://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	third := h.loginState(c, "dev1")
+	if third.Proxy == "" || third.Proxy == first.Proxy {
+		t.Errorf("port taken, reconnected with proxy %q", third.Proxy)
+	}
+}
+
+// host.proxy = false runs none.
+func TestHostProxyOff(t *testing.T) {
+	h := newHostHarnessConfig(t, sshtest.Options{Forwarding: true}, 0, `slime.config{ host = { proxy = false } }`)
+	c := h.connect()
+	st := h.loginState(c, "dev1")
+	if st.Proxy != "" {
+		t.Errorf("connected with proxy %q", st.Proxy)
+	}
+	if hosts := hostList(t, c); len(hosts) != 1 || hosts[0].Proxy != "" {
+		t.Errorf("hosts = %+v", hosts)
 	}
 }
