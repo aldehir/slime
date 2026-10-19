@@ -1050,7 +1050,8 @@ type ConfigDesc struct {
 }
 
 // Binding is one slime.bind: Key as it was written (a chord such as
-// "ctrl+shift+d", which the window parses), and what it runs: Action
+// "ctrl+shift+d", or a sequence of them joined by ">", which the window
+// parses), and what it runs: Action
 // with Args, a window action by name (new_split, copy_to_clipboard,
 // ...) or else a config action to invoke; or Lua, a function the config
 // file gave, which the window runs with action.invoke{lua}. Neither is

@@ -2590,19 +2590,28 @@ fn outputArrived(self: *App) void {
     }
 }
 
-/// Run the key binding a key press triggers (`keymap`). Returns true if
-/// the key is consumed, which also holds for the release of a key that
-/// ran a binding.
-fn keyBinding(self: *App, msg: u32, wparam: win32.WPARAM) bool {
-    const vk: u32 = @truncate(wparam);
-    if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) {
+/// Run the key binding a key press triggers (`keymap`), or take the key
+/// into the sequence it starts or goes on with. Returns true if the key
+/// is consumed, which also holds for the release of a key that ran a
+/// binding or was part of a sequence.
+fn keyBinding(self: *App, k: Msg.Key) bool {
+    const vk: u32 = @truncate(k.wparam);
+    if (k.msg == win32.WM_KEYUP or k.msg == win32.WM_SYSKEYUP) {
         if (self.bound_key != vk) return false;
         self.bound_key = null;
         return true;
     }
 
-    const b = self.keymap.find(vk, self.shell.mods()) orelse return false;
-    if (!self.runAction(b.action) and b.performable) return false;
+    // A modifier on its own is no key of a sequence: ctrl+b then c is
+    // pressed as ctrl, b, c. Escape ends one.
+    if (input.isModifier(k.wparam, k.lparam)) return false;
+    if (vk == win32.VK_ESCAPE and self.keymap.pending().len > 0) {
+        self.keymap.cancel();
+    } else switch (self.keymap.press(vk, self.shell.mods())) {
+        .none => return false,
+        .pending, .cancelled => {},
+        .binding => |b| if (!self.runAction(b.action) and b.performable) return false,
+    }
 
     // Drop the text TranslateMessage posted for the key (ctrl+shift+c
     // gives 0x03).
@@ -2700,8 +2709,10 @@ fn setFocus(self: *App, focused: bool) void {
     self.focused = focused;
     self.markDirty();
     if (!focused) self.hideTip();
-    // Menus go with the focus, as Windows' do.
+    // Menus go with the focus, as Windows' do, and a key sequence under
+    // way.
     if (!focused) self.closeMenu();
+    if (!focused) self.keymap.cancel();
     if (focused) {
         self.resetBlink();
     } else {
@@ -3264,13 +3275,13 @@ fn keyInput(self: *App, k: Msg.Key) Result {
                 .terminal => unreachable,
             };
             if (taken) return .handled;
-            if (self.keyBinding(msg, wparam)) return .handled;
+            if (self.keyBinding(k)) return .handled;
             // Keep alt+F4; the session gets nothing.
             if (msg == win32.WM_SYSKEYDOWN and wparam == win32.VK_F4) return .default;
             return .handled;
         },
     }
-    if (self.keyBinding(msg, wparam)) return .handled;
+    if (self.keyBinding(k)) return .handled;
     // Nothing shown: the keys have nowhere to go but alt+F4.
     if (!self.hasTabs()) {
         if (msg == win32.WM_SYSKEYDOWN and wparam == win32.VK_F4) return .default;
@@ -3399,6 +3410,9 @@ pub const TestShell = struct {
     title_buf: [64]u16 = undefined,
     title_len: usize = 0,
     titles: u32 = 0,
+    /// The modifiers held, as `mods` reports them.
+    held: input.Mods = .{},
+    font_size: f32 = 12,
 
     fn captureMouse(ctx: *anyopaque) void {
         self_(ctx).captured = true;
@@ -3431,8 +3445,8 @@ pub const TestShell = struct {
     fn keyDown(_: *anyopaque, _: i32) bool {
         return false;
     }
-    fn mods(_: *anyopaque) input.Mods {
-        return .{};
+    fn mods(ctx: *anyopaque) input.Mods {
+        return self_(ctx).held;
     }
     fn dragThreshold(_: *anyopaque) [2]i32 {
         return .{ 4, 4 };
@@ -3454,10 +3468,12 @@ pub const TestShell = struct {
     fn frameInterval(_: *anyopaque) u32 {
         return 0;
     }
-    fn fontSize(_: *anyopaque) f32 {
-        return 12;
+    fn fontSize(ctx: *anyopaque) f32 {
+        return self_(ctx).font_size;
     }
-    fn setFontSize(_: *anyopaque, _: f32) void {}
+    fn setFontSize(ctx: *anyopaque, size: f32) void {
+        self_(ctx).font_size = size;
+    }
     fn relayout(_: *anyopaque) void {}
     fn stats(_: *anyopaque) []const u16 {
         return &.{};
@@ -3582,6 +3598,50 @@ test "the connect field opens on its button, takes text, and closes on Escape" {
     // Its release goes nowhere, and alt+F4 is still Windows'.
     try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYUP, .wparam = win32.VK_ESCAPE, .lparam = 0 } }));
     try std.testing.expectEqual(Result.default, app.update(.{ .key = .{ .msg = win32.WM_SYSKEYDOWN, .wparam = win32.VK_F4, .lparam = 0 } }));
+}
+
+test "a key sequence runs its binding on the last key; Escape or losing the focus ends it" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    try app.keymap.apply(&.{.{ .key = "ctrl+b>f1", .action = "increase_font_size", .args = "{\"amount\":2}" }});
+
+    // Pressed as ctrl, b, c: the modifier's own message doesn't end the
+    // sequence, and every key of it is consumed, releases too.
+    const ctrl_lparam: win32.LPARAM = 0x1D << 16;
+    shell.held = .{ .ctrl = true };
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_CONTROL, .lparam = ctrl_lparam } });
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'B', .lparam = 0 } }));
+    try std.testing.expectEqual(1, app.keymap.pending().len);
+    try std.testing.expectEqual(12, shell.font_size);
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYUP, .wparam = 'B', .lparam = 0 } }));
+    shell.held = .{};
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYUP, .wparam = win32.VK_CONTROL, .lparam = ctrl_lparam } });
+    try std.testing.expectEqual(1, app.keymap.pending().len);
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_F1, .lparam = 0 } }));
+    try std.testing.expectEqual(14, shell.font_size);
+    try std.testing.expectEqual(0, app.keymap.pending().len);
+
+    // Escape cancels, and F1 alone then does nothing.
+    shell.held = .{ .ctrl = true };
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'B', .lparam = 0 } });
+    shell.held = .{};
+    try std.testing.expectEqual(1, app.keymap.pending().len);
+    try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_ESCAPE, .lparam = 0 } }));
+    try std.testing.expectEqual(0, app.keymap.pending().len);
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_F1, .lparam = 0 } });
+    try std.testing.expectEqual(14, shell.font_size);
+
+    // So does the focus going.
+    app.setFocus(true);
+    shell.held = .{ .ctrl = true };
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'B', .lparam = 0 } });
+    shell.held = .{};
+    try std.testing.expectEqual(1, app.keymap.pending().len);
+    app.setFocus(false);
+    try std.testing.expectEqual(0, app.keymap.pending().len);
 }
 
 test "the keyboard goes to the host field, a rename, or the kill dialog, one at a time" {

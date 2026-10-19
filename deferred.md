@@ -409,8 +409,15 @@ over `binding.zig`'s defaults, which every window takes up again on
 - **Font fallback families.** Ghostty uses every `font.family` after the
   first as a fallback ahead of the system's; we use the first one that's
   installed and fall back through DirectWrite.
-- **Key sequences and modes** (`ctrl+b>c`), and Ghostty's physical-key
-  triggers: chords are virtual keys with modifiers only.
+- **Key modes** (Rex's `resize/left`, entered and left by actions), and
+  Ghostty's physical-key triggers: chords are virtual keys with
+  modifiers only.
+- **A sequence under way shows nothing**: Rex hints the keys that can
+  follow; a strip or tooltip here needs chrome. And a key that's not
+  in the sequence is dropped with it, not sent on.
+- **Unbinding by prefix** (`slime.unbind("ctrl+b>*")`), and `ctx` for a
+  function bound to a sequence doesn't say which keys ran it (Rex's
+  `ev.prefix`): one function per sequence for now.
 - **`chrome.layout`** (sidebar or tabs) waits on the tabs layout.
 - **A window attached to a host keeps the local settings**; a host's
   `init.lua` can't restyle the panes drawn from it.

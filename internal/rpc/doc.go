@@ -81,7 +81,8 @@ const ShapesDoc = `A workspace id is an integer; a tab id is the string "w.t" an
                   errors?: [string]}
                  settings is slime.config's table (see slime help lua); errors is why
                  the last evaluation failed, the rest then being the last good config
-  Binding        {key, action?, args?, lua?}: a chord ("ctrl+shift+d"), and a window
+  Binding        {key, action?, args?, lua?}: a chord ("ctrl+shift+d") or a sequence
+                 of them ("ctrl+b>c"), and a window
                  action by name with args, a config action to invoke, or lua, a
                  function the window runs with action.invoke{lua}; neither unbinds`
 
