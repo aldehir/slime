@@ -119,8 +119,10 @@ tracking_nc_mouse: bool = false,
 /// The idle timer (`armIdle`) is set.
 idle_armed: bool = false,
 
-/// Only used with `-Dstats`.
+/// The frame stats, shown in the sidebar while `stats_shown`: from the
+/// start with `-Dstats`, else once the palette's command turns them on.
 stats: Stats = .{},
+stats_shown: bool = build_options.stats,
 
 /// Create the window, showing the workspaces the last window did (or
 /// what slime has, or a new one running `command_line`, CreateProcessW
@@ -128,8 +130,8 @@ stats: Stats = .{},
 /// too, and is remembered in `hosts`. Local sessions opened later run
 /// `local_command`. `daemon` is the connection `config` and `keymap`
 /// came from, if one was made; the window owns it from here and goes
-/// on with it.
-pub fn create(alloc: Allocator, io: std.Io, config: *Config, source: Config.Source, keymap: []const binding.Entry, hosts: *Hosts, shown: *Shown, command_line: []const u16, local_command: []const u16, daemon: ?*Daemon) !*Window {
+/// on with it. `actions` are init.lua's, for the command palette.
+pub fn create(alloc: Allocator, io: std.Io, config: *Config, source: Config.Source, keymap: []const binding.Entry, actions: []const Daemon.ConfigAction, hosts: *Hosts, shown: *Shown, command_line: []const u16, local_command: []const u16, daemon: ?*Daemon) !*Window {
     // Ours until the app has it.
     var pending = daemon;
     errdefer if (pending) |conn| conn.deinit();
@@ -193,6 +195,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *Config, source: Config.Sour
         .alloc = alloc,
         .config = config,
         .keymap = keymap,
+        .actions = actions,
         .daemon = pending,
         .local_command = local_command,
         .hosts = hosts,
@@ -202,7 +205,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *Config, source: Config.Sour
         .shell = self.shell(),
         .hwnd = hwnd,
         .output_event = output_event,
-        .stats_bytes = if (build_options.stats) &self.stats.bytes else null,
+        .stats_bytes = &self.stats.bytes,
     });
     pending = null;
     errdefer self.app.deinit();
@@ -221,10 +224,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *Config, source: Config.Sour
     // Have the frame recomputed now that WM_NCCALCSIZE can be answered.
     _ = win32.SetWindowPos(hwnd, null, 0, 0, 0, 0, win32.SWP_FRAMECHANGED | win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
 
-    if (build_options.stats) {
-        self.stats = .init();
-        _ = win32.SetTimer(hwnd, stats_timer_id, 1000, null);
-    }
+    if (self.stats_shown) self.startStats();
 
     _ = win32.ShowWindow(hwnd, win32.SW_SHOWDEFAULT);
     return self;
@@ -469,7 +469,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
     r.waitForFrame();
     const app = &self.app;
     app.dirty = false;
-    const stats = build_options.stats;
+    const stats = self.stats_shown;
     var t: i64 = if (stats) Stats.now() else 0;
     self.frame_panes.clearRetainingCapacity();
     // With nothing shown, the chrome alone is drawn.
@@ -695,6 +695,24 @@ fn paneBox(self: *const Window, shadows: *[2]Renderer.BoxStyle.Shadow) Renderer.
     };
 }
 
+/// Start counting frames for the sidebar's stats, reported once a second.
+fn startStats(self: *Window) void {
+    self.stats = .init();
+    _ = win32.SetTimer(self.hwnd.?, stats_timer_id, 1000, null);
+}
+
+/// Show the frame stats, or stop showing them.
+fn toggleStats(self: *Window) void {
+    self.stats_shown = !self.stats_shown;
+    if (self.stats_shown) {
+        self.startStats();
+    } else {
+        _ = win32.KillTimer(self.hwnd.?, stats_timer_id);
+        self.stats_len = 0;
+    }
+    self.app.markDirty();
+}
+
 /// Take the last second's stats for the sidebar to show.
 fn showStats(self: *Window) void {
     var utf8: [max_stats_len]u8 = undefined;
@@ -755,6 +773,8 @@ const shell_vtable: App.Shell.VTable = .{
     .relayout = shellRelayout,
     .reloadConfig = shellReloadConfig,
     .stats = shellStats,
+    .statsShown = shellStatsShown,
+    .toggleStats = shellToggleStats,
     .webMouse = shellWebMouse,
     .webGo = shellWebGo,
     .webFollow = shellWebFollow,
@@ -882,6 +902,14 @@ fn shellReloadConfig(ctx: *anyopaque, settings: []const u8) void {
 fn shellStats(ctx: *anyopaque) []const u16 {
     const self = fromCtx(ctx);
     return self.stats_text[0..self.stats_len];
+}
+
+fn shellStatsShown(ctx: *anyopaque) bool {
+    return fromCtx(ctx).stats_shown;
+}
+
+fn shellToggleStats(ctx: *anyopaque) void {
+    fromCtx(ctx).toggleStats();
 }
 
 fn shellWebMouse(ctx: *anyopaque, s: *Session, msg: u32, wparam: win32.WPARAM, pos: win32.POINT) void {

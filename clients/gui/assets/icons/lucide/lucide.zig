@@ -2,16 +2,19 @@
 //! the SVG as Lucide ships it: a 24 x 24 view box, stroked in
 //! `currentColor`. Painter recolors and restrokes them as it draws.
 
+pub const activity = @embedFile("activity.svg");
 pub const arrow_left = @embedFile("arrow-left.svg");
 pub const arrow_right = @embedFile("arrow-right.svg");
 pub const check = @embedFile("check.svg");
 pub const clipboard = @embedFile("clipboard.svg");
+pub const code = @embedFile("code.svg");
 pub const columns_2 = @embedFile("columns-2.svg");
 pub const copy = @embedFile("copy.svg");
 pub const eye = @embedFile("eye.svg");
 pub const eye_off = @embedFile("eye-off.svg");
 pub const globe = @embedFile("globe.svg");
 pub const key_round = @embedFile("key-round.svg");
+pub const layers = @embedFile("layers.svg");
 pub const lock = @embedFile("lock.svg");
 pub const maximize_2 = @embedFile("maximize-2.svg");
 pub const minimize_2 = @embedFile("minimize-2.svg");
@@ -22,6 +25,7 @@ pub const plug = @embedFile("plug.svg");
 pub const plus = @embedFile("plus.svg");
 pub const rotate_cw = @embedFile("rotate-cw.svg");
 pub const rows_2 = @embedFile("rows-2.svg");
+pub const search = @embedFile("search.svg");
 pub const shield_alert = @embedFile("shield-alert.svg");
 pub const shield_question_mark = @embedFile("shield-question-mark.svg");
 pub const terminal = @embedFile("terminal.svg");

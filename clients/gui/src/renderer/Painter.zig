@@ -57,6 +57,9 @@ pub const LucideIcons = std.EnumArray(Lucide, Icon);
 /// draw SVG.
 pub fn initLucide(ctx: *d2d1.IDeviceContext) ?LucideIcons {
     var icons: LucideIcons = undefined;
+    // Past 30 or so icons the walk over them is more than comptime's
+    // default budget.
+    @setEvalBranchQuota(4000);
     inline for (comptime std.enums.values(Lucide), 0..) |name, i| {
         icons.set(name, Icon.init(ctx, @field(lucide_svgs, @tagName(name)), 24) orelse {
             for (std.enums.values(Lucide)[0..i]) |done| icons.get(done).deinit();

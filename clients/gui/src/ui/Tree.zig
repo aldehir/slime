@@ -11,6 +11,7 @@ const Painter = @import("../renderer/Painter.zig");
 const TextField = @import("TextField.zig");
 const Dialog = @import("Dialog.zig");
 const Menu = @import("Menu.zig");
+const Palette = @import("Palette.zig");
 const ProgramStatus = @import("../ProgramStatus.zig");
 const Ui = @import("Ui.zig");
 
@@ -60,7 +61,7 @@ pub const Size = struct { w: ?f32 = null, h: ?f32 = null };
 pub const Insets = struct { left: f32 = 0, right: f32 = 0, top: f32 = 0, bottom: f32 = 0 };
 
 /// A text format of the UI's (`Ui.Fonts`).
-pub const Font = enum { body, body_strong, title, section, hint, tip, mono, heading, prose, mono_prose, button, button_strong };
+pub const Font = enum { body, body_strong, title, section, hint, tip, tip_strong, mono, heading, prose, mono_prose, button, button_strong };
 
 pub const Kind = union(enum) {
     /// Children top to bottom; those with no height share what's left.
@@ -96,6 +97,8 @@ pub const Kind = union(enum) {
     dialog: DialogView,
     /// A context menu's box, over everything.
     menu: MenuView,
+    /// The command palette's box, over everything.
+    palette: PaletteView,
     /// The title bar's minimize, maximize, and close.
     caption_button: CaptionButton,
 };
@@ -299,6 +302,14 @@ pub const DialogView = struct {
 
 pub const MenuView = struct {
     menu: *const Menu,
+};
+
+pub const PaletteView = struct {
+    palette: *const Palette,
+    /// The window's regions, which place the box.
+    frame: *const Ui.Frame,
+    /// The field's caret shows.
+    caret: bool,
 };
 
 pub const CaptionButton = struct {

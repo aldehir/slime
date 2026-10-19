@@ -30,6 +30,8 @@ pub const Action = union(enum) {
     resize_split: ResizeSplit,
     equalize_splits,
     toggle_split_zoom,
+    /// Open the command palette, or close it.
+    toggle_command_palette,
     /// A function init.lua bound, which the daemon runs
     /// (action.invoke{lua}) for the focused pane.
     lua: u32,
@@ -130,6 +132,7 @@ pub const defaults = [_]Binding{
     .{ .trigger = .{ .vk = win32.VK_LEFT, .mods = ctrl_alt_shift }, .action = .{ .resize_split = .{ .direction = .left, .amount = 1 } }, .performable = true },
     .{ .trigger = .{ .vk = win32.VK_RIGHT, .mods = ctrl_alt_shift }, .action = .{ .resize_split = .{ .direction = .right, .amount = 1 } }, .performable = true },
     .{ .trigger = .{ .vk = win32.VK_OEM_PLUS, .mods = ctrl_alt_shift }, .action = .equalize_splits, .performable = true },
+    .{ .trigger = .{ .vk = 'P', .mods = ctrl_shift }, .action = .toggle_command_palette },
 };
 
 /// The binding for a key pressed with `mods`, with no sequence under
@@ -316,6 +319,7 @@ pub fn fromName(name: []const u8, args: ?std.json.Value) ?Action {
         .reset_font_size => .reset_font_size,
         .equalize_splits => .equalize_splits,
         .toggle_split_zoom => .toggle_split_zoom,
+        .toggle_command_palette => .toggle_command_palette,
         .increase_font_size => .{ .increase_font_size = argNumber(args, "amount", 1) },
         .decrease_font_size => .{ .decrease_font_size = argNumber(args, "amount", 1) },
         .new_split => .{ .new_split = argEnum(SplitDirection, args, "direction", .right) },

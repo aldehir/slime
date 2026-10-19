@@ -45,6 +45,8 @@ pub const Target = union(enum) {
     dialog: u8,
     /// A context menu's entry, by its index into the menu's items.
     menu: u8,
+    /// The command palette's result, by its index into the results.
+    palette: u16,
 };
 
 /// Which control of the target.
@@ -68,6 +70,11 @@ pub const Part = enum {
     dismiss,
     /// A context menu's box, between its entries.
     menu,
+    /// The command palette's box, between its rows.
+    palette,
+    /// A list's scrollbar: the strip along its right edge, thumb and
+    /// track.
+    scrollbar,
     /// The host field, or the button that opens it.
     connect,
     /// A row's fold arrow.

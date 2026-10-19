@@ -156,7 +156,8 @@ which are for the top level only:
                              close_surface, next_tab, previous_tab, goto_split
                              {direction}, resize_split {direction, amount},
                              equalize_splits, toggle_split_zoom,
-                             copy_to_clipboard, paste_from_clipboard,
+                             toggle_command_palette, copy_to_clipboard,
+                             paste_from_clipboard,
                              increase_font_size {amount}, decrease_font_size
                              {amount}, reset_font_size), or else an action of
                              this file by name. A later bind of the key
