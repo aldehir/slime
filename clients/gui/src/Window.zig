@@ -556,9 +556,9 @@ fn webTabOut(ctx: *anyopaque, s: *Session, next: bool) void {
     self.syncKeyFocus();
 }
 
-fn webKey(ctx: *anyopaque, msg: u32, vk: u32) bool {
+fn webKey(ctx: *anyopaque, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
     const self = fromCtx(ctx);
-    const taken = self.app.acceleratorKey(msg, vk);
+    const taken = self.app.acceleratorKey(.{ .msg = msg, .wparam = wparam, .lparam = lparam });
     self.syncKeyFocus();
     return taken;
 }

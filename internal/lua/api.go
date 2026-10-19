@@ -147,20 +147,30 @@ which are for the top level only:
                              JSON: no functions.
   slime.bind(key, action[, args])
                              key (a chord: "ctrl+shift+d"; modifiers ctrl,
-                             shift, alt, super/win, then a key name) runs a
-                             window action by name with args (slime-gui's:
-                             new_tab, new_split {direction}, close_surface,
-                             next_tab, previous_tab, goto_split {direction},
-                             resize_split {direction, amount}, equalize_splits,
-                             toggle_split_zoom, copy_to_clipboard,
-                             paste_from_clipboard, increase_font_size {amount},
-                             decrease_font_size {amount}, reset_font_size), or
-                             else an action of this file by name. A later bind
-                             of the key replaces the earlier, and the window's
-                             default for it.
+                             shift, alt, super/win, then a key name; or keys
+                             pressed one after another, joined by >:
+                             "ctrl+b>c") runs a window action by name with
+                             args (slime-gui's: new_tab, new_split {direction},
+                             close_surface, next_tab, previous_tab, goto_split
+                             {direction}, resize_split {direction, amount},
+                             equalize_splits, toggle_split_zoom,
+                             copy_to_clipboard, paste_from_clipboard,
+                             increase_font_size {amount}, decrease_font_size
+                             {amount}, reset_font_size), or else an action of
+                             this file by name. A later bind of the key
+                             replaces the earlier, and the window's default for
+                             it. A key runs an action or starts a sequence,
+                             never both: the later binding hides the earlier
+                             (bind "ctrl+b>c" and ctrl+b alone no longer
+                             reaches the program; bind "ctrl+b>ctrl+b" to a
+                             function that writes it). The window keeps the
+                             keys of a sequence; Escape ends one, as does a key
+                             that's not in it, or a reload.
   slime.bind(key, fn)        key runs fn(ctx, args) in the daemon; a function
                              binding always consumes its key
-  slime.unbind(key)          key does nothing, even if the window binds it
+  slime.unbind(key)          key does nothing, even if the window binds it;
+                             exactly that key: unbinding "ctrl+b" leaves
+                             "ctrl+b>c" bound
   slime.action{name, title, args, run}
                              an action: slime do <name> key=value..., a bound
                              key, and slime.invoke run run(ctx, args), and print

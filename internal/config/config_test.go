@@ -90,6 +90,9 @@ func TestSettingsAndBindings(t *testing.T) {
 		slime.bind("ctrl+shift+t", "dev", { file = "a" })
 		slime.bind("ctrl+alt+l", function(ctx, args) return ctx end)
 		slime.unbind("ctrl+shift+w")
+		-- A sequence is a key of its own: unbinding its first key leaves it.
+		slime.bind("Ctrl+B > c", "new_tab")
+		slime.unbind("ctrl+b")
 		slime.action{ name = "dev", title = "Dev layout", args = { file = "string" }, run = function(ctx, args) return args end }
 		slime.action{ name = "dev", title = "Dev again", run = function(ctx, args) return "again" end }
 		slime.action{ name = "other", run = function() end }
@@ -110,6 +113,8 @@ func TestSettingsAndBindings(t *testing.T) {
 		{Key: "ctrl+shift+t", Action: "dev", Args: json.RawMessage(`{"file":"a"}`)},
 		{Key: "ctrl+alt+l", Lua: 1},
 		{Key: "ctrl+shift+w"},
+		{Key: "ctrl+b>c", Action: "new_tab"},
+		{Key: "ctrl+b"},
 	}
 	if got, _ := json.Marshal(d.Keymap); string(got) != string(mustJSON(want)) {
 		t.Errorf("keymap %s", got)

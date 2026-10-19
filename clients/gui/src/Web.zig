@@ -71,7 +71,7 @@ pub const Events = struct {
     tab_out: *const fn (*anyopaque, *Session, bool) void,
     /// A key a page was about to get (a WM_(SYS)KEYDOWN/UP and its
     /// virtual key): returns true if one of the app's bindings took it.
-    key: *const fn (*anyopaque, u32, u32) bool,
+    key: *const fn (*anyopaque, u32, win32.WPARAM, win32.LPARAM) bool,
     /// A page's cursor changed.
     cursor: *const fn (*anyopaque) void,
 };
@@ -675,9 +675,10 @@ fn moveFocusRequested(self: *View, _: *wv.IController, args: *wv.IMoveFocusReque
 fn acceleratorKey(self: *View, _: *wv.IController, args: *wv.IAcceleratorKeyPressedEventArgs) win32.HRESULT {
     var kind: wv.KeyEventKind = undefined;
     var vk: u32 = 0;
-    if (args.getKeyEventKind(&kind) < 0 or args.getVirtualKey(&vk) < 0) return com.S_OK;
+    var lparam: i32 = 0;
+    if (args.getKeyEventKind(&kind) < 0 or args.getVirtualKey(&vk) < 0 or args.getKeyEventLParam(&lparam) < 0) return com.S_OK;
     const msg = wv.keyMessage(kind) orelse return com.S_OK;
-    if (self.web.events.key(self.web.events.ctx, msg, vk)) _ = args.putHandled(true);
+    if (self.web.events.key(self.web.events.ctx, msg, vk, lparam)) _ = args.putHandled(true);
     return com.S_OK;
 }
 

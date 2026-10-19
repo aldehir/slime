@@ -14,7 +14,7 @@ func TestProgramStatus(t *testing.T) {
 	s.report(vt.Status{State: vt.StatusDone, Progress: -1, ID: "deployed"})
 	// A report replaces its record whole.
 	s.report(vt.Status{State: vt.StatusWorking, Progress: -1})
-	want := []StatusRecord{{"deploy/eu", 3, -1}, {"deployed", 2, -1}, {"", 1, -1}}
+	want := []StatusRecord{{ID: "deploy/eu", State: 3, Progress: -1}, {ID: "deployed", State: 2, Progress: -1}, {ID: "", State: 1, Progress: -1}}
 	if got := s.records(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("records: got %v, want %v", got, want)
 	}
