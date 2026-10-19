@@ -736,7 +736,9 @@ fn shellPostClose(ctx: *anyopaque) void {
 }
 
 fn shellSetTitle(ctx: *anyopaque, title: [:0]const u16) void {
-    _ = win32.SetWindowTextW(fromCtx(ctx).hwnd.?, title);
+    // A browser's setup can fail after the window has gone.
+    const hwnd = fromCtx(ctx).hwnd orelse return;
+    _ = win32.SetWindowTextW(hwnd, title);
 }
 
 fn shellCaption(ctx: *anyopaque, part: Id.Part) void {
@@ -1173,10 +1175,10 @@ fn handle(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM
         win32.WM_DESTROY => {
             _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
             self.hwnd = null;
-            win32.PostQuitMessage(0);
-            return 0;
             // Its timers went with it.
             self.idle_armed = false;
+            win32.PostQuitMessage(0);
+            return 0;
         },
 
         else => return win32.DefWindowProcW(hwnd, msg, wparam, lparam),
