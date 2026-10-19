@@ -425,17 +425,11 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
 }
 
 /// How the renderer draws each pane: rounded as the chrome's corners,
-/// with a hairline border and two shadows, one tight at its edge and one
-/// soft around it. `shadows` holds them. A blur reaches about 3 sigma, so
-/// the soft one fades out within the gap between panes rather than
-/// running under the sidebar, which would cut it off.
+/// with a hairline border and the UI's two shadows, which `shadows`
+/// holds.
 fn paneBox(self: *const Window, shadows: *[2]Renderer.BoxStyle.Shadow) Renderer.BoxStyle {
     const c = &self.ui;
-    const s = c.theme.pane_shadow;
-    shadows.* = .{
-        .{ .color = s, .sigma = c.px(1), .offset = c.px(1) },
-        .{ .color = .{ s[0], s[1], s[2], s[3] * 0.7 }, .sigma = c.px(3), .offset = c.px(2) },
-    };
+    for (shadows, c.shadows()) |*out, s| out.* = .{ .color = s.color, .sigma = s.sigma, .offset = s.offset };
     return .{
         .radius = self.frame.corner,
         .border_width = c.stroke(),

@@ -138,7 +138,7 @@ pub fn paintDrag(ui: *const Ui, p: *Painter, tree: *const Tree, thumb: ?Painter.
     const radius = @round(f.corner * scale) + ui.px(2);
     ui.paintShadow(p, r, radius);
     p.image(img, r, radius, thumb_opacity);
-    p.strokeRounded(r, radius, ui.stroke(), ui.theme.dialog_outline);
+    p.strokeRounded(r, radius, ui.stroke(), ui.theme.pane_border);
 }
 
 /// A pane with split and zoom buttons, for the tests.

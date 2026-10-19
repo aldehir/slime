@@ -168,7 +168,7 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
     const r = l.box;
 
     ui.paintShadow(p, r, ui.px(radius));
-    const edge = if (d.danger) mix(t.dialog_outline, t.danger, 0.35) else t.dialog_outline;
+    const edge = if (d.danger) mix(t.pane_border, t.danger, 0.35) else t.pane_border;
     ui.fillBordered(p, r, ui.px(radius), t.dialog, edge);
 
     const accent = if (d.danger) t.danger else t.accent;

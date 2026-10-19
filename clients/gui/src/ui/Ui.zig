@@ -344,11 +344,47 @@ pub fn buttonState(self: *const Ui, id: Id) ButtonState {
     return if (self.pressed.eql(id)) .pressed else .hover;
 }
 
-/// A soft shadow around the rounded rect `r`, the same under every raised
-/// widget: three faint rings a DIP apart, so they add up to a fade outward.
-pub fn paintShadow(self: *const Ui, p: *Painter, r: Rect, radius: f32) void {
-    paintRings(p, r, radius, 3, self.px(1), .{ 0, 0, 0, 0.06 });
+/// A shadow under a pane or a raised widget: a Gaussian blur of its box
+/// in `color`, fallen `offset` pixels.
+pub const Shadow = struct {
+    color: Color,
+    /// The blur's standard deviation, in pixels.
+    sigma: f32,
+    offset: f32,
+};
+
+/// The shadows under every pane and raised widget: one tight at the edge
+/// and one soft around it. A blur reaches about 3 sigma, so the soft one
+/// fades out within the gap between panes rather than running under the
+/// sidebar, which would cut it off.
+pub fn shadows(self: *const Ui) [2]Shadow {
+    const s = self.theme.pane_shadow;
+    return .{
+        .{ .color = s, .sigma = self.px(1), .offset = self.px(1) },
+        .{ .color = colors.withAlpha(s, s[3] * 0.7), .sigma = self.px(3), .offset = self.px(2) },
+    };
 }
+
+/// The pane shadows (`shadows`) under the rounded rect `r`, as Direct2D
+/// can draw them: each blur as rings of one faint color, each out to
+/// where the blur has that ring's share of its strength left, so together
+/// they step down its curve. The box itself, drawn over, hides the rest.
+pub fn paintShadow(self: *const Ui, p: *Painter, r: Rect, radius: f32) void {
+    for (self.shadows()) |s| {
+        const fallen: Rect = .{ .x = r.x, .y = r.y + s.offset, .w = r.w, .h = r.h };
+        // At the box's edge a blur is at half strength; the rings share it.
+        const color = colors.withAlpha(s.color, s.color[3] * 0.5 / blur_rings.len);
+        for (blur_rings) |sigmas| {
+            const spread = sigmas * s.sigma;
+            p.fillRounded(fallen.inset(-spread, -spread), radius + spread, color);
+        }
+    }
+}
+
+/// Where each of six rings of a blur ends, in sigmas: where the Gaussian's
+/// tail is down to (i - 1/2) / 12 for ring i, so an even share of its
+/// strength is lost between one ring and the next.
+const blur_rings = [_]f32{ 1.73, 1.15, 0.81, 0.55, 0.32, 0.105 };
 
 /// A glow around `r` in `color`, for what has the keyboard, drawn before
 /// it: rings a stroke apart.
