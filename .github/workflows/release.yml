@@ -62,9 +62,15 @@ jobs:
           . .\scripts\setup-msvc.ps1
           zig build test
 
+      # go test alone needs libghostty-vt in internal\vt\lib, which only
+      # the install step of zig build produces. A failing native command
+      # does not stop pwsh, so check vet's exit code by hand.
       - name: Test the daemon
         run: |
+          . .\scripts\setup-msvc.ps1
+          .\scripts\build-vt-lib.ps1
           go vet ./...
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           go test ./...
 
       - name: Build
