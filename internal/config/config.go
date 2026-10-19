@@ -21,7 +21,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	glua "github.com/yuin/gopher-lua"
@@ -59,7 +58,7 @@ type Host interface {
 
 // Output takes what an evaluation or an invocation prints: print to
 // stdout, slime.log to stderr.
-type Output func(stream lua.Stream, text string)
+type Output = lua.Output
 
 // Timeout bounds an evaluation: a file that never returns fails.
 const Timeout = 30 * time.Second
@@ -78,13 +77,10 @@ type Config struct {
 	host Host
 	r    *lua.Runner
 	// loading is set while the file's top level runs: when bind,
-	// action, and config are allowed.
+	// action, and config are allowed, and out takes what it prints
+	// (nil: the daemon's log, through host).
 	loading bool
-
-	// One invocation runs at a time; out is where the running one's
-	// output goes (nil: the daemon's log, through host).
-	mu  sync.Mutex
-	out Output
+	out     Output
 
 	settings *glua.LTable
 	bindings []*rpc.Binding
@@ -110,7 +106,7 @@ type action struct {
 // reasons; Load never returns both.
 func Load(host Host, path string, out Output) (*Config, []string) {
 	c := &Config{path: path, host: host, out: out, byName: map[string]*action{}}
-	c.r = lua.New(c, lua.Context{})
+	c.r = lua.New(c, lua.Context{Persistent: true})
 	L := c.r.L
 	c.settings = L.NewTable()
 	c.funcs = L.NewTable()
@@ -139,12 +135,14 @@ func Load(host Host, path string, out Output) (*Config, []string) {
 	return c, nil
 }
 
-// Close frees the state, once no invocation runs in it.
-func (c *Config) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.r.Close()
-}
+// Close ends the config: what runs in it is cancelled, its hooks and
+// timers stop, the processes it started are killed, and the state is
+// freed.
+func (c *Config) Close() { c.r.Close() }
+
+// Deliver gives the config's hooks an event (slime.on). It never
+// blocks: the daemon calls it under its lock.
+func (c *Config) Deliver(name string, params json.RawMessage) { c.r.Deliver(name, params) }
 
 // Path is the file this came from.
 func (c *Config) Path() string { return c.path }
@@ -190,16 +188,21 @@ type Invocation struct {
 }
 
 // Run invokes an action or a bound function and returns what it
-// returned, with its output going to out. Invocations run one at a
-// time; Run waits for the one before. The error is an *rpc.Error for
-// an invocation that can't start, or the Lua error that ended it, or
-// lua.ErrCancelled.
+// returned, with its output going to out. Invocations are tasks of
+// the config's run: one runs Lua at a time, and one that blocks
+// (slime.sleep, wait, exec) lets the others run meanwhile. The error
+// is an *rpc.Error for an invocation that can't start, or the Lua
+// error that ended it, or lua.ErrCancelled.
 func (c *Config) Run(ctx context.Context, inv Invocation, out Output) (json.RawMessage, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.out = out
-	defer func() { c.out = nil }()
-	return c.invoke(ctx, inv)
+	fn, args, err := c.prepare(inv)
+	if err != nil {
+		return nil, err
+	}
+	origin := inv.Origin
+	if origin == "" {
+		origin = OriginAPI
+	}
+	return c.r.Call(ctx, lua.CallOptions{Pane: inv.Pane, Out: out}, fn, c.ctxTable(lua.IDsOf(inv.Pane), origin), args)
 }
 
 // Check says whether inv names something to run: the *rpc.Error Run
@@ -228,46 +231,37 @@ func (c *Config) find(inv Invocation) (*glua.LFunction, *action, error) {
 	return nil, nil, rpc.Errorf(rpc.CodeInvalidParams, "an action's name or a binding's id is needed")
 }
 
-// invoke runs inv in the state, which the caller has.
-func (c *Config) invoke(ctx context.Context, inv Invocation) (json.RawMessage, error) {
+// prepare finds what inv names and builds its args table, converted
+// by the action's spec.
+func (c *Config) prepare(inv Invocation) (*glua.LFunction, *glua.LTable, error) {
 	L := c.r.L
 	fn, act, err := c.find(inv)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	args := L.NewTable()
 	if len(inv.Args) > 0 {
 		v, err := lua.FromJSON(L, inv.Args)
 		if err != nil {
-			return nil, rpc.Errorf(rpc.CodeInvalidParams, "args: %v", err)
+			return nil, nil, rpc.Errorf(rpc.CodeInvalidParams, "args: %v", err)
 		}
 		if t, ok := v.(*glua.LTable); ok {
 			args = t
 		} else if v != glua.LNil {
-			return nil, rpc.Errorf(rpc.CodeInvalidParams, "args must be an object")
+			return nil, nil, rpc.Errorf(rpc.CodeInvalidParams, "args must be an object")
 		}
 	}
 	if act != nil {
 		if err := coerce(args, act.spec); err != nil {
-			return nil, rpc.Errorf(rpc.CodeInvalidParams, "%s: %v", inv.Name, err)
+			return nil, nil, rpc.Errorf(rpc.CodeInvalidParams, "%s: %v", inv.Name, err)
 		}
 	}
-	saved := c.r.IDs()
-	defer c.r.SetIDs(saved)
-	if !inv.Pane.IsZero() {
-		c.r.SetPane(inv.Pane)
-	}
-	origin := inv.Origin
-	if origin == "" {
-		origin = OriginAPI
-	}
-	return c.r.Call(ctx, fn, c.ctxTable(origin), args)
+	return fn, args, nil
 }
 
 // ctxTable is an invocation's ctx: what it runs for, and who asked.
-func (c *Config) ctxTable(origin string) *glua.LTable {
+func (c *Config) ctxTable(ids lua.IDs, origin string) *glua.LTable {
 	t := c.r.L.NewTable()
-	ids := c.r.IDs()
 	t.RawSetString("workspace_id", ids.Workspace)
 	t.RawSetString("tab_id", ids.Tab)
 	t.RawSetString("pane_id", ids.Pane)
@@ -312,32 +306,33 @@ func coerce(args, spec *glua.LTable) error {
 	return err
 }
 
-// The config is its runner's host: calls go to the daemon, output to
-// the running invocation.
+// The config is its runner's host: calls go to the daemon; output
+// from a task with no console of its own (the file loading, a hook, a
+// timer) goes to the log.
 
 func (c *Config) Call(method string, params json.RawMessage) (json.RawMessage, error) {
 	return c.host.Call(method, params)
 }
 
 func (c *Config) Output(stream lua.Stream, text string) {
-	if c.out != nil {
+	if c.loading && c.out != nil {
 		c.out(stream, text)
 		return
 	}
 	c.host.Log(strings.TrimRight(text, "\n"))
 }
 
-func (c *Config) Log(text string) {
-	c.host.Log(text)
-	if c.out != nil {
-		c.out(lua.Stderr, text+"\n")
-	}
-}
+func (c *Config) Log(text string) { c.host.Log(text) }
 
 // Invoke is slime.invoke from the file's own functions: the action runs
 // here and now, nested in the one running, for the same pane.
 func (c *Config) Invoke(name string, args json.RawMessage) (json.RawMessage, error) {
-	return c.invoke(context.Background(), Invocation{Name: name, Args: args, Origin: OriginScript})
+	inv := Invocation{Name: name, Args: args, Origin: OriginScript}
+	fn, argsT, err := c.prepare(inv)
+	if err != nil {
+		return nil, err
+	}
+	return c.r.CallNested(fn, c.ctxTable(c.r.IDs(), inv.Origin), argsT)
 }
 
 // install adds the file's functions to the slime table, and makes

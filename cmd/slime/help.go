@@ -172,7 +172,8 @@ func eventsDoc() string {
 	var b strings.Builder
 	b.WriteString("A window gets its workspaces' events without subscribing; a script's owner\n" +
 		"gets script.* for its scripts; anyone else subscribes (the subscribe method,\n" +
-		"on a connection of its own). Scripts can't receive events yet.\n\n")
+		"on a connection of its own). Scripts and init.lua hook them with slime.on\n" +
+		"and slime.wait (slime help lua).\n\n")
 	tw := tabwriter.NewWriter(&b, 0, 4, 2, ' ', 0)
 	for _, e := range rpc.EventDocs {
 		fmt.Fprintf(tw, "  %s\t%s\n", e.Name, e.Params)

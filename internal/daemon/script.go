@@ -32,6 +32,10 @@ type script struct {
 	detached bool
 	ctx      context.Context
 	cancel   context.CancelFunc
+	// runner is the script's own state, which gets every event for its
+	// hooks (emitLocked), while it runs; an action's (action.invoke)
+	// runs in the config's, which has its own. Under the server's lock.
+	runner *lua.Runner
 }
 
 func (sc *script) desc() rpc.ScriptDesc {
@@ -90,9 +94,12 @@ func (s *Server) startScriptLocked(cl *callCtx, name string, pane PaneID, detach
 // runScript drives a script to its end and reports it.
 func (s *Server) runScript(sc *script, lctx lua.Context, source string) {
 	r := lua.New(&scriptHost{s: s, sc: sc}, lctx)
+	s.mu.Lock()
+	sc.runner = r
+	s.mu.Unlock()
 	result, err := r.Run(sc.ctx, sc.name, source)
-	r.Close()
 	s.scriptEnded(sc, result, err)
+	r.Close()
 }
 
 // scriptEnded forgets a run and reports how it went.
@@ -100,6 +107,7 @@ func (s *Server) scriptEnded(sc *script, result json.RawMessage, err error) {
 	sc.cancel()
 	s.mu.Lock()
 	delete(s.scripts, sc.id)
+	sc.runner = nil
 	s.checkIdleLocked()
 	s.mu.Unlock()
 

@@ -331,7 +331,34 @@ it leaves out. `init.lua` (internal/config) is a state of its own that
 lives as long as the daemon: `slime.config` sets the settings, `slime.bind`
 the keys, and `slime.action` the actions that `slime do <name>`, bound
 keys, and `slime.invoke` run (`action.invoke`, which runs as a script).
-Hooks, waiting, timers, and exec wait on the rearchitect plan's stage 8.
+Scripts and `init.lua` see the daemon's events (`slime.on`, `slime.wait`),
+sleep and set timers, run programs (`slime.exec`), and ask the windows on
+their workspace to act (`slime.client.queue`): each hook or timer call is
+a task on a goroutine with a thread of the state, and a baton lets one
+run Lua at a time, so a blocking call lets the others run.
+
+- **An event nobody waits for yet is dropped**: a script that causes an
+  event and then calls `slime.wait` could miss one that came in between,
+  if the cause were as quick as a few Lua instructions. Keeping recent
+  events for a late `wait` would need a rule for how recent.
+- **`slime.wait` filters are tables of equal fields** only; a function
+  filter would need to run under the baton in the dispatcher.
+- **A run ending kills the processes it started**, and a running process
+  doesn't keep a run alive: `slime.exec.start` then returning kills it.
+  A `detach` option could leave it running.
+- **`slime.exec` kills the process alone**, not what it started (a
+  killed `cmd.exe`'s `ping` runs on, holding the pipes for up to a
+  second).
+- **`pane.clipboard`** (OSC 52 writes) isn't an event; viewers get the
+  Notice.
+- **A `client.action` acts on each viewing window's own focus**, not on
+  the workspace it was queued for: a window showing several workspaces
+  performs it on whichever is active there. And every viewer performs
+  it: two windows on one workspace make two splits of one
+  `slime.client.queue("new_split")`. Sending it to one viewer (the one
+  that last sent input, say) would need the daemon to track that.
+- **Hooks in `init.lua` can't fall back to a window**: `slime.on` runs
+  in the daemon; there's no `client.on`.
 
 - **`ctx.client_id`** isn't filled in: connections have no ids, so an
   action can't tell which window pressed its key.
@@ -360,8 +387,6 @@ Hooks, waiting, timers, and exec wait on the rearchitect plan's stage 8.
 - **A script's `workspace.new` needs tabs.** With none, the workspace
   would have no viewer to keep it; `slime.tab.new` can't add to it
   first.
-- **Scripts can't subscribe to events** until stage 8: `subscribe`
-  needs a connection, and a script runs in process.
 
 ## Configuration
 

@@ -1857,6 +1857,7 @@ fn daemonPosted(self: *App) void {
         self.daemonChanged(conn);
         self.hostsChanged(conn);
         self.openWorkspaces(conn);
+        self.performClientActions(conn);
         if (conn.isLost()) self.dropWorkspacesOf(conn);
     }
     var i: usize = 0;
@@ -1868,6 +1869,7 @@ fn daemonPosted(self: *App) void {
                 self.workspacesChanged(conn);
                 self.remoteChanged(&self.remotes.items[i]);
                 self.openWorkspaces(conn);
+                self.performClientActions(conn);
                 if (conn.isLost()) self.dropWorkspacesOf(conn);
             },
             .failed => {
@@ -1888,6 +1890,31 @@ fn openWorkspaces(self: *App, conn: *Daemon) void {
     const ids = conn.takeOpens();
     defer self.alloc.free(ids);
     for (ids) |id| if (self.workspaceIn(conn, id)) |w| self.showWorkspace(w.key);
+}
+
+/// Perform the window actions scripts on `conn` asked for
+/// (slime.client.queue): each as if its key were pressed, on this
+/// window's focus. A name that isn't a window action's is logged;
+/// init.lua's own actions are for slime.invoke.
+fn performClientActions(self: *App, conn: *Daemon) void {
+    const actions = conn.takeClientActions();
+    defer {
+        for (actions) |*a| a.deinit(self.alloc);
+        self.alloc.free(actions);
+    }
+    for (actions) |a| {
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        var args: ?std.json.Value = null;
+        if (a.args.len > 0) {
+            args = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), a.args, .{}) catch null;
+        }
+        const action = binding.fromName(a.name, args) orelse {
+            log.warn("client.action \"{s}\" is no window action", .{a.name});
+            continue;
+        };
+        if (!self.runAction(action)) log.info("client.action {s} couldn't run", .{a.name});
+    }
 }
 
 /// Take up what host's slime `r` sent. Once its panes have come, they

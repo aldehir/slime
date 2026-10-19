@@ -18,8 +18,13 @@ import (
 const Doc = `Scripts run in the daemon (slime do) with gopher-lua, a Lua 5.1. The
 libraries are base, package, table, string, math, coroutine, debug, and
 os without exit; there is no io, and print goes to the console that ran
-the script. One state per run, cancelled between instructions, so a
-blocking call finishes before a cancel lands.
+the script. One state per run. The chunk, and each call of a hook,
+timer, or process callback, is a task: one runs Lua at a time, and a
+task that blocks (sleep, wait, exec, a process's wait) lets the others
+run meanwhile, so Lua never runs concurrently with itself. A script
+ends when its chunk has returned and no hook or timer is live, when it
+calls slime.stop, or when it's cancelled (its tasks end at their next
+instruction or blocking call).
 
 THE SLIME TABLE
 
@@ -64,6 +69,54 @@ Calls return the result table, or nil, message, code (see slime help
 methods for the codes). Wrap in assert(...) when failure should end the
 script. The namespaces are metatables: any method the daemon has works,
 including ones added later, without a Lua-side list.
+
+EVENTS, WAITING, TIMERS, PROCESSES
+
+  slime.on(event, fn)        fn(ctx, ev) runs for each event (a name from slime
+                             help events, "pane.*" for a group, or "*"), in a
+                             task of its own; ev is the event's params. Returns
+                             a handle: h:cancel() ends it, h:active() says. A
+                             live hook keeps a script running after its chunk
+                             returns; cancel it or call slime.stop to end.
+  slime.wait(event, filter, timeout)
+                             blocks until the next such event whose fields
+                             equal filter's (a table, or nil for any): a key
+                             names a field of ev, except workspace_id, tab_id,
+                             and pane_id, which name what the event is about
+                             (a pane's names its tab and workspace too).
+                             Returns ev, or nil, "timeout" after timeout
+                             seconds (none waits as long as the run lasts).
+  slime.sleep(seconds)       blocks for that long
+  slime.after(seconds, fn)   fn(ctx) runs once after the delay; a handle as on
+  slime.every(seconds, fn)   and again after each delay until cancelled
+  slime.exec(argv, opts)     runs a program on the daemon's host to its end:
+                             argv a list of strings (the program first), opts
+                             {cwd, env = {VAR = "value"}, stdin = "text",
+                             timeout = seconds}. Returns {status, ok, stdout,
+                             stderr}, or nil, err if it couldn't start or timed
+                             out (it's killed then).
+  slime.exec.start(argv, opts)
+                             starts one and returns a handle: p.pid, p:running(),
+                             p:wait([timeout]) (the result above, or nil,
+                             "timeout"), p:kill(), and with opts.stdin = true,
+                             p:write(text) and p:close_stdin(). opts.stdout and
+                             opts.stderr may be functions that get each piece of
+                             output as it comes (then wait's are empty). A run
+                             ending kills the processes it started.
+  slime.client.queue(name, args)
+                             asks the windows on this script's workspace to
+                             perform window action name (new_tab, new_split
+                             {direction = "down"}, toggle_split_zoom, ...) with
+                             args, as if its key were pressed there; each
+                             window showing the workspace does, on its own focus
+
+ctx for a hook is {workspace_id, tab_id, pane_id, origin = "event", event}:
+what the event is about, as filter sees it; for a timer, what the
+script runs for and origin = "timer". Hooks and timers run for the ids
+the script had when they were set. An error in a hook ends the script
+(in init.lua, it's logged). An event nobody is waiting for yet isn't
+kept: set the hook, or start the wait, before causing the event where
+it matters.
 
 INIT.LUA
 
@@ -137,8 +190,12 @@ Caveats: pcall catches slime.stop (it is an error under the hood). A
 script is never a viewer: slime.workspace.new needs tabs; run from a
 pane, the windows on that pane's workspace open the new one, otherwise
 it starts detached. A script's split, tab.new, and move don't take the
-focus (a window's own do). subscribe, hooks, wait, timers, and exec are
-not available yet; slime.config, bind, unbind, and action are init.lua's.
+focus (a window's own do). subscribe is the wire's; slime.on is a
+script's. slime.config, bind, unbind, and action are init.lua's. In
+init.lua, hooks and timers set at the top level live as long as that
+config does (a reload ends them, and what the old config was running),
+and an action may sleep, wait, and exec: another key's action runs
+meanwhile.
 
 EXAMPLES
 
@@ -189,7 +246,28 @@ Errors and stopping early:
 
   local p, err, code = slime.pane.info{ id = "1.1.999" }
   if not p then slime.log("no pane:", err, code) end          -- 1000 is not found
-  if #assert(slime.workspace.list{}).workspaces > 0 then slime.stop("already set up") end`
+  if #assert(slime.workspace.list{}).workspaces > 0 then slime.stop("already set up") end
+
+Run a command below and wait for it (slime do build.lua):
+
+  local p = assert(slime.pane.split{ direction = "down", share = 3000, command = "go build ./..." })
+  local ev = slime.wait("pane.exited", { pane_id = p.pane }, 600)
+  if not ev then slime.stop("still building") end
+  if ev.status ~= 0 then slime.client.queue("toggle_split_zoom") end
+  return "exit " .. ev.status
+
+Watch for bells until stopped (slime do --detach watch.lua; slime scripts kill <id>):
+
+  slime.on("pane.bell", function(ctx, ev)
+    local info = assert(slime.pane.info{ id = ev.id })
+    slime.log("bell in", ev.id, info.title or "")
+  end)
+  slime.every(60, function() slime.log("still watching") end)
+
+Shell out (on the daemon's host):
+
+  local r = assert(slime.exec({ "git", "status", "--short" }, { cwd = slime.args.dir }))
+  for line in r.stdout:gmatch("[^\n]+") do print(line) end`
 
 // install sets the script's globals: the slime table, and print.
 func (r *Runner) install(ctx Context) {
@@ -203,7 +281,7 @@ func (r *Runner) install(ctx Context) {
 		}
 	}
 	slime.RawSetString("args", args)
-	r.SetPane(ctx.Pane)
+	r.setIDs(idsOf(ctx.Pane))
 	slime.RawSetString("call", L.NewFunction(r.luaCall))
 	slime.RawSetString("invoke", L.NewFunction(r.luaInvoke))
 	for _, group := range []string{"workspace", "tab", "pane"} {
@@ -224,8 +302,36 @@ func (r *Runner) install(ctx Context) {
 	slime.RawSetString("json", jsonT)
 	slime.RawSetString("log", L.NewFunction(r.luaLog))
 	slime.RawSetString("stop", L.NewFunction(r.luaStop))
+	slime.RawSetString("on", L.NewFunction(r.luaOn))
+	slime.RawSetString("wait", L.NewFunction(r.luaWait))
+	slime.RawSetString("sleep", L.NewFunction(r.luaSleep))
+	slime.RawSetString("after", L.NewFunction(r.luaAfter))
+	slime.RawSetString("every", L.NewFunction(r.luaEvery))
+	r.installHandles()
+	r.installExec()
+	client := L.NewTable()
+	client.RawSetString("queue", L.NewFunction(r.luaClientQueue))
+	slime.RawSetString("client", client)
 	L.SetGlobal("slime", slime)
 	L.SetGlobal("print", L.NewFunction(r.luaPrint))
+}
+
+// luaClientQueue is slime.client.queue(name, args): the windows on the
+// script's workspace perform window action name with args
+// (client.queue, which sends them client.action).
+func (r *Runner) luaClientQueue(L *glua.LState) int {
+	name := L.CheckString(1)
+	params := L.NewTable()
+	params.RawSetString("name", glua.LString(name))
+	if args := L.OptTable(2, nil); args != nil {
+		params.RawSetString("args", args)
+	}
+	ws := r.slime.RawGetString("workspace_id")
+	if ws == glua.LNil {
+		return pushError(L, "client.queue: no workspace: the script runs for no pane", 0)
+	}
+	params.RawSetString("workspace", ws)
+	return r.call(L, rpc.ClientQueue, params)
 }
 
 // namespace is slime.<group>: a table whose missing keys become the
@@ -341,7 +447,13 @@ func (r *Runner) luaInvoke(L *glua.LState) int {
 		}
 		raw = b
 	}
+	// A nested call (the config's own) runs in the state this was
+	// called from, which may be a coroutine of the task's.
+	t := r.current
+	saved := t.callL
+	t.callL = L
 	result, err := r.host.Invoke(name, raw)
+	t.callL = saved
 	return pushResult(L, "invoke "+name, result, err)
 }
 
@@ -379,13 +491,18 @@ func pushError(L *glua.LState, msg string, code int) int {
 
 // luaPrint is print: a line on stdout.
 func (r *Runner) luaPrint(L *glua.LState) int {
-	r.host.Output(Stdout, line(L)+"\n")
+	r.output(Stdout, line(L)+"\n")
 	return 0
 }
 
-// luaLog is slime.log(...): a line for the daemon's log.
+// luaLog is slime.log(...): a line for the daemon's log, and on the
+// task's own stderr if it has one.
 func (r *Runner) luaLog(L *glua.LState) int {
-	r.host.Log(line(L))
+	text := line(L)
+	r.host.Log(text)
+	if t := r.current; t != nil && t.out != nil {
+		t.out(Stderr, text+"\n")
+	}
 	return 0
 }
 
@@ -405,7 +522,7 @@ func line(L *glua.LState) string {
 // result as what it returned.
 func (r *Runner) luaStop(L *glua.LState) int {
 	if L.GetTop() > 0 {
-		r.stopResult = L.Get(1)
+		r.current.stopResult = L.Get(1)
 	}
 	L.Error(r.stop, 0)
 	return 0

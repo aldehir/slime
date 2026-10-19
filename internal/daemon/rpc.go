@@ -3,7 +3,6 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
-	"strings"
 
 	"github.com/aldehir/slime/internal/rpc"
 )
@@ -94,6 +93,7 @@ var methods = map[string]handler{
 	rpc.ConfigReload:    method((*Server).configReload),
 	rpc.ConfigCheck:     method((*Server).configCheck),
 	rpc.ActionInvoke:    method((*Server).actionInvoke),
+	rpc.ClientQueue:     method((*Server).clientQueue),
 }
 
 // Methods lists the control plane's methods.
@@ -192,9 +192,19 @@ func notify(name string, params any) *Notify {
 
 // emitLocked sends event name to the viewers of ws, if any, and to
 // every connection subscribed to it, each once, except skip (which
-// made the change, or already has it). Under the server's lock.
+// made the change, or already has it); and to the Lua running in
+// process (scripts and the config), whose hooks pick what they want.
+// Under the server's lock.
 func (s *Server) emitLocked(name string, params any, ws *workspace, skip ...*conn) {
 	n := notify(name, params)
+	for _, sc := range s.scripts {
+		if sc.runner != nil {
+			sc.runner.Deliver(name, n.Notification.Params)
+		}
+	}
+	if s.config != nil {
+		s.config.Deliver(name, n.Notification.Params)
+	}
 	skipped := func(c *conn) bool {
 		for _, x := range skip {
 			if x == c {
@@ -234,12 +244,31 @@ func (s *Server) subscribe(cl *callCtx, p rpc.SubscribeParams) (rpc.Empty, error
 // group ("host.*"), or for everything ("*").
 func (c *conn) subscribedLocked(name string) bool {
 	for _, sub := range c.subs {
-		switch {
-		case sub == "*", sub == name:
-			return true
-		case strings.HasSuffix(sub, ".*") && strings.HasPrefix(name, sub[:len(sub)-1]):
+		if rpc.MatchEvent(sub, name) {
 			return true
 		}
 	}
 	return false
+}
+
+// clientQueue asks a workspace's viewers to perform a window action:
+// client.action goes to them (and to client.* subscribers).
+func (s *Server) clientQueue(_ *callCtx, p rpc.ClientQueueParams) (rpc.Empty, error) {
+	if p.Name == "" {
+		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "client.queue needs an action name")
+	}
+	if len(p.Args) > 0 {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(p.Args, &obj); err != nil {
+			return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "args must be a JSON object")
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ws := s.workspaces[p.Workspace]
+	if ws == nil {
+		return rpc.Empty{}, errNoWorkspace
+	}
+	s.emitLocked(rpc.EvClientAction, rpc.ClientActionParams{Workspace: ws.id, Name: p.Name, Args: p.Args}, ws)
+	return rpc.Empty{}, nil
 }

@@ -104,6 +104,7 @@ const (
 	ConfigReload    = "config.reload"
 	ConfigCheck     = "config.check"
 	ActionInvoke    = "action.invoke"
+	ClientQueue     = "client.queue"
 )
 
 // Notifications. A workspace's viewers get their workspace's without
@@ -124,12 +125,30 @@ const (
 	EvPaneMoved             = "pane.moved"
 	EvPaneAttached          = "pane.attached"
 	EvPaneExited            = "pane.exited"
+	EvPaneTitle             = "pane.title"
+	EvPanePwd               = "pane.pwd"
+	EvPaneBell              = "pane.bell"
+	EvPaneStatus            = "pane.status"
 	EvHostChanged           = "host.changed"
 	EvHostPrompt            = "host.prompt"
 	EvScriptOutput          = "script.output"
 	EvScriptDone            = "script.done"
 	EvConfigChanged         = "config.changed"
+	EvClientAction          = "client.action"
 )
+
+// MatchEvent says whether event name is one pattern asks for: the name
+// itself, its group ("host.*"), or everything ("*"). Subscriptions and
+// a script's hooks are lists of patterns.
+func MatchEvent(pattern, name string) bool {
+	switch {
+	case pattern == "*", pattern == name:
+		return true
+	case strings.HasSuffix(pattern, ".*") && strings.HasPrefix(name, pattern[:len(pattern)-1]):
+		return true
+	}
+	return false
+}
 
 // Size is a terminal's grid and, if known, its cell size in pixels.
 type Size struct {
@@ -769,6 +788,50 @@ type PaneAttachedParams struct {
 type PaneExitedParams struct {
 	ID     PaneID `json:"id"`
 	Status uint32 `json:"status"`
+}
+
+// PaneTitleParams: pane.title, the pane's title as the program set it
+// (OSC 0/2).
+type PaneTitleParams struct {
+	ID    PaneID `json:"id"`
+	Title string `json:"title"`
+}
+
+// PanePwdParams: pane.pwd, the pane's working directory as the shell
+// reported it (OSC 7; a file:// URI as sent).
+type PanePwdParams struct {
+	ID  PaneID `json:"id"`
+	Pwd string `json:"pwd"`
+}
+
+// PaneBellParams: pane.bell, the program rang the bell.
+type PaneBellParams struct {
+	ID PaneID `json:"id"`
+}
+
+// PaneStatusParams: pane.status, a program's status report changed
+// (OSC 7501): Status is every record now, oldest update first, as
+// PaneDesc carries them.
+type PaneStatusParams struct {
+	ID     PaneID         `json:"id"`
+	Status []StatusRecord `json:"status"`
+}
+
+// ClientQueueParams: client.queue asks the viewers of Workspace to
+// perform the window action Name (new_tab, new_split, ...) with Args, a
+// JSON object or nothing: the daemon sends them client.action. Lua's
+// slime.client.queue fills Workspace from what the script runs for.
+type ClientQueueParams struct {
+	Workspace uint32          `json:"workspace"`
+	Name      string          `json:"name"`
+	Args      json.RawMessage `json:"args,omitempty"`
+}
+
+// ClientActionParams: client.action, to a workspace's viewers.
+type ClientActionParams struct {
+	Workspace uint32          `json:"workspace"`
+	Name      string          `json:"name"`
+	Args      json.RawMessage `json:"args,omitempty"`
 }
 
 // Hosts: SSH hosts the daemon connects to, on Windows. A host's id is

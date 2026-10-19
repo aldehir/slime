@@ -60,6 +60,11 @@ Don't guess flags, methods, or fields: read them from `slime help`.
   an action the user's `init.lua` defined (`slime actions` lists them,
   `slime config show` the rest of the config). Don't edit `init.lua`
   unless asked.
+- A script can wait for things instead of polling: `slime.wait("pane.exited",
+  { pane_id = id }, 60)` blocks until that pane's program ends, and
+  `slime.on` runs a function for each event (`slime help lua`, `slime help
+  events`). A script with a live hook keeps running; `slime scripts kill`
+  ends it.
 
 ## Manners
 

@@ -38,6 +38,16 @@ type Pane struct {
 	// What the terminal answered its program since the last take, for
 	// the child: written outside the lock (writeReplies).
 	replies []byte
+	// Events for the subscribers since the last take (pane.title and
+	// the rest), emitted outside the lock (emitEvents): the server's
+	// lock is never taken inside the pane's.
+	events []paneEvent
+}
+
+// paneEvent is a notification a pane's terminal gave rise to.
+type paneEvent struct {
+	name   string
+	params any
 }
 
 func newPane(srv *Server, id PaneID, command string, size Size, p pty.Pty, term *vt.Terminal) *Pane {
@@ -67,12 +77,17 @@ func newPane(srv *Server, id PaneID, command string, size Size, p pty.Pty, term 
 		TitleChanged: func() {
 			title, _ := pn.term.Title()
 			pn.notify(&Notice{Kind: NoticeTitle, Text: title})
+			pn.events = append(pn.events, paneEvent{rpc.EvPaneTitle, rpc.PaneTitleParams{ID: pn.id, Title: title}})
 		},
 		PwdChanged: func() {
 			pwd, _ := pn.term.Pwd()
 			pn.notify(&Notice{Kind: NoticePwd, Text: pwd})
+			pn.events = append(pn.events, paneEvent{rpc.EvPanePwd, rpc.PanePwdParams{ID: pn.id, Pwd: pwd}})
 		},
-		Bell:           func() { pn.notify(&Notice{Kind: NoticeBell}) },
+		Bell: func() {
+			pn.notify(&Notice{Kind: NoticeBell})
+			pn.events = append(pn.events, paneEvent{rpc.EvPaneBell, rpc.PaneBellParams{ID: pn.id}})
+		},
 		ClipboardWrite: func(text []byte) { pn.notify(&Notice{Kind: NoticeClipboard, Text: string(text)}) },
 	})
 	pn.startFraming()
@@ -104,7 +119,30 @@ func (p *Pane) notify(n *Notice) {
 // statusChanged sends the viewers every status record. Runs inside
 // term.Write, under p.mu.
 func (p *Pane) statusChanged() {
-	p.notify(&Notice{Kind: NoticeStatus, Status: p.status.records()})
+	records := p.status.records()
+	p.notify(&Notice{Kind: NoticeStatus, Status: records})
+	p.events = append(p.events, paneEvent{rpc.EvPaneStatus, rpc.PaneStatusParams{ID: p.id, Status: records}})
+}
+
+// takeEventsLocked returns the events since the last take, for
+// emitEvents once the lock is released.
+func (p *Pane) takeEventsLocked() []paneEvent {
+	e := p.events
+	p.events = nil
+	return e
+}
+
+// emitEvents sends the subscribers and the hooks what the terminal
+// gave rise to. Outside the pane's lock.
+func (p *Pane) emitEvents(events []paneEvent) {
+	if len(events) == 0 {
+		return
+	}
+	p.srv.mu.Lock()
+	defer p.srv.mu.Unlock()
+	for _, e := range events {
+		p.srv.emitLocked(e.name, e.params, nil)
+	}
 }
 
 // mode is the state of a mode libghostty-vt leaves to us
@@ -154,8 +192,10 @@ func (p *Pane) run() {
 			p.term.Write(buf[:n])
 			p.changedLocked()
 			replies := p.takeRepliesLocked()
+			events := p.takeEventsLocked()
 			p.mu.Unlock()
 			p.writeReplies(replies)
+			p.emitEvents(events)
 		}
 		if err != nil {
 			break

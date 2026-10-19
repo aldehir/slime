@@ -52,7 +52,9 @@ var MethodDocs = []MethodDoc{
 	{ConfigReload, "none", "Config",
 		"evaluates init.lua again: on success it replaces the settings, keymap, and actions and config.changed goes out; on failure the last good ones stay and errors says why (to config.changed too)"},
 	{ConfigCheck, "{path?}", "Config", "evaluates init.lua (or path) without applying it"},
-	{Subscribe, "{events: [\"pane.exited\", \"host.*\", \"*\"]}", "{}", "needs a connection (not from Lua)"},
+	{Subscribe, "{events: [\"pane.exited\", \"host.*\", \"*\"]}", "{}", "needs a connection (not from Lua, which has slime.on)"},
+	{ClientQueue, "{workspace, name, args?: object}", "{}",
+		"sends client.action to the workspace's viewers: each window performs its action name (new_tab, new_split {direction}, ...) with args"},
 	{HostConnect, "{dest}", "Host", "prompts arrive as host.prompt, answered with host.answer"},
 	{HostAnswer, "{host, choice: accept|cancel|skip, answers?}", "{}", ""},
 	{HostDisconnect, "{host}", "{}", ""},
@@ -108,11 +110,16 @@ var EventDocs = []EventDoc{
 	{EvPaneMoved, "{id, from}: to another tab, under a new id"},
 	{EvPaneAttached, "{id, moved_from?, command, status?} (viewers only; frames follow)"},
 	{EvPaneExited, "{id, status}"},
+	{EvPaneTitle, "{id, title}: the program set the title (subscribers only; viewers have it in the pane's notices)"},
+	{EvPanePwd, "{id, pwd}: the shell reported its directory (OSC 7)"},
+	{EvPaneBell, "{id}"},
+	{EvPaneStatus, "{id, status: [{id, state, progress}]}: a program's status report changed (OSC 7501); every record now"},
 	{EvScriptOutput, "{id, stream: stdout|stderr, data}"},
 	{EvScriptDone, "{id, ok, result?, error?}"},
 	{EvHostChanged, "Host"},
 	{EvHostPrompt, "{host, kind, title?, text?, detail?, error?, questions?}"},
 	{EvConfigChanged, "Config: after config.reload, whether it succeeded (errors says)"},
+	{EvClientAction, "{workspace, name, args?}: a script asked the workspace's viewers to perform a window action (client.queue)"},
 }
 
 // CodeDoc is one error code.

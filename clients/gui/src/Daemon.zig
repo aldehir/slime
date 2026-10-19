@@ -132,6 +132,9 @@ attached: std.AutoHashMapUnmanaged(u32, void) = .empty,
 /// run from one of ours made them for this window. Taken by
 /// `takeOpens`.
 opens: std.ArrayList(u32) = .empty,
+/// Window actions a script asked for (`client.action`, from Lua's
+/// slime.client.queue), in order. Taken by `takeClientActions`.
+client_actions: std.ArrayList(ClientAction) = .empty,
 /// Ids of our `focus` calls not yet replied to. A structure that comes
 /// meanwhile may predate them, so its focus isn't taken.
 focus_calls: std.ArrayList(u32) = .empty,
@@ -197,6 +200,19 @@ pub const WorkspaceInfo = struct {
 
     pub fn deinit(self: *WorkspaceInfo, alloc: Allocator) void {
         alloc.free(self.name);
+    }
+};
+
+/// A window action a script asked the workspace's viewers to perform:
+/// its name as `binding.fromName` knows it, and its args as JSON (or
+/// empty). Both owned.
+pub const ClientAction = struct {
+    name: []const u8,
+    args: []const u8,
+
+    pub fn deinit(self: *ClientAction, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.args.len > 0) alloc.free(self.args);
     }
 };
 
@@ -748,6 +764,7 @@ pub const Json = struct {
     const PaneAttached = struct { id: PaneRef, moved_from: PaneRef = .none, command: []const u8 = "", status: []const Status = &.{} };
     const Status = struct { id: []const u8 = "", state: u8 = 0, progress: i8 = -1 };
     const PaneExited = struct { id: PaneRef, status: u32 = 0 };
+    const ClientActionJson = struct { workspace: u32 = 0, name: []const u8 = "", args: std.json.Value = .null };
     const WorkspaceDetached = struct { id: u32, reason: []const u8 = "" };
     const WorkspaceOpen = struct { id: u32, name: []const u8 = "" };
     const WorkspaceCreated = struct { id: u32, name: []const u8 = "" };
@@ -1121,6 +1138,8 @@ fn freeState(self: *Daemon) void {
     self.attach_calls.deinit(self.alloc);
     self.host_lists.deinit(self.alloc);
     self.opens.deinit(self.alloc);
+    for (self.client_actions.items) |*a| a.deinit(self.alloc);
+    self.client_actions.deinit(self.alloc);
     for (self.structures.items) |st| st.destroy(self.alloc);
     self.structures.deinit(self.alloc);
     for (self.host_events.items) |*e| e.deinit(self.alloc);
@@ -1249,6 +1268,15 @@ pub fn takeOpens(self: *Daemon) []u32 {
     win32.AcquireSRWLockExclusive(&self.lock);
     defer win32.ReleaseSRWLockExclusive(&self.lock);
     return self.opens.toOwnedSlice(self.alloc) catch &.{};
+}
+
+/// Take the window actions scripts asked for, in order. The caller
+/// owns them (`ClientAction.deinit` each, then free the slice). UI
+/// thread.
+pub fn takeClientActions(self: *Daemon) []ClientAction {
+    win32.AcquireSRWLockExclusive(&self.lock);
+    defer win32.ReleaseSRWLockExclusive(&self.lock);
+    return self.client_actions.toOwnedSlice(self.alloc) catch &.{};
 }
 
 /// Attach workspace `ws`, with the window's tab area: its panes arrive
@@ -1599,9 +1627,21 @@ fn notified(self: *Daemon, a: Allocator, method: []const u8, params: std.json.Va
         @"host.changed",
         @"host.prompt",
         @"config.changed",
+        @"client.action",
     };
     const ev = std.meta.stringToEnum(Event, method) orelse return;
     switch (ev) {
+        .@"client.action" => {
+            const p = try std.json.parseFromValueLeaky(Json.ClientActionJson, a, params, json_opts);
+            const name = try self.alloc.dupe(u8, p.name);
+            errdefer self.alloc.free(name);
+            const args: []const u8 = if (p.args == .null) "" else try std.json.Stringify.valueAlloc(self.alloc, p.args, .{});
+            errdefer if (args.len > 0) self.alloc.free(args);
+            win32.AcquireSRWLockExclusive(&self.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.lock);
+            try self.client_actions.append(self.alloc, .{ .name = name, .args = args });
+            if (self.posting.load(.acquire)) _ = win32.PostMessageW(self.notify.hwnd, self.notify.msg, 0, 0);
+        },
         .@"config.changed" => {
             const c = try std.json.parseFromValueLeaky(Json.Config, a, params, json_opts);
             for (c.errors) |e| log.warn("init.lua: {s}", .{e});
