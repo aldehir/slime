@@ -176,6 +176,15 @@ func (c *Config) Shell() string {
 	return ""
 }
 
+// HostProxy is settings.host.proxy: whether the daemon runs a SOCKS
+// proxy over each host's connection. On unless set false.
+func (c *Config) HostProxy() bool {
+	if host, ok := c.settings.RawGetString("host").(*glua.LTable); ok {
+		return host.RawGetString("proxy") != glua.LFalse
+	}
+	return true
+}
+
 // Invocation says what to run: the action Name with Args (a JSON
 // object), or the function binding Lua; for Pane (none if zero); from
 // Origin.

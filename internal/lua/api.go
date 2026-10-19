@@ -137,7 +137,10 @@ which are for the top level only:
 
   slime.config{...}          the settings, one table, merged over earlier
                              calls key by key (lists replace). The daemon takes
-                             shell.command (what a pane runs when nothing says);
+                             shell.command (what a pane runs when nothing says)
+                             and host.proxy (false: no SOCKS proxy over a host's
+                             connection; the proxy is loopback-only and has no
+                             auth, so any local program can use the tunnel);
                              each window takes what it understands and ignores
                              the rest (slime-gui: font, theme, colors, window,
                              chrome, selection, clipboard, ssh). Values must be
@@ -180,6 +183,7 @@ one without applying it.
     window = { padding = { x = 3, y = 3 } },
     chrome = { scale = 1 },
     shell = { command = "pwsh -NoLogo" },
+    host = { proxy = true },         -- a SOCKS proxy per connected host (slime host ls)
   }
   slime.bind("ctrl+shift+d", "new_split", { direction = "right" })
   slime.bind("ctrl+shift+t", "new_tab")

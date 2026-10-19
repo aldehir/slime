@@ -58,8 +58,13 @@ func hostCommands() []*cobra.Command {
 		},
 	}, &cobra.Command{
 		Use:   "ls",
-		Short: "List the hosts the daemon knows and their state",
-		Args:  cobra.NoArgs,
+		Short: "List the hosts the daemon knows, their state, and their proxies",
+		Long: "Lists the hosts the daemon knows and their state. A connected host has a SOCKS5\n" +
+			"proxy into its network, on loopback with no auth (as ssh -D's), shown as\n" +
+			"socks5://127.0.0.1:<port>; curl --proxy socks5h://127.0.0.1:<port> http://intranet/\n" +
+			"has the host resolve and reach intranet. slime.config{ host = { proxy = false } }\n" +
+			"turns it off.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var hosts rpc.HostListResult
 			if err := call(rpc.HostList, nil, &hosts); err != nil {
@@ -70,7 +75,12 @@ func hostCommands() []*cobra.Command {
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			for _, h := range hosts.Hosts {
-				fmt.Fprintf(w, "host %d\t%s\t%s\t%s\n", h.ID, h.Dest, h.State, h.Text)
+				// A connected host has no text; its proxy goes there.
+				detail := h.Text
+				if h.Proxy != "" {
+					detail = "proxy " + h.Proxy
+				}
+				fmt.Fprintf(w, "host %d\t%s\t%s\t%s\n", h.ID, h.Dest, h.State, detail)
 			}
 			return w.Flush()
 		},

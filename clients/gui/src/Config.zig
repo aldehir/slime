@@ -263,7 +263,7 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
     while (it.next()) |kv| {
         const key = kv.key_ptr.*;
         const value = kv.value_ptr.*;
-        if (std.mem.eql(u8, key, "theme") or std.mem.eql(u8, key, "shell")) continue; // handled above; the daemon's
+        if (std.mem.eql(u8, key, "theme") or std.mem.eql(u8, key, "shell") or std.mem.eql(u8, key, "host")) continue; // handled above; the daemon's
         const Section = enum { font, colors, window, chrome, selection, clipboard, ssh };
         const section = std.meta.stringToEnum(Section, key) orelse {
             log.warn("unknown setting \"{s}\"", .{key});

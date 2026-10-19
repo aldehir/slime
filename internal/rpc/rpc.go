@@ -944,11 +944,15 @@ const (
 // Host describes a host: host.connect's result, host.list's items, and
 // host.changed. Text is a status line while connecting (the server's,
 // or ours: "installing slime"), or why it failed, was lost, or went.
+// Proxy is the SOCKS5 proxy into the host's network while it's
+// connected ("socks5://127.0.0.1:<port>"; names resolve on the host),
+// unless the config's host.proxy is false.
 type Host struct {
 	ID    uint32    `json:"id"`
 	Dest  string    `json:"dest"`
 	State HostState `json:"state"`
 	Text  string    `json:"text,omitempty"`
+	Proxy string    `json:"proxy,omitempty"`
 }
 
 // HostConnectParams logs in to Dest (ssh://[user@]host[:port],
