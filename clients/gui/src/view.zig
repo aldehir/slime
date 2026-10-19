@@ -705,8 +705,11 @@ test "a context menu is over everything, and the window under it is scrim" {
     var m: Menu = .{ .target = .{ .workspace = key }, .anchor = .{ .point = .{ .x = 100, .y = 100 } } };
     m.add(.{ .label = L("New tab"), .action = .{ .part = .new_tab } });
     m.add(.{ .label = L("Kill"), .action = .{ .part = .kill }, .danger = true });
+    try std.testing.expect(!app.ui.hasOver(app.view()));
     app.mode = .{ .menu = m };
     const built = app.view();
+    // Drawn over what the renderer shows of its own, as a browser pane.
+    try std.testing.expect(app.ui.hasOver(built));
     const box = Ui.find(built, .window(.menu)).?;
     try std.testing.expectEqual(@as(f32, 100), box.rect.x);
     try std.testing.expectEqual(@as(f32, 100), box.rect.y);

@@ -271,10 +271,39 @@ pub fn findIn(node: *const Node, id: Id) ?*const Node {
     return null;
 }
 
-/// Draw `tree`, then the tooltip over it.
-pub fn paint(self: *const Ui, p: *Painter, tree: *const Tree) void {
-    self.paintNode(p, &tree.root);
-    widgets.Tooltip.paint(self, p, tree);
+/// What a paint pass draws: the whole tree into one target, or, while
+/// the renderer has content of its own over the ground (a browser pane's),
+/// the ground and what must be over that content (dialogs, the menu, the
+/// tooltip) in two.
+pub const Layer = enum { all, ground, over };
+
+/// Draw `tree`'s `layer`, then the tooltip over it if that's in the layer.
+pub fn paint(self: *const Ui, p: *Painter, tree: *const Tree, layer: Layer) void {
+    if (layer == .all) {
+        self.paintNode(p, &tree.root);
+    } else {
+        // What's over is decided by the root's children: the regions the
+        // builder stacked last.
+        const root = &tree.root;
+        if (root.clip) p.pushClip(root.rect);
+        defer if (root.clip) p.popClip();
+        for (children(root)) |*child| if (isOver(child) == (layer == .over)) self.paintNode(p, child);
+    }
+    if (layer != .ground) widgets.Tooltip.paint(self, p, tree);
+}
+
+/// Whether `paint`'s `.over` layer draws anything.
+pub fn hasOver(self: *const Ui, tree: *const Tree) bool {
+    if (self.tip.target != .none or dragCapture(tree) != null) return true;
+    for (children(&tree.root)) |*child| if (isOver(child)) return true;
+    return false;
+}
+
+fn isOver(node: *const Node) bool {
+    return switch (node.kind) {
+        .dialog, .menu => true,
+        else => false,
+    };
 }
 
 pub fn paintNode(self: *const Ui, p: *Painter, node: *const Node) void {

@@ -9,6 +9,7 @@ pub const d3d11 = @import("d3d11.zig");
 pub const d3dcompiler = @import("d3dcompiler.zig");
 pub const dwrite = @import("dwrite.zig");
 pub const d2d1 = @import("d2d1.zig");
+pub const dcomp = @import("dcomp.zig");
 pub const conpty = @import("conpty.zig");
 
 pub const BOOL = i32;

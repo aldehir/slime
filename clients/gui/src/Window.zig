@@ -188,7 +188,7 @@ pub fn create(alloc: Allocator, io: std.Io, config: *const Config, keymap: []con
     });
     pending = null;
     errdefer self.app.deinit();
-    self.renderer = try Renderer.init(hwnd, size.width, size.height, config.@"font-antialias");
+    self.renderer = try Renderer.init(self.alloc, hwnd, size.width, size.height, config.@"font-antialias");
     errdefer {
         self.renderer.?.deinit();
         self.renderer = null;
@@ -372,8 +372,12 @@ const Overlay = struct {
     ui: *const Ui,
     tree: *const Ui.Tree,
 
-    pub fn paint(self: Overlay, p: *Painter) void {
-        self.ui.paint(p, self.tree);
+    pub fn paint(self: Overlay, p: *Painter, layer: Ui.Layer) void {
+        self.ui.paint(p, self.tree, layer);
+    }
+
+    pub fn hasOver(self: Overlay) bool {
+        return self.ui.hasOver(self.tree);
     }
 
     pub fn capture(self: Overlay) ?Ui.Rect {
