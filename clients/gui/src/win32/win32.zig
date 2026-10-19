@@ -12,6 +12,7 @@ pub const d2d1 = @import("d2d1.zig");
 pub const dcomp = @import("dcomp.zig");
 pub const conpty = @import("conpty.zig");
 pub const webview2 = @import("webview2.zig");
+pub const wic = @import("wic.zig");
 
 pub const BOOL = i32;
 pub const TRUE: BOOL = 1;
@@ -586,6 +587,8 @@ pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 pub extern "ole32" fn CoTaskMemFree(?*anyopaque) callconv(.winapi) void;
 pub extern "ole32" fn CoTaskMemAlloc(usize) callconv(.winapi) ?*anyopaque;
 pub const COINIT_APARTMENTTHREADED = 0x2;
+pub extern "ole32" fn CoCreateInstance(*const GUID, ?*anyopaque, u32, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT;
+pub const CLSCTX_INPROC_SERVER = 0x1;
 pub extern "user32" fn SystemParametersInfoW(u32, u32, ?*anyopaque, u32) callconv(.winapi) BOOL;
 pub extern "user32" fn GetMessageTime() callconv(.winapi) i32;
 pub extern "user32" fn GetDoubleClickTime() callconv(.winapi) u32;
@@ -597,7 +600,16 @@ pub extern "user32" fn SetClipboardData(u32, ?HANDLE) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn GetClipboardData(u32) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn IsClipboardFormatAvailable(u32) callconv(.winapi) BOOL;
 
-pub const IStream = extern struct { vtable: com.VTable };
+pub const IStream = extern struct {
+    vtable: com.VTable,
+
+    /// Back to the start: a stream just written would be read from its
+    /// end.
+    pub fn rewind(self: *IStream) HRESULT {
+        return com.call(self, 5, fn (i64, u32, ?*u64) HRESULT, .{ 0, STREAM_SEEK_SET, null });
+    }
+};
+pub const STREAM_SEEK_SET = 0;
 
 pub extern "shlwapi" fn SHCreateMemStream(?[*]const u8, u32) callconv(.winapi) ?*IStream;
 

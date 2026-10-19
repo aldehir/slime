@@ -2,9 +2,9 @@
 //! rounded box with a border and a shadow; over it goes a title strip at
 //! its top that holds its title and its buttons (faint until the mouse is
 //! over one). A pane without focus is dimmed. A browser pane's strip
-//! holds its history buttons and URL bar in place of the title, and
-//! until a browser draws its page, the page's title and url stand in
-//! for it under the strip.
+//! holds its history buttons and URL bar in place of the title, the
+//! site's icon (or a globe) at the bar's left, and until a browser draws
+//! its page, the page's title and url stand in for it under the strip.
 //!
 //! Dragging a pane by its title strip (`Tree.drag`) leaves it dimmed
 //! where it was, puts a small picture of it by the mouse, and highlights
@@ -36,6 +36,9 @@ const url_pad = 7;
 /// The least the URL bar keeps beside the history buttons: narrower, they
 /// go, and it takes their room.
 const url_min = 140;
+/// The site's icon in the URL bar, and between it and the url.
+const site_icon = 16;
+const site_gap = 6;
 /// Between the last icon and the pane's right edge.
 const margin = 3;
 /// Before the title, and the focus dot before it.
@@ -153,13 +156,28 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
 fn paintUrl(ui: *const Ui, p: *Painter, r: Rect, b: BrowserPane, focused: bool) void {
     if (r.w < 1 or r.h < 1) return;
     const radius = ui.px(6);
-    const inner = r.inset(ui.px(url_pad), 0);
-    if (b.field) |field| {
+    var inner = r.inset(ui.px(url_pad), 0);
+    if (b.field != null) {
         ui.fillBordered(p, r, radius, ui.theme.surface, ui.theme.accent);
+    } else {
+        p.fillRounded(r, radius, ui.theme.field);
+    }
+    // The site's icon, where the bar has room for it and some url.
+    const size = ui.px(site_icon);
+    if (inner.w >= 4 * size) {
+        const icon: Rect = .{ .x = inner.x, .y = r.y + @round((r.h - size) / 2), .w = size, .h = size };
+        if (b.favicon) |img| {
+            p.image(img, icon, 0, 1);
+        } else {
+            ui.drawIcon(p, .globe, icon.inset(ui.px(1), ui.px(1)), if (focused) ui.theme.text_muted else ui.theme.text_inactive);
+        }
+        const skip = size + ui.px(site_gap);
+        inner = .{ .x = inner.x + skip, .y = inner.y, .w = inner.w - skip, .h = inner.h };
+    }
+    if (b.field) |field| {
         ui.paintEditText(p, inner, field, .{ .caret = b.caret });
         return;
     }
-    p.fillRounded(r, radius, ui.theme.field);
     p.pushClip(inner);
     defer p.popClip();
     p.text(shownUrl(b.url), ui.fonts.get(.body), inner, if (focused) ui.theme.text else ui.theme.text_muted);
@@ -234,6 +252,17 @@ pub fn paintDrag(ui: *const Ui, p: *Painter, tree: *const Tree, thumb: ?Painter.
     const radius = @round(f.corner * scale) + ui.px(2);
     ui.paintShadow(p, r, radius);
     p.image(img, r, radius, thumb_opacity);
+    // The page over its box, which the copy of the frame has empty.
+    if (d.page) |page| if (d.source) |src| {
+        const k = r.w / src.w;
+        const at_page: Rect = .{
+            .x = r.x + (page.rect.x - src.x) * k,
+            .y = r.y + (page.rect.y - src.y) * k,
+            .w = page.rect.w * k,
+            .h = page.rect.h * k,
+        };
+        p.imageIn(page.image, at_page, r, radius, thumb_opacity);
+    };
     p.strokeRounded(r, radius, ui.stroke(), ui.theme.pane_border);
 }
 

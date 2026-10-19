@@ -1507,6 +1507,14 @@ pub fn split(self: *Daemon, pane: PaneRef, dir: Direction, command: []const u16)
     _ = try self.call("pane.split", .{ .pane = pane, .direction = dir, .share = 5000, .command = cmd });
 }
 
+/// Ask for a browser pane showing `url` on side `dir` of `pane`, as
+/// `split` does. UI thread.
+pub fn splitBrowser(self: *Daemon, pane: PaneRef, dir: Direction, url: []const u16) !void {
+    const text = try commandUtf8(self.alloc, url);
+    defer self.alloc.free(text);
+    _ = try self.call("pane.split", .{ .pane = pane, .direction = dir, .share = 5000, .kind = "browser", .url = text });
+}
+
 /// Send browser pane `pane` to `url`: every window showing it follows,
 /// this one too (pane.url). UI thread.
 pub fn paneNavigate(self: *Daemon, pane: PaneRef, url: []const u16) !void {

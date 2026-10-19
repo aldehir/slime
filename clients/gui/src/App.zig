@@ -188,7 +188,8 @@ pub const Mode = union(enum) {
     rename: Rename,
     /// A browser pane's URL bar being typed in.
     url: UrlEdit,
-    /// Asking before killing a workspace, over the terminal area.
+    /// Asking before killing a workspace, or whether a page may have a
+    /// permission, over the terminal area.
     confirm: Confirm,
     /// A context menu, over everything, until it's chosen from or
     /// dismissed.
@@ -209,11 +210,16 @@ pub const UrlEdit = struct {
     field: TextField,
 };
 
-/// Asking whether to kill a workspace. The dialog's strings point into
-/// the buffers, so it stays where it is.
+/// Asking whether to kill a workspace, or to let a browser pane's page
+/// have a permission. The dialog's strings point into the buffers, so it
+/// stays where it is.
 pub const Confirm = struct {
-    /// The workspace's key.
-    ws: u32,
+    about: union(enum) {
+        /// The workspace's key.
+        kill: u32,
+        /// The pane's session's id.
+        permission: u32,
+    },
     dialog: Dialog,
     title: [TextField.max_len + 32]u16 = undefined,
     text: [96]u16 = undefined,
@@ -474,6 +480,11 @@ pub const Shell = struct {
         /// A click on a browser pane's stand-in: its browser gets
         /// another go.
         webRetry: *const fn (*anyopaque, *Session) void,
+        /// A browser pane is dragged (true), or no longer: a picture of
+        /// its page is wanted for the dragged pane's (`Browser.preview`).
+        webCapture: *const fn (*anyopaque, *Session, bool) void,
+        /// The answer to a browser pane's page asking for a permission.
+        webAnswer: *const fn (*anyopaque, *Session, Web.Answer) void,
     };
 
     fn captureMouse(self: Shell) void {
@@ -559,6 +570,12 @@ pub const Shell = struct {
     }
     fn webRetry(self: Shell, s: *Session) void {
         self.vt.webRetry(self.ctx, s);
+    }
+    fn webCapture(self: Shell, s: *Session, on: bool) void {
+        self.vt.webCapture(self.ctx, s, on);
+    }
+    fn webAnswer(self: Shell, s: *Session, answer: Web.Answer) void {
+        self.vt.webAnswer(self.ctx, s, answer);
     }
 };
 
@@ -1053,7 +1070,7 @@ fn workspaceGone(self: *App, conn: *Daemon, id: u32) void {
 fn forgetWorkspace(self: *App, key: u32) void {
     switch (self.mode) {
         .rename => |r| if (r.ws == key) self.cancelRename(),
-        .confirm => |c| if (c.ws == key) self.closeConfirm(),
+        .confirm => |c| if (std.meta.eql(c.about, .{ .kill = key })) self.closeConfirm(),
         .menu => |m| if (std.meta.eql(m.target, Id.Target{ .workspace = key })) self.closeMenu(),
         .terminal, .connect, .url => {},
     }
@@ -1174,7 +1191,8 @@ fn askKillWorkspace(self: *App, key: u32) void {
     if (entry.tabs == 0) return entry.conn.killWorkspace(entry.id);
     self.cancelConnect();
     self.cancelRename();
-    self.mode = .{ .confirm = .{ .ws = key, .dialog = undefined } };
+    self.closeConfirm();
+    self.mode = .{ .confirm = .{ .about = .{ .kill = key }, .dialog = undefined } };
     const c = &self.mode.confirm;
     const prefix = std.unicode.utf8ToUtf16LeStringLiteral("Kill workspace \u{201c}");
     const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\u{201d}?");
@@ -1199,21 +1217,87 @@ fn askKillWorkspace(self: *App, key: u32) void {
     self.markDirty();
 }
 
-/// Act on the kill dialog's button.
+/// Browser pane `s`'s page at `site` asks to `what`: ask the user, unless
+/// a dialog is up already. Returns false if not asked.
+pub fn askPermission(self: *App, s: *Session, site: []const u16, what: []const u8) bool {
+    if (self.mode == .confirm or s.login != null) return false;
+    self.cancelConnect();
+    self.cancelRename();
+    self.cancelUrl();
+    self.closeMenu();
+    self.mode = .{ .confirm = .{ .about = .{ .permission = s.id }, .dialog = undefined } };
+    const c = &self.mode.confirm;
+    var title: std.ArrayList(u16) = .initBuffer(&c.title);
+    title.appendSliceBounded(site[0..@min(site.len, c.title.len / 2)]) catch {};
+    title.appendSliceBounded(L(" wants to ")) catch {};
+    for (what) |ch| title.appendBounded(ch) catch break;
+    var text: std.ArrayList(u16) = .initBuffer(&c.text);
+    const page = s.title();
+    if (page.len > 0) {
+        text.appendSliceBounded(L("Asked by \u{201c}")) catch {};
+        text.appendSliceBounded(page[0..@min(page.len, c.text.len - 16)]) catch {};
+        text.appendSliceBounded(L("\u{201d}.")) catch {};
+    }
+    c.dialog = .{ .icon = .warning, .title = title.items, .text = text.items };
+    c.dialog.addButton(.{ .label = L("Deny"), .action = .cancel });
+    c.dialog.addButton(.{ .label = L("Allow"), .action = .accept, .style = .primary });
+    c.dialog.focus = .{ .button = 0 };
+    _ = self.ui.setHover(.none);
+    self.resetBlink();
+    self.markDirty();
+    return true;
+}
+
+/// Act on the kill or permission dialog's button.
 fn confirmAction(self: *App, action: Dialog.Action) void {
-    const ws = switch (self.mode) {
-        .confirm => |c| c.ws,
+    const about = switch (self.mode) {
+        .confirm => |c| c.about,
         else => return,
     };
-    if (action == .accept) if (self.workspaceEntry(ws)) |w| w.conn.killWorkspace(w.id);
+    switch (about) {
+        .kill => |ws| if (action == .accept) if (self.workspaceEntry(ws)) |w| w.conn.killWorkspace(w.id),
+        .permission => |id| {
+            // Closed first, which would deny.
+            self.mode = .terminal;
+            if (self.findSession(id)) |f| self.shell.webAnswer(f.s, if (action == .accept) .allow else .deny);
+            _ = self.ui.setHover(.none);
+            self.markDirty();
+            return;
+        },
+    }
     self.closeConfirm();
 }
 
+/// Close the kill or permission dialog; a permission it asked about is
+/// denied.
 fn closeConfirm(self: *App) void {
-    if (self.mode != .confirm) return;
+    const c = switch (self.mode) {
+        .confirm => |c| c,
+        else => return,
+    };
     self.mode = .terminal;
+    switch (c.about) {
+        .kill => {},
+        .permission => |id| if (self.findSession(id)) |f| self.shell.webAnswer(f.s, .dismiss),
+    }
     _ = self.ui.setHover(.none);
     self.markDirty();
+}
+
+/// Whether the permission dialog's question is still open: its pane's
+/// page may have gone, or its browser, which answered it.
+fn confirmStillAsks(self: *App) bool {
+    const c = switch (self.mode) {
+        .confirm => |c| c,
+        else => return true,
+    };
+    const id = switch (c.about) {
+        .kill => return true,
+        .permission => |id| id,
+    };
+    const f = self.findSession(id) orelse return false;
+    const b = f.s.browser() orelse return false;
+    return b.asking;
 }
 
 /// Edit workspace `key`'s name in its row.
@@ -1268,7 +1352,8 @@ fn confirmKey(self: *App, d: *Dialog, vk: u32) bool {
     switch (vk) {
         win32.VK_RETURN => if (d.enterAction()) |action| self.confirmAction(action),
         win32.VK_SPACE => if (d.focusedButton()) |b| self.confirmAction(b.action) else return false,
-        win32.VK_ESCAPE => self.confirmAction(.cancel),
+        // Dismissed: a page asking isn't answered for good.
+        win32.VK_ESCAPE => self.closeConfirm(),
         win32.VK_TAB => if (self.shell.keyDown(win32.VK_CONTROL)) return false else d.cycleFocus(!self.shell.keyDown(win32.VK_SHIFT)),
         else => return false,
     }
@@ -2379,7 +2464,10 @@ fn endSidebarDrag(self: *App) void {
 fn cancelDrag(self: *App) void {
     if (self.drag == null and self.pane_drag == null) return;
     self.drag = null;
-    if (self.pane_drag != null) self.markDirty();
+    if (self.pane_drag) |d| {
+        self.markDirty();
+        self.shell.webCapture(d.source, false);
+    }
     self.pane_drag = null;
     self.shell.releaseMouse();
 }
@@ -2407,6 +2495,9 @@ fn paneDragTo(self: *App, d: *PaneDrag, pos: win32.POINT) void {
             self.layoutTab(d.tab);
             self.syncFocus();
         }
+        // A browser's page is in a visual of its own, not the frame the
+        // picture is copied from: its browser draws one.
+        self.shell.webCapture(d.source, true);
     }
     d.at = pos;
     d.drop = self.dropAt(d, pos);
@@ -2419,6 +2510,7 @@ fn endPaneDrag(self: *App) void {
     // First: releasing the capture comes back as `capture_lost`.
     self.pane_drag = null;
     self.shell.releaseMouse();
+    self.shell.webCapture(d.source, false);
     self.markDirty();
     const drop = d.drop orelse return;
     d.tab.move(self.alloc, d.source, drop.place) catch |err| return log.err("moving the pane failed: {}", .{err});
@@ -2704,6 +2796,24 @@ fn runBinding(self: *App, k: Msg.Key, drop_chars: bool) bool {
     return true;
 }
 
+/// Browser pane `s`'s page opens a window at `url`: a browser pane split
+/// off its right shows it. Returns false if the pane can't be split (it
+/// isn't slime's, or it ended).
+pub fn browserNewWindow(self: *App, s: *Session, url: []const u16) bool {
+    if (s.ended) return false;
+    const pane = s.daemonPane() orelse return false;
+    const f = self.findSession(s.id) orelse return false;
+    const t = self.tabs.items[f.tab];
+    const conn = t.conn orelse return false;
+    self.unzoom(t);
+    conn.splitBrowser(pane, .right, url) catch |err| {
+        log.err("opening {f} beside pane {d} failed: {}", .{ std.unicode.fmtUtf16Le(url), s.id, err });
+        return false;
+    };
+    self.markDirty();
+    return true;
+}
+
 /// Browser pane `s`'s page, title, history, or browser changed.
 pub fn browserChanged(self: *App, s: *Session) void {
     self.markDirty();
@@ -2859,6 +2969,7 @@ fn blinkTick(self: *App) void {
 /// Show the host field in place of "Connect".
 fn startConnect(self: *App) void {
     if (self.mode == .connect) return;
+    self.closeConfirm();
     // Destinations go on the helper's command line unquoted.
     self.mode = .{ .connect = .{ .reject = std.unicode.utf8ToUtf16LeStringLiteral(" \t\"") } };
     self.resetBlink();
@@ -2907,6 +3018,7 @@ fn startUrl(self: *App, s: *Session) void {
     const url = s.pageUrl() orelse return;
     if (self.mode == .url and self.mode.url.pane == s.id) return;
     self.focusPane(s);
+    self.closeConfirm();
     self.mode = .{ .url = .{ .pane = s.id, .field = .{} } };
     const field = &self.mode.url.field;
     field.insert(url);
@@ -3131,9 +3243,14 @@ fn anyWorking(self: *App) bool {
 /// is gone. The renderer calls this once a frame; `hitAt` reuses the
 /// tree while nothing has changed (`currentTree`).
 pub fn view(self: *App) *const Tree {
-    // A menu about something that's gone goes too, and a URL bar.
+    // A menu about something that's gone goes too, and a URL bar, and a
+    // question a page no longer asks.
     if (!self.menuTargetExists()) self.closeMenu();
     if (!self.urlShown()) self.cancelUrl();
+    if (!self.confirmStillAsks()) {
+        self.mode = .terminal;
+        _ = self.ui.setHover(.none);
+    }
     // The builder reads the placement.
     _ = self.placed();
     _ = self.arena.reset(.retain_capacity);
@@ -3620,6 +3737,8 @@ pub const TestShell = struct {
     /// The modifiers held, as `mods` reports them.
     held: input.Mods = .{},
     font_size: f32 = 12,
+    /// The last answer to a page's permission question.
+    answer: ?Web.Answer = null,
 
     fn captureMouse(ctx: *anyopaque) void {
         self_(ctx).captured = true;
@@ -3692,6 +3811,11 @@ pub const TestShell = struct {
     fn webRetry(_: *anyopaque, s: *Session) void {
         if (s.browser()) |b| b.failed = null;
     }
+    fn webCapture(_: *anyopaque, _: *Session, _: bool) void {}
+    fn webAnswer(ctx: *anyopaque, s: *Session, answer: Web.Answer) void {
+        if (s.browser()) |b| b.asking = false;
+        self_(ctx).answer = answer;
+    }
 
     fn self_(ctx: *anyopaque) *TestShell {
         return @ptrCast(@alignCast(ctx));
@@ -3726,6 +3850,8 @@ pub const TestShell = struct {
         .webFollow = webFollow,
         .webHost = webHost,
         .webRetry = webRetry,
+        .webCapture = webCapture,
+        .webAnswer = webAnswer,
     };
 
     fn shell(self: *TestShell) Shell {
@@ -3878,7 +4004,7 @@ test "the keyboard goes to the host field, a rename, or the kill dialog, one at 
     try std.testing.expect(app.keyboard() == .rename);
     try std.testing.expectEqual(&app.mode.rename.field, app.keyboard().field().?);
 
-    app.mode = .{ .confirm = .{ .ws = 7, .dialog = .{ .icon = .warning, .title = &.{} } } };
+    app.mode = .{ .confirm = .{ .about = .{ .kill = 7 }, .dialog = .{ .icon = .warning, .title = &.{} } } };
     try std.testing.expect(app.keyboard() == .confirm);
     try std.testing.expect(app.keyboard().field() == null);
     try std.testing.expectEqual(&app.mode.confirm.dialog, app.activeDialog().?);
@@ -4022,6 +4148,44 @@ test "the blink timer toggles the phase and redraws only what blinks" {
     try std.testing.expectEqual(@as(?u32, 500), shell.timers.get(.blink));
     _ = app.update(.{ .focus = false });
     try std.testing.expectEqual(@as(?u32, null), shell.timers.get(.blink));
+}
+
+test "a permission dialog: its buttons answer, Escape dismisses, and one asks at a time" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    try app.spawnFailed("a", error.A);
+    const s = app.focusedSession().?;
+    const escape: Msg = .{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_ESCAPE, .lparam = 0 } };
+    const deny: Id = .{ .target = .{ .dialog = 0 }, .part = .button };
+    const allow: Id = .{ .target = .{ .dialog = 1 }, .part = .button };
+
+    try std.testing.expect(app.askPermission(s, L("example.com"), "show notifications"));
+    try std.testing.expect(app.keyboard() == .confirm);
+    try std.testing.expectEqualSlices(u16, L("example.com wants to show notifications"), app.mode.confirm.dialog.title);
+    // Another while it's open isn't asked.
+    try std.testing.expect(!app.askPermission(s, L("example.org"), "read the clipboard"));
+    _ = app.update(escape);
+    try std.testing.expect(app.mode == .terminal);
+    try std.testing.expectEqual(Web.Answer.dismiss, shell.answer.?);
+
+    try std.testing.expect(app.askPermission(s, L("example.com"), "show notifications"));
+    _ = app.update(.{ .click = allow });
+    try std.testing.expect(app.mode == .terminal);
+    try std.testing.expectEqual(Web.Answer.allow, shell.answer.?);
+
+    try std.testing.expect(app.askPermission(s, L("example.com"), "show notifications"));
+    _ = app.update(.{ .click = deny });
+    try std.testing.expect(app.mode == .terminal);
+    try std.testing.expectEqual(Web.Answer.deny, shell.answer.?);
+
+    // Replaced by another dialog: dismissed.
+    try std.testing.expect(app.askPermission(s, L("example.com"), "show notifications"));
+    shell.answer = null;
+    app.startConnect();
+    try std.testing.expectEqual(Web.Answer.dismiss, shell.answer.?);
 }
 
 test "the tabs can all go and a new one come while the active index is past them" {

@@ -20,7 +20,14 @@
 //! fails, or its host's connection ends or comes back on another proxy
 //! (`hostChanged`). A failed view leaves the pane's stand-in saying why
 //! (`Session.Browser.failed`), and a click there makes a new one; one
-//! closed for its host makes a new one by itself once it can.
+//! closed for its host makes a new one by itself once it can. One hidden
+//! longer than `browser.idle` is closed too (`closeIdle`), and the next
+//! placement opens the pane's url again.
+//!
+//! A page opening a window splits its pane with a browser pane there
+//! (`Events.new_window`). Camera, microphone, and location are denied;
+//! other permissions are asked about in the window's dialog
+//! (`Events.permission`), one at a time per pane.
 
 const Web = @This();
 
@@ -33,6 +40,7 @@ const wv = win32.webview2;
 const Session = @import("Session.zig");
 const Renderer = @import("renderer/D3D11.zig");
 const Daemon = @import("Daemon.zig");
+const Painter = Renderer.Painter;
 
 const log = std.log.scoped(.web);
 
@@ -84,6 +92,13 @@ pub const Events = struct {
     host: *const fn (*anyopaque, u32) ?Host,
     /// Draw again: panes waiting on a host's browser may get one.
     redraw: *const fn (*anyopaque) void,
+    /// A pane's page opens a window at a url: returns true if it went
+    /// into a new pane.
+    new_window: *const fn (*anyopaque, *Session, []const u16) bool,
+    /// A pane's page at `site` asks to `what` (`permissionPolicy`):
+    /// returns true if the window asks the user, whose answer comes to
+    /// `answer`.
+    permission: *const fn (*anyopaque, *Session, []const u16, []const u8) bool,
 };
 
 /// A connected host, as a browser on it needs it. Borrowed.
@@ -634,9 +649,17 @@ const TestEvents = struct {
             .cursor = redraw,
             .host = host,
             .redraw = redraw,
+            .new_window = newWin,
+            .permission = permit,
         };
     }
     fn changed(_: *anyopaque, _: *Session) void {}
+    fn newWin(_: *anyopaque, _: *Session, _: []const u16) bool {
+        return false;
+    }
+    fn permit(_: *anyopaque, _: *Session, _: []const u16, _: []const u8) bool {
+        return false;
+    }
     fn onFocus(_: *anyopaque, _: *Session, _: bool) void {}
     fn key(_: *anyopaque, _: u32, _: win32.WPARAM, _: win32.LPARAM) bool {
         return false;
@@ -697,7 +720,8 @@ test "an environment retired while it's made waits, and a click drops it" {
 }
 
 /// A COM object WebView2 calls back, embedded in `Outer` as `field`:
-/// `invoke` gets the outer struct, and references count on it.
+/// `invoke` gets the outer struct, and references count on it. A
+/// one-argument handler's `invoke` takes void for the second.
 fn Callback(
     comptime H: type,
     comptime Outer: type,
@@ -712,7 +736,7 @@ fn Callback(
             .QueryInterface = queryInterface,
             .AddRef = addRef,
             .Release = release,
-            .Invoke = call,
+            .Invoke = if (H.B == void) call1 else call,
         };
 
         fn outer(iface: *H) *Outer {
@@ -740,6 +764,10 @@ fn Callback(
 
         fn call(iface: *H, a: H.A, b: H.B) callconv(.winapi) win32.HRESULT {
             return invoke(outer(iface), a, b);
+        }
+
+        fn call1(iface: *H, a: H.A) callconv(.winapi) win32.HRESULT {
+            return invoke(outer(iface), a, {});
         }
     };
 }
@@ -771,6 +799,14 @@ pub const View = struct {
     focus_asked: bool = false,
     /// `show` placed it this frame.
     placed_mark: bool = false,
+    /// When it was hidden (GetTickCount64), while it is.
+    hidden_at: ?u64 = null,
+    /// The page's picture being made for a drag (`capture`), and whether
+    /// it's still wanted.
+    preview_stream: ?*win32.IStream = null,
+    want_preview: bool = false,
+    /// A permission the window is asking the user about.
+    pending: ?Pending = null,
 
     created: Callback(wv.CompositionControllerCompletedHandler, View, "created", controllerCreated) = .{},
     navigation_starting: Callback(wv.NavigationStartingEventHandler, View, "navigation_starting", navigationStarting) = .{},
@@ -785,6 +821,31 @@ pub const View = struct {
     lost_focus: Callback(wv.FocusChangedEventHandler, View, "lost_focus", lostFocus) = .{},
     move_focus: Callback(wv.MoveFocusRequestedEventHandler, View, "move_focus", moveFocusRequested) = .{},
     accelerator: Callback(wv.AcceleratorKeyPressedEventHandler, View, "accelerator", acceleratorKey) = .{},
+    captured: Callback(wv.CapturePreviewCompletedHandler, View, "captured", previewCaptured) = .{},
+    favicon_changed: Callback(wv.FaviconChangedEventHandler, View, "favicon_changed", faviconChanged) = .{},
+    favicon_got: Callback(wv.GetFaviconCompletedHandler, View, "favicon_got", faviconGot) = .{},
+    permission: Callback(wv.PermissionRequestedEventHandler, View, "permission", permissionRequested) = .{},
+
+    /// A permission request held open (`GetDeferral`) for the user's
+    /// answer.
+    const Pending = struct {
+        args: *wv.IPermissionRequestedEventArgs,
+        deferral: *wv.IDeferral,
+
+        /// Answer, and let it go. A dismissed question is denied for
+        /// this request alone; an answer the user chose is kept for the
+        /// site, as browsers keep them.
+        fn answer(self: Pending, a: Answer) void {
+            if (a == .dismiss) if (com.query(self.args, wv.IPermissionRequestedEventArgs3)) |args3| {
+                defer com.release(args3);
+                _ = args3.putSavesInProfile(false);
+            };
+            _ = self.args.putState(if (a == .allow) .allow else .deny);
+            _ = self.deferral.complete();
+            com.release(self.deferral);
+            com.release(self.args);
+        }
+    };
 
     fn retain(self: *View) u32 {
         self.refs += 1;
@@ -839,6 +900,9 @@ pub const View = struct {
             break;
         };
         self.unplace();
+        self.settle(.dismiss);
+        self.want_preview = false;
+        com.releaseOpt(&self.preview_stream);
         if (self.controller) |c| _ = c.close();
         com.releaseOpt(&self.webview);
         com.releaseOpt(&self.controller);
@@ -846,6 +910,14 @@ pub const View = struct {
         com.releaseOpt(&self.visual);
         if (web.renderer) |r| r.commit() catch {};
         _ = self.release();
+    }
+
+    /// Answer the pending permission, if there is one.
+    fn settle(self: *View, a: Answer) void {
+        const p = self.pending orelse return;
+        self.pending = null;
+        if (self.browser()) |b| b.asking = false;
+        p.answer(a);
     }
 
     /// Shut the view, its pane standing in saying `why`.
@@ -891,12 +963,14 @@ pub const View = struct {
         }
         self.bounds = p.bounds;
         self.shown = true;
+        self.hidden_at = null;
     }
 
     /// Out of sight, kept: another tab is shown, or another pane zoomed.
     fn hide(self: *View) void {
         self.unplace();
         if (self.shown and self.state == .ready) _ = self.controller.?.putIsVisible(false);
+        if (self.hidden_at == null) self.hidden_at = win32.GetTickCount64();
         self.shown = false;
     }
 };
@@ -1004,6 +1078,12 @@ fn setUp(self: *View, comp: *wv.ICompositionController) !void {
     try com.check(controller.addLostFocus(&self.lost_focus.iface, &token), "add_LostFocus");
     try com.check(controller.addMoveFocusRequested(&self.move_focus.iface, &token), "add_MoveFocusRequested");
     try com.check(controller.addAcceleratorKeyPressed(&self.accelerator.iface, &token), "add_AcceleratorKeyPressed");
+    try com.check(w.addPermissionRequested(&self.permission.iface, &token), "add_PermissionRequested");
+    // Without it (a runtime before 1.0.1185), the globe stays.
+    if (com.query(w, wv.IWebView15)) |w15| {
+        defer com.release(w15);
+        com.check(w15.addFaviconChanged(&self.favicon_changed.iface, &token), "add_FaviconChanged") catch {};
+    }
 
     self.state = .ready;
     // Placed while it was made: show it there.
@@ -1079,14 +1159,250 @@ fn historyChanged(self: *View, w: *wv.IWebView, _: ?*wv.IUnknown) win32.HRESULT 
     return com.S_OK;
 }
 
-/// A page opening a window opens it here instead.
+/// A page opening a window opens it in a pane split off its own, or,
+/// where the window can't split it, in its own.
 fn newWindow(self: *View, _: *wv.IWebView, args: *wv.INewWindowRequestedEventArgs) win32.HRESULT {
     _ = args.putHandled(true);
     var uri: ?win32.LPWSTR = null;
     if (args.getUri(&uri) < 0) return com.S_OK;
     defer win32.CoTaskMemFree(uri);
-    if (uri) |u| navigate(self, std.mem.span(u));
+    const url = std.mem.span(uri orelse return com.S_OK);
+    if (url.len == 0) return com.S_OK;
+    if (self.session) |s| if (self.web.events.new_window(self.web.events.ctx, s, url)) return com.S_OK;
+    navigate(self, url);
     return com.S_OK;
+}
+
+fn faviconChanged(self: *View, w: *wv.IWebView, _: ?*wv.IUnknown) win32.HRESULT {
+    const w15 = com.query(w, wv.IWebView15) orelse return com.S_OK;
+    defer com.release(w15);
+    var uri: ?win32.LPWSTR = null;
+    _ = w15.getFaviconUri(&uri);
+    defer win32.CoTaskMemFree(uri);
+    if (!hasFavicon(if (uri) |u| std.mem.span(u) else null)) {
+        setFavicon(self, null);
+        return com.S_OK;
+    }
+    com.check(w15.getFavicon(.png, &self.favicon_got.iface), "ICoreWebView2_15::GetFavicon") catch setFavicon(self, null);
+    return com.S_OK;
+}
+
+fn faviconGot(self: *View, hr: win32.HRESULT, stream: ?*win32.IStream) win32.HRESULT {
+    if (self.state != .ready) return com.S_OK;
+    const r = self.web.renderer orelse return com.S_OK;
+    const png = stream orelse {
+        if (hr < 0) log.warn("pane {d}'s favicon: HRESULT=0x{X:0>8}", .{ self.key, @as(u32, @bitCast(hr)) });
+        setFavicon(self, null);
+        return com.S_OK;
+    };
+    setFavicon(self, r.decodeImage(png) catch null);
+    return com.S_OK;
+}
+
+/// Show `img` as the pane's icon; null for the globe.
+fn setFavicon(self: *View, img: ?Painter.Image) void {
+    const b = self.browser() orelse {
+        if (img) |i| com.release(i.bitmap);
+        return;
+    };
+    if (img == null and b.favicon == null) return;
+    Session.Browser.setImage(&b.favicon, img);
+    self.web.events.changed(self.web.events.ctx, self.session.?);
+}
+
+/// Whether a page whose favicon is at `uri` has one to show: one that
+/// has none, or one that won't decode, shows the globe.
+pub fn hasFavicon(uri: ?[]const u16) bool {
+    const u = uri orelse return false;
+    return u.len > 0;
+}
+
+test hasFavicon {
+    try std.testing.expect(hasFavicon(L("https://www.iana.org/favicon.ico")));
+    // A data: page, or one that has none.
+    try std.testing.expect(!hasFavicon(L("")));
+    try std.testing.expect(!hasFavicon(null));
+}
+
+fn previewCaptured(self: *View, hr: win32.HRESULT, _: void) win32.HRESULT {
+    const stream = self.preview_stream orelse return com.S_OK;
+    self.preview_stream = null;
+    defer com.release(stream);
+    if (!self.want_preview or self.state != .ready) return com.S_OK;
+    if (hr < 0) {
+        log.warn("capturing pane {d}'s page failed: HRESULT=0x{X:0>8}", .{ self.key, @as(u32, @bitCast(hr)) });
+        return com.S_OK;
+    }
+    const r = self.web.renderer orelse return com.S_OK;
+    const img = r.decodeImage(stream) catch return com.S_OK;
+    const b = self.browser() orelse {
+        com.release(img.bitmap);
+        return com.S_OK;
+    };
+    Session.Browser.setImage(&b.preview, img);
+    self.web.events.redraw(self.web.events.ctx);
+    return com.S_OK;
+}
+
+fn permissionRequested(self: *View, _: *wv.IWebView, args: *wv.IPermissionRequestedEventArgs) win32.HRESULT {
+    var kind: wv.PermissionKind = .unknown;
+    _ = args.getPermissionKind(&kind);
+    var uri: ?win32.LPWSTR = null;
+    _ = args.getUri(&uri);
+    defer win32.CoTaskMemFree(uri);
+    const site = siteOf(if (uri) |u| std.mem.span(u) else &.{});
+    const what = switch (permissionPolicy(kind)) {
+        .deny => {
+            log.info("pane {d}: {f} asked for permission {d}: denied", .{ self.key, std.unicode.fmtUtf16Le(site), @intFromEnum(kind) });
+            return deny(args);
+        },
+        .ask => |what| what,
+    };
+    // One question at a time: another while one is open is denied.
+    const s = self.session orelse return deny(args);
+    if (self.pending != null) return deny(args);
+    var deferral: ?*wv.IDeferral = null;
+    if (args.getDeferral(&deferral) < 0 or deferral == null) return deny(args);
+    _ = com.call(args, 1, fn () u32, .{});
+    self.pending = .{ .args = args, .deferral = deferral.? };
+    if (s.browser()) |b| b.asking = true;
+    if (!self.web.events.permission(self.web.events.ctx, s, site, what)) self.settle(.dismiss);
+    return com.S_OK;
+}
+
+fn deny(args: *wv.IPermissionRequestedEventArgs) win32.HRESULT {
+    _ = args.putState(.deny);
+    return com.S_OK;
+}
+
+pub const Policy = union(enum) {
+    deny,
+    /// The dialog says the site wants to do this.
+    ask: []const u8,
+};
+
+/// What a page asking for permission `kind` gets: denied without asking
+/// (camera, microphone, and location, which a terminal's browser has no
+/// business with, and kinds we can't name), or asked about.
+pub fn permissionPolicy(kind: wv.PermissionKind) Policy {
+    return switch (kind) {
+        .camera, .microphone, .geolocation, .unknown => .deny,
+        .notifications => .{ .ask = "show notifications" },
+        .other_sensors => .{ .ask = "use your device's motion sensors" },
+        .clipboard_read => .{ .ask = "read the clipboard" },
+        .multiple_automatic_downloads => .{ .ask = "download several files" },
+        .file_read_write => .{ .ask = "read and change files" },
+        .autoplay => .{ .ask = "play media by itself" },
+        .local_fonts => .{ .ask = "use your installed fonts" },
+        .midi_system_exclusive_messages => .{ .ask = "control your MIDI devices" },
+        .window_management => .{ .ask = "manage windows on your displays" },
+        .persistent_storage => .{ .ask = "store data permanently" },
+        _ => .deny,
+    };
+}
+
+test permissionPolicy {
+    try std.testing.expect(permissionPolicy(.camera) == .deny);
+    try std.testing.expect(permissionPolicy(.microphone) == .deny);
+    try std.testing.expect(permissionPolicy(.geolocation) == .deny);
+    try std.testing.expect(permissionPolicy(@enumFromInt(99)) == .deny);
+    try std.testing.expectEqualStrings("show notifications", permissionPolicy(.notifications).ask);
+    try std.testing.expectEqualStrings("read the clipboard", permissionPolicy(.clipboard_read).ask);
+}
+
+/// Who's asking, as the dialog names it: the host of `uri`, with its
+/// port; "This page" for one with none (data:, file:).
+pub fn siteOf(uri: []const u16) []const u16 {
+    const none = L("This page");
+    const colon = std.mem.indexOfScalar(u16, uri, ':') orelse return none;
+    if (!std.mem.startsWith(u16, uri[colon..], L("://"))) return none;
+    var rest = uri[colon + 3 ..];
+    if (std.mem.indexOfAny(u16, rest, L("/?#"))) |end| rest = rest[0..end];
+    // Credentials aren't the site.
+    if (std.mem.lastIndexOfScalar(u16, rest, '@')) |at| rest = rest[at + 1 ..];
+    return if (rest.len == 0) none else rest;
+}
+
+test siteOf {
+    try std.testing.expectEqualSlices(u16, L("example.com"), siteOf(L("https://example.com/a?b")));
+    try std.testing.expectEqualSlices(u16, L("localhost:8080"), siteOf(L("http://user:pw@localhost:8080")));
+    try std.testing.expectEqualSlices(u16, L("This page"), siteOf(L("data:text/html,<a href=\"https://example.org/\">")));
+    try std.testing.expectEqualSlices(u16, L("This page"), siteOf(L("file:///C:/x.html")));
+}
+
+/// What the user made of a permission question: an answer, or none
+/// (Escape, the dialog replaced or gone).
+pub const Answer = enum { allow, deny, dismiss };
+
+/// The user answered pane `s`'s permission question.
+pub fn answer(self: *Web, s: *Session, a: Answer) void {
+    _ = self;
+    const b = s.browser() orelse return;
+    const v = b.view orelse return;
+    v.settle(a);
+}
+
+/// A drag of pane `s` began (`on`) or ended: make a picture of its page
+/// for the dragged pane's, or let it go.
+pub fn capture(self: *Web, s: *Session, on: bool) void {
+    _ = self;
+    const b = s.browser() orelse return;
+    const v = b.view orelse return;
+    v.want_preview = on;
+    if (!on) return Session.Browser.setImage(&b.preview, null);
+    if (v.state != .ready or v.preview_stream != null) return;
+    const stream = win32.SHCreateMemStream(null, 0) orelse return;
+    v.preview_stream = stream;
+    com.check(v.webview.?.capturePreview(.png, stream, &v.captured.iface), "ICoreWebView2::CapturePreview") catch {
+        com.releaseOpt(&v.preview_stream);
+    };
+}
+
+/// Close the views hidden longer than `idle_ms` (0: never) at tick
+/// `now`: their panes stand in, and open their url again when next
+/// placed. One asking a question is kept.
+pub fn closeIdle(self: *Web, now: u64, idle_ms: u64) void {
+    var i: usize = self.views.items.len;
+    while (i > 0) {
+        i -= 1;
+        const v = self.views.items[i];
+        if (v.pending != null) continue;
+        const left = idleLeft(v.hidden_at, now, idle_ms) orelse continue;
+        if (left > 0) continue;
+        log.info("closing pane {d}'s browser, hidden {d} s", .{ v.key, (now - v.hidden_at.?) / 1000 });
+        v.shut();
+    }
+}
+
+/// How long until the first hidden view is idle long enough to close,
+/// in ms; null if none will be.
+pub fn nextIdle(self: *const Web, now: u64, idle_ms: u64) ?u64 {
+    var next: ?u64 = null;
+    for (self.views.items) |v| {
+        if (v.pending != null) continue;
+        const left = idleLeft(v.hidden_at, now, idle_ms) orelse continue;
+        next = if (next) |n| @min(n, left) else left;
+    }
+    return next;
+}
+
+/// How long, at tick `now`, until a view hidden at `hidden_at` (null:
+/// shown) has been hidden `idle_ms` (0: it never closes), in ms; 0 once
+/// it has. Null for never.
+pub fn idleLeft(hidden_at: ?u64, now: u64, idle_ms: u64) ?u64 {
+    const at = hidden_at orelse return null;
+    if (idle_ms == 0) return null;
+    const hidden = now -| at;
+    return idle_ms -| hidden;
+}
+
+test idleLeft {
+    // Shown, or idle closing turned off.
+    try std.testing.expectEqual(@as(?u64, null), idleLeft(null, 5000, 1000));
+    try std.testing.expectEqual(@as(?u64, null), idleLeft(1000, 5000, 0));
+    try std.testing.expectEqual(@as(?u64, 600), idleLeft(1000, 1400, 1000));
+    try std.testing.expectEqual(@as(?u64, 0), idleLeft(1000, 2000, 1000));
+    try std.testing.expectEqual(@as(?u64, 0), idleLeft(1000, 9000, 1000));
 }
 
 fn processFailed(self: *View, _: *wv.IWebView, args: *wv.IProcessFailedEventArgs) win32.HRESULT {

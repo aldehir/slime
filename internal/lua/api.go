@@ -143,8 +143,8 @@ which are for the top level only:
                              auth, so any local program can use the tunnel);
                              each window takes what it understands and ignores
                              the rest (slime-gui: font, theme, colors, window,
-                             chrome, selection, clipboard, ssh). Values must be
-                             JSON: no functions.
+                             chrome, selection, clipboard, ssh, browser).
+                             Values must be JSON: no functions.
   slime.bind(key, action[, args])
                              key (a chord: "ctrl+shift+d"; modifiers ctrl,
                              shift, alt, super/win, then a key name; or keys
@@ -192,6 +192,7 @@ one without applying it.
     colors = { background = "#282c34", cursor = "#ffcc00" },
     window = { padding = { x = 3, y = 3 } },
     chrome = { scale = 1 },
+    browser = { idle = 600 },        -- seconds a hidden browser pane stays open (0: always)
     shell = { command = "pwsh -NoLogo" },
     host = { proxy = true },         -- a SOCKS proxy per connected host (slime host ls)
   }

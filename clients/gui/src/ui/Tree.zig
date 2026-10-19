@@ -32,6 +32,10 @@ pub const Tree = struct {
         drop: ?Rect = null,
         /// The mouse, once it's moved enough to drag.
         mouse: ?struct { x: f32, y: f32 } = null,
+        /// A browser pane's page, once its browser has drawn a picture
+        /// of it, and where it is: the copy of the frame has the pane's
+        /// box there.
+        page: ?struct { image: Painter.Image, rect: Rect } = null,
     };
 };
 
@@ -278,6 +282,8 @@ pub const BrowserPane = struct {
     ended: []const u16 = &.{},
     /// Its browser draws the page, over the stand-in, which isn't drawn.
     live: bool = false,
+    /// The site's icon, at the bar's left; null for a globe.
+    favicon: ?Painter.Image = null,
 };
 
 pub const DialogView = struct {

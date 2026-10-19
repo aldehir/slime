@@ -30,6 +30,7 @@ const d3dcompiler = win32.d3dcompiler;
 const dxgi = win32.dxgi;
 const d2d1 = win32.d2d1;
 const dcomp = win32.dcomp;
+const wic = win32.wic;
 const font = @import("../font/font.zig");
 const cells = @import("cells.zig");
 const image = @import("image.zig");
@@ -109,6 +110,8 @@ overlay: ?OverlayChain = null,
 /// A copy of part of the last frame, for the UI to draw scaled (a pane
 /// being dragged). Kept between frames at its last size.
 capture: ?Capture = null,
+/// Decodes `decodeImage`'s pictures; made with the first.
+wic_factory: ?*wic.IImagingFactory = null,
 
 /// GPU copies of one terminal's kitty images (see `image.Images`), by
 /// kitty image ID. Each terminal needs its own: image IDs are per
@@ -328,6 +331,7 @@ pub fn deinit(self: *D3D11) void {
     if (self.icon) |icon| icon.deinit();
     if (self.lucide) |*icons| Painter.deinitLucide(icons);
     if (self.capture) |c| c.deinit();
+    com.releaseOpt(&self.wic_factory);
     (D2d{ .factory = self.d2d_factory, .device = self.d2d_device, .context = self.d2d_context, .brush = self.brush }).deinit();
     com.release(self.image_placement);
     com.release(self.box);
@@ -554,11 +558,14 @@ fn checkPresent(hr: win32.HRESULT) error{ DeviceLost, HResult }!void {
 
 /// The overlay's frame: `ui`'s `.over` and, if `capture`, `paintOver`
 /// with `img`, over transparency. An overlay with nothing to show is
-/// presented once, cleared, and then left alone.
+/// presented cleared, and then left alone.
 fn drawOverlay(self: *D3D11, o: *OverlayChain, ui: anytype, capture: bool, img: ?Painter.Image) error{ DeviceLost, HResult }!void {
     const over = ui.hasOver();
-    if (!over and !o.shown) return;
-    o.shown = over;
+    if (!over) {
+        if (o.shown) try self.clearOverlay(o);
+        return;
+    }
+    o.shown = true;
     self.context.clearRenderTargetView(o.rtv.?, &.{ 0, 0, 0, 0 });
     const d2d = self.d2d_context;
     d2d.setTarget(o.d2d_target);
@@ -689,6 +696,39 @@ fn captureRegion(self: *D3D11, region: Painter.Rect) Error!?Painter.Image {
     defer com.releaseOpt(&back_buffer);
     self.context.copySubresourceRegion(c.texture.resource(), 0, 0, back_buffer.?.resource(), &.{ .left = x0, .top = y0, .right = x1, .bottom = y1 });
     return .{ .bitmap = c.bitmap, .w = @floatFromInt(w), .h = @floatFromInt(h) };
+}
+
+/// Decode the PNG (or JPEG) in `stream`, read from its start, into an
+/// image to draw with `Painter.image`. The caller owns it: release its
+/// bitmap, before the renderer goes.
+pub fn decodeImage(self: *D3D11, stream: *win32.IStream) Error!Painter.Image {
+    if (self.wic_factory == null) {
+        var out: ?*anyopaque = null;
+        try com.check(win32.CoCreateInstance(&wic.CLSID_ImagingFactory, null, win32.CLSCTX_INPROC_SERVER, &wic.IImagingFactory.iid, &out), "CoCreateInstance(WICImagingFactory)");
+        self.wic_factory = @ptrCast(@alignCast(out.?));
+    }
+    const factory = self.wic_factory.?;
+    try com.check(stream.rewind(), "IStream::Seek");
+    var decoder: ?*wic.IBitmapDecoder = null;
+    try com.check(factory.createDecoderFromStream(stream, &decoder), "IWICImagingFactory::CreateDecoderFromStream");
+    defer com.releaseOpt(&decoder);
+    var frame: ?*wic.IBitmapSource = null;
+    try com.check(decoder.?.getFrame(0, &frame), "IWICBitmapDecoder::GetFrame");
+    defer com.releaseOpt(&frame);
+    var converter: ?*wic.IFormatConverter = null;
+    try com.check(factory.createFormatConverter(&converter), "IWICImagingFactory::CreateFormatConverter");
+    defer com.releaseOpt(&converter);
+    try com.check(converter.?.initialize(frame.?, &wic.GUID_PixelFormat32bppPBGRA), "IWICFormatConverter::Initialize");
+    var w: u32 = 0;
+    var h: u32 = 0;
+    try com.check(frame.?.getSize(&w, &h), "IWICBitmapSource::GetSize");
+    if (w == 0 or h == 0) return error.HResult;
+    var bitmap: ?*d2d1.IBitmap1 = null;
+    try com.check(self.d2d_context.createBitmapFromWicBitmap(converter.?, &.{
+        .pixelFormat = .{ .format = buffer_format, .alphaMode = d2d1.ALPHA_MODE_PREMULTIPLIED },
+        .bitmapOptions = 0,
+    }, &bitmap), "ID2D1DeviceContext::CreateBitmapFromWicBitmap");
+    return .{ .bitmap = bitmap.?, .w = @floatFromInt(w), .h = @floatFromInt(h) };
 }
 
 fn createCapture(self: *D3D11, w: u32, h: u32) Error!Capture {
@@ -1094,9 +1134,15 @@ fn createOverlay(self: *D3D11, above: *dcomp.IVisual) Error!void {
     log.info("overlay chain created {d}x{d}", .{ self.width, self.height });
 }
 
+/// Present the overlay clear. Twice: DWM can hold a flip chain's last
+/// present back until another comes (it did with no display attached),
+/// and the overlay presents nothing more until it has something to show,
+/// so a single clear left a closed dialog on screen.
 fn clearOverlay(self: *D3D11, o: *OverlayChain) Error!void {
-    self.context.clearRenderTargetView(o.rtv.?, &.{ 0, 0, 0, 0 });
-    try com.check(o.swap_chain.present(0, 0), "IDXGISwapChain::Present(overlay)");
+    for (0..2) |_| {
+        self.context.clearRenderTargetView(o.rtv.?, &.{ 0, 0, 0, 0 });
+        try com.check(o.swap_chain.present(0, 0), "IDXGISwapChain::Present(overlay)");
+    }
     o.shown = false;
 }
 

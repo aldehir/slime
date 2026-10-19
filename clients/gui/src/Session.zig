@@ -31,7 +31,8 @@ const Renderer = @import("renderer/D3D11.zig");
 const Cells = @import("renderer/cells.zig").Cells;
 const image = @import("renderer/image.zig");
 const Images = image.Images;
-const Rect = @import("renderer/Painter.zig").Rect;
+const Painter = @import("renderer/Painter.zig");
+const Rect = Painter.Rect;
 
 const log = std.log.scoped(.session);
 
@@ -201,12 +202,27 @@ pub const Browser = struct {
     failed: ?[]const u8 = null,
     /// The page's pointer, a copy the pane owns.
     cursor: ?win32.HCURSOR = null,
+    /// The site's icon, which the URL bar shows (a globe without one).
+    /// Owned, as `preview`.
+    favicon: ?Painter.Image = null,
+    /// A picture of the page, for the pane's while it's dragged.
+    preview: ?Painter.Image = null,
+    /// The page asked for a permission the window is asking about.
+    asking: bool = false,
 
     fn deinit(self: *Browser, alloc: Allocator) void {
         if (self.view) |v| v.detach();
         if (self.cursor) |c| _ = win32.DestroyIcon(c);
+        setImage(&self.favicon, null);
+        setImage(&self.preview, null);
         alloc.free(self.url);
         if (self.next_url) |u| alloc.free(u);
+    }
+
+    /// Replace `slot`'s image with `img`, letting the old one go.
+    pub fn setImage(slot: *?Painter.Image, img: ?Painter.Image) void {
+        if (slot.*) |old| win32.com.release(old.bitmap);
+        slot.* = img;
     }
 
     /// Its browser is up: the page draws over the stand-in.

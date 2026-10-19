@@ -55,8 +55,9 @@ pub fn guid(comptime s: []const u8) GUID {
     };
 }
 
-/// A callback interface we implement: IUnknown, then `Invoke(a, b)`.
-/// Embed as the first field of the implementing struct.
+/// A callback interface we implement: IUnknown, then `Invoke(a, b)`, or
+/// `Invoke(a)` for a `B_` of void. Embed as the first field of the
+/// implementing struct.
 pub fn Handler(comptime iid_: []const u8, comptime A_: type, comptime B_: type) type {
     return extern struct {
         const Self = @This();
@@ -70,7 +71,10 @@ pub fn Handler(comptime iid_: []const u8, comptime A_: type, comptime B_: type) 
             QueryInterface: *const fn (*Self, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
             AddRef: *const fn (*Self) callconv(.winapi) u32,
             Release: *const fn (*Self) callconv(.winapi) u32,
-            Invoke: *const fn (*Self, A_, B_) callconv(.winapi) HRESULT,
+            Invoke: if (B_ == void)
+                *const fn (*Self, A_) callconv(.winapi) HRESULT
+            else
+                *const fn (*Self, A_, B_) callconv(.winapi) HRESULT,
         };
     };
 }
@@ -90,6 +94,10 @@ pub const FocusChangedEventHandler = Handler("05ea24bd-6452-4926-9014-4b82b49813
 pub const MoveFocusRequestedEventHandler = Handler("69035451-6dc7-4cb8-9bce-b2bd70ad289f", *IController, *IMoveFocusRequestedEventArgs);
 pub const AcceleratorKeyPressedEventHandler = Handler("b29c7e28-fa79-41a8-8e44-65811c76dcb2", *IController, *IAcceleratorKeyPressedEventArgs);
 pub const BrowserProcessExitedEventHandler = Handler("fa504257-a216-4911-a860-fe8825712861", *IEnvironment, *IUnknown);
+pub const CapturePreviewCompletedHandler = Handler("697e05e9-3d8f-45fa-96f4-8ffe1ededaf5", HRESULT, void);
+pub const FaviconChangedEventHandler = Handler("2913da94-833d-4de0-8dca-900fc524a1a4", *IWebView, ?*IUnknown);
+pub const GetFaviconCompletedHandler = Handler("a2508329-7da8-49d7-8c05-fa125e4aee8d", HRESULT, ?*win32.IStream);
+pub const PermissionRequestedEventHandler = Handler("15e1c6a3-c72a-4df3-91d7-d097fbec6bfd", *IWebView, *IPermissionRequestedEventArgs);
 
 /// ICoreWebView2EnvironmentOptions, which we implement: what
 /// `CreateEnvironmentWithOptions` reads the browser's arguments from.
@@ -304,8 +312,18 @@ pub const IWebView = extern struct {
         return com.call(self, 15, fn (*NavigationCompletedEventHandler, *EventRegistrationToken) HRESULT, .{ h, token });
     }
 
+    pub fn addPermissionRequested(self: *IWebView, h: *PermissionRequestedEventHandler, token: *EventRegistrationToken) HRESULT {
+        return com.call(self, 23, fn (*PermissionRequestedEventHandler, *EventRegistrationToken) HRESULT, .{ h, token });
+    }
+
     pub fn addProcessFailed(self: *IWebView, h: *ProcessFailedEventHandler, token: *EventRegistrationToken) HRESULT {
         return com.call(self, 25, fn (*ProcessFailedEventHandler, *EventRegistrationToken) HRESULT, .{ h, token });
+    }
+
+    /// The page as shown, encoded into `stream`, which it grows, by the
+    /// time `done` is called.
+    pub fn capturePreview(self: *IWebView, format: ImageFormat, stream: *win32.IStream, done: *CapturePreviewCompletedHandler) HRESULT {
+        return com.call(self, 30, fn (ImageFormat, *win32.IStream, *CapturePreviewCompletedHandler) HRESULT, .{ format, stream, done });
     }
 
     pub fn reload(self: *IWebView) HRESULT {
@@ -349,6 +367,31 @@ pub const IWebView = extern struct {
     }
 };
 
+/// ICoreWebView2_15, through _14.
+pub const IWebView15 = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = guid("517b2d1d-7dae-4a66-a4f4-10352ffb9518");
+
+    pub fn addFaviconChanged(self: *IWebView15, h: *FaviconChangedEventHandler, token: *EventRegistrationToken) HRESULT {
+        return com.call(self, 109, fn (*FaviconChangedEventHandler, *EventRegistrationToken) HRESULT, .{ h, token });
+    }
+
+    /// Empty when the page has none.
+    pub fn getFaviconUri(self: *IWebView15, out: *?win32.LPWSTR) HRESULT {
+        return com.call(self, 111, fn (*?win32.LPWSTR) HRESULT, .{out});
+    }
+
+    /// The favicon's image, a stream `done` is handed (null without one).
+    pub fn getFavicon(self: *IWebView15, format: ImageFormat, done: *GetFaviconCompletedHandler) HRESULT {
+        return com.call(self, 112, fn (ImageFormat, *GetFaviconCompletedHandler) HRESULT, .{ format, done });
+    }
+};
+
+/// COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT and COREWEBVIEW2_FAVICON_
+/// IMAGE_FORMAT, which agree.
+pub const ImageFormat = enum(i32) { png = 0, jpeg = 1 };
+
 /// ICoreWebView2NewWindowRequestedEventArgs.
 pub const INewWindowRequestedEventArgs = extern struct {
     vtable: com.VTable,
@@ -360,6 +403,72 @@ pub const INewWindowRequestedEventArgs = extern struct {
     /// Without a new window put, handled means no window opens.
     pub fn putHandled(self: *INewWindowRequestedEventArgs, handled: bool) HRESULT {
         return com.call(self, 6, fn (BOOL) HRESULT, .{@as(BOOL, @intFromBool(handled))});
+    }
+};
+
+pub const PermissionKind = enum(i32) {
+    unknown = 0,
+    microphone = 1,
+    camera = 2,
+    geolocation = 3,
+    notifications = 4,
+    other_sensors = 5,
+    clipboard_read = 6,
+    multiple_automatic_downloads = 7,
+    file_read_write = 8,
+    autoplay = 9,
+    local_fonts = 10,
+    midi_system_exclusive_messages = 11,
+    window_management = 12,
+    persistent_storage = 13,
+    _,
+};
+
+pub const PermissionState = enum(i32) { default = 0, allow = 1, deny = 2 };
+
+/// ICoreWebView2PermissionRequestedEventArgs.
+pub const IPermissionRequestedEventArgs = extern struct {
+    vtable: com.VTable,
+
+    /// The asking page's.
+    pub fn getUri(self: *IPermissionRequestedEventArgs, out: *?win32.LPWSTR) HRESULT {
+        return com.call(self, 3, fn (*?win32.LPWSTR) HRESULT, .{out});
+    }
+
+    pub fn getPermissionKind(self: *IPermissionRequestedEventArgs, out: *PermissionKind) HRESULT {
+        return com.call(self, 4, fn (*PermissionKind) HRESULT, .{out});
+    }
+
+    /// The answer; `default` is the browser's own prompt.
+    pub fn putState(self: *IPermissionRequestedEventArgs, state: PermissionState) HRESULT {
+        return com.call(self, 7, fn (PermissionState) HRESULT, .{state});
+    }
+
+    /// Answer later: the state put is read once the deferral completes.
+    pub fn getDeferral(self: *IPermissionRequestedEventArgs, out: *?*IDeferral) HRESULT {
+        return com.call(self, 8, fn (*?*IDeferral) HRESULT, .{out});
+    }
+};
+
+/// ICoreWebView2PermissionRequestedEventArgs3, through Args2.
+pub const IPermissionRequestedEventArgs3 = extern struct {
+    vtable: com.VTable,
+
+    pub const iid: GUID = guid("e61670bc-3dce-4177-86d2-c629ae3cb6ac");
+
+    /// Whether the answer is kept for the origin (the default) or holds
+    /// for this request alone.
+    pub fn putSavesInProfile(self: *IPermissionRequestedEventArgs3, saves: bool) HRESULT {
+        return com.call(self, 12, fn (BOOL) HRESULT, .{@as(BOOL, @intFromBool(saves))});
+    }
+};
+
+/// ICoreWebView2Deferral.
+pub const IDeferral = extern struct {
+    vtable: com.VTable,
+
+    pub fn complete(self: *IDeferral) HRESULT {
+        return com.call(self, 3, fn () HRESULT, .{});
     }
 };
 
@@ -439,6 +548,7 @@ test "handlers are IUnknown and Invoke" {
     try std.testing.expectEqual(4 * @sizeOf(usize), @sizeOf(EnvironmentCompletedHandler.VTable));
     try std.testing.expectEqual(@sizeOf(usize), @sizeOf(FocusChangedEventHandler));
     try std.testing.expectEqual(@as(usize, 3), @offsetOf(MoveFocusRequestedEventHandler.VTable, "Invoke") / @sizeOf(usize));
+    try std.testing.expectEqual(4 * @sizeOf(usize), @sizeOf(CapturePreviewCompletedHandler.VTable));
     try std.testing.expectEqual(@as(usize, 10), @offsetOf(EnvironmentOptions.VTable, "put_AllowSingleSignOnUsingOSPrimaryAccount") / @sizeOf(usize));
 }
 

@@ -347,7 +347,21 @@ forward, reload (stop while loading), and a URL bar (a click selects it
 all, Enter sends `pane.navigate`, Escape puts it back). The mouse is
 forwarded to the page, its keys go to it but for the app's bindings,
 and a pane without a browser (no runtime, or one that failed) shows its
-title and url and why (`.plans/browser-pane-plan.md`).
+title and url and why (`.plans/browser-pane-plan.md`). The URL bar shows
+the site's favicon (a globe without one), a dragged pane's picture has
+the page in it (`CapturePreview` at drag start), and a page opening a
+window (`target=_blank`, `window.open`) splits its pane with a browser
+pane to the right, or navigates in place where the pane can't be split.
+A browser hidden (tab switched away, another pane zoomed) longer than
+`browser.idle` seconds (600; 0 never) is closed, and opens its url again
+when shown. Camera, microphone, and location requests are denied
+without asking; other permissions (notifications, clipboard read, ...)
+ask in the window's dialog, "<site> wants to <...>" with Deny and Allow,
+one question at a time per pane (a second while one is open is denied,
+as is one while another dialog is up). A clicked Allow or Deny is kept
+for the site, as browsers keep them; Escape, or the dialog going any
+other way (replaced, its pane gone), denies that request alone
+(`SavesInProfile` false), so the site asks again next time.
 
 A browser pane in a host's workspace browses the host's network: its
 WebView2 environment is the host's
@@ -387,19 +401,24 @@ browser…" until the next one starts by itself.
   "Reconnecting…": a click there stops waiting, lets the old
   environment go, and the next placement makes a new one, which may
   join the old browser and its old proxy if it still runs.
-- **No favicon**: the strip's icon could be the site's
-  (`ICoreWebView2_15::FaviconChanged`).
-- **No find in page** (`ICoreWebView2Find`).
-- **A dragged browser pane's picture is its strip over an empty box**:
-  the page is in a visual of its own, not the frame the picture is
-  copied from. `CapturePreview` at drag start would give the page.
-- **A page opening a window opens it in its own pane**, not a split.
-- **Permission prompts** (camera, location, notifications) are
-  WebView2's defaults; `PermissionRequested` to a dialog of ours, with
-  camera and location denied by default, is the plan.
-- **Hidden browsers stay open**: a browser in a tab not shown keeps
-  its page and memory until the pane leaves the window; closing idle
-  ones after a while would cost a reload.
+- **No find in page**: `ICoreWebView2Find` waits for the terminal's
+  own search (Persistent workspaces: "Search and link detection"), so
+  both use one find bar rather
+  than the browser getting one of its own.
+- **An idle-closed browser comes back as a new page**: its url opens
+  again, but its history (back and forward), scroll, and form state are
+  gone. A browser asking a permission question isn't closed while it
+  asks.
+- **Permission answers are WebView2's to keep**: a clicked Allow or
+  Deny is saved in the profile and the site isn't asked again; there's
+  no list of sites' permissions to change one. A kind WebView2 can't name (`unknown`, or
+  newer than its 1.0.4258.31 header) is denied. A page in a pane whose
+  tab isn't shown still asks, over the tab that is.
+- **A narrow URL bar has no site icon**: under four icons' width of
+  text, the favicon (or globe) goes; the sidebar always shows a globe.
+- **A dragged browser pane's picture is its strip over an empty box**
+  until `CapturePreview` comes back (tens of ms); the page in it is as
+  it was when the drag began.
 - **A failed browser comes back on a click** in its stand-in or Enter
   in its URL bar; a crash shows only the last page's title and url.
 - **Untried on a real display**: modifier chords into a page (posted

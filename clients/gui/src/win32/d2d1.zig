@@ -209,6 +209,11 @@ pub const IDeviceContext = extern struct {
         return com.call(self, 49, fn (?*u64, ?*u64) HRESULT, .{ null, null });
     }
 
+    /// `source` is an IWICBitmapSource, of pixels in `props`' format.
+    pub fn createBitmapFromWicBitmap(self: *IDeviceContext, source: *anyopaque, props: *const BITMAP_PROPERTIES1, out: *?*IBitmap1) HRESULT {
+        return com.call(self, 58, fn (*anyopaque, *const BITMAP_PROPERTIES1, *?*IBitmap1) HRESULT, .{ source, props, out });
+    }
+
     pub fn createBitmapFromDxgiSurface(
         self: *IDeviceContext,
         surface: *dxgi.ISurface,

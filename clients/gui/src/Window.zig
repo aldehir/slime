@@ -56,6 +56,8 @@ const stats_timer_id = 1;
 /// Draws pending output while DefWindowProc's modal move/size loop runs
 /// instead of ours.
 const sizemove_timer_id = 2;
+/// Closes browsers hidden longer than `browser.idle` (`Web.closeIdle`).
+const idle_timer_id = 3;
 /// The app's timers (`App.Timer`), after ours.
 const blink_timer_id = 4;
 const spinner_timer_id = 5;
@@ -454,6 +456,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
         }
     }
     self.placeBrowsers();
+    self.armIdle();
     var shadows: [2]Renderer.BoxStyle.Shadow = undefined;
     try r.draw(self.alloc, .{
         .atlas = &self.grid.atlas,
@@ -494,6 +497,22 @@ fn placeBrowsers(self: *Window) void {
     }
 }
 
+/// `browser.idle`, in ms.
+fn idleMs(self: *const Window) u64 {
+    return @as(u64, self.config.@"browser-idle") * 1000;
+}
+
+/// Wake when the next hidden browser has been hidden `browser.idle`.
+fn armIdle(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const left = self.web.nextIdle(win32.GetTickCount64(), self.idleMs()) orelse {
+        _ = win32.KillTimer(hwnd, idle_timer_id);
+        return;
+    };
+    // USER_TIMER_MINIMUM is 10 ms.
+    _ = win32.SetTimer(hwnd, idle_timer_id, @intCast(@max(10, @min(left, std.math.maxInt(u31)))), null);
+}
+
 /// Keep the keyboard focus where the app says the keys go: in the
 /// focused browser pane's page, or on the window. Left alone while
 /// another program has it.
@@ -531,7 +550,21 @@ fn webEvents(self: *Window) Web.Events {
         .cursor = webCursor,
         .host = webHost,
         .redraw = webRedraw,
+        .new_window = webNewWindow,
+        .permission = webPermission,
     };
+}
+
+fn webNewWindow(ctx: *anyopaque, s: *Session, url: []const u16) bool {
+    return fromCtx(ctx).app.browserNewWindow(s, url);
+}
+
+fn webPermission(ctx: *anyopaque, s: *Session, site: []const u16, what: []const u8) bool {
+    const self = fromCtx(ctx);
+    const asked = self.app.askPermission(s, site, what);
+    // The dialog takes the keys from the page.
+    self.syncKeyFocus();
+    return asked;
 }
 
 fn webHost(ctx: *anyopaque, id: u32) ?Web.Host {
@@ -662,6 +695,8 @@ const shell_vtable: App.Shell.VTable = .{
     .webFollow = shellWebFollow,
     .webHost = shellWebHost,
     .webRetry = shellWebRetry,
+    .webCapture = shellWebCapture,
+    .webAnswer = shellWebAnswer,
 };
 
 fn fromCtx(ctx: *anyopaque) *Window {
@@ -796,6 +831,16 @@ fn shellWebHost(ctx: *anyopaque, host: u32) void {
 
 fn shellWebRetry(ctx: *anyopaque, s: *Session) void {
     fromCtx(ctx).web.retry(s);
+}
+
+fn shellWebCapture(ctx: *anyopaque, s: *Session, on: bool) void {
+    fromCtx(ctx).web.capture(s, on);
+}
+
+fn shellWebAnswer(ctx: *anyopaque, s: *Session, answer: Web.Answer) void {
+    const self = fromCtx(ctx);
+    self.web.answer(s, answer);
+    self.syncKeyFocus();
 }
 
 fn registerClass(instance: ?win32.HINSTANCE) !void {
@@ -984,6 +1029,10 @@ fn handle(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM
                 blink_timer_id => _ = app.update(.{ .tick = .blink }),
                 spinner_timer_id => _ = app.update(.{ .tick = .spinner }),
                 tip_timer_id => _ = app.update(.{ .tick = .tip }),
+                idle_timer_id => {
+                    self.web.closeIdle(win32.GetTickCount64(), self.idleMs());
+                    self.armIdle();
+                },
                 sizemove_timer_id => {
                     if (win32.WaitForSingleObject(self.output_event, 0) == win32.WAIT_OBJECT_0) self.outputArrived();
                     if (app.dirty) self.render();

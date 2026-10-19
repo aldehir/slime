@@ -21,6 +21,7 @@ const tree = @import("ui/Tree.zig");
 const TreeList = @import("ui/widgets/TreeList.zig");
 const PaneStrip = @import("ui/widgets/PaneStrip.zig");
 const Popup = @import("ui/widgets/Popup.zig");
+const Web = @import("Web.zig");
 
 const Id = Ui.Id;
 const Menu = Ui.Menu;
@@ -595,6 +596,7 @@ const Builder = struct {
             .page_title = s.title(),
             .ended = ended,
             .live = b.live(),
+            .favicon = b.favicon,
         };
     }
 
@@ -625,10 +627,24 @@ const Builder = struct {
     fn drag(self: *const Builder) ?Tree.Drag {
         const d = self.app.pane_drag orelse return null;
         const at = d.at orelse return null;
+        const placed = self.app.placed().find(d.source);
         return .{
-            .source = if (self.app.placed().find(d.source)) |p| p.frame else null,
+            .source = if (placed) |p| p.frame else null,
             .drop = if (d.drop) |drop| drop.rect else null,
             .mouse = .{ .x = @floatFromInt(at.x), .y = @floatFromInt(at.y) },
+            .page = page: {
+                const p = placed orelse break :page null;
+                const b = d.source.browser() orelse break :page null;
+                const img = b.preview orelse break :page null;
+                // Where its browser shows it (`Window.placeBrowsers`).
+                const r = Web.pageBounds(p.rect, self.ui.stroke());
+                break :page .{ .image = img, .rect = .{
+                    .x = @floatFromInt(r.left),
+                    .y = @floatFromInt(r.top),
+                    .w = @floatFromInt(r.right - r.left),
+                    .h = @floatFromInt(r.bottom - r.top),
+                } };
+            },
         };
     }
 };

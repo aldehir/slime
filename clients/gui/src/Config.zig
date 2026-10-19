@@ -17,6 +17,7 @@
 //!   selection = { word_chars = " \t'\"" },
 //!   clipboard = { read = "ask", write = "allow" },
 //!   ssh = { terminfo = true },
+//!   browser = { idle = 600 },              -- seconds; 0 keeps hidden browsers open
 //! }
 //! ```
 //!
@@ -77,6 +78,11 @@ palette: Palette = .{},
 /// into ~/.terminfo on hosts that lack it (Ghostty's ssh-terminfo). Hosts
 /// it can't be installed on get xterm-256color, as do all with this off.
 @"ssh-terminfo": bool = true,
+
+/// Seconds a browser pane's page stays open while it isn't shown (its tab
+/// switched away, or another pane zoomed) before its browser is closed,
+/// to open its url again when it's shown. 0 keeps them open.
+@"browser-idle": u32 = 600,
 
 /// A theme name or absolute path, or a light/dark pair to follow the
 /// Windows app mode. Names are looked up in `themes` next to init.lua,
@@ -264,7 +270,7 @@ pub fn load(gpa: Allocator, io: std.Io, settings: std.json.Value, opts: LoadOpti
         const key = kv.key_ptr.*;
         const value = kv.value_ptr.*;
         if (std.mem.eql(u8, key, "theme") or std.mem.eql(u8, key, "shell") or std.mem.eql(u8, key, "host")) continue; // handled above; the daemon's
-        const Section = enum { font, colors, window, chrome, selection, clipboard, ssh };
+        const Section = enum { font, colors, window, chrome, selection, clipboard, ssh, browser };
         const section = std.meta.stringToEnum(Section, key) orelse {
             log.warn("unknown setting \"{s}\"", .{key});
             continue;
@@ -362,6 +368,9 @@ fn setJson(self: *Config, alloc: Allocator, section: anytype, name: []const u8, 
                 .bool => |b| b,
                 else => return error.InvalidValue,
             };
+        } else return error.UnknownKey,
+        .browser => if (eql(u8, name, "idle")) {
+            self.@"browser-idle" = try unsignedOf(value);
         } else return error.UnknownKey,
     }
 }
@@ -541,7 +550,7 @@ test "padding, word chars, theme, clipboard, and bad values keep defaults" {
         \\{"window": {"padding": {"x": [2, 4], "y": 6}},
         \\ "selection": {"word_chars": "\\t;\\u{2502}"},
         \\ "theme": {"light": "Catppuccin Latte", "dark": "Catppuccin Mocha"},
-        \\ "clipboard": {"write": "deny"}, "chrome": {"scale": 1.25}, "ssh": {"terminfo": false},
+        \\ "clipboard": {"write": "deny"}, "chrome": {"scale": 1.25}, "ssh": {"terminfo": false}, "browser": {"idle": 30},
         \\ "font": {"size": -1, "antialias": "subpixel", "weight": 3}, "colors": {"background": "nope"}, "nonsense": 1}
     );
     defer c.deinit();
@@ -554,6 +563,7 @@ test "padding, word chars, theme, clipboard, and bad values keep defaults" {
     try std.testing.expectEqual(.deny, c.@"clipboard-write");
     try std.testing.expectEqual(1.25, c.@"chrome-scale");
     try std.testing.expect(!c.@"ssh-terminfo");
+    try std.testing.expectEqual(30, c.@"browser-idle");
     try std.testing.expectEqual(12, c.@"font-size");
     try std.testing.expectEqual(.grayscale, c.@"font-antialias");
     try std.testing.expectEqual(RGB{ .r = 0x28, .g = 0x2c, .b = 0x34 }, c.background);
@@ -561,6 +571,7 @@ test "padding, word chars, theme, clipboard, and bad values keep defaults" {
     var none = try testConfig("null");
     defer none.deinit();
     try std.testing.expectEqual(12, none.@"font-size");
+    try std.testing.expectEqual(600, none.@"browser-idle");
 }
 
 test "theme under user colors" {
