@@ -469,7 +469,7 @@ func TestWireRoundTrip(t *testing.T) {
 		&Call{Request: rpc.Request{JSONRPC: "2.0", ID: 7, Method: "tab.new", Params: json.RawMessage(`{"workspace":9,"command":"cmd.exe /k"}`)}},
 		&Ack{Seq: 4},
 		&Event{Data: []byte{1, 2, 3}},
-		&Resize{Size: Size{1, 2, 3, 4}},
+		&Resize{Size: Size{Cols: 1, Rows: 2, CellW: 3, CellH: 4}},
 		&Bridge{Host: 3, Term: "xterm-ghostty"},
 		&HelloReply{Version: 1, PID: 99, FrameLayout: 1 << 63},
 		&Reply{Response: rpc.Response{JSONRPC: "2.0", ID: 7, Result: json.RawMessage(`{"pane":"9.2.3"}`)}},
@@ -479,7 +479,7 @@ func TestWireRoundTrip(t *testing.T) {
 		&Draw{Seq: 4, Data: []byte{1, 2, 3}},
 		&Image{ID: 7, Generation: 1 << 40, Width: 2, Height: 3, Total: 10, Offset: 4, Data: []byte{9, 8, 7}},
 		&Copied{Tag: 5, Text: "sel"},
-		&Notice{Kind: NoticeStatus, Text: "", Status: []StatusRecord{{"", 1, 40}, {"deploy/eu", 3, -1}}},
+		&Notice{Kind: NoticeStatus, Text: "", Status: []StatusRecord{{ID: "", State: 1, Progress: 40}, {ID: "deploy/eu", State: 3, Progress: -1}}},
 	}
 	ids := func(i int) PaneID { return PaneID{WS: uint32(i), Tab: uint32(i) * 2, N: uint32(i) * 3} }
 	var stream bytes.Buffer

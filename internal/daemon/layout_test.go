@@ -147,16 +147,16 @@ func TestSharesDontDrift(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
-	good := &Node{Axis: Row, Children: []Child{{4000, leaf(pid(1))}, {6000, leaf(pid(2))}}}
+	good := &Node{Axis: Row, Children: []Child{{Share: 4000, Node: leaf(pid(1))}, {Share: 6000, Node: leaf(pid(2))}}}
 	if err := Validate(good, pids(2, 1)); err != nil {
 		t.Errorf("good tree: %v", err)
 	}
 	bad := map[string]*Node{
-		"sum":       {Axis: Row, Children: []Child{{4000, leaf(pid(1))}, {5000, leaf(pid(2))}}},
-		"one child": {Axis: Row, Children: []Child{{Whole, leaf(pid(1))}}},
-		"axis":      {Axis: 9, Children: []Child{{5000, leaf(pid(1))}, {5000, leaf(pid(2))}}},
-		"duplicate": {Axis: Row, Children: []Child{{5000, leaf(pid(1))}, {5000, leaf(pid(1))}}},
-		"zero":      {Axis: Row, Children: []Child{{0, leaf(pid(1))}, {Whole, leaf(pid(2))}}},
+		"sum":       {Axis: Row, Children: []Child{{Share: 4000, Node: leaf(pid(1))}, {Share: 5000, Node: leaf(pid(2))}}},
+		"one child": {Axis: Row, Children: []Child{{Share: Whole, Node: leaf(pid(1))}}},
+		"axis":      {Axis: 9, Children: []Child{{Share: 5000, Node: leaf(pid(1))}, {Share: 5000, Node: leaf(pid(2))}}},
+		"duplicate": {Axis: Row, Children: []Child{{Share: 5000, Node: leaf(pid(1))}, {Share: 5000, Node: leaf(pid(1))}}},
+		"zero":      {Axis: Row, Children: []Child{{Share: 0, Node: leaf(pid(1))}, {Share: Whole, Node: leaf(pid(2))}}},
 	}
 	for name, n := range bad {
 		if err := Validate(n, pids(1, 2)); err == nil {
