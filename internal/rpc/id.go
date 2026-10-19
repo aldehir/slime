@@ -59,8 +59,21 @@ func (id PaneID) String() string {
 	return id.TabID().String() + "." + strconv.FormatUint(uint64(id.N), 10)
 }
 
-func (id TabID) MarshalText() ([]byte, error)  { return []byte(id.String()), nil }
-func (id PaneID) MarshalText() ([]byte, error) { return []byte(id.String()), nil }
+// MarshalText writes the zero id as "", as UnmarshalText reads it: a
+// *PaneID set to none (workspace.focus's zoomed) round-trips.
+func (id TabID) MarshalText() ([]byte, error) {
+	if id.IsZero() {
+		return nil, nil
+	}
+	return []byte(id.String()), nil
+}
+
+func (id PaneID) MarshalText() ([]byte, error) {
+	if id.IsZero() {
+		return nil, nil
+	}
+	return []byte(id.String()), nil
+}
 
 // UnmarshalText reads "WS.N"; an empty string is the zero id (none).
 func (id *TabID) UnmarshalText(b []byte) error {

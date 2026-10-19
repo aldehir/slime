@@ -63,6 +63,16 @@ func TestIDs(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"id":"1.2","tree":{"pane":"1.2.3"},"zoomed":""}`), &tab); err != nil || tab.ID != (TabID{WS: 1, N: 2}) || tab.Focus != (PaneID{}) || tab.Zoomed != (PaneID{}) {
 		t.Errorf("tab %+v: %v", tab, err)
 	}
+	// A pointer to the zero id, as workspace.focus's unzoom sends, is ""
+	// on the wire and the zero id back.
+	b, _ = json.Marshal(WorkspaceFocusParams{Pane: id, Zoomed: new(PaneID)})
+	if want := `{"pane":"1.2.3","zoomed":""}`; string(b) != want {
+		t.Errorf("unzoom %s, want %s", b, want)
+	}
+	var focus WorkspaceFocusParams
+	if err := json.Unmarshal(b, &focus); err != nil || focus.Zoomed == nil || !focus.Zoomed.IsZero() {
+		t.Errorf("unzoom back %+v: %v", focus, err)
+	}
 	for _, good := range []string{"1.2.3", "10.20.30"} {
 		if _, err := ParsePaneID(good); err != nil {
 			t.Errorf("%q: %v", good, err)
