@@ -213,8 +213,9 @@ gets its own frames, a pane takes the smallest window's size, input
 comes from any of them, and the active tab, focused pane, and zoom are
 the daemon's, shared by all. Each sidebar row is a tab, drawn as its tree of panes,
 each under a title strip whose buttons split it or zoom it. Dragging the
-gap between panes resizes them; dragging a pane by its strip moves it
-beside another, along a side of the tab, or into another's place.
+gap between panes resizes them, and dragging a corner where gaps meet
+resizes both ways; dragging a pane by its strip moves it beside another,
+along a side of the tab, or into another's place.
 `slime tab new`, `split`, and the rest change a workspace from scripts,
 attached or not. If slime can't be started, a tab says why.
 

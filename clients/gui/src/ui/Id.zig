@@ -38,6 +38,9 @@ pub const Target = union(enum) {
     /// The gap between two panes of the active tab, by its place in the
     /// tab's dividers from the last layout.
     divider: u16,
+    /// A corner where the active tab's dividers meet, by its place in the
+    /// tab's corners from the last layout.
+    corner: u16,
     /// A dialog's field or button, by its index.
     dialog: u8,
     /// A context menu's entry, by its index into the menu's items.

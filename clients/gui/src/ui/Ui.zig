@@ -306,9 +306,9 @@ pub fn paintDrag(self: *const Ui, p: *Painter, tree: *const Tree, thumb: ?Painte
 /// Track what the mouse is over. Returns true if that changed what's
 /// drawn.
 pub fn setHover(self: *Ui, hit: Id) bool {
-    // The caption and dividers draw nothing for hover, nor does a pane's
-    // title strip; a pane shows its buttons.
-    const h: Id = if (hit.part == .caption or hit.part == .title or hit.target == .divider) .none else hit;
+    // The caption, dividers, and corners draw nothing for hover, nor
+    // does a pane's title strip; a pane shows its buttons.
+    const h: Id = if (hit.part == .caption or hit.part == .title or hit.target == .divider or hit.target == .corner) .none else hit;
     if (self.hover.eql(h)) return false;
     self.hover = h;
     self.tip = .none;

@@ -396,6 +396,7 @@ pub fn place(self: *Tab, alloc: Allocator, p: *Placement, area: Rect, gap: f32) 
         return;
     }
     try placeNode(alloc, p, &self.root, area, gap);
+    try p.findCorners(alloc, gap);
 }
 
 fn placeNode(alloc: Allocator, p: *Placement, node: *Node, r: Rect, gap: f32) !void {
@@ -733,6 +734,84 @@ test "navigating, resizing, and equalizing panes" {
     try std.testing.expectEqual(@as(u16, 3333), row_split.children[0].share);
     try std.testing.expectEqual(@as(u16, 6667), row_split.children[1].share);
     try std.testing.expectEqual(@as(u16, 5000), pair_split.children[0].share);
+}
+
+test "corners are where a divider ends at one across it" {
+    const alloc = std.testing.allocator;
+    var a: Session = undefined;
+    var b: Session = undefined;
+    var c: Session = undefined;
+    var d: Session = undefined;
+    // a | (b over (c | d)): the column's divider ends at the row's, and
+    // the pair's at the column's.
+    const pair = try alloc.alloc(Child, 2);
+    pair[0] = .{ .share = 5000, .node = .{ .pane = &c } };
+    pair[1] = .{ .share = 5000, .node = .{ .pane = &d } };
+    const column = try alloc.alloc(Child, 2);
+    column[0] = .{ .share = 5000, .node = .{ .pane = &b } };
+    column[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .row, .children = pair } } };
+    const row = try alloc.alloc(Child, 2);
+    row[0] = .{ .share = 5000, .node = .{ .pane = &a } };
+    row[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = column } } };
+    const tab = try create(alloc, 1, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    defer tab.destroy(alloc);
+    var p: Placement = .{};
+    defer p.deinit(alloc);
+    try tab.place(alloc, &p, .{ .w = 401, .h = 201 }, 1);
+
+    try std.testing.expectEqual(@as(usize, 3), p.dividers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), p.corners.items.len);
+    const outer = p.corners.items[0];
+    try std.testing.expectEqual(@as(u16, 0), outer.through);
+    try std.testing.expectEqual([2]?u16{ 1, null }, outer.ends);
+    try std.testing.expectEqual(Rect{ .x = 199.5, .y = 99.5, .w = 2, .h = 2 }, outer.rect);
+    const second = p.corners.items[1];
+    try std.testing.expectEqual(@as(u16, 1), second.through);
+    try std.testing.expectEqual([2]?u16{ 2, null }, second.ends);
+    try std.testing.expectEqual(Rect{ .x = 300.5, .y = 99.5, .w = 2, .h = 2 }, second.rect);
+
+    // Dragging the first corner left and down moves the row's divider
+    // and the column's, each by its own axis.
+    const across = p.dividers.items[outer.through];
+    const down = p.dividers.items[outer.ends[0].?];
+    across.drag(across.shares(), -100, 50);
+    down.drag(down.shares(), 50, 50);
+    try std.testing.expectEqual([2]u16{ 2500, 7500 }, across.shares());
+    try std.testing.expectEqual([2]u16{ 7500, 2500 }, down.shares());
+    try std.testing.expectEqual([2]u16{ 5000, 5000 }, p.dividers.items[2].shares());
+}
+
+test "a cross is one corner with an end from each side" {
+    const alloc = std.testing.allocator;
+    var a: Session = undefined;
+    var b: Session = undefined;
+    var c: Session = undefined;
+    var d: Session = undefined;
+    // (a over b) | (c over d), both columns split halfway.
+    const left = try alloc.alloc(Child, 2);
+    left[0] = .{ .share = 5000, .node = .{ .pane = &a } };
+    left[1] = .{ .share = 5000, .node = .{ .pane = &b } };
+    const right = try alloc.alloc(Child, 2);
+    right[0] = .{ .share = 5000, .node = .{ .pane = &c } };
+    right[1] = .{ .share = 5000, .node = .{ .pane = &d } };
+    const row = try alloc.alloc(Child, 2);
+    row[0] = .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = left } } };
+    row[1] = .{ .share = 5000, .node = .{ .split = .{ .axis = .column, .children = right } } };
+    const tab = try create(alloc, 1, null, 0, .none, .{ .split = .{ .axis = .row, .children = row } }, &a);
+    defer tab.destroy(alloc);
+    var p: Placement = .{};
+    defer p.deinit(alloc);
+    try tab.place(alloc, &p, .{ .w = 401, .h = 201 }, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), p.corners.items.len);
+    const cross = p.corners.items[0];
+    try std.testing.expectEqual(@as(u16, 1), cross.through);
+    try std.testing.expectEqual([2]?u16{ 0, 2 }, cross.ends);
+
+    // Zoomed, there are no dividers and so no corners.
+    tab.zoom = &a;
+    try tab.place(alloc, &p, .{ .w = 401, .h = 201 }, 1);
+    try std.testing.expectEqual(@as(usize, 0), p.corners.items.len);
 }
 
 test "moving panes" {

@@ -474,6 +474,10 @@ const Builder = struct {
             for (app.placed().dividers.items, 0..) |d, i| {
                 try items.append(self.arena, .{ .id = .{ .target = .{ .divider = @intCast(i) } }, .kind = .hit_area, .rect = d.rect });
             }
+            // Over the dividers' ends, so they win there.
+            for (app.placed().corners.items, 0..) |c, i| {
+                try items.append(self.arena, .{ .id = .{ .target = .{ .corner = @intCast(i) } }, .kind = .hit_area, .rect = c.rect });
+            }
         } else {
             const area = self.frame.terminal;
             const h = self.ui.px(20);

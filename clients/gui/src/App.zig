@@ -150,7 +150,8 @@ bound_key: ?u32 = null,
 /// A mouse button went down over the terminal, which then gets the mouse
 /// until every button is up.
 mouse_in_terminal: bool = false,
-/// A divider being dragged, which has the mouse until the button's up.
+/// A divider or corner being dragged, which has the mouse until the
+/// button's up.
 drag: ?Drag = null,
 /// A pane pressed on its title strip, which drags it once the mouse moves
 /// far enough, until the button's up.
@@ -221,13 +222,24 @@ pub const Keyboard = union(enum) {
 
 const Drag = struct {
     tab: *Tab,
-    /// As `Tab.place` made it when the button went down; the tree it
-    /// points into doesn't change while dragging (see `cancelDrag`).
-    divider: Tab.Divider,
-    /// The children's shares then, and the mouse's position across the
-    /// divider.
-    from: [2]u16,
-    origin: i32,
+    /// The dividers moving: one, or a corner's. As `Tab.place` made them
+    /// when the button went down; the tree they point into doesn't
+    /// change while dragging (see `cancelDrag`).
+    parts: [3]?Part,
+    /// The mouse then.
+    origin: win32.POINT,
+
+    const Part = struct {
+        divider: Tab.Divider,
+        /// The children's shares when the button went down.
+        from: [2]u16,
+    };
+
+    /// A divider's sizing arrows, or a corner's.
+    fn cursor(self: Drag) Cursor {
+        if (self.parts[1] != null) return .size_all;
+        return dividerCursor(self.parts[0].?.divider);
+    }
 };
 
 const PaneDrag = struct {
@@ -2110,18 +2122,40 @@ fn equalizePanes(self: *App) void {
 
 /// Start dragging divider `i` of the active tab, if slime has its tree.
 fn startDrag(self: *App, i: usize, pos: win32.POINT) void {
-    const t = self.activeTab();
     const dividers = self.placed().dividers.items;
-    if (t.conn == null or i >= dividers.len) return;
-    const d = dividers[i];
+    if (i >= dividers.len) return;
+    self.startDragging(.{ dragPart(dividers[i]), null, null }, pos);
+}
+
+/// Start dragging corner `i` of the active tab: the divider through it
+/// and the one or two ending there.
+fn startCornerDrag(self: *App, i: usize, pos: win32.POINT) void {
+    const p = self.placed();
+    if (i >= p.corners.items.len) return;
+    const c = p.corners.items[i];
+    const dividers = p.dividers.items;
+    self.startDragging(.{
+        dragPart(dividers[c.through]),
+        dragPart(dividers[c.ends[0].?]),
+        if (c.ends[1]) |e| dragPart(dividers[e]) else null,
+    }, pos);
+}
+
+fn dragPart(d: Tab.Divider) Drag.Part {
+    return .{ .divider = d, .from = d.shares() };
+}
+
+fn startDragging(self: *App, parts: [3]?Drag.Part, pos: win32.POINT) void {
+    const t = self.activeTab();
+    if (t.conn == null) return;
     self.hideTip();
-    self.drag = .{ .tab = t, .divider = d, .from = d.shares(), .origin = across(d, pos) };
+    self.drag = .{ .tab = t, .parts = parts, .origin = pos };
     self.shell.captureMouse();
 }
 
-/// The mouse's position across divider `d`'s axis.
-fn across(d: Tab.Divider, pos: win32.POINT) i32 {
-    return if (d.axis() == .row) pos.x else pos.y;
+/// How far the mouse has moved across divider `d`'s axis from `origin`.
+fn across(d: Tab.Divider, origin: win32.POINT, pos: win32.POINT) f32 {
+    return @floatFromInt(if (d.axis() == .row) pos.x - origin.x else pos.y - origin.y);
 }
 
 /// The least a pane takes along `axis` when a divider moves: room for a
@@ -2132,23 +2166,32 @@ fn paneMin(self: *const App, axis: Tab.Axis) f32 {
     return @floatFromInt(if (axis == .row) pad.left + pad.right + 4 * m.width else pad.top + pad.bottom + 2 * m.height);
 }
 
-/// Move the dragged divider to the mouse, resizing the panes either side
-/// as it goes.
+/// Move the dragged dividers to the mouse, resizing the panes either
+/// side of each as it goes. A corner's are on both axes, each dividing
+/// its own split's span, so they move independently.
 fn dragTo(self: *App, d: Drag, pos: win32.POINT) void {
-    const before = d.divider.shares();
-    d.divider.drag(d.from, @floatFromInt(across(d.divider, pos) - d.origin), self.paneMin(d.divider.axis()));
-    if (std.meta.eql(before, d.divider.shares())) return;
+    var moved = false;
+    for (d.parts) |p_| {
+        const p = p_ orelse break;
+        const before = p.divider.shares();
+        p.divider.drag(p.from, across(p.divider, d.origin, pos), self.paneMin(p.divider.axis()));
+        if (!std.meta.eql(before, p.divider.shares())) moved = true;
+    }
+    if (!moved) return;
     self.layoutTab(d.tab);
     self.markDirty();
 }
 
-/// Let go of the dragged divider and send slime the tree it left.
+/// Let go of the dragged dividers and send slime the tree they left.
 fn endDrag(self: *App) void {
     const d = self.drag orelse return;
     // First: releasing the capture comes back as `capture_lost`.
     self.drag = null;
     self.shell.releaseMouse();
-    if (std.meta.eql(d.from, d.divider.shares())) return;
+    for (d.parts) |p_| {
+        const p = p_ orelse return;
+        if (!std.meta.eql(p.from, p.divider.shares())) break;
+    } else return;
     self.sendLayout(d.tab);
 }
 
@@ -2852,18 +2895,19 @@ pub fn hitAt(self: *App, pos: win32.POINT) Id {
 }
 
 /// What the mouse cursor should be at a client position: a text field's
-/// I-beam, a divider's or a dragged pane's sizing arrows, or the shape a
-/// pane's program set.
+/// I-beam, a divider's, corner's, or dragged pane's sizing arrows, or
+/// the shape a pane's program set.
 pub fn cursor(self: *App, pos: win32.POINT) Cursor {
     var cursor_: Cursor = .arrow;
     const hit = self.hitAt(pos);
     // A dialog's field, or a workspace's name being edited.
     if (hit.part == .field) cursor_ = .ibeam;
-    const divider: ?Tab.Divider = if (self.drag) |d| d.divider else switch (hit.target) {
-        .divider => |i| if (i < self.placed().dividers.items.len) self.placed().dividers.items[i] else null,
+    const sizing: ?Cursor = if (self.drag) |d| d.cursor() else switch (hit.target) {
+        .divider => |i| if (i < self.placed().dividers.items.len) dividerCursor(self.placed().dividers.items[i]) else null,
+        .corner => |i| if (i < self.placed().corners.items.len) .size_all else null,
         else => null,
     };
-    if (divider) |d| cursor_ = if (d.axis() == .row) .size_we else .size_ns;
+    if (sizing) |c| cursor_ = c;
     if (self.sidebar_drag != null or hit.eql(.window(.sidebar_edge))) cursor_ = .size_we;
     if (self.pane_drag) |d| if (d.at != null) {
         cursor_ = .size_all;
@@ -2871,6 +2915,10 @@ pub fn cursor(self: *App, pos: win32.POINT) Cursor {
     const pane = if (self.mouse_in_terminal) self.focusedSession() else if (hit.part == .terminal) self.shownPane(hit.target) else null;
     if (pane) |s| cursor_ = .{ .shape = s.mouseShape() };
     return cursor_;
+}
+
+fn dividerCursor(d: Tab.Divider) Cursor {
+    return if (d.axis() == .row) .size_we else .size_ns;
 }
 
 /// A client position relative to pane `s`'s terminal. A pane that isn't
@@ -2975,6 +3023,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
     switch (msg) {
         win32.WM_LBUTTONDOWN => {
             if (hit.target == .divider) return self.startDrag(hit.target.divider, pos);
+            if (hit.target == .corner) return self.startCornerDrag(hit.target.corner, pos);
             if (hit.eql(.window(.sidebar_edge))) return self.startSidebarDrag(pos);
             if (hit.part == .title) if (self.shownPane(hit.target)) |pane| return self.startPaneDrag(pane, pos);
             self.setPressed(hit);
