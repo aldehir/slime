@@ -17,9 +17,14 @@ import (
 // temp file and renaming it over the old fool a watch on the file
 // itself; a second's poll is cheap on a directory this small.
 
-// watchConfig polls every interval until stop is closed.
+// watchConfig polls every interval, in a goroutine of its own, until
+// stop is closed. The baseline is taken before it returns, so a change
+// made after the call is seen for sure.
 func (s *Server) watchConfig(interval time.Duration, stop <-chan struct{}) {
-	last := s.configStamp()
+	go s.pollConfig(s.configStamp(), interval, stop)
+}
+
+func (s *Server) pollConfig(last string, interval time.Duration, stop <-chan struct{}) {
 	// A change was seen; the reload waits for a poll in which nothing
 	// changed, so a file being written isn't read half way.
 	pending := false

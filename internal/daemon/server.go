@@ -130,7 +130,7 @@ func (s *Server) Serve(l net.Listener) error {
 	if s.watch > 0 && s.configPath != "" {
 		stop := make(chan struct{})
 		defer close(stop)
-		go s.watchConfig(s.watch, stop)
+		s.watchConfig(s.watch, stop)
 	}
 	errc := make(chan error, 1)
 	go func() {

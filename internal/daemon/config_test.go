@@ -284,7 +284,7 @@ func TestConfigWatch(t *testing.T) {
 	h, path := newConfigHarness(t, `slime.config{ shell = { command = "one" } }`)
 	stop := make(chan struct{})
 	t.Cleanup(func() { close(stop) })
-	go h.srv.watchConfig(10*time.Millisecond, stop)
+	h.srv.watchConfig(10*time.Millisecond, stop)
 	sub := h.connect()
 	if err := sub.Call(rpc.Subscribe, rpc.SubscribeParams{Events: []string{"config.*"}}, nil); err != nil {
 		t.Fatal(err)
