@@ -351,12 +351,12 @@ run Lua at a time, so a blocking call lets the others run.
   second).
 - **`pane.clipboard`** (OSC 52 writes) isn't an event; viewers get the
   Notice.
-- **A `client.action` acts on each viewing window's own focus**, not on
-  the workspace it was queued for: a window showing several workspaces
-  performs it on whichever is active there. And every viewer performs
-  it: two windows on one workspace make two splits of one
-  `slime.client.queue("new_split")`. Sending it to one viewer (the one
-  that last sent input, say) would need the daemon to track that.
+- **A `client.action` runs in every window viewing the workspace**, on
+  each one's own focus, so `client.queue` refuses the actions that
+  change the workspace (`rpc.DaemonActions`: their methods do it once,
+  for the pane named) and takes the window-local ones: clipboard and
+  font size. Sending one to a single viewer (the one that last sent
+  input, say) would need the daemon to track that.
 - **Hooks in `init.lua` can't fall back to a window**: `slime.on` runs
   in the daemon; there's no `client.on`.
 

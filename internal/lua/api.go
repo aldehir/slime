@@ -105,10 +105,14 @@ EVENTS, WAITING, TIMERS, PROCESSES
                              ending kills the processes it started.
   slime.client.queue(name, args)
                              asks the windows on this script's workspace to
-                             perform window action name (new_tab, new_split
-                             {direction = "down"}, toggle_split_zoom, ...) with
-                             args, as if its key were pressed there; each
-                             window showing the workspace does, on its own focus
+                             perform a window action with args, as if its key
+                             were pressed there: copy_to_clipboard,
+                             paste_from_clipboard, increase_font_size
+                             {amount}, decrease_font_size, reset_font_size.
+                             Every window showing the workspace does, so one
+                             that changes the workspace (new_split, new_tab,
+                             toggle_split_zoom, ...) is refused: slime.pane.split
+                             and the rest do that once, for the pane named
 
 ctx for a hook is {workspace_id, tab_id, pane_id, origin = "event", event}:
 what the event is about, as filter sees it; for a timer, what the
@@ -253,7 +257,6 @@ Run a command below and wait for it (slime do build.lua):
   local p = assert(slime.pane.split{ direction = "down", share = 3000, command = "go build ./..." })
   local ev = slime.wait("pane.exited", { pane_id = p.pane }, 600)
   if not ev then slime.stop("still building") end
-  if ev.status ~= 0 then slime.client.queue("toggle_split_zoom") end
   return "exit " .. ev.status
 
 Watch for bells until stopped (slime do --detach watch.lua; slime scripts kill <id>):

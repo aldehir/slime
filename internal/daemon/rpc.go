@@ -257,6 +257,9 @@ func (s *Server) clientQueue(_ *callCtx, p rpc.ClientQueueParams) (rpc.Empty, er
 	if p.Name == "" {
 		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "client.queue needs an action name")
 	}
+	if method, ok := rpc.DaemonActions[p.Name]; ok {
+		return rpc.Empty{}, rpc.Errorf(rpc.CodeInvalidParams, "%s changes the workspace, and every window would: call %s for the pane instead", p.Name, method)
+	}
 	if len(p.Args) > 0 {
 		var obj map[string]json.RawMessage
 		if err := json.Unmarshal(p.Args, &obj); err != nil {

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -135,24 +136,34 @@ func TestClientQueue(t *testing.T) {
 	c := h.connect()
 	// From a script, for its pane's workspace; and the method itself.
 	_, done := runScript(t, c, rpc.ScriptRunParams{Pane: pane, Source: `
-		assert(slime.client.queue("new_split", { direction = "down" }))
+		assert(slime.client.queue("increase_font_size", { amount = 2 }))
 		local ok, err = slime.client.queue("")
 		assert(not ok and err:find("name"), err)
+		-- One that changes the workspace would run once per window.
+		local split, why = slime.client.queue("new_split", { direction = "down" })
+		assert(not split and why:find("pane.split"), why)
 		return "queued"
 	`})
 	if !done.OK {
 		t.Fatalf("script failed: %s", done.Error)
 	}
 	got := nextEvent[rpc.ClientActionParams](w, rpc.EvClientAction)
-	if got.Workspace != w.ws.ID || got.Name != "new_split" || string(got.Args) != `{"direction":"down"}` {
+	if got.Workspace != w.ws.ID || got.Name != "increase_font_size" || string(got.Args) != `{"amount":2}` {
 		t.Errorf("client.action %+v", got)
 	}
-	if err := c.Call(rpc.ClientQueue, rpc.ClientQueueParams{Workspace: w.ws.ID, Name: "new_tab"}, nil); err != nil {
+	if err := c.Call(rpc.ClientQueue, rpc.ClientQueueParams{Workspace: w.ws.ID, Name: "reset_font_size"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	got = nextEvent[rpc.ClientActionParams](w, rpc.EvClientAction)
-	if got.Name != "new_tab" || got.Args != nil {
+	if got.Name != "reset_font_size" || got.Args != nil {
 		t.Errorf("client.action %+v", got)
+	}
+	for name := range rpc.DaemonActions {
+		err := c.Call(rpc.ClientQueue, rpc.ClientQueueParams{Workspace: w.ws.ID, Name: name}, nil)
+		var rerr *rpc.Error
+		if !errors.As(err, &rerr) || rerr.Code != rpc.CodeInvalidParams || !strings.Contains(rerr.Message, rpc.DaemonActions[name]) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 	// No workspace: not from a script run for none, nor for one that
 	// doesn't exist.
@@ -163,7 +174,7 @@ func TestClientQueue(t *testing.T) {
 	if !done.OK || !strings.Contains(string(done.Result), "no workspace") {
 		t.Errorf("without a pane: %s %s", done.Result, done.Error)
 	}
-	if err := c.Call(rpc.ClientQueue, rpc.ClientQueueParams{Workspace: 99, Name: "new_tab"}, nil); err == nil {
+	if err := c.Call(rpc.ClientQueue, rpc.ClientQueueParams{Workspace: 99, Name: "reset_font_size"}, nil); err == nil {
 		t.Error("queued to a workspace that doesn't exist")
 	}
 }

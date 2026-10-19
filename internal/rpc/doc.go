@@ -54,7 +54,7 @@ var MethodDocs = []MethodDoc{
 	{ConfigCheck, "{path?}", "Config", "evaluates init.lua (or path) without applying it"},
 	{Subscribe, "{events: [\"pane.exited\", \"host.*\", \"*\"]}", "{}", "needs a connection (not from Lua, which has slime.on)"},
 	{ClientQueue, "{workspace, name, args?: object}", "{}",
-		"sends client.action to the workspace's viewers: each window performs its action name (new_tab, new_split {direction}, ...) with args"},
+		"sends client.action to the workspace's viewers: each window performs its action name with args (copy_to_clipboard, paste_from_clipboard, increase_font_size {amount}, decrease_font_size, reset_font_size); one that changes the workspace (new_split, new_tab, close_surface, next_tab, goto_split, toggle_split_zoom, resize_split, ...) is refused, as it would run once per window: its method does it once"},
 	{HostConnect, "{dest}", "Host", "prompts arrive as host.prompt, answered with host.answer"},
 	{HostAnswer, "{host, choice: accept|cancel|skip, answers?}", "{}", ""},
 	{HostDisconnect, "{host}", "{}", ""},

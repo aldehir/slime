@@ -818,13 +818,31 @@ type PaneStatusParams struct {
 }
 
 // ClientQueueParams: client.queue asks the viewers of Workspace to
-// perform the window action Name (new_tab, new_split, ...) with Args, a
-// JSON object or nothing: the daemon sends them client.action. Lua's
+// perform the window action Name (copy_to_clipboard, increase_font_size,
+// ...) with Args, a JSON object or nothing: the daemon sends them
+// client.action, and every window showing the workspace performs it.
+// So an action that changes the workspace is refused: it has a method
+// that does it once, for the pane named (DaemonActions). Lua's
 // slime.client.queue fills Workspace from what the script runs for.
 type ClientQueueParams struct {
 	Workspace uint32          `json:"workspace"`
 	Name      string          `json:"name"`
 	Args      json.RawMessage `json:"args,omitempty"`
+}
+
+// DaemonActions are the window actions client.queue refuses, each with
+// the method that does the same for one pane, once: a window's own
+// would run in every viewer.
+var DaemonActions = map[string]string{
+	"new_tab":           TabNew,
+	"new_split":         PaneSplit,
+	"close_surface":     PaneKill,
+	"next_tab":          WorkspaceFocus,
+	"previous_tab":      WorkspaceFocus,
+	"goto_split":        WorkspaceFocus,
+	"toggle_split_zoom": WorkspaceFocus,
+	"resize_split":      TabLayout,
+	"equalize_splits":   TabLayout,
 }
 
 // ClientActionParams: client.action, to a workspace's viewers.
