@@ -549,17 +549,23 @@ func paneCommand() *cobra.Command {
 	navigate := &cobra.Command{
 		Use:   "navigate [pane] <url>",
 		Short: "Send a browser pane (this one, by default) to a url, in every window showing it",
-		Args:  cobra.RangeArgs(1, 2),
+		Long: "Sends a browser pane to url, in every window showing it. A first argument\n" +
+			"that is a pane id (workspace.tab.pane) is the pane; without one, this console's\n" +
+			"($SLIME_PANE).",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			id := envPane()
-			if len(args) == 2 {
-				var err error
-				if id, err = rpc.ParsePaneID(args[0]); err != nil {
-					return err
-				}
+			// paneArg's rule, except that a url can have two dots too
+			// (www.example.com): only an id that parses is the pane.
+			id, err := rpc.ParsePaneID(args[0])
+			if err == nil {
 				args = args[1:]
-			} else if id.IsZero() {
+			} else if len(args) == 2 {
+				return err
+			} else if id = envPane(); id.IsZero() {
 				return errNoPane
+			}
+			if len(args) != 1 {
+				return fmt.Errorf("a url: %s", cmd.UseLine())
 			}
 			return call(rpc.PaneNavigate, rpc.PaneNavigateParams{Pane: id, URL: args[0]}, nil)
 		},

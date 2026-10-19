@@ -85,7 +85,8 @@ const ShapesDoc = `A workspace id is an integer; a tab id is the string "w.t" an
   Created        {pane: "w.t.p"}
   Host           {id, dest, state: connecting|connected|failed|lost|gone, text?, proxy?}
                  proxy is "socks5://127.0.0.1:<port>" while connected: a tunnel
-                 into the host's network, names resolved there
+                 into the host's network, names resolved there; none if host.proxy
+                 was false when the host connected
   Config         {path, settings: object, keymap: [Binding], actions: [{name, title?, args?}],
                   errors?: [string]}
                  settings is slime.config's table (see slime help lua); errors is why

@@ -343,3 +343,26 @@ func TestBrowser(t *testing.T) {
 		}
 	}
 }
+
+// slime.layout.browser leaves its table alone, so reusing it for
+// slime.layout.pane makes a terminal leaf.
+func TestBrowserReusedTable(t *testing.T) {
+	res, err := run(t, &fakeHost{}, Context{}, `
+		local spec = { cwd = "/tmp" }
+		local b = slime.layout.browser(spec)
+		return slime.layout.vertical(b, slime.layout.pane(spec))
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var l rpc.Layout
+	if err := json.Unmarshal(res, &l); err != nil {
+		t.Fatalf("%v: %s", err, res)
+	}
+	if p := l.Children[0].Node.Pane; p.Kind != rpc.PaneBrowser {
+		t.Errorf("browser leaf %+v", p)
+	}
+	if p := l.Children[1].Node.Pane; p.Kind != rpc.PaneTerminal || p.Cwd != "/tmp" {
+		t.Errorf("terminal leaf %+v", p)
+	}
+}

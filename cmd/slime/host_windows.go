@@ -63,7 +63,8 @@ func hostCommands() []*cobra.Command {
 			"proxy into its network, on loopback with no auth (as ssh -D's), shown as\n" +
 			"socks5://127.0.0.1:<port>; curl --proxy socks5h://127.0.0.1:<port> http://intranet/\n" +
 			"has the host resolve and reach intranet. slime.config{ host = { proxy = false } }\n" +
-			"turns it off.",
+			"turns it off for the hosts that connect after it's set; one already connected\n" +
+			"keeps its proxy until it reconnects.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var hosts rpc.HostListResult

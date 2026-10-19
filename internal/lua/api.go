@@ -140,7 +140,9 @@ which are for the top level only:
                              shell.command (what a pane runs when nothing says)
                              and host.proxy (false: no SOCKS proxy over a host's
                              connection; the proxy is loopback-only and has no
-                             auth, so any local program can use the tunnel);
+                             auth, so any local program can use the tunnel;
+                             read when a host connects, so a reload changes
+                             only the hosts that connect after it);
                              each window takes what it understands and ignores
                              the rest (slime-gui: font, theme, colors, window,
                              chrome, selection, clipboard, ssh, browser).
@@ -625,9 +627,11 @@ func layoutPane(L *glua.LState) int {
 }
 
 // layoutBrowser is slime.layout.browser{url}: a leaf whose pane is a
-// browser.
+// browser. It copies the table, so one reused for slime.layout.pane
+// stays a terminal's.
 func layoutBrowser(L *glua.LState) int {
-	spec := L.OptTable(1, L.NewTable())
+	spec := L.NewTable()
+	L.OptTable(1, L.NewTable()).ForEach(spec.RawSet)
 	spec.RawSetString("kind", glua.LString(rpc.PaneBrowser))
 	leaf := L.NewTable()
 	leaf.RawSetString("pane", spec)
