@@ -166,6 +166,7 @@ pub const Cells = struct {
                 .styles = screen_row.styles.items,
                 .graphemes = screen_row.graphemes.items,
                 .selection = screen_row.selection,
+                .highlights = screen_row.highlights.items,
                 .cursor_x = if (cursor_pos) |pos| (if (pos.y == y) pos.x else null) else null,
                 .cursor_block = cursor_style == .block,
             };
@@ -243,10 +244,26 @@ pub const Cells = struct {
                 bg = if (config.selection_background) |c| c.resolve(cell_fg, cell_bg) else colors.foreground;
                 fg = if (config.selection_foreground) |c| c.resolve(cell_fg, cell_bg) else colors.background;
             }
+            // A search match: the match color, faint behind every match
+            // and solid with inverted text behind the current one, over
+            // the selection too (the current match is the selection).
+            var highlight: u8 = 0;
+            for (row.highlights) |hl| {
+                if (x >= hl.first and x <= hl.last and hl.tag > highlight) highlight = hl.tag;
+            }
+            if (highlight != 0) {
+                const match = if (config.search_match) |c| c.resolve(fg, bg) else colors.palette[3];
+                if (highlight >= 2) {
+                    bg = match;
+                    fg = colors.background;
+                } else if (!selected) {
+                    bg = mix(bg, match, 0.35);
+                }
+            }
             // Default backgrounds are left transparent: the frame is
             // cleared to it, and kitty images below the background
             // show through.
-            const default_bg = !selected and !style.flags.inverse and style.bg(&raw, &colors.palette) == null;
+            const default_bg = !selected and highlight == 0 and !style.flags.inverse and style.bg(&raw, &colors.palette) == null;
             out.bg.items[x] = if (default_bg) 0 else pack(bg, 255);
 
             self.row_text.items[x] = .{ .has_text = false, .face = 0, .color = 0 };
@@ -362,6 +379,17 @@ pub const Cells = struct {
     }
 };
 
+/// `a` with `t` of `b` blended over it.
+fn mix(a: RGB, b: RGB, t: f32) RGB {
+    const f = struct {
+        fn go(x: u8, y: u8, k: f32) u8 {
+            const v = @as(f32, @floatFromInt(x)) * (1 - k) + @as(f32, @floatFromInt(y)) * k;
+            return @intFromFloat(@round(std.math.clamp(v, 0, 255)));
+        }
+    }.go;
+    return .{ .r = f(a.r, b.r, t), .g = f(a.g, b.g, t), .b = f(a.b, b.b, t) };
+}
+
 /// Window state that decides how the cursor is drawn.
 pub const CursorOptions = struct {
     /// Unfocused windows show a hollow block that doesn't blink.
@@ -377,7 +405,11 @@ pub const ColorOptions = struct {
     cursor_text: ?TerminalColor = null,
     selection_background: ?TerminalColor = null,
     selection_foreground: ?TerminalColor = null,
+    /// Behind search matches; null for the palette's yellow.
+    search_match: ?TerminalColor = null,
 };
+
+const Highlight = std.meta.Elem(@FieldType(@FieldType(Screen.Row, "highlights"), "items"));
 
 /// Everything building one row reads, apart from the state hashed by
 /// `cacheKey`.
@@ -388,6 +420,8 @@ const Row = struct {
     /// Valid only for cells with graphemes.
     graphemes: []const []const u21,
     selection: @FieldType(Screen.Row, "selection"),
+    /// Search matches in the row (frame.zig's tags).
+    highlights: []const Highlight,
     /// The cursor's column, if it's drawn on this row.
     cursor_x: ?u32,
     cursor_block: bool,
@@ -395,6 +429,7 @@ const Row = struct {
     fn hash(self: Row) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.sliceAsBytes(self.raws));
+        for (self.highlights) |hl| std.hash.autoHash(&h, hl);
 
         // Style ids only mean something within one page, so also mix in
         // the style each id resolves to. A row is in one page, so once

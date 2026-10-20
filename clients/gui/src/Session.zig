@@ -106,6 +106,11 @@ program_status: ProgramStatus = .{},
 /// `program_status` changed since the window last looked. Set by the
 /// reader thread.
 status_changed: std.atomic.Value(bool) = .init(false),
+/// The needle this window last searched the pane for: its pill shows
+/// it while that search is on (`search_needle_live`). UI thread only.
+search_needle_buf: [64]u16 = undefined,
+search_needle_len: usize = 0,
+search_needle_live: bool = false,
 
 /// What fills a pane.
 pub const Content = union(enum) {
@@ -628,6 +633,9 @@ pub fn applyFrames(self: *Session) void {
     }
     for (t.screen.dropped.items) |id| t.images.remove(self.alloc, id);
     t.screen.dropped.clearRetainingCapacity();
+    // A search that ended (another window's Escape) isn't this window's
+    // any more; the needle stays for the next.
+    if (!t.screen.search) self.search_needle_live = false;
     const cell = self.env.cellSize();
     t.images.update(self.alloc, t.screen.placements.items, cell.width, cell.height) catch |err| log.err("laying out images failed: {}", .{err});
 }
@@ -1120,6 +1128,96 @@ pub fn copySelection(self: *Session) bool {
     @atomicStore(u32, &t.copy_tag, tag, .monotonic);
     self.send(.{ .copy = tag });
     return true;
+}
+
+/// Search the pane for `needle` (search.zig, in slime), `direction`
+/// being the way the next match lies; an empty needle ends the search.
+pub fn search(self: *Session, direction: event.SearchDirection, needle: []const u8) void {
+    self.send(.{ .search = .{ .direction = direction, .needle = needle } });
+}
+
+/// To the search's next or previous match.
+pub fn searchStep(self: *Session, step: event.SearchStep) void {
+    self.send(.{ .search_step = step });
+}
+
+/// End the search: its highlights go, the selection stays, and so does
+/// the needle, for the next search to start from.
+pub fn endSearch(self: *Session) void {
+    self.search(.down, "");
+    self.search_needle_live = false;
+}
+
+/// The search as the last frame showed it, if one is on.
+pub const SearchInfo = struct { matches: u32, current: u32, partial: bool };
+
+pub fn searchInfo(self: *const Session) ?SearchInfo {
+    return switch (self.content) {
+        .terminal => |*t| if (t.screen.search) .{ .matches = t.screen.matches, .current = t.screen.current, .partial = t.screen.search_partial } else null,
+        .browser => null,
+    };
+}
+
+/// Keep the needle this window searched for, for its pill and the next
+/// search; an empty one leaves the last.
+pub fn setSearchNeedle(self: *Session, text: []const u16) void {
+    if (text.len == 0) {
+        self.search_needle_live = false;
+        return;
+    }
+    const n = @min(text.len, self.search_needle_buf.len);
+    @memcpy(self.search_needle_buf[0..n], text[0..n]);
+    self.search_needle_len = n;
+    self.search_needle_live = true;
+}
+
+/// The last needle this window searched for.
+pub fn searchNeedle(self: *const Session) []const u16 {
+    return self.search_needle_buf[0..self.search_needle_len];
+}
+
+/// The needle for the pill: this window's, while the search it started
+/// is on; empty for another window's search.
+pub fn liveSearchNeedle(self: *const Session) []const u16 {
+    return if (self.search_needle_live) self.searchNeedle() else &.{};
+}
+
+/// The selection's text as the last frame showed it, if it's within one
+/// row: a search's first needle. Into `buf`; null for none, or one over
+/// several rows.
+pub fn selectedRowText(self: *const Session, buf: []u16) ?[]const u16 {
+    const t = switch (self.content) {
+        .terminal => |*t| t,
+        .browser => return null,
+    };
+    var found: ?usize = null;
+    for (t.screen.row_data.items, 0..) |row, y| {
+        if (row.selection == null) continue;
+        if (found != null) return null;
+        found = y;
+    }
+    const row = &t.screen.row_data.items[found orelse return null];
+    const sel = row.selection.?;
+    var n: usize = 0;
+    var x: usize = sel[0];
+    while (x <= sel[1] and x < row.raws.items.len) : (x += 1) {
+        const raw = row.raws.items[x];
+        if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
+        const cp: u21 = if (raw.hasText()) raw.codepoint() else ' ';
+        if (cp < 0x10000) {
+            if (n + 1 > buf.len) break;
+            buf[n] = @intCast(cp);
+            n += 1;
+        } else {
+            if (n + 2 > buf.len) break;
+            const v = cp - 0x10000;
+            buf[n] = @intCast(0xD800 + (v >> 10));
+            buf[n + 1] = @intCast(0xDC00 + (v & 0x3FF));
+            n += 2;
+        }
+    }
+    const text = std.mem.trim(u16, buf[0..n], &.{ ' ', '\t' });
+    return if (text.len == 0) null else text;
 }
 
 /// Send the clipboard's text, which slime brackets if the program asked

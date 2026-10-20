@@ -267,6 +267,24 @@ pub const Pane = struct {
     /// A browser pane's URL bar, in place of the title, and what stands
     /// in for its page.
     browser: ?BrowserPane = null,
+    /// A search's card (the field being typed) or pill (its count) at
+    /// the right under the strip, over the terminal.
+    search: ?SearchView = null,
+};
+
+pub const SearchView = struct {
+    /// The field, while this window types the needle; null for the pill.
+    field: ?*const TextField = null,
+    caret: bool = false,
+    /// The needle the pill shows, if this window typed it.
+    needle: []const u16 = &.{},
+    /// Matches on the pane's screen, and the current one from the top.
+    matches: u32 = 0,
+    current: u32 = 0,
+    /// The count is still growing.
+    partial: bool = false,
+    /// A needle with no match: the error color.
+    none: bool = false,
 };
 
 pub const BrowserPane = struct {

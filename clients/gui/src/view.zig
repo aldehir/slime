@@ -517,6 +517,7 @@ const Builder = struct {
                     .buttons = buttons.nodes,
                     .nav = buttons.nav,
                     .browser = try self.browserPane(s, p.rect),
+                    .search = self.searchView(s),
                 } }, .rect = p.frame });
             }
             for (app.placed().dividers.items, 0..) |d, i| {
@@ -592,6 +593,27 @@ const Builder = struct {
             b.* = .{ .id = id.with(part), .kind = .{ .icon_button = .{ .icon = icon, .size = 13, .style = .faint, .tip = tip, .key = key } } };
         }
         return .{ .nodes = buttons, .nav = nav.len };
+    }
+
+    /// A pane's search: the card while this window types its needle,
+    /// else the pill with its count while a search is on. Null for
+    /// neither.
+    fn searchView(self: *const Builder, s: *Session) ?tree.SearchView {
+        const app = self.app;
+        const editing = app.mode == .search and app.mode.search.pane == s.id;
+        const info = s.searchInfo();
+        if (!editing and info == null) return null;
+        const i = info orelse Session.SearchInfo{ .matches = 0, .current = 0, .partial = false };
+        const typed = if (editing) app.mode.search.field.text().len > 0 else true;
+        return .{
+            .field = if (editing) &app.mode.search.field else null,
+            .caret = editing and app.focused and app.blink_visible,
+            .needle = if (editing) &.{} else s.liveSearchNeedle(),
+            .matches = i.matches,
+            .current = i.current,
+            .partial = i.partial,
+            .none = info != null and typed and i.matches == 0 and !i.partial,
+        };
     }
 
     /// A browser pane's URL bar, and what stands in for its page in

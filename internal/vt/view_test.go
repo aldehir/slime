@@ -19,7 +19,7 @@ func newSource(t testing.TB) *Source {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(s.Close)
+	t.Cleanup(func() { s.Close(nil) })
 	return s
 }
 

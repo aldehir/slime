@@ -25,6 +25,9 @@
 //!               background, foreground, u8 has cursor color, rgb
 //!               cursor color, rgb palette[256]
 //!     cancel:   (a selection drag lost the mouse)
+//!     search:   u8 direction (0 down, 1 up), the rest the utf8 needle
+//!               (empty: end the search)
+//!     search_step: u8 (0 next, 1 previous)
 //!
 //! A win32 record is win32-input-mode's: u16 vk, u16 scan code, u16 char,
 //! u8 down, u32 control key state, u16 repeat. Mouse and wheel positions
@@ -43,7 +46,18 @@ pub const Kind = enum(u8) {
     geometry = 8,
     settings = 9,
     cancel = 10,
+    search = 11,
+    search_step = 12,
 };
+
+/// A search event (search.zig): which way `next` goes, and what to
+/// look for.
+pub const Search = struct {
+    direction: SearchDirection,
+    needle: []const u8,
+};
+pub const SearchDirection = enum(u8) { down = 0, up = 1 };
+pub const SearchStep = enum(u8) { next = 0, previous = 1 };
 
 /// A wheel that scrolls a page a notch (SPI_GETWHEELSCROLLLINES).
 pub const lines_page = std.math.maxInt(u32);
@@ -156,6 +170,8 @@ pub fn Codec(comptime vt: type) type {
             geometry: Geometry,
             settings: Settings,
             cancel,
+            search: Search,
+            search_step: SearchStep,
         };
 
         pub fn encode(w: *std.Io.Writer, ev: Event) std.Io.Writer.Error!void {
@@ -222,6 +238,11 @@ pub fn Codec(comptime vt: type) type {
                     for (c.palette) |p| try writeRgb(w, p);
                 },
                 .cancel => {},
+                .search => |s| {
+                    try w.writeByte(@intFromEnum(s.direction));
+                    try w.writeAll(s.needle);
+                },
+                .search_step => |step| try w.writeByte(@intFromEnum(step)),
             }
         }
 
@@ -321,6 +342,11 @@ pub fn Codec(comptime vt: type) type {
                     } };
                 },
                 .cancel => .cancel,
+                .search => .{ .search = .{
+                    .direction = std.enums.fromInt(SearchDirection, try r.takeByte()) orelse return error.BadEvent,
+                    .needle = bytes[2..],
+                } },
+                .search_step => .{ .search_step = std.enums.fromInt(SearchStep, try r.takeByte()) orelse return error.BadEvent },
             };
         }
 

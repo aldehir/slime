@@ -108,6 +108,12 @@ pub const Part = enum {
     field,
     /// A dialog's button.
     button,
+    /// A pane's search card: its field (or the pill), and its previous,
+    /// next, and close buttons.
+    search,
+    search_prev,
+    search_next,
+    search_close,
 };
 
 pub fn eql(a: Id, b: Id) bool {

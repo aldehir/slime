@@ -17,6 +17,7 @@ $targets = @(
 )
 # slime's own exports, compiled in next to the C API.
 $extra = Join-Path $root 'internal\vt\slime.zig'
+$libs = @()
 Push-Location (Join-Path $root 'ghostty')
 try {
     foreach ($t in $targets) {
@@ -28,11 +29,19 @@ try {
         # Named as an archive on both, for cgo's -l (its flag check
         # rejects a .lib path).
         Copy-Item (Join-Path $prefix "lib\$($t.Lib)") (Join-Path $dir 'libghostty-vt.a')
+        $libs += Join-Path $prefix "lib\$($t.Lib)"
         Write-Host "internal\vt\lib\$($t.Go)\libghostty-vt.a ($Optimize)"
     }
 } finally {
     Pop-Location
 }
+
+# A Go file with the libraries' hash, so go build and go test relink
+# when they change (cgo doesn't track a static library's bytes); as
+# build.zig writes it with build/libstamp.zig.
+$stamp = Join-Path $root 'internal\vt\zz_libstamp.go'
+zig run (Join-Path $root 'build\libstamp.zig') -- $stamp @libs
+if ($LASTEXITCODE -ne 0) { throw "libstamp failed ($LASTEXITCODE)" }
 
 # Go's race runtime links -lsynchronization, which Zig's MinGW has no
 # import library for. scripts\race.ps1 points cgo here.

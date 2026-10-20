@@ -48,6 +48,21 @@ const site_gap = 6;
 const margin = 3;
 /// Before the title, and the focus dot before it.
 const title_pad = 14;
+/// The search card under the strip's right end (`Tree.Pane.search`):
+/// its size, the pill's height, below what width it loses its icon and
+/// buttons, and below what width it isn't drawn at all.
+const search_width = 300;
+const search_height = 32;
+const pill_height = 24;
+const search_narrow = 240;
+const search_min = 120;
+const pill_min = 80;
+const search_top = 6;
+const search_side = 12;
+const search_pad = 10;
+const search_button = 24;
+const search_icon = 14;
+const search_count = 60;
 /// A drop highlight's corners.
 const drop_radius = 8;
 
@@ -126,11 +141,117 @@ fn urlRect(ui: *const Ui, node: *const Node) Rect {
     return .{ .x = left, .y = bar.y + inset, .w = @max(0, right - left), .h = @max(0, bar.h - 2 * inset) };
 }
 
-/// A button, else the title strip (which drags the pane), else a
-/// browser's URL bar or the rest of its address row (which does
-/// nothing: the strip above is enough to drag by), else the terminal.
+/// Where the search card's parts go: the box under the strip's right
+/// end, the field (or the pill's text) in it, the count after it, and
+/// the previous, next, and close buttons when the pane has room for
+/// them. Null when there's no search, or no room for the box.
+const SearchRects = struct {
+    box: Rect,
+    icon: ?Rect,
+    field: Rect,
+    count: Rect,
+    prev: ?Rect,
+    next: ?Rect,
+    close: ?Rect,
+};
+
+fn searchRects(ui: *const Ui, node: *const Node) ?SearchRects {
+    const sv = node.kind.pane.search orelse return null;
+    const f = node.rect;
+    const strip = titleRect(ui, node);
+    const side = ui.px(search_side);
+    const pill = sv.field == null;
+    const room = f.w - 2 * side;
+    var w = @min(ui.px(search_width), room);
+    if (pill) w = @min(w, ui.px(if (sv.needle.len > 0) 190 else 110));
+    if (w < ui.px(if (pill) pill_min else search_min)) return null;
+    const h = ui.px(if (pill) pill_height else search_height);
+    const box: Rect = .{ .x = f.right() - side - w, .y = strip.bottom() + ui.px(search_top), .w = w, .h = h };
+    const pad = ui.px(search_pad);
+    const button = ui.px(search_button);
+    const wide = !pill and w >= ui.px(search_narrow);
+    var right = box.right() - (if (wide or pill) ui.px(6) else pad);
+    var close: ?Rect = null;
+    var next: ?Rect = null;
+    var prev: ?Rect = null;
+    const by = box.y + @round((h - button) / 2);
+    if (wide) {
+        close = .{ .x = right - button, .y = by, .w = button, .h = button };
+        next = .{ .x = right - 2 * button, .y = by, .w = button, .h = button };
+        prev = .{ .x = right - 3 * button, .y = by, .w = button, .h = button };
+        right -= 3 * button + ui.px(4);
+    } else if (pill) {
+        // The pill ends the search too.
+        close = .{ .x = right - button, .y = by, .w = button, .h = button };
+        right -= button + ui.px(2);
+    }
+    const count_w = ui.px(search_count);
+    const count: Rect = .{ .x = right - count_w, .y = box.y, .w = count_w, .h = h };
+    var left = box.x + pad;
+    var icon: ?Rect = null;
+    if (wide) {
+        const size = ui.px(search_icon);
+        icon = .{ .x = left, .y = box.y + @round((h - size) / 2), .w = size, .h = size };
+        left += size + ui.px(8);
+    }
+    const field: Rect = .{ .x = left, .y = box.y, .w = @max(0, count.x - ui.px(6) - left), .h = h };
+    return .{ .box = box, .icon = icon, .field = field, .count = count, .prev = prev, .next = next, .close = close };
+}
+
+/// The search card or pill, over the terminal.
+fn paintSearch(ui: *const Ui, p: *Painter, node: *const Node) void {
+    const sv = node.kind.pane.search orelse return;
+    const r = searchRects(ui, node) orelse return;
+    const t = &ui.theme;
+    const pill = sv.field == null;
+    const radius = ui.px(if (pill) 12 else 8);
+    const border = if (sv.none) t.danger else if (pill) t.outline else t.accent;
+    // A raised box, as a dialog's: the strip's translucent field tint
+    // would show the border color through.
+    p.fillRounded(r.box.inset(-ui.px(2), -ui.px(2)), radius + ui.px(2), t.pane_shadow);
+    ui.fillBordered(p, r.box, radius, t.dialog, border);
+    if (r.icon) |box| ui.drawIcon(p, .search, box, t.text_muted);
+
+    // The field, or the pill's needle.
+    const field = r.field;
+    if (sv.field) |f| {
+        ui.paintEditText(p, field, f, .{ .caret = sv.caret });
+    } else if (sv.needle.len > 0) {
+        p.pushClip(field);
+        defer p.popClip();
+        p.text(sv.needle, ui.fonts.get(.mono), field, t.text);
+    }
+
+    // The count: current over total, a plus while the total grows.
+    var buf: [40]u16 = undefined;
+    var text: []const u16 = &.{};
+    if (sv.matches > 0 or sv.none) {
+        var utf8: [40]u8 = undefined;
+        const s = std.fmt.bufPrint(&utf8, "{d} / {d}{s}", .{ sv.current, sv.matches, if (sv.partial) "+" else "" }) catch "";
+        const n = std.unicode.utf8ToUtf16Le(&buf, s) catch 0;
+        text = buf[0..n];
+    }
+    p.text(text, ui.fonts.get(.hint), r.count, if (sv.none) t.danger else t.text_muted);
+
+    const lit = sv.matches > 0;
+    const button_color = if (lit) t.text_muted else t.text_inactive;
+    if (r.prev) |b| ui.drawIcon(p, .chevron_up, b.inset(ui.px(5), ui.px(5)), button_color);
+    if (r.next) |b| ui.drawIcon(p, .chevron_down, b.inset(ui.px(5), ui.px(5)), button_color);
+    if (r.close) |b| ui.drawIcon(p, .x, b.inset(ui.px(5), ui.px(5)), t.text_muted);
+}
+
+/// A button, else the search card's parts, else the title strip (which
+/// drags the pane), else a browser's URL bar or the rest of its address
+/// row (which does nothing: the strip above is enough to drag by), else
+/// the terminal.
 pub fn hitTest(ui: *const Ui, node: *const Node, x: f32, y: f32) ?Id {
     for (node.kind.pane.buttons) |*b| if (ui.hitNode(b, x, y)) |id| return id;
+    if (searchRects(ui, node)) |r| if (r.box.contains(x, y)) {
+        if (r.prev) |b| if (b.contains(x, y)) return node.id.with(.search_prev);
+        if (r.next) |b| if (b.contains(x, y)) return node.id.with(.search_next);
+        if (r.close) |b| if (b.contains(x, y)) return node.id.with(.search_close);
+        return node.id.with(.search);
+    };
     if (titleRect(ui, node).contains(x, y)) return node.id.with(.title);
     if (node.kind.pane.browser != null) {
         if (urlRect(ui, node).contains(x, y)) return node.id.with(.field);
@@ -160,6 +281,7 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
         paintUrl(ui, p, urlRect(ui, node), b, pane.focused);
         if (!b.live) paintPage(ui, p, b);
     }
+    paintSearch(ui, p, node);
     ui.paintChildren(p, node);
     if (pane.dimmed) p.fillRounded(node.rect, ui.px(10), .{ pane.bg[0], pane.bg[1], pane.bg[2], dim });
 }

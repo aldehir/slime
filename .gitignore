@@ -5,3 +5,4 @@ tools/
 /internal/vt/lib/
 *.exe
 .plans/
+/internal/vt/zz_libstamp.go

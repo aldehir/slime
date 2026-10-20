@@ -28,7 +28,8 @@ extern bool slime_vt_screen_apply(SlimeScreen* s, const uint8_t* ptr, size_t len
 extern bool slime_vt_screen_text(const SlimeScreen* s, uint8_t** out_ptr, size_t* out_len);
 typedef struct SlimeSource SlimeSource;
 extern SlimeSource* slime_vt_source_new(void);
-extern void slime_vt_source_free(SlimeSource* s);
+extern void slime_vt_source_free(SlimeSource* s, GhosttyTerminal t);
+extern bool slime_vt_source_search_pending(SlimeSource* s);
 extern SlimeView* slime_vt_view_new(SlimeSource* source);
 extern void slime_vt_view_free(SlimeView* v, GhosttyTerminal t);
 extern void slime_vt_view_reset(SlimeView* v, GhosttyTerminal t);
@@ -153,12 +154,24 @@ func NewSource() (*Source, error) {
 	return &Source{s: s}, nil
 }
 
-// Close frees the Source. Its Views must be closed.
-func (s *Source) Close() {
+// Close frees the Source. Its Views must be closed. t is its terminal,
+// which must still be open: a search holds places in it, which stay
+// held if t is nil (for a terminal about to close).
+func (s *Source) Close(t *Terminal) {
 	if s.s != nil {
-		C.slime_vt_source_free(s.s)
+		var term C.GhosttyTerminal
+		if t != nil {
+			term = t.term
+		}
+		C.slime_vt_source_free(s.s, term)
 		s.s = nil
 	}
+}
+
+// SearchPending reports whether a search is still working through the
+// history: another frame should follow for its count.
+func (s *Source) SearchPending() bool {
+	return bool(C.slime_vt_source_search_pending(s.s))
 }
 
 // View is one terminal as a client sees and drives it: frames of it to

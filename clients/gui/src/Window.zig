@@ -506,6 +506,7 @@ fn renderFallible(self: *Window, r: *Renderer) !void {
                 .cursor_text = self.config.@"cursor-text",
                 .selection_background = self.config.@"selection-background",
                 .selection_foreground = self.config.@"selection-foreground",
+                .search_match = self.config.@"search-match",
             });
             if (stats) t = self.stats.lap(.build, t);
             try self.frame_panes.append(self.alloc, .{

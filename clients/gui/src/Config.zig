@@ -64,6 +64,9 @@ palette: Palette = .{},
 /// inverted.
 @"selection-background": ?TerminalColor = null,
 @"selection-foreground": ?TerminalColor = null,
+/// Behind a search's matches, faintly, and solid behind the current
+/// one. Null takes the palette's yellow.
+@"search-match": ?TerminalColor = null,
 
 /// In points. Ghostty defaults to 2; 3 keeps our original padding.
 @"window-padding-x": Padding = .{ .top_left = 3, .bottom_right = 3 },
@@ -394,6 +397,8 @@ fn setJson(self: *Config, alloc: Allocator, section: anytype, name: []const u8, 
             self.@"selection-background" = try TerminalColor.parse(try stringOf(value));
         } else if (eql(u8, name, "selection_foreground")) {
             self.@"selection-foreground" = try TerminalColor.parse(try stringOf(value));
+        } else if (eql(u8, name, "search_match")) {
+            self.@"search-match" = try TerminalColor.parse(try stringOf(value));
         } else if (eql(u8, name, "palette")) {
             try self.setPalette(value);
         } else return error.UnknownKey,
@@ -563,7 +568,7 @@ fn setThemeKey(self: *Config, key: []const u8, value: []const u8) !void {
 }
 
 fn themeKey(comptime name: []const u8) bool {
-    for ([_][]const u8{ "background", "foreground", "palette", "cursor-color", "cursor-text", "selection-background", "selection-foreground" }) |k| {
+    for ([_][]const u8{ "background", "foreground", "palette", "cursor-color", "cursor-text", "selection-background", "selection-foreground", "search-match" }) |k| {
         if (std.mem.eql(u8, name, k)) return true;
     }
     return false;

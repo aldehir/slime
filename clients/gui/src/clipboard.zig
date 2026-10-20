@@ -24,12 +24,15 @@ pub fn set(hwnd: win32.HWND, text: []const u8) !void {
         const ptr: [*]u16 = @ptrCast(@alignCast(win32.GlobalLock(mem) orelse return win32.lastError("GlobalLock")));
         defer _ = win32.GlobalUnlock(mem);
         var n: usize = 0;
+        var first = true;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
-            if (n > 0) {
+            // Before every line but the first, which may be empty.
+            if (!first) {
                 ptr[n..][0..2].* = .{ '\r', '\n' };
                 n += 2;
             }
+            first = false;
             n += std.unicode.utf8ToUtf16Le(ptr[n..len], line) catch unreachable;
         }
         std.debug.assert(n == len);

@@ -12,6 +12,7 @@ const std = @import("std");
 const vt = @import("root");
 const frame = @import("frame.zig");
 const event = @import("event.zig");
+const search = @import("search.zig");
 
 const Terminal = vt.c_api.terminal.Terminal;
 const Frames = frame.Codec(vt);
@@ -103,11 +104,15 @@ const Source = struct {
     /// The generation of the last update that changed everything (a
     /// resize, a screen switch): a view behind it sends a full frame.
     full_generation: u64 = 0,
+    /// Search (search.zig): the terminal's, so every view shows it.
+    search: search.State = .{},
 
     /// Bring the state up to date with the terminal, marking the rows
     /// that changed with a new generation.
     fn update(self: *Source, term: *vt.Terminal) !void {
         try self.state.update(alloc, term);
+        // Its highlights go in before the dirty rows are read.
+        self.search.refresh(term, &self.state);
         self.generation += 1;
         const rows = @min(self.state.row_data.len, self.state.rows);
         var full = self.state.dirty == .full;
@@ -133,9 +138,11 @@ export fn slime_vt_source_new() ?*Source {
     return s;
 }
 
-/// Free a source. Its views must be gone.
-export fn slime_vt_source_free(s: ?*Source) void {
+/// Free a source. Its views must be gone. `t` is its terminal, which
+/// must still be open: a search holds places in it.
+export fn slime_vt_source_free(s: ?*Source, t: Terminal) void {
     const self = s orelse return;
+    self.search.deinit(zigTerminal(t));
     self.state.deinit(alloc);
     self.gens.deinit(alloc);
     alloc.destroy(self);
@@ -205,6 +212,13 @@ const Result = extern struct {
     /// every autoscroll_ms while this stays set.
     autoscroll: bool = false,
 };
+
+/// Whether a search is still working through the history: another frame
+/// should follow for its count.
+export fn slime_vt_source_search_pending(s: ?*Source) bool {
+    const self = s orelse return false;
+    return self.search.pending();
+}
 
 /// A view on the terminal whose source is `source`, which outlives it.
 export fn slime_vt_view_new(source: ?*Source) ?*View {
@@ -318,6 +332,7 @@ export fn slime_vt_view_frame(
         .motion = term.flags.mouse_event == .any,
         .mouse_shape = std.math.cast(u8, @intFromEnum(term.mouse_shape)) orelse 0,
         .images = &self.images,
+        .search = if (src.search.isOn()) .{ .matches = src.search.total, .current = src.search.current, .partial = src.search.partial } else null,
     }) catch return false;
     self.generation = src.generation;
     self.cursor_shown = src.state.cursor.visible;
@@ -505,6 +520,15 @@ fn handle(self: *View, t: *vt.Terminal, win32_input: bool, ev: Events.Event, res
             result.changed = true;
         },
         .cancel => if (self.selecting) endSelection(self, t, null),
+        .search => |s| {
+            const direction: search.Direction = @enumFromInt(@intFromEnum(s.direction));
+            self.source.search.start(t, s.needle, direction) catch return error.SelectionFailed;
+            result.changed = true;
+        },
+        .search_step => |step| {
+            self.source.search.step(t, @enumFromInt(@intFromEnum(step))) catch return error.SelectionFailed;
+            result.changed = true;
+        },
     }
 }
 

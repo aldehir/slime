@@ -156,7 +156,9 @@ which are for the top level only:
                              close_surface, next_tab, previous_tab, goto_split
                              {direction}, resize_split {direction, amount},
                              equalize_splits, toggle_split_zoom,
-                             toggle_command_palette, copy_to_clipboard,
+                             toggle_command_palette, start_search,
+                             navigate_search {direction = "next"|"previous"},
+                             end_search, copy_to_clipboard,
                              paste_from_clipboard,
                              increase_font_size {amount}, decrease_font_size
                              {amount}, reset_font_size), or else an action of
@@ -180,6 +182,13 @@ which are for the top level only:
   slime.unbind(key)          key does nothing, even if the window binds it;
                              exactly that key: unbinding "ctrl+b" leaves
                              "ctrl+b>c" bound
+  Search                     ctrl+shift+f (start_search) opens a card at the
+                             pane's top right; the daemon searches the screen
+                             and scrollback as the needle is typed, marks every
+                             match (colors.search_match, the palette's yellow
+                             by default), and makes the current one the
+                             selection; Enter and shift+Enter step, Escape
+                             closes.
   slime.action{name, title, args, run}
                              an action: slime do <name> key=value..., a bound
                              key, and slime.invoke run run(ctx, args), and print

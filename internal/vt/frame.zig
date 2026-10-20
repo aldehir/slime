@@ -19,9 +19,11 @@
 //!     rgb  palette[256]                     if flags.palette
 //!     cursor: u8 bits (Cursor), u8 visual style, u16 x, u16 y,
 //!             u64 cell, style
+//!     u32  search matches, u32 current match (from the top; 0 none)
 //!     u16  row count, then each row:
 //!       u16  y
 //!       u8   has selection, u16 first, u16 last
+//!       u8   highlights, each: u8 tag, u16 first, u16 last
 //!       runs of equal cells covering cols: u64 cell, uleb128 count
 //!       u16  styles, each: u16 style id, style
 //!       u16  graphemes, each: u16 x, u8 n, n * u24 extra codepoints
@@ -44,7 +46,7 @@ const Allocator = std.mem.Allocator;
 /// Bumped with any change to the encoding. It's also derived from the
 /// cell and style layouts (`layout_id`), so a client and a slime built
 /// from different libghostty-vt versions refuse each other's frames.
-pub const version = 2;
+pub const version = 3;
 
 /// One kitty image placed in the viewport, as a frame carries it. Its
 /// pixel sizes come from the sender's cell size (the one the receiver
@@ -79,7 +81,20 @@ pub const Flags = packed struct(u8) {
     /// The program wants mouse motion without a button held (any-event
     /// tracking, mode 1003); the client sends it only then.
     motion: bool = false,
-    _pad: u5 = 0,
+    /// A search is on (search.zig): the rows' highlights are its
+    /// matches, the header's counts theirs.
+    search: bool = false,
+    /// The search hasn't finished with the history: the count grows.
+    search_partial: bool = false,
+    _pad: u3 = 0,
+};
+
+/// A highlighted range in a row: search's matches (tag 1), and the
+/// current one (tag 2).
+pub const Highlight = struct {
+    tag: u8,
+    first: u16,
+    last: u16,
 };
 
 const CursorBits = packed struct(u8) {
@@ -312,9 +327,18 @@ pub fn Codec(comptime vt: type) type {
             /// The images placed, from `ImageSender.gather`; none if
             /// null.
             images: ?*const ImageSender = null,
+            /// The search, if one is on: its counts, and that it's
+            /// still counting.
+            search: ?struct { matches: u32, current: u32, partial: bool } = null,
         }) std.Io.Writer.Error!void {
             const full = opts.full or state.dirty == .full;
-            const flags: Flags = .{ .full = full, .palette = opts.palette or full, .motion = opts.motion };
+            const flags: Flags = .{
+                .full = full,
+                .palette = opts.palette or full,
+                .motion = opts.motion,
+                .search = opts.search != null,
+                .search_partial = if (opts.search) |s| s.partial else false,
+            };
             try w.writeByte(@bitCast(flags));
             try w.writeInt(u16, state.cols, .little);
             try w.writeInt(u16, state.rows, .little);
@@ -342,6 +366,8 @@ pub fn Codec(comptime vt: type) type {
             try w.writeInt(u16, pos.y, .little);
             try w.writeInt(u64, @bitCast(cur.cell), .little);
             try writeStyle(w, cur.style);
+            try w.writeInt(u32, if (opts.search) |s| s.matches else 0, .little);
+            try w.writeInt(u32, if (opts.search) |s| s.current else 0, .little);
 
             const rows = state.row_data.slice();
             const n_rows = @min(rows.len, state.rows);
@@ -356,13 +382,20 @@ pub fn Codec(comptime vt: type) type {
             var count: u16 = 0;
             for (0..n_rows) |y| count += @intFromBool(carries(full, opts.changed, dirty, y));
             try w.writeInt(u16, count, .little);
-            for (rows.items(.cells)[0..n_rows], rows.items(.selection)[0..n_rows], 0..) |row_cells, sel, y| {
+            for (rows.items(.cells)[0..n_rows], rows.items(.selection)[0..n_rows], rows.items(.highlights)[0..n_rows], 0..) |row_cells, sel, hls, y| {
                 if (!carries(full, opts.changed, dirty, y)) continue;
                 try w.writeInt(u16, @intCast(y), .little);
                 try w.writeByte(@intFromBool(sel != null));
                 const s = sel orelse .{ 0, 0 };
                 try w.writeInt(u16, s[0], .little);
                 try w.writeInt(u16, s[1], .little);
+                const n_hls: u8 = @intCast(@min(hls.items.len, 255));
+                try w.writeByte(n_hls);
+                for (hls.items[0..n_hls]) |hl| {
+                    try w.writeByte(hl.tag);
+                    try w.writeInt(u16, hl.range[0], .little);
+                    try w.writeInt(u16, hl.range[1], .little);
+                }
                 try writeCells(w, row_cells.slice(), state.cols);
             }
 
@@ -460,6 +493,13 @@ pub fn Codec(comptime vt: type) type {
             mouse_shape: u8 = 0,
             /// Send mouse motion without a button held (Flags.motion).
             motion: bool = false,
+            /// A search is on (Flags.search), its matches and the
+            /// current one as the header counts them, and whether the
+            /// history is still being counted.
+            search: bool = false,
+            search_partial: bool = false,
+            matches: u32 = 0,
+            current: u32 = 0,
             /// The images placed in the viewport, as of the last frame.
             placements: std.ArrayList(Placement) = .empty,
             /// Images the frames applied dropped, for the owner of the
@@ -478,6 +518,8 @@ pub fn Codec(comptime vt: type) type {
                 graphemes: std.ArrayList([]const u21) = .empty,
                 codepoints: std.ArrayList(u21) = .empty,
                 selection: ?[2]u16 = null,
+                /// Search matches in the row.
+                highlights: std.ArrayList(Highlight) = .empty,
                 /// Set by `apply` for each row a frame changed.
                 dirty: bool = false,
 
@@ -486,6 +528,7 @@ pub fn Codec(comptime vt: type) type {
                     self.styles.deinit(alloc);
                     self.graphemes.deinit(alloc);
                     self.codepoints.deinit(alloc);
+                    self.highlights.deinit(alloc);
                 }
             };
 
@@ -516,6 +559,8 @@ pub fn Codec(comptime vt: type) type {
                 for (self.row_data.items) |*row| row.dirty = false;
                 self.mouse_shape = try r.takeByte();
                 self.motion = flags.motion;
+                self.search = flags.search;
+                self.search_partial = flags.search_partial;
 
                 self.colors.background = try readRgb(&r);
                 self.colors.foreground = try readRgb(&r);
@@ -539,6 +584,8 @@ pub fn Codec(comptime vt: type) type {
                 self.cursor.viewport = if (bits.in_viewport) .{ .x = x, .y = y, .wide_tail = bits.wide_tail } else null;
                 self.cursor.cell = cell;
                 self.cursor.style = style;
+                self.matches = try r.takeInt(u32, .little);
+                self.current = try r.takeInt(u32, .little);
 
                 const count = try r.takeInt(u16, .little);
                 for (0..count) |_| {
@@ -548,6 +595,14 @@ pub fn Codec(comptime vt: type) type {
                     const has_sel = try r.takeByte() != 0;
                     const sel = [2]u16{ try r.takeInt(u16, .little), try r.takeInt(u16, .little) };
                     row.selection = if (has_sel) sel else null;
+                    const n_hls = try r.takeByte();
+                    row.highlights.clearRetainingCapacity();
+                    try row.highlights.ensureTotalCapacity(alloc, n_hls);
+                    for (0..n_hls) |_| row.highlights.appendAssumeCapacity(.{
+                        .tag = try r.takeByte(),
+                        .first = try r.takeInt(u16, .little),
+                        .last = try r.takeInt(u16, .little),
+                    });
                     try self.readCells(alloc, &r, row);
                     row.dirty = true;
                 }

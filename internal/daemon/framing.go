@@ -110,7 +110,7 @@ func (p *Pane) stopFramingLocked() {
 		p.detachFramesLocked(c, v)
 	}
 	if p.fr.source != nil {
-		p.fr.source.Close()
+		p.fr.source.Close(p.term)
 		p.fr.source = nil
 	}
 }
@@ -268,6 +268,12 @@ func (p *Pane) frameLocked(v *paneViewer) {
 	v.full = false
 	v.lastSent = now
 	v.holdFrom = time.Time{}
+	// A search still counting the history gets another frame next
+	// interval, for the count.
+	if p.fr.source.SearchPending() {
+		v.changed = true
+		p.wakeIn(v, v.c.interval)
+	}
 }
 
 // sendImagesLocked sends v the kitty images the frame just cut places

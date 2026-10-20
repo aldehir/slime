@@ -211,6 +211,8 @@ pub const Mode = union(enum) {
     rename: Rename,
     /// A browser pane's URL bar being typed in.
     url: UrlEdit,
+    /// A pane's search card being typed in.
+    search: SearchEdit,
     /// Asking before killing a workspace, or whether a page may have a
     /// permission, over the terminal area.
     confirm: Confirm,
@@ -242,6 +244,13 @@ pub const UrlEdit = struct {
     field: TextField,
 };
 
+/// A search's needle being typed, for a pane (Session.search).
+pub const SearchEdit = struct {
+    /// The pane's session's id.
+    pane: u32,
+    field: TextField,
+};
+
 /// Asking whether to kill a workspace, or to let a browser pane's page
 /// have a permission. The dialog's strings point into the buffers, so it
 /// stays where it is.
@@ -266,6 +275,8 @@ pub const Keyboard = union(enum) {
     rename: *TextField,
     /// A browser pane's URL bar.
     url: *TextField,
+    /// A pane's search card.
+    search: *TextField,
     confirm: *Dialog,
     menu: *Menu,
     palette: *Palette,
@@ -277,7 +288,7 @@ pub const Keyboard = union(enum) {
     /// The text field typed into, if one has the keyboard.
     pub fn field(self: Keyboard) ?*TextField {
         return switch (self) {
-            .connect, .rename, .url => |f| f,
+            .connect, .rename, .url, .search => |f| f,
             .palette => |p| &p.query,
             .login => |l| l.dialog.focused(),
             .terminal, .confirm, .menu, .browser => null,
@@ -1162,7 +1173,7 @@ fn forgetWorkspace(self: *App, key: u32) void {
         .confirm => |c| if (std.meta.eql(c.about, .{ .kill = key })) self.closeConfirm(),
         .menu => |m| if (std.meta.eql(m.target, Id.Target{ .workspace = key })) self.closeMenu(),
         // The palette lists what's there as it's drawn.
-        .terminal, .connect, .url, .palette => {},
+        .terminal, .connect, .url, .search, .palette => {},
     }
     if (self.activate_ws == key) self.activate_ws = null;
     for (self.workspaces.items, 0..) |w, k| {
@@ -1316,6 +1327,7 @@ pub fn askPermission(self: *App, s: *Session, site: []const u16, what: []const u
     self.cancelConnect();
     self.cancelRename();
     self.cancelUrl();
+    self.cancelSearch(false);
     self.closeMenu();
     self.closePalette();
     self.mode = .{ .confirm = .{ .about = .{ .permission = s.id }, .dialog = undefined } };
@@ -2900,8 +2912,10 @@ fn deactivate(self: *App) void {
     const had_mouse = self.mouse_in_terminal;
     self.mouse_in_terminal = false;
     if (had_mouse) self.shell.releaseMouse();
-    // Its URL bar goes with its focus.
+    // Its URL bar goes with its focus, and a search card folds to its
+    // pill (the search stays).
     self.cancelUrl();
+    self.cancelSearch(false);
     s.cancelSelection();
     if (self.focused) s.reportFocus(false);
 }
@@ -3075,6 +3089,22 @@ fn runAction(self: *App, action: binding.Action) bool {
     switch (action) {
         // A page copies and pastes for itself.
         .copy_to_clipboard => return s.copySelection(),
+        .start_search => {
+            if (s.content != .terminal) return false;
+            self.startSearch(s);
+        },
+        .navigate_search => |to| {
+            if (s.content != .terminal or s.searchInfo() == null) return false;
+            s.searchStep(switch (to) {
+                .next => .next,
+                .previous => .previous,
+            });
+        },
+        .end_search => {
+            if (s.content != .terminal) return false;
+            if (self.mode == .search and self.mode.search.pane == s.id) self.cancelSearch(true) else s.endSearch();
+            self.markDirty();
+        },
         .paste_from_clipboard => {
             if (s.content == .browser or !self.shell.clipboardHasText()) return false;
             s.paste();
@@ -3131,6 +3161,8 @@ fn setFocus(self: *App, focused: bool) void {
     // way.
     if (!focused) self.closeMenu();
     if (!focused) self.closePalette();
+    // A search card folds to its pill; the search stays.
+    if (!focused) self.cancelSearch(false);
     if (!focused) self.keymap.cancel();
     if (focused) {
         self.resetBlink();
@@ -3164,7 +3196,7 @@ fn blinkTick(self: *App) void {
         if (s.cursorBlinks()) self.markDirty();
     }
     switch (self.keyboard()) {
-        .connect, .rename, .url, .palette => self.markDirty(),
+        .connect, .rename, .url, .search, .palette => self.markDirty(),
         .terminal, .confirm, .menu, .login, .browser => {},
     }
 }
@@ -3215,6 +3247,7 @@ pub fn openPalette(self: *App) void {
     self.cancelConnect();
     self.cancelRename();
     self.cancelUrl();
+    self.cancelSearch(false);
     self.closeConfirm();
     self.mode = .{ .palette = .init(self.alloc) };
     self.hideTip();
@@ -3428,6 +3461,7 @@ fn paletteCommands(self: *App, p: *Palette) Allocator.Error!void {
         .{ .label = L("Split down"), .icon = .rows_2, .action = .{ .new_split = .down } },
         .{ .label = if (zoomed) L("Unzoom pane") else L("Zoom pane"), .icon = if (zoomed) .minimize_2 else .maximize_2, .action = .toggle_split_zoom },
         .{ .label = L("Equalize splits"), .icon = .columns_2, .action = .equalize_splits },
+        .{ .label = L("Search"), .icon = .search, .action = .start_search },
         .{ .label = L("Next tab"), .icon = .arrow_right, .action = .next_tab },
         .{ .label = L("Previous tab"), .icon = .arrow_left, .action = .previous_tab },
         .{ .label = L("Increase font size"), .icon = null, .action = .{ .increase_font_size = 1 } },
@@ -3595,6 +3629,77 @@ fn urlShown(self: *App) bool {
     return found.tab == self.active and self.activeTab().shows(found.s);
 }
 
+/// Open the search card on pane `s`, with the selection as its needle
+/// if there's one within a row, or bring an open card's keys back.
+fn startSearch(self: *App, s: *Session) void {
+    if (s.content != .terminal) return;
+    if (self.mode == .search and self.mode.search.pane == s.id) {
+        self.mode.search.field.press(.select_all, false, false);
+        self.resetBlink();
+        self.markDirty();
+        return;
+    }
+    self.focusPane(s);
+    self.closeConfirm();
+    self.closePalette();
+    self.mode = .{ .search = .{ .pane = s.id, .field = .{} } };
+    // The field starts with the selection (within a row), selected, so
+    // typing replaces it.
+    var buf: [TextField.max_len]u16 = undefined;
+    if (s.selectedRowText(&buf)) |text| {
+        self.mode.search.field.insert(text);
+        self.mode.search.field.press(.select_all, false, false);
+        self.searchChanged();
+    }
+    self.resetBlink();
+    self.markDirty();
+}
+
+/// The needle changed: search the pane for it.
+fn searchChanged(self: *App) void {
+    const se = &self.mode.search;
+    const found = self.findSession(se.pane) orelse return;
+    var buf: [TextField.max_len * 3]u8 = undefined;
+    const n = std.unicode.utf16LeToUtf8(&buf, se.field.text()) catch 0;
+    found.s.search(.down, buf[0..n]);
+    found.s.setSearchNeedle(se.field.text());
+}
+
+/// A key down while a search card has the keyboard: Enter and
+/// shift+Enter step through the matches, Escape closes it. Returns
+/// false for keys it doesn't take.
+fn searchKey(self: *App, field: *TextField, vk: u32) bool {
+    const se = &self.mode.search;
+    switch (vk) {
+        win32.VK_RETURN => if (self.findSession(se.pane)) |found| {
+            found.s.searchStep(if (self.shell.keyDown(win32.VK_SHIFT)) .previous else .next);
+        },
+        win32.VK_ESCAPE => self.cancelSearch(true),
+        else => {
+            if (!self.editKey(field, vk, true)) return false;
+            self.searchChanged();
+        },
+    }
+    self.keyHandled();
+    return true;
+}
+
+/// Whether the search card being typed in is still on screen: its pane
+/// is shown in the active tab.
+fn searchShown(self: *App) bool {
+    if (self.mode != .search) return true;
+    const found = self.findSession(self.mode.search.pane) orelse return false;
+    return found.tab == self.active and self.activeTab().shows(found.s);
+}
+
+/// Close the card, ending the search too if `end`.
+fn cancelSearch(self: *App, end: bool) void {
+    if (self.mode != .search) return;
+    if (end) if (self.findSession(self.mode.search.pane)) |found| found.s.endSearch();
+    self.mode = .terminal;
+    self.markDirty();
+}
+
 /// Edit `field` for an editing key, as Windows edit controls do.
 /// `copyable` is false for passwords. Returns false for other keys.
 fn editKey(self: *App, field: *TextField, vk: u32, copyable: bool) bool {
@@ -3655,6 +3760,7 @@ pub fn keyboard(self: *App) Keyboard {
         .connect => |*f| return .{ .connect = f },
         .rename => |*r| return .{ .rename = &r.field },
         .url => |*u| return .{ .url = &u.field },
+        .search => |*s| return .{ .search = &s.field },
         .confirm => |*c| return .{ .confirm = &c.dialog },
         .menu => |*m| return .{ .menu = m },
         .palette => |*p| return .{ .palette = p },
@@ -3775,6 +3881,7 @@ pub fn view(self: *App) *const Tree {
     // question a page no longer asks.
     if (!self.menuTargetExists()) self.closeMenu();
     if (!self.urlShown()) self.cancelUrl();
+    if (!self.searchShown()) self.cancelSearch(false);
     if (!self.confirmStillAsks()) {
         self.mode = .terminal;
         _ = self.ui.setHover(.none);
@@ -3825,7 +3932,7 @@ pub fn cursor(self: *App, pos: win32.POINT) Cursor {
     var cursor_: Cursor = .arrow;
     const hit = self.hitAt(pos);
     // A dialog's field, or a workspace's name being edited.
-    if (hit.part == .field) cursor_ = .ibeam;
+    if (hit.part == .field or hit.part == .search) cursor_ = .ibeam;
     const sizing: ?Cursor = if (self.drag) |d| d.cursor() else switch (hit.target) {
         .divider => |i| if (i < self.placed().dividers.items.len) dividerCursor(self.placed().dividers.items[i]) else null,
         .corner => |i| if (i < self.placed().corners.items.len) .size_all else null,
@@ -4106,6 +4213,18 @@ fn widgetClick(self: *App, hit: Id) void {
             .pane => if (self.shownPane(hit.target)) |s| self.startUrl(s),
             else => {},
         },
+        .search => if (self.shownPane(hit.target)) |s| self.startSearch(s),
+        .search_prev, .search_next => if (self.shownPane(hit.target)) |s| {
+            s.searchStep(if (hit.part == .search_prev) .previous else .next);
+        },
+        .search_close => if (self.shownPane(hit.target)) |s| {
+            if (self.mode == .search and self.mode.search.pane == s.id) {
+                self.cancelSearch(true);
+            } else {
+                s.endSearch();
+                self.markDirty();
+            }
+        },
         .close => if (self.tabIndexOf(hit.target)) |i| self.closeTab(i),
         .fold => if (self.tabIndexOf(hit.target)) |i| {
             const t = self.tabs.items[i];
@@ -4150,6 +4269,7 @@ fn keyInput(self: *App, k: Msg.Key) Result {
                 .connect => self.connectKey(owner, vk),
                 .rename => self.renameKey(owner, vk),
                 .url => self.urlKey(owner, vk),
+                .search => self.searchKey(owner, vk),
                 .confirm => self.confirmKey(owner, vk),
                 .menu => self.menuKey(owner, vk),
                 .palette => self.paletteKey(owner, vk),
@@ -4211,6 +4331,7 @@ fn charInput(self: *App, unit: u16, sys: bool) void {
         .terminal, .browser => if (self.focusedSession()) |s| s.charInput(unit),
         else => |owner| if (!sys) if (owner.field()) |f| {
             f.insert(&.{unit});
+            if (self.mode == .search) self.searchChanged();
             self.resetBlink();
             self.markDirty();
         },

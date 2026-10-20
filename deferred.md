@@ -277,8 +277,9 @@ so; the host's button reconnects, reattaches, and replaces them.
   doesn't return to one goes unseen; PowerShell's hook wraps `prompt`, so
   a profile that redefines it afterwards (oh-my-posh, starship) drops it
   unless the slime line comes last.
-- **Search and link detection** would run in slime, over the terminal
-  it holds, with matches marked in frames as the selection is.
+- **Link detection** (OSC 8 hyperlinks, regex links, ctrl+click) would
+  run in slime over the terminal it holds, marked in frames as search's
+  matches are (`internal/vt/search.zig`, frame row highlights).
 
 - **A pane can't be dragged to another tab**, or out into a tab of its
   own, in the window: `pane.move` (`slime pane move`) does it in slime,
@@ -356,6 +357,31 @@ so; the host's button reconnects, reattaches, and replaces them.
   tab; per-window views (tmux's grouped sessions) are the model if
   that's wanted. A window showing several workspaces has its own
   current tab among them, so this only bites windows on the same one.
+
+## Search
+
+ctrl+shift+f (`start_search`) opens a card at the pane's top right; the
+daemon searches the screen and scrollback with libghostty-vt's `search`
+module (`internal/vt/search.zig`) as the needle is typed, frames carry
+the matches as row highlights and the count in their header, and the
+current match is the selection. A second window on the pane shows the
+matches and a pill with the count.
+
+- **Case-sensitive only.** libghostty-vt matches bytes; a smart-case
+  toggle on the card would need a lowercased copy of the needle and
+  rows, or a change in the fork.
+- **No regex, whole-word, or history** of needles.
+- **The needle isn't in frames**: another window's pill shows the count
+  alone, and a window that reconnects loses the text it typed.
+- **The first match is the newest**, wherever the viewport is; the
+  window's own cursor isn't a position to search from. Enter steps down
+  (newer) and shift+Enter up, wrapping at the ends.
+- **The card covers the grid's top-right cells**; a row under the strip
+  would resize the pty on every open. Scrolling to a match doesn't
+  allow for it, so in a narrow pane a match can land under the card.
+- **Copy mode** (tmux's, with vi keys, and `/ ? n N` on this search)
+  is built on the `copy-mode` branch (worktree `slime-copymode`) and
+  not merged.
 
 ## Browser panes
 
