@@ -267,9 +267,16 @@ so; the host's button reconnects, reattaches, and replaces them.
   to another display.
 - **A frame that fails to apply** (out of memory, or a bad one) leaves
   the pane wrong until the next full frame, which nothing asks for.
-- **The pwd (OSC 7) and the bell** come from slime but aren't used: a
-  new tab doesn't start in the focused pane's directory, and the bell
-  does nothing.
+- **A new tab doesn't start in the focused pane's directory**; a split
+  does (`pane.split` reads the pane's reported pwd), but `tab.new` names
+  no pane to take it from, and the window doesn't pass one. **The bell**
+  comes from slime but does nothing.
+- **The pwd hook is manual** (`slime shell-integration`, one line in
+  the rc file); slime doesn't inject it as Ghostty does with `ENV` and
+  `ZDOTDIR`. Bash reports only at the prompt, so a `cd` in a script that
+  doesn't return to one goes unseen; PowerShell's hook wraps `prompt`, so
+  a profile that redefines it afterwards (oh-my-posh, starship) drops it
+  unless the slime line comes last.
 - **Search and link detection** would run in slime, over the terminal
   it holds, with matches marked in frames as the selection is.
 

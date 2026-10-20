@@ -189,6 +189,10 @@ func (c *conpty) spawn(command, dir string, env map[string]string) error {
 	if err != nil {
 		return err
 	}
+	// Home without one, as a login does; not the daemon's own.
+	if dir == "" {
+		dir, _ = os.UserHomeDir()
+	}
 	var cwd *uint16
 	if dir != "" {
 		if cwd, err = windows.UTF16PtrFromString(dir); err != nil {

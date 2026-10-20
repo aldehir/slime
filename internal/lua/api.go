@@ -252,8 +252,9 @@ Build a workspace from a layout (slime do dev.lua file=app.log):
 From inside a pane (ids default to this pane):
 
   local me = assert(slime.pane.info{})
-  local below = assert(slime.pane.split{ direction = "down", share = 3000 })
-  assert(slime.pane.write{ id = below.pane, text = "cd " .. me.pwd .. "\r" })
+  slime.log("splitting", me.id, "in", me.pwd)          -- the shell's directory, if it reports it
+  local below = assert(slime.pane.split{ direction = "down", share = 3000 })  -- starts there too
+  assert(slime.pane.write{ id = below.pane, text = "git status\r" })
   assert(slime.workspace.focus{ pane = below.pane })   -- its tab comes with it
 
 Walk a tab's tree:

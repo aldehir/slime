@@ -60,7 +60,8 @@ func newCommand() *cobra.Command {
 	}
 	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "print results as JSON, as the daemon replies")
 	root.AddCommand(serveCommand(), stopCommand(), connectCommand(), lsCommand(), wsCommand(), tabCommand(),
-		paneCommand(), doCommand(), actionsCommand(), scriptsCommand(), configCommand(), callCommand(), skillCommand())
+		paneCommand(), doCommand(), actionsCommand(), scriptsCommand(), configCommand(), callCommand(), skillCommand(),
+		shellIntegrationCommand())
 	root.AddCommand(hostCommands()...)
 	root.AddCommand(topicCommands()...)
 	root.SetHelpCommand(helpCommand(root))

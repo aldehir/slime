@@ -793,6 +793,14 @@ func (s *Server) paneSplit(cl *callCtx, m rpc.PaneSplitParams) (*rpc.Created, er
 	}
 	t := target.tabOf()
 	beside := target.paneID()
+	// A terminal split from a terminal starts where that one's shell
+	// is, the directory it last reported (OSC 7), unless told where.
+	var inherited string
+	if spec.Cwd == "" && spec.Kind == rpc.PaneTerminal {
+		if src, ok := target.(*Pane); ok {
+			inherited = src.localPwd()
+		}
+	}
 	id := t.newPaneID()
 	trial, err := splitNode(t.root.Clone(), beside, id, m.Direction, m.Share)
 	if err != nil {
@@ -804,6 +812,13 @@ func (s *Server) paneSplit(cl *callCtx, m rpc.PaneSplitParams) (*rpc.Created, er
 	size := s.measureLocked(t.ws, t.ws.area, trial, map[PaneID]Size{id: target.cell()})[id]
 	s.mu.Unlock()
 
+	// A shell can be in a directory that's gone (PowerShell holds none
+	// open): the child couldn't start there, so start it at home.
+	if inherited != "" {
+		if fi, err := os.Stat(inherited); err == nil && fi.IsDir() {
+			spec.Cwd = inherited
+		}
+	}
 	st, err := s.startPane(id, spec, size)
 	if err != nil {
 		return nil, err

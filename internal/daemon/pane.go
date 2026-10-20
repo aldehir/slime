@@ -417,6 +417,19 @@ func (p *Pane) renameLocked(id PaneID) {
 	p.mu.Unlock()
 }
 
+// localPwd is the directory the pane's shell last reported, as a path
+// on this machine (pwdPath), or "" if it reported none, another
+// host's, or has ended.
+func (p *Pane) localPwd() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return ""
+	}
+	pwd, _ := p.term.Pwd()
+	return pwdPath(pwd, localHost())
+}
+
 // desc describes the pane as workspace.list and pane.info do.
 func (p *Pane) desc() rpc.PaneDesc {
 	p.mu.Lock()
