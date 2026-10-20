@@ -1124,7 +1124,7 @@ fn handle(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM
 
         win32.WM_TIMER => {
             switch (wparam) {
-                stats_timer_id => if (build_options.stats) self.showStats(),
+                stats_timer_id => self.showStats(),
                 blink_timer_id => _ = app.update(.{ .tick = .blink }),
                 spinner_timer_id => _ = app.update(.{ .tick = .spinner }),
                 tip_timer_id => _ = app.update(.{ .tick = .tip }),
