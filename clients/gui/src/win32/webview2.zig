@@ -93,6 +93,7 @@ pub const CursorChangedEventHandler = Handler("9da43ccc-26e1-4dad-b56c-d8961c94c
 pub const FocusChangedEventHandler = Handler("05ea24bd-6452-4926-9014-4b82b498135d", *IController, ?*IUnknown);
 pub const MoveFocusRequestedEventHandler = Handler("69035451-6dc7-4cb8-9bce-b2bd70ad289f", *IController, *IMoveFocusRequestedEventArgs);
 pub const AcceleratorKeyPressedEventHandler = Handler("b29c7e28-fa79-41a8-8e44-65811c76dcb2", *IController, *IAcceleratorKeyPressedEventArgs);
+pub const ZoomFactorChangedEventHandler = Handler("b52d71d6-c4df-4543-a90c-64a3e60f38cb", *IController, ?*IUnknown);
 pub const BrowserProcessExitedEventHandler = Handler("fa504257-a216-4911-a860-fe8825712861", *IEnvironment, *IUnknown);
 pub const CapturePreviewCompletedHandler = Handler("697e05e9-3d8f-45fa-96f4-8ffe1ededaf5", HRESULT, void);
 pub const FaviconChangedEventHandler = Handler("2913da94-833d-4de0-8dca-900fc524a1a4", *IWebView, ?*IUnknown);
@@ -183,6 +184,22 @@ pub const IController = extern struct {
     /// In the parent window's client pixels.
     pub fn putBounds(self: *IController, bounds: win32.RECT) HRESULT {
         return com.call(self, 6, fn (win32.RECT) HRESULT, .{bounds});
+    }
+
+    pub fn getZoomFactor(self: *IController, out: *f64) HRESULT {
+        return com.call(self, 7, fn (*f64) HRESULT, .{out});
+    }
+
+    /// The page zoom, which becomes the WebView's own: it holds across
+    /// navigations, where one the user makes lasts the page.
+    pub fn putZoomFactor(self: *IController, zoom: f64) HRESULT {
+        return com.call(self, 8, fn (f64) HRESULT, .{zoom});
+    }
+
+    /// The user zoomed, or a navigation did; `putZoomFactor` doesn't
+    /// raise it.
+    pub fn addZoomFactorChanged(self: *IController, h: *ZoomFactorChangedEventHandler, token: *EventRegistrationToken) HRESULT {
+        return com.call(self, 9, fn (*ZoomFactorChangedEventHandler, *EventRegistrationToken) HRESULT, .{ h, token });
     }
 
     pub fn moveFocus(self: *IController, reason: MoveFocusReason) HRESULT {

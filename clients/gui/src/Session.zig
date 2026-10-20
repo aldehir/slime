@@ -208,6 +208,9 @@ pub const Browser = struct {
     can_go_back: bool = false,
     can_go_forward: bool = false,
     loading: bool = false,
+    /// The page zoom, which holds across navigations and a view closed
+    /// while hidden (`Web.View`'s `zoomChanged`).
+    zoom: f64 = 1,
     /// The browser showing the page, while the pane is in the window
     /// and has one. UI thread only, as everything below.
     view: ?*Web.View = null,

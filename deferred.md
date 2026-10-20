@@ -393,7 +393,11 @@ with WebView2 in visual mode (`Web.zig`), under its title strip (the
 page's title, and the split and zoom buttons) and an address row with
 back, forward, reload (stop while loading), and a URL bar (a click
 selects it all, Enter sends `pane.navigate`, Escape puts it back); only
-the strip drags the pane. The mouse is forwarded to the page (a right
+the strip drags the pane. A pane keeps its page zoom (Ctrl+wheel,
+Ctrl+plus and minus) across reloads, navigations, and its browser closed
+while hidden, for every site it goes to, not per site as browsers keep
+it; Ctrl+0 in the page puts it back to 100% (not slime's font reset),
+and the window going loses it. The mouse is forwarded to the page (a right
 click opens the page's own menu, not slime's; the strip and row open
 slime's), its keys go to it but for the app's bindings,
 and a pane without a browser (no runtime, or one that failed) shows its

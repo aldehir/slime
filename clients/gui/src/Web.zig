@@ -42,6 +42,7 @@ const Session = @import("Session.zig");
 const Renderer = @import("renderer/D3D11.zig");
 const Daemon = @import("Daemon.zig");
 const Config = @import("Config.zig");
+const input = @import("input.zig");
 const Painter = Renderer.Painter;
 
 const log = std.log.scoped(.web);
@@ -944,6 +945,7 @@ pub const View = struct {
     lost_focus: Callback(wv.FocusChangedEventHandler, View, "lost_focus", lostFocus) = .{},
     move_focus: Callback(wv.MoveFocusRequestedEventHandler, View, "move_focus", moveFocusRequested) = .{},
     accelerator: Callback(wv.AcceleratorKeyPressedEventHandler, View, "accelerator", acceleratorKey) = .{},
+    zoom_changed: Callback(wv.ZoomFactorChangedEventHandler, View, "zoom_changed", zoomChanged) = .{},
     captured: Callback(wv.CapturePreviewCompletedHandler, View, "captured", previewCaptured) = .{},
     favicon_changed: Callback(wv.FaviconChangedEventHandler, View, "favicon_changed", faviconChanged) = .{},
     favicon_got: Callback(wv.GetFaviconCompletedHandler, View, "favicon_got", faviconGot) = .{},
@@ -1204,6 +1206,7 @@ fn setUp(self: *View, comp: *wv.ICompositionController) !void {
     try com.check(controller.addLostFocus(&self.lost_focus.iface, &token), "add_LostFocus");
     try com.check(controller.addMoveFocusRequested(&self.move_focus.iface, &token), "add_MoveFocusRequested");
     try com.check(controller.addAcceleratorKeyPressed(&self.accelerator.iface, &token), "add_AcceleratorKeyPressed");
+    try com.check(controller.addZoomFactorChanged(&self.zoom_changed.iface, &token), "add_ZoomFactorChanged");
     try com.check(w.addPermissionRequested(&self.permission.iface, &token), "add_PermissionRequested");
     // Without it (a runtime before 1.0.1185), the globe stays.
     if (com.query(w, wv.IWebView15)) |w15| {
@@ -1216,6 +1219,9 @@ fn setUp(self: *View, comp: *wv.ICompositionController) !void {
     if (self.container) |c| try com.check(c.addVisual(visual.?, true, null), "IDCompositionVisual::AddVisual");
     _ = controller.putBounds(self.bounds);
     _ = controller.putIsVisible(self.shown);
+    if (self.browser()) |b| if (b.zoom != 1) {
+        _ = controller.putZoomFactor(b.zoom);
+    };
     try r.commit();
     // Where slime sent it while it was made is slime's; its own url (a
     // new pane's, one closed while hidden) is reported as it lands.
@@ -1646,8 +1652,33 @@ fn acceleratorKey(self: *View, _: *wv.IController, args: *wv.IAcceleratorKeyPres
     var lparam: i32 = 0;
     if (args.getKeyEventKind(&kind) < 0 or args.getVirtualKey(&vk) < 0 or args.getKeyEventLParam(&lparam) < 0) return com.S_OK;
     const msg = wv.keyMessage(kind) orelse return com.S_OK;
+    // Ctrl+0 is the page's, as in a browser, back to its own size: the
+    // WebView's would go back to the zoom `zoomChanged` kept.
+    if (msg == win32.WM_KEYDOWN and (vk == '0' or vk == win32.VK_NUMPAD0)) {
+        const m = input.currentMods();
+        if (m.ctrl and !m.shift and !m.alt and !m.super) {
+            setZoom(self, 1);
+            _ = args.putHandled(true);
+            return com.S_OK;
+        }
+    }
     if (self.web.events.key(self.web.events.ctx, msg, vk, lparam)) _ = args.putHandled(true);
     return com.S_OK;
+}
+
+/// The user zoomed the page (Ctrl+wheel, Ctrl+plus), which WebView2
+/// keeps for the page alone: make it the WebView's, which holds across
+/// reloads and navigations, and the pane's, for a view made again.
+fn zoomChanged(self: *View, controller: *wv.IController, _: ?*wv.IUnknown) win32.HRESULT {
+    var zoom: f64 = 1;
+    if (controller.getZoomFactor(&zoom) < 0) return com.S_OK;
+    setZoom(self, zoom);
+    return com.S_OK;
+}
+
+fn setZoom(self: *View, zoom: f64) void {
+    if (self.controller) |c| _ = c.putZoomFactor(zoom);
+    if (self.browser()) |b| b.zoom = zoom;
 }
 
 /// Begin placing the frame's views: those `show` doesn't place by
