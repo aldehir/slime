@@ -37,9 +37,10 @@ pub fn keyEvent(
     };
 
     // Windows applies ctrl to the text (ctrl+c gives 0x03). The encoder
-    // derives control codes from the key itself, so drop those.
+    // derives control codes from the key itself and skips that text, but
+    // slime sends it for the keys the encoder leaves empty (ctrl+[ is ESC).
+    event.utf8 = text;
     if (text.len > 0 and !(text.len == 1 and std.ascii.isControl(text[0]))) {
-        event.utf8 = text;
         // AltGr arrives as ctrl+alt; when it produced text, it's consumed.
         const altgr = mods.ctrl and mods.alt;
         event.consumed_mods = .{ .shift = mods.shift, .ctrl = altgr, .alt = altgr };
@@ -344,6 +345,15 @@ test Win32Key {
         .control_state = win32.LEFT_CTRL_PRESSED,
     }).encode(&w);
     try std.testing.expectEqualStrings("\x1b[219;26;27;1;8;1_", w.buffered());
+}
+
+test keyEvent {
+    // ctrl+[ keeps the ESC Windows produced: the legacy encoder sends
+    // nothing for it, and slime falls back to the text.
+    const lparam: win32.LPARAM = 0x1A << 16;
+    const ev = keyEvent(win32.WM_KEYDOWN, 0xDB, lparam, "\x1b", false);
+    try std.testing.expectEqualStrings("\x1b", ev.utf8);
+    try std.testing.expect(!ev.consumed_mods.ctrl);
 }
 
 test mouseButton {
