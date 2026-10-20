@@ -93,6 +93,10 @@ func TestSettingsAndBindings(t *testing.T) {
 		-- A sequence is a key of its own: unbinding its first key leaves it.
 		slime.bind("Ctrl+B > c", "new_tab")
 		slime.unbind("ctrl+b")
+		-- A repeat is the same key as its sequence: the unbind takes it.
+		slime.bind("Repeat: ctrl+b > ctrl+b > h", "resize_split", { direction = "left" })
+		slime.unbind("ctrl+b>ctrl+b>h")
+		slime.bind("repeat:ctrl+b>h", "resize_split", { direction = "left" })
 		slime.action{ name = "dev", title = "Dev layout", args = { file = "string" }, run = function(ctx, args) return args end }
 		slime.action{ name = "dev", title = "Dev again", run = function(ctx, args) return "again" end }
 		slime.action{ name = "other", run = function() end }
@@ -115,6 +119,8 @@ func TestSettingsAndBindings(t *testing.T) {
 		{Key: "ctrl+shift+w"},
 		{Key: "ctrl+b>c", Action: "new_tab"},
 		{Key: "ctrl+b"},
+		{Key: "ctrl+b>ctrl+b>h"},
+		{Key: "ctrl+b>h", Action: "resize_split", Args: json.RawMessage(`{"direction":"left"}`), Repeat: true},
 	}
 	if got, _ := json.Marshal(d.Keymap); string(got) != string(mustJSON(want)) {
 		t.Errorf("keymap %s", got)
@@ -129,6 +135,10 @@ func TestSettingsAndBindings(t *testing.T) {
 	res, err := c.Run(context.Background(), Invocation{Name: "dev"}, nil)
 	if err != nil || string(res) != `"again"` {
 		t.Errorf("run dev: %s, %v", res, err)
+	}
+	// A repeat needs a sequence: a key alone repeats as it's held.
+	if _, errs := Load(&fakeHost{}, write(t, map[string]string{"init.lua": `slime.bind("repeat:ctrl+b", "new_tab")`}), nil); len(errs) != 1 || !strings.Contains(errs[0], "repeat: needs a sequence") {
+		t.Errorf("repeat alone: %q", errs)
 	}
 }
 

@@ -93,10 +93,12 @@ const ShapesDoc = `A workspace id is an integer; a tab id is the string "w.t" an
                   errors?: [string]}
                  settings is slime.config's table (see slime help lua); errors is why
                  the last evaluation failed, the rest then being the last good config
-  Binding        {key, action?, args?, lua?}: a chord ("ctrl+shift+d") or a sequence
-                 of them ("ctrl+b>c"), and a window
+  Binding        {key, action?, args?, lua?, repeat?}: a chord ("ctrl+shift+d") or a
+                 sequence of them ("ctrl+b>c"), and a window
                  action by name with args, a config action to invoke, or lua, a
-                 function the window runs with action.invoke{lua}; neither unbinds`
+                 function the window runs with action.invoke{lua}; neither unbinds;
+                 repeat keeps a sequence's earlier keys pressed once it runs, so its
+                 last key again runs it again`
 
 // EventDoc is one notification and its params.
 type EventDoc struct {

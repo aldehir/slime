@@ -421,14 +421,12 @@ func merge(dst, src *glua.LTable) {
 }
 
 // luaBind is slime.bind(key, action[, args]) or slime.bind(key, fn): a
-// later bind of the same key replaces the earlier.
+// later bind of the same key replaces the earlier. A "repeat:" prefix
+// on the key makes the binding repeatable.
 func (c *Config) luaBind(L *glua.LState) int {
 	c.topLevel(L, "bind")
-	key := normKey(L.CheckString(1))
-	if key == "" {
-		L.ArgError(1, "a key is needed")
-	}
-	b := &rpc.Binding{Key: key}
+	key, repeat := bindKey(L, L.CheckString(1))
+	b := &rpc.Binding{Key: key, Repeat: repeat}
 	switch v := L.Get(2).(type) {
 	case glua.LString:
 		if v == "" {
@@ -457,12 +455,24 @@ func (c *Config) luaBind(L *glua.LState) int {
 // window binds it by default.
 func (c *Config) luaUnbind(L *glua.LState) int {
 	c.topLevel(L, "unbind")
-	key := normKey(L.CheckString(1))
+	key, _ := bindKey(L, L.CheckString(1))
+	c.setBinding(&rpc.Binding{Key: key})
+	return 0
+}
+
+// bindKey is the key of a bind or unbind, normalized, and whether it
+// was written with the "repeat:" prefix, which a sequence takes:
+// a key alone repeats as it's held. A bad key is a Lua error.
+func bindKey(L *glua.LState, raw string) (key string, repeat bool) {
+	key = normKey(raw)
+	key, repeat = strings.CutPrefix(key, "repeat:")
 	if key == "" {
 		L.ArgError(1, "a key is needed")
 	}
-	c.setBinding(&rpc.Binding{Key: key})
-	return 0
+	if repeat && !strings.Contains(key, ">") {
+		L.ArgError(1, "repeat: needs a sequence (\"repeat:ctrl+b>h\"); a key alone repeats as it's held")
+	}
+	return key, repeat
 }
 
 // setBinding replaces the binding of b's key, or adds it.

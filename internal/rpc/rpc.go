@@ -1133,11 +1133,14 @@ type ConfigDesc struct {
 // ...) or else a config action to invoke; or Lua, a function the config
 // file gave, which the window runs with action.invoke{lua}. Neither is
 // an unbind: the key does nothing, even if the window had a default.
+// Repeat keeps a sequence's earlier keys pressed once it runs, so its
+// last key again runs it again (tmux's bind -r).
 type Binding struct {
 	Key    string          `json:"key"`
 	Action string          `json:"action,omitempty"`
 	Args   json.RawMessage `json:"args,omitempty"`
 	Lua    uint32          `json:"lua,omitempty"`
+	Repeat bool            `json:"repeat,omitempty"`
 }
 
 // ActionDesc is one slime.action: Args is its argument spec as given

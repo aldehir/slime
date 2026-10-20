@@ -62,6 +62,7 @@ const idle_timer_id = 3;
 const blink_timer_id = 4;
 const spinner_timer_id = 5;
 const tip_timer_id = 6;
+const repeat_timer_id = 7;
 
 alloc: Allocator,
 io: std.Io,
@@ -793,6 +794,7 @@ fn timerId(timer: App.Timer) usize {
         .blink => blink_timer_id,
         .spinner => spinner_timer_id,
         .tip => tip_timer_id,
+        .repeat => repeat_timer_id,
     };
 }
 
@@ -1128,6 +1130,7 @@ fn handle(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM
                 blink_timer_id => _ = app.update(.{ .tick = .blink }),
                 spinner_timer_id => _ = app.update(.{ .tick = .spinner }),
                 tip_timer_id => _ = app.update(.{ .tick = .tip }),
+                repeat_timer_id => _ = app.update(.{ .tick = .repeat }),
                 idle_timer_id => {
                     self.web.closeIdle(win32.GetTickCount64(), self.idleMs());
                     self.armIdle();

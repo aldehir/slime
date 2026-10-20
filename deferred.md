@@ -572,7 +572,10 @@ load, with the last good config kept, or settings it couldn't take.
   modifiers only.
 - **A sequence under way shows nothing**: Rex hints the keys that can
   follow; a strip or tooltip here needs chrome. And a key that's not
-  in the sequence is dropped with it, not sent on.
+  in the sequence is dropped with it, not sent on (while a `repeat:`
+  binding's prefix is kept, such a key does go on, as tmux's does).
+- **Repeat time** is 500 ms (`App.repeat_ms`), tmux's default, with no
+  setting for it.
 - **Unbinding by prefix** (`slime.unbind("ctrl+b>*")`), and `ctx` for a
   function bound to a sequence doesn't say which keys ran it (Rex's
   `ev.prefix`): one function per sequence for now.

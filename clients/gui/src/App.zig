@@ -435,7 +435,14 @@ pub const Timer = enum {
     spinner,
     /// Shows a tooltip once the mouse rests on a button.
     tip,
+    /// Ends a repeatable key binding's repeat (`repeat_ms` after its
+    /// last press).
+    repeat,
 };
+
+/// How long a repeatable binding's prefix stays pressed after it runs,
+/// tmux's repeat-time.
+pub const repeat_ms = 500;
 
 /// What the window does with a message after `update`: nothing more, or
 /// what Windows would have (DefWindowProc), for alt+F4.
@@ -819,6 +826,12 @@ pub fn update(self: *App, msg: Msg) Result {
             .tip => {
                 self.shell.killTimer(.tip);
                 if (self.ui.showTip(self.currentTree())) self.markDirty();
+            },
+            .repeat => {
+                self.shell.killTimer(.repeat);
+                // Another key may have ended the repeat and started a
+                // sequence since, which stays.
+                if (self.keymap.isRepeating()) self.keymap.cancel();
             },
         },
         .output => self.outputArrived(),
@@ -2974,6 +2987,8 @@ fn runBinding(self: *App, k: Msg.Key, drop_chars: bool) bool {
         .pending, .cancelled => {},
         .binding => |b| if (!self.runAction(b.action) and b.performable) return false,
     }
+    // Each repeat restarts the clock; a stale timer finds nothing to end.
+    if (self.keymap.isRepeating()) self.shell.setTimer(.repeat, repeat_ms);
 
     // Drop the text TranslateMessage posted for the key (ctrl+shift+c
     // gives 0x03).
@@ -4582,6 +4597,53 @@ test "a key sequence runs its binding on the last key; Escape or losing the focu
     try std.testing.expectEqual(1, app.keymap.pending().len);
     app.setFocus(false);
     try std.testing.expectEqual(0, app.keymap.pending().len);
+}
+
+test "a repeatable binding runs again on its last key, until the repeat timer or another key ends it" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+    try app.keymap.apply(&.{.{ .key = "ctrl+b>f1", .action = "increase_font_size", .args = "{\"amount\":2}", .repeat = true }});
+    const f1: Msg = .{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = win32.VK_F1, .lparam = 0 } };
+
+    shell.held = .{ .ctrl = true };
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'B', .lparam = 0 } });
+    shell.held = .{};
+    try std.testing.expectEqual(null, shell.timers.get(.repeat));
+    try std.testing.expectEqual(Result.handled, app.update(f1));
+    try std.testing.expectEqual(14, shell.font_size);
+    try std.testing.expectEqual(repeat_ms, shell.timers.get(.repeat));
+    try std.testing.expectEqual(1, app.keymap.pending().len);
+    // F1 again, with no ctrl+b, runs it again and restarts the clock.
+    shell.timers.set(.repeat, null);
+    try std.testing.expectEqual(Result.handled, app.update(f1));
+    try std.testing.expectEqual(16, shell.font_size);
+    try std.testing.expectEqual(repeat_ms, shell.timers.get(.repeat));
+    // The timer ends it: F1 then does nothing.
+    _ = app.update(.{ .tick = .repeat });
+    try std.testing.expectEqual(null, shell.timers.get(.repeat));
+    try std.testing.expectEqual(0, app.keymap.pending().len);
+    _ = app.update(f1);
+    try std.testing.expectEqual(16, shell.font_size);
+
+    // ctrl+b while repeating starts the sequence over, which the stale
+    // timer then leaves alone.
+    shell.held = .{ .ctrl = true };
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'B', .lparam = 0 } });
+    shell.held = .{};
+    _ = app.update(f1);
+    try std.testing.expectEqual(18, shell.font_size);
+    shell.held = .{ .ctrl = true };
+    _ = app.update(.{ .key = .{ .msg = win32.WM_KEYDOWN, .wparam = 'B', .lparam = 0 } });
+    shell.held = .{};
+    try std.testing.expect(!app.keymap.isRepeating());
+    try std.testing.expectEqual(1, app.keymap.pending().len);
+    _ = app.update(.{ .tick = .repeat });
+    try std.testing.expectEqual(1, app.keymap.pending().len);
+    _ = app.update(f1);
+    try std.testing.expectEqual(20, shell.font_size);
 }
 
 test "the keyboard goes to the host field, a rename, or the kill dialog, one at a time" {

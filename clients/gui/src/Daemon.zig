@@ -854,7 +854,7 @@ pub const Json = struct {
     const WorkspaceList = struct { workspaces: []const WorkspaceDesc = &.{} };
     /// rpc.ConfigDesc: `settings` is slime.config's table.
     pub const Config = struct { path: []const u8 = "", settings: std.json.Value = .null, keymap: []const Binding = &.{}, actions: []const ActionDesc = &.{}, errors: []const []const u8 = &.{} };
-    const Binding = struct { key: []const u8, action: []const u8 = "", args: std.json.Value = .null, lua: u32 = 0 };
+    const Binding = struct { key: []const u8, action: []const u8 = "", args: std.json.Value = .null, lua: u32 = 0, repeat: bool = false };
     /// rpc.ActionDesc, but for its args, which the palette passes none of.
     pub const ActionDesc = struct { name: []const u8, title: []const u8 = "" };
     const WorkspaceDesc = struct { id: u32, name: []const u8 = "", attached: bool = false, viewers: usize = 0, detached_at: i64 = 0, active_tab: TabRef = .none, tabs: []const Tab = &.{} };
@@ -964,7 +964,7 @@ pub fn keymapFromJson(alloc: Allocator, bindings: []const Json.Binding) ![]bindi
         const action = try alloc.dupe(u8, b.action);
         errdefer alloc.free(action);
         const args: []const u8 = if (b.args == .null) "" else try std.json.Stringify.valueAlloc(alloc, b.args, .{});
-        e.* = .{ .key = key, .action = action, .args = args, .lua = b.lua };
+        e.* = .{ .key = key, .action = action, .args = args, .lua = b.lua, .repeat = b.repeat };
         made += 1;
     }
     return entries;
