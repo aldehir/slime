@@ -1,6 +1,6 @@
 .{
     .name = .slime_gui,
-    .version = "0.3.3",
+    .version = "0.3.4",
     .fingerprint = 0xeb2525db07672daf,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
