@@ -158,6 +158,17 @@ pub fn hitTest(ui: *const Ui, node: *const Node, x: f32, y: f32) ?Id {
     return node.id;
 }
 
+/// Where dialog field `i` has its text, while asking.
+pub fn fieldText(ui: *const Ui, node: *const Node, i: usize) ?Rect {
+    const d = node.kind.dialog.dialog;
+    if (d.state != .asking or i >= d.field_count) return null;
+    return fieldTextIn(ui, layoutIn(ui, node.rect, d).fields[i].box);
+}
+
+fn fieldTextIn(ui: *const Ui, box: Rect) Rect {
+    return box.inset(ui.px(10), 0);
+}
+
 pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
     const v = node.kind.dialog;
     const d = v.dialog;
@@ -194,7 +205,7 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
         const box = fr.box;
         if (focused) ui.paintGlow(p, box, ui.px(6), t.accent);
         ui.fillBordered(p, box, ui.px(6), if (dim) v.terminal_bg else t.ground, if (focused) t.accent else t.outline);
-        ui.paintEditText(p, box.inset(ui.px(10), 0), &field.edit, .{
+        ui.paintEditText(p, fieldTextIn(ui, box), &field.edit, .{
             .caret = focused and v.caret,
             .mask = !field.echo,
             .color = if (dim) t.text_muted else t.text_strong,

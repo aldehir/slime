@@ -1,6 +1,7 @@
 //! A one-line text box's contents and editing: a caret, a selection
-//! from `anchor` to `caret`, and the keys Windows edit controls take.
-//! `Ui` draws it; the app feeds it keys, characters and the clipboard.
+//! from `anchor` to `caret`, and the keys and clicks Windows edit
+//! controls take. `Ui` draws it; the app feeds it keys, characters,
+//! the clipboard, and where the mouse is in its text.
 const TextField = @This();
 
 const std = @import("std");
@@ -16,6 +17,14 @@ caret: usize = 0,
 anchor: usize = 0,
 /// Units dropped from typed and pasted text.
 reject: []const u16 = &.{},
+/// How far the text is drawn left of the box, in pixels: as an edit
+/// control's, it moves only to bring the caret into view, so text
+/// doesn't shift under a click. `Ui.editScroll` keeps it.
+scroll: f32 = 0,
+/// A scroll kept even where the text ends short of the box's right
+/// edge: after a press opens a URL bar, its hidden `https://`'s width,
+/// so the text stays where it was at rest, till a key edits or moves.
+hold: f32 = 0,
 
 pub fn text(self: *const TextField) []const u16 {
     return self.buf[0..self.len];
@@ -35,6 +44,7 @@ pub fn selected(self: *const TextField) []const u16 {
 /// Replace the selection with `units`, without control characters,
 /// line breaks, or `reject`ed units, and as much as fits.
 pub fn insert(self: *TextField, units: []const u16) void {
+    self.hold = 0;
     self.deleteSelection();
     for (units) |u| {
         if (u < 0x20 or u == 0x7f or std.mem.indexOfScalar(u16, self.reject, u) != null) continue;
@@ -52,6 +62,7 @@ pub const Key = enum { left, right, home, end, backspace, delete, select_all };
 /// Edit or move for `key`. `word` moves by words (ctrl), and `extend`
 /// moves the caret without the anchor (shift).
 pub fn press(self: *TextField, key: Key, word: bool, extend: bool) void {
+    self.hold = 0;
     switch (key) {
         .select_all => {
             self.anchor = 0;
@@ -76,6 +87,47 @@ pub fn press(self: *TextField, key: Key, word: bool, extend: bool) void {
             self.deleteSelection();
         },
     }
+}
+
+/// Put the caret at `at`, as a click does, moving the anchor with it
+/// unless `extend` (shift).
+pub fn place(self: *TextField, at: usize, extend: bool) void {
+    self.caret = self.boundary(at);
+    if (!extend) self.anchor = self.caret;
+}
+
+/// The word at `at`, as a double click selects it: its run of word
+/// characters, or of the separators between them.
+pub fn wordAt(self: *const TextField, at: usize) Range {
+    if (self.len == 0) return .{ .start = 0, .end = 0 };
+    // Past the end, the last character's.
+    const i = @min(self.boundary(at), self.len - 1);
+    const word = isWord(self.buf[i]);
+    var r: Range = .{ .start = i, .end = i };
+    while (r.start > 0 and isWord(self.buf[r.start - 1]) == word) r.start -= 1;
+    while (r.end < self.len and isWord(self.buf[r.end]) == word) r.end += 1;
+    return r;
+}
+
+/// Select from the words in `origin` (where a double click was) to the
+/// word at `at`, as dragging after a double click does.
+pub fn selectWords(self: *TextField, origin: Range, at: usize) void {
+    const w = self.wordAt(at);
+    if (w.start < origin.start) {
+        self.anchor = origin.end;
+        self.caret = w.start;
+    } else {
+        self.anchor = origin.start;
+        self.caret = @max(w.end, origin.end);
+    }
+}
+
+/// `at`, within the text and not inside a surrogate pair.
+fn boundary(self: *const TextField, at: usize) usize {
+    const i = @min(at, self.len);
+    if (i > 0 and i < self.len and std.unicode.utf16IsLowSurrogate(self.buf[i]) and
+        std.unicode.utf16IsHighSurrogate(self.buf[i - 1])) return i - 1;
+    return i;
 }
 
 fn deleteSelection(self: *TextField) void {
@@ -152,6 +204,58 @@ test "selection" {
     f.press(.select_all, false, false);
     f.insert(L("pi"));
     try std.testing.expectEqualSlices(u16, L("pi"), f.text());
+}
+
+test "clicks place the caret, and shift extends the selection" {
+    var f: TextField = .{};
+    f.insert(L("example.com"));
+    f.press(.select_all, false, false);
+    // A click in a selection drops it.
+    f.place(3, false);
+    try std.testing.expectEqual(Range{ .start = 3, .end = 3 }, f.selection());
+    f.place(7, true);
+    try std.testing.expectEqualSlices(u16, L("mple"), f.selected());
+    // Past the end is the end.
+    f.place(99, false);
+    try std.testing.expectEqual(@as(usize, 11), f.caret);
+}
+
+test "a double click's word, and dragging by words" {
+    var f: TextField = .{};
+    f.insert(L("https://github.com/aldehir"));
+    try std.testing.expectEqual(Range{ .start = 8, .end = 14 }, f.wordAt(10));
+    // Between words, the separators.
+    try std.testing.expectEqual(Range{ .start = 5, .end = 8 }, f.wordAt(6));
+    // At the end, the last word.
+    try std.testing.expectEqual(Range{ .start = 19, .end = 26 }, f.wordAt(26));
+    const origin = f.wordAt(10);
+    f.selectWords(origin, 20);
+    try std.testing.expectEqualSlices(u16, L("github.com/aldehir"), f.selected());
+    f.selectWords(origin, 2);
+    try std.testing.expectEqualSlices(u16, L("https://github"), f.selected());
+    try std.testing.expectEqual(@as(usize, 0), f.caret);
+    var empty: TextField = .{};
+    try std.testing.expectEqual(Range{ .start = 0, .end = 0 }, empty.wordAt(0));
+}
+
+test "a held scroll lets go on a key" {
+    var f: TextField = .{};
+    f.insert(L("example.com"));
+    f.hold = 40;
+    f.place(3, false);
+    try std.testing.expectEqual(@as(f32, 40), f.hold);
+    f.press(.end, false, false);
+    try std.testing.expectEqual(@as(f32, 0), f.hold);
+    f.hold = 40;
+    f.insert(L("x"));
+    try std.testing.expectEqual(@as(f32, 0), f.hold);
+}
+
+test "a click never lands inside a surrogate pair" {
+    var f: TextField = .{};
+    f.insert(L("a\u{1F600}b"));
+    f.place(2, false);
+    try std.testing.expectEqual(@as(usize, 1), f.caret);
 }
 
 test "filters and surrogate pairs" {

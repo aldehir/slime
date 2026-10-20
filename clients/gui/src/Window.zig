@@ -764,6 +764,7 @@ const shell_vtable: App.Shell.VTable = .{
     .mods = shellMods,
     .dragThreshold = shellDragThreshold,
     .hoverTime = shellHoverTime,
+    .doubleClick = shellDoubleClick,
     .caretBlinkTime = shellCaretBlinkTime,
     .dropPendingChars = shellDropPendingChars,
     .clipboardHasText = shellClipboardHasText,
@@ -854,6 +855,14 @@ fn shellHoverTime(_: *anyopaque) u32 {
     var ms: u32 = 400;
     _ = win32.SystemParametersInfoW(win32.SPI_GETMOUSEHOVERTIME, 0, &ms, 0);
     return ms;
+}
+
+fn shellDoubleClick(ctx: *anyopaque) App.DoubleClick {
+    const dpi = fromCtx(ctx).dpi;
+    return .{
+        .ms = win32.GetDoubleClickTime(),
+        .size = .{ win32.GetSystemMetricsForDpi(win32.SM_CXDOUBLECLK, dpi), win32.GetSystemMetricsForDpi(win32.SM_CYDOUBLECLK, dpi) },
+    };
 }
 
 fn shellCaretBlinkTime(_: *anyopaque) ?u32 {

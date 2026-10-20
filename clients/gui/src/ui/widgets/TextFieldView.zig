@@ -19,9 +19,14 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
     const f = node.kind.text_field;
     const r = node.rect;
     ui.fillBordered(p, r, ui.px(6), ui.theme.surface, ui.theme.accent);
-    const inner = r.inset(ui.px(10), 0);
+    const inner = textRect(ui, node);
     if (f.field.len == 0) p.text(f.placeholder, ui.fonts.get(.body), inner, ui.theme.text_inactive);
     ui.paintEditText(p, inner, f.field, .{ .caret = f.caret });
+}
+
+/// Where the field has its text, inside its box.
+pub fn textRect(ui: *const Ui, node: *const Node) Ui.Rect {
+    return node.rect.inset(ui.px(10), 0);
 }
 
 test "a field takes the row's height unless given one" {

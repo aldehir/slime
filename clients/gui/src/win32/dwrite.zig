@@ -234,6 +234,22 @@ pub const ITextLayout = extern struct {
     pub fn getMetrics(self: *ITextLayout, out: *TEXT_METRICS) HRESULT {
         return com.call(self, 60, fn (*TEXT_METRICS) HRESULT, .{out});
     }
+
+    pub fn hitTestPoint(self: *ITextLayout, x: f32, y: f32, trailing: *BOOL, inside: *BOOL, out: *HIT_TEST_METRICS) HRESULT {
+        return com.call(self, 64, fn (f32, f32, *BOOL, *BOOL, *HIT_TEST_METRICS) HRESULT, .{ x, y, trailing, inside, out });
+    }
+};
+
+pub const HIT_TEST_METRICS = extern struct {
+    textPosition: u32,
+    length: u32,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    bidiLevel: u32,
+    isText: BOOL,
+    isTrimmed: BOOL,
 };
 
 pub const IInlineObject = extern struct { vtable: com.VTable };

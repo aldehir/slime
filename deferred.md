@@ -186,9 +186,9 @@ one.
   Layouts flyout takes hover over maximize.
 
 - **Reordering hosts.** They're listed in the order first connected to.
-- **The mouse in text fields** (`ui/TextField.zig`): clicking to
-  place the caret, dragging to select, double-click for a word. Only
-  the keyboard edits them.
+- **Auto-scrolling a text field's drag.** Dragging past a field's edge
+  scrolls it only as the mouse moves, not on a timer while it's held
+  still, as edit controls do.
 - **IME composition in text fields.** Committed text arrives as
   WM_CHAR, but the candidate window isn't placed at the caret.
 - **Long keyboard-interactive rounds.** One past eight questions is cut
@@ -392,7 +392,8 @@ The daemon keeps a browser's url and title; the window fills the pane
 with WebView2 in visual mode (`Web.zig`), under its title strip (the
 page's title, and the split and zoom buttons) and an address row with
 back, forward, reload (stop while loading), and a URL bar (a click
-selects it all, Enter sends `pane.navigate`, Escape puts it back); only
+selects it all, and a click in it then places the caret; Enter sends
+`pane.navigate`, Escape puts it back); only
 the strip drags the pane. A pane keeps its page zoom (Ctrl+wheel,
 Ctrl+plus and minus) across reloads, navigations, and its browser closed
 while hidden, for every site it goes to, not per site as browsers keep

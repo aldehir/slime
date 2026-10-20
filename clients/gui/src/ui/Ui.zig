@@ -473,20 +473,49 @@ pub const EditTextOptions = struct {
     color: ?Color = null,
 };
 
+/// A text field's text as drawn: dots for a password's (`mask`), one a
+/// unit, so indexes into it are the field's.
+fn editText(field: *const TextField, mask: bool, dots: *[TextField.max_len]u16) []const u16 {
+    if (!mask) return field.text();
+    @memset(dots[0..field.len], 0x25CF);
+    return dots[0..field.len];
+}
+
+/// How far `field`'s text is scrolled in `inner`: its `scroll`, moved
+/// just enough to show the caret, with room for it at the right edge,
+/// and back so no more than that room is left past the text's end
+/// (unless the field holds a scroll, `TextField.hold`). The
+/// window stores it back in the field once laid out, and draws and
+/// hit-tests with it.
+pub fn editScroll(self: *const Ui, inner: Rect, field: *const TextField, mask: bool) f32 {
+    var dots: [TextField.max_len]u16 = undefined;
+    const text = editText(field, mask, &dots);
+    const font = self.fonts.get(.body);
+    const room = inner.w - self.stroke();
+    const caret_x = self.fonts.measure(text[0..field.caret], font);
+    var scroll = @min(field.scroll, @max(field.hold, self.fonts.measure(text, font) - room));
+    if (caret_x - scroll > room) scroll = caret_x - room;
+    if (caret_x < scroll) scroll = caret_x;
+    return @max(0, scroll);
+}
+
+/// The caret position in `field` nearest client x `x`, its text drawn
+/// in `inner`.
+pub fn editIndex(self: *const Ui, inner: Rect, field: *const TextField, mask: bool, x: f32) usize {
+    var dots: [TextField.max_len]u16 = undefined;
+    const text = editText(field, mask, &dots);
+    return self.fonts.hitTest(text, self.fonts.get(.body), x - inner.x + self.editScroll(inner, field, mask));
+}
+
 /// A text field's text in `inner`, scrolled to keep the caret in view,
 /// with its selection behind it and the caret if `opts.caret`.
 pub fn paintEditText(self: *const Ui, p: *Painter, inner: Rect, field: *const TextField, opts: EditTextOptions) void {
     var dots: [TextField.max_len]u16 = undefined;
-    const text = if (opts.mask) dots: {
-        @memset(dots[0..field.len], 0x25CF);
-        break :dots dots[0..field.len];
-    } else field.text();
+    const text = editText(field, opts.mask, &dots);
     const font = self.fonts.get(.body);
 
     const caret_x = self.fonts.measure(text[0..field.caret], font);
-    // Room for the caret at the right edge.
-    const scroll = @max(0, caret_x - (inner.w - self.stroke()));
-    const x = inner.x - scroll;
+    const x = inner.x - self.editScroll(inner, field, opts.mask);
     p.pushClip(inner);
     defer p.popClip();
     const sel = field.selection();
@@ -641,6 +670,26 @@ pub const Fonts = struct {
     pub fn measure(self: *const Fonts, text: []const u16, format: *dwrite.ITextFormat) f32 {
         const m = self.layoutMetrics(text, format, unbounded) orelse return 0;
         return m.widthIncludingTrailingWhitespace;
+    }
+
+    /// The caret position in `text` laid out in `format` nearest `x`
+    /// pixels from its start: before or after the character there, by
+    /// which half `x` is in.
+    pub fn hitTest(self: *const Fonts, text: []const u16, format: *dwrite.ITextFormat, x: f32) usize {
+        if (text.len == 0) return 0;
+        const factory = self.factory orelse return 0;
+        var text_layout: ?*dwrite.ITextLayout = null;
+        const hr = factory.createTextLayout(text, format, unbounded, unbounded, &text_layout);
+        if (hr < 0) {
+            com.check(hr, "IDWriteFactory::CreateTextLayout") catch {};
+            return 0;
+        }
+        defer com.releaseOpt(&text_layout);
+        var trailing: win32.BOOL = win32.FALSE;
+        var inside: win32.BOOL = win32.FALSE;
+        var m: dwrite.HIT_TEST_METRICS = undefined;
+        if (text_layout.?.hitTestPoint(x, 0, &trailing, &inside, &m) < 0) return 0;
+        return @min(text.len, m.textPosition + if (trailing != win32.FALSE) m.length else 0);
     }
 
     /// The height of `text` wrapped to `width` in a wrapping `format`, in

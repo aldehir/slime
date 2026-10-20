@@ -34,6 +34,9 @@ const Dialog = Ui.Dialog;
 const Menu = Ui.Menu;
 const Palette = Ui.Palette;
 const PaletteView = @import("ui/widgets/PaletteView.zig");
+const PaneStrip = @import("ui/widgets/PaneStrip.zig");
+const Modal = @import("ui/widgets/Modal.zig");
+const TextFieldView = @import("ui/widgets/TextFieldView.zig");
 const Painter = @import("renderer/Painter.zig");
 const Tree = Ui.Tree;
 
@@ -193,6 +196,11 @@ pane_drag: ?PaneDrag = null,
 sidebar_drag: ?SidebarDrag = null,
 /// The palette's scrollbar thumb being dragged, likewise.
 palette_scroll: ?PaletteScroll = null,
+/// A text field pressed in, selecting as the mouse moves, likewise.
+field_drag: ?FieldDrag = null,
+/// The last press in a text field, to count a third click: Windows
+/// reports a second (WM_LBUTTONDBLCLK), not a third.
+field_click: FieldClick = .{},
 /// The tab a middle click went down on, to close it on release.
 middle_pressed: ?Id.Target = null,
 
@@ -235,6 +243,36 @@ pub const Rename = struct {
 const PaletteScroll = struct {
     /// How far into the thumb the mouse took hold, in pixels.
     grab: f32,
+};
+
+/// A text field pressed in, while the button's down.
+const FieldDrag = struct {
+    /// What had the keyboard: the drag ends if that changes.
+    owner: std.meta.Tag(Keyboard),
+    field: *TextField,
+    /// By words from `origin`, the word double-clicked; else from the
+    /// caret's place at the press.
+    words: bool,
+    origin: TextField.Range,
+    /// The press gave the field the keyboard: let go there, it selects
+    /// everything, as a URL bar does.
+    fresh: bool,
+    moved: bool = false,
+};
+
+const FieldClick = struct {
+    at: u64 = 0,
+    pos: win32.POINT = .{ .x = 0, .y = 0 },
+    count: u8 = 0,
+};
+
+/// The field with the keyboard, where it has its text, and whether its
+/// text is a password's.
+const Editing = struct {
+    owner: std.meta.Tag(Keyboard),
+    field: *TextField,
+    inner: Rect,
+    mask: bool = false,
 };
 
 /// A browser pane's URL bar being typed in.
@@ -472,6 +510,12 @@ pub const Cursor = union(enum) {
     handle: win32.HCURSOR,
 };
 
+pub const DoubleClick = struct {
+    ms: u32,
+    /// The box, centered on the first click, the next lands in.
+    size: [2]i32,
+};
+
 /// What the app asks of the window: every Win32 call it still needs.
 /// The window implements it; tests fake it.
 pub const Shell = struct {
@@ -500,6 +544,9 @@ pub const Shell = struct {
         dragThreshold: *const fn (*anyopaque) [2]i32,
         /// How long the mouse rests before a tooltip, in milliseconds.
         hoverTime: *const fn (*anyopaque) u32,
+        /// How soon, and how near, a click follows another to count
+        /// with it.
+        doubleClick: *const fn (*anyopaque) DoubleClick,
         /// The caret's blink period, or null when blinking is off.
         caretBlinkTime: *const fn (*anyopaque) ?u32,
         /// Drop the WM_CHAR messages posted for the key being handled.
@@ -584,6 +631,9 @@ pub const Shell = struct {
     }
     fn hoverTime(self: Shell) u32 {
         return self.vt.hoverTime(self.ctx);
+    }
+    fn doubleClick(self: Shell) DoubleClick {
+        return self.vt.doubleClick(self.ctx);
     }
     fn caretBlinkTime(self: Shell) ?u32 {
         return self.vt.caretBlinkTime(self.ctx);
@@ -889,6 +939,7 @@ fn captureLost(self: *App) void {
     if (self.drag != null) self.endDrag();
     if (self.sidebar_drag != null) self.endSidebarDrag();
     if (self.palette_scroll != null) self.endPaletteScroll();
+    self.endFieldDrag();
     // A pane drag that lost the mouse lands nowhere.
     self.cancelDrag();
     if (self.mouse_in_terminal) {
@@ -3352,6 +3403,169 @@ fn endPaletteScroll(self: *App) void {
     self.shell.releaseMouse();
 }
 
+/// The field with the keyboard, and where `tree` has its text.
+fn editingIn(self: *App, tree: *const Tree) ?Editing {
+    const kb = self.keyboard();
+    const owner = std.meta.activeTag(kb);
+    switch (kb) {
+        .connect => |f| {
+            const n = Ui.find(tree, .window(.connect)) orelse return null;
+            if (n.kind != .text_field) return null;
+            return .{ .owner = owner, .field = f, .inner = TextFieldView.textRect(self.ui, n) };
+        },
+        .rename => |f| {
+            // The row and its field share the id.
+            const row = Ui.find(tree, .{ .target = .{ .workspace = self.mode.rename.ws }, .part = .field }) orelse return null;
+            const n = if (row.kind == .text_field) row else for (Ui.children(row)) |*c| {
+                if (c.kind == .text_field) break c;
+            } else return null;
+            return .{ .owner = owner, .field = f, .inner = TextFieldView.textRect(self.ui, n) };
+        },
+        .url, .search => |f| {
+            const pane = if (kb == .url) self.mode.url.pane else self.mode.search.pane;
+            const n = Ui.find(tree, .{ .target = .{ .pane = pane }, .part = .terminal }) orelse return null;
+            const inner = PaneStrip.fieldText(self.ui, n, kb == .url) orelse return null;
+            return .{ .owner = owner, .field = f, .inner = inner };
+        },
+        .palette => |p| return .{ .owner = owner, .field = &p.query, .inner = PaletteView.layoutIn(self.ui, self.frame, p).field },
+        .confirm, .login => {
+            const d = self.activeDialog() orelse return null;
+            const i = switch (d.focus) {
+                .field => |i| i,
+                else => return null,
+            };
+            const n = Ui.find(tree, .window(.scrim)) orelse return null;
+            if (n.kind != .dialog) return null;
+            const inner = Modal.fieldText(self.ui, n, i) orelse return null;
+            return .{ .owner = owner, .field = &d.fields[i].edit, .inner = inner, .mask = !d.fields[i].echo };
+        },
+        else => return null,
+    }
+}
+
+/// A press on a text field: it takes the keyboard if it hadn't, and
+/// the click puts the caret there, shift extends the selection to it, a
+/// double click selects the word, and a third everything. The mouse then
+/// selects as it moves, till the button's up (`fieldDragTo`). False
+/// when `hit` isn't a field.
+fn fieldPress(self: *App, hit: Id, m: Msg.Mouse) bool {
+    const x: f32 = @floatFromInt(m.pos.x);
+    // Where in the url a press opening a URL bar is, by the url at rest
+    // (`PaneStrip.shownUrl`), and how wide the part it hides is.
+    var rest: ?struct { at: usize, hidden: f32 } = null;
+    const fresh = switch (hit.part) {
+        .field => switch (hit.target) {
+            .pane => fresh: {
+                const s = self.shownPane(hit.target) orelse return false;
+                if (self.mode == .url and self.mode.url.pane == s.id) break :fresh false;
+                const url = s.pageUrl() orelse return false;
+                const n = Ui.find(self.currentTree(), hit.with(.terminal)) orelse return false;
+                const inner = PaneStrip.fieldText(self.ui, n, true) orelse return false;
+                const shown = PaneStrip.shownUrl(url);
+                const hidden = url[0 .. url.len - shown.len];
+                const font = self.ui.fonts.get(.body);
+                rest = .{ .at = hidden.len + self.ui.fonts.hitTest(shown, font, x - inner.x), .hidden = self.ui.fonts.measure(hidden, font) };
+                self.startUrl(s);
+                if (self.mode != .url) return false;
+                break :fresh true;
+            },
+            .dialog => |i| fresh: {
+                const d = self.activeDialog() orelse return false;
+                d.focus = .{ .field = i };
+                break :fresh false;
+            },
+            .workspace => |ws| if (self.mode == .rename and self.mode.rename.ws == ws) false else return false,
+            .window => if (self.mode == .palette) false else return false,
+            else => return false,
+        },
+        .search => fresh: {
+            const s = self.shownPane(hit.target) orelse return false;
+            if (self.mode == .search and self.mode.search.pane == s.id) break :fresh false;
+            self.startSearch(s);
+            if (self.mode != .search) return false;
+            break :fresh true;
+        },
+        .connect => if (self.mode == .connect) false else return false,
+        else => return false,
+    };
+    self.hideTip();
+    const e = self.editingIn(self.currentTree()) orelse return true;
+    const f = e.field;
+    // The url's hidden start scrolled out of view, so the text stays
+    // put under the mouse where the bar has room for that.
+    if (rest) |r| {
+        f.scroll = r.hidden;
+        f.hold = r.hidden;
+    }
+    const at = if (rest) |r| r.at else self.ui.editIndex(e.inner, f, e.mask, x);
+    var drag: FieldDrag = .{ .owner = e.owner, .field = f, .words = false, .origin = .{ .start = at, .end = at }, .fresh = fresh };
+    const clicks = self.countClick(m);
+    switch (clicks) {
+        1 => f.place(at, !fresh and m.wparam & win32.MK_SHIFT != 0),
+        // A password has no words to show.
+        2 => if (e.mask) f.press(.select_all, false, false) else {
+            const w = f.wordAt(at);
+            f.anchor = w.start;
+            f.caret = w.end;
+            drag.words = true;
+            drag.origin = w;
+        },
+        else => f.press(.select_all, false, false),
+    }
+    // With everything selected, there's nothing to drag to.
+    if (clicks < 3 and !(clicks == 2 and e.mask)) {
+        self.field_drag = drag;
+        self.shell.captureMouse();
+    }
+    self.resetBlink();
+    self.markDirty();
+    return true;
+}
+
+/// How many clicks a press in a field makes: two on a double click,
+/// three on a press soon after one and near it.
+fn countClick(self: *App, m: Msg.Mouse) u8 {
+    const now = self.shell.tickCount();
+    const dc = self.shell.doubleClick();
+    const last = self.field_click;
+    const near = @abs(m.pos.x - last.pos.x) * 2 <= dc.size[0] and @abs(m.pos.y - last.pos.y) * 2 <= dc.size[1];
+    const count: u8 = if (m.msg == win32.WM_LBUTTONDBLCLK) 2 else if (last.count == 2 and near and now -% last.at <= dc.ms) 3 else 1;
+    self.field_click = .{ .at = now, .pos = m.pos, .count = count };
+    return count;
+}
+
+/// Select in the field pressed in to the mouse at `pos`: from the press,
+/// or by words from the word double-clicked.
+fn fieldDragTo(self: *App, d: *FieldDrag, pos: win32.POINT) void {
+    const e = self.editingIn(self.currentTree()) orelse return self.endFieldDrag();
+    if (e.owner != d.owner or e.field != d.field) return self.endFieldDrag();
+    const at = self.ui.editIndex(e.inner, e.field, e.mask, @floatFromInt(pos.x));
+    if (d.words) {
+        e.field.selectWords(d.origin, at);
+    } else {
+        e.field.place(at, true);
+    }
+    if (at != d.origin.start) d.moved = true;
+    self.resetBlink();
+    self.markDirty();
+}
+
+/// The button's up: a click that opened its field without selecting
+/// selects everything, from the start, so a long url shows its start.
+fn endFieldDrag(self: *App) void {
+    const d = self.field_drag orelse return;
+    // First: releasing the capture comes back as `capture_lost`.
+    self.field_drag = null;
+    self.shell.releaseMouse();
+    if (!d.fresh or d.moved) return;
+    const kb = self.keyboard();
+    if (std.meta.activeTag(kb) != d.owner) return;
+    d.field.anchor = d.field.len;
+    d.field.caret = 0;
+    d.field.hold = 0;
+    self.markDirty();
+}
+
 /// Scroll the palette's list so the focus is among the rows drawn. How
 /// many fit depends on where the list starts (the captions), so it
 /// settles in a few goes.
@@ -3898,6 +4112,9 @@ pub fn view(self: *App) *const Tree {
     self.ui.layout(&self.tree.?);
     self.tree_stale = false;
     self.views +%= 1;
+    // The field with the keyboard scrolls to show its caret, from where
+    // it was.
+    if (self.editingIn(&self.tree.?)) |e| e.field.scroll = self.ui.editScroll(e.inner, e.field, e.mask);
     return &self.tree.?;
 }
 
@@ -3932,7 +4149,8 @@ pub fn cursor(self: *App, pos: win32.POINT) Cursor {
     var cursor_: Cursor = .arrow;
     const hit = self.hitAt(pos);
     // A dialog's field, or a workspace's name being edited.
-    if (hit.part == .field or hit.part == .search) cursor_ = .ibeam;
+    if (hit.part == .field or hit.part == .search or self.field_drag != null) cursor_ = .ibeam;
+    if (self.mode == .connect and hit.eql(.window(.connect))) cursor_ = .ibeam;
     const sizing: ?Cursor = if (self.drag) |d| d.cursor() else switch (hit.target) {
         .divider => |i| if (i < self.placed().dividers.items.len) dividerCursor(self.placed().dividers.items[i]) else null,
         .corner => |i| if (i < self.placed().corners.items.len) .size_all else null,
@@ -4039,6 +4257,10 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
         if (!held) self.endPaletteScroll();
         return;
     }
+    if (self.field_drag) |*d| {
+        if (held) self.fieldDragTo(d, pos) else self.endFieldDrag();
+        return;
+    }
 
     if (self.mouse_in_terminal) {
         if (self.focusedSession()) |s| self.paneMouse(s, msg, wparam, pos);
@@ -4095,6 +4317,7 @@ fn mouseInput(self: *App, m: Msg.Mouse) void {
             if (hit.target == .corner) return self.startCornerDrag(hit.target.corner, pos);
             if (hit.eql(.window(.sidebar_edge))) return self.startSidebarDrag(pos);
             if (hit.eql(.window(.scrollbar))) return self.startPaletteScroll(pos);
+            if (self.fieldPress(hit, m)) return;
             if (hit.part == .title) if (self.shownPane(hit.target)) |pane| {
                 // Double-clicking a pane's title zooms it, as its button
                 // does. The release may then land on the zoomed pane's
@@ -4467,6 +4690,9 @@ pub const TestShell = struct {
     fn hoverTime(_: *anyopaque) u32 {
         return 400;
     }
+    fn doubleClick(_: *anyopaque) DoubleClick {
+        return .{ .ms = 500, .size = .{ 4, 4 } };
+    }
     fn caretBlinkTime(_: *anyopaque) ?u32 {
         return 500;
     }
@@ -4528,6 +4754,7 @@ pub const TestShell = struct {
         .mods = mods,
         .dragThreshold = dragThreshold,
         .hoverTime = hoverTime,
+        .doubleClick = doubleClick,
         .caretBlinkTime = caretBlinkTime,
         .dropPendingChars = dropPendingChars,
         .clipboardHasText = clipboardHasText,
@@ -4639,6 +4866,57 @@ test "the connect field opens on its button, takes text, and closes on Escape" {
     // Its release goes nowhere, and alt+F4 is still Windows'.
     try std.testing.expectEqual(Result.handled, app.update(.{ .key = .{ .msg = win32.WM_KEYUP, .wparam = win32.VK_ESCAPE, .lparam = 0 } }));
     try std.testing.expectEqual(Result.default, app.update(.{ .key = .{ .msg = win32.WM_SYSKEYDOWN, .wparam = win32.VK_F4, .lparam = 0 } }));
+}
+
+test "clicks in a field: one drops the selection, shift extends it, two select a word, three everything" {
+    var shell: TestShell = .{};
+    var t: TestApp = .{ .hosts = undefined, .shown = undefined, .ui = undefined, .frame = undefined };
+    try t.init(&shell);
+    defer t.deinit();
+    const app = &t.app;
+
+    _ = app.update(.{ .click = .window(.connect) });
+    for (L("alde@host")) |u| _ = app.update(.{ .char = .{ .unit = u, .sys = false } });
+    const field = &app.mode.connect;
+    // Without fonts every x is the text's start.
+    const r = Ui.find(app.view(), .window(.connect)).?.rect;
+    const pos: win32.POINT = .{ .x = @intFromFloat(r.x + 20), .y = @intFromFloat(r.y + r.h / 2) };
+    try std.testing.expectEqual(Cursor.ibeam, app.cursor(pos));
+    const Click = struct {
+        fn send(a: *App, msg: u32, wparam: win32.WPARAM, at: win32.POINT) void {
+            _ = a.update(.{ .mouse = .{ .msg = msg, .wparam = wparam, .pos = at } });
+        }
+    };
+
+    field.press(.select_all, false, false);
+    Click.send(app, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, pos);
+    try std.testing.expectEqual(TextField.Range{ .start = 0, .end = 0 }, field.selection());
+    try std.testing.expect(app.field_drag != null);
+    Click.send(app, win32.WM_LBUTTONUP, 0, pos);
+    try std.testing.expect(app.field_drag == null);
+    try std.testing.expect(app.mode == .connect);
+
+    // Shift extends from the caret.
+    field.place(field.len, false);
+    Click.send(app, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON | win32.MK_SHIFT, pos);
+    Click.send(app, win32.WM_LBUTTONUP, win32.MK_SHIFT, pos);
+    try std.testing.expectEqualSlices(u16, L("alde@host"), field.selected());
+
+    Click.send(app, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, pos);
+    Click.send(app, win32.WM_LBUTTONUP, 0, pos);
+    Click.send(app, win32.WM_LBUTTONDBLCLK, win32.MK_LBUTTON, pos);
+    try std.testing.expectEqualSlices(u16, L("alde"), field.selected());
+    Click.send(app, win32.WM_LBUTTONUP, 0, pos);
+    try std.testing.expectEqualSlices(u16, L("alde"), field.selected());
+    Click.send(app, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, pos);
+    try std.testing.expectEqualSlices(u16, L("alde@host"), field.selected());
+    Click.send(app, win32.WM_LBUTTONUP, 0, pos);
+    try std.testing.expectEqualSlices(u16, L("alde@host"), field.selected());
+    // A fourth starts over.
+    Click.send(app, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, pos);
+    try std.testing.expectEqual(TextField.Range{ .start = 0, .end = 0 }, field.selection());
+    Click.send(app, win32.WM_LBUTTONUP, 0, pos);
+    try std.testing.expect(app.mode == .connect);
 }
 
 test "the notice shows the config's errors' first lines, counts the rest, and closes on its button" {

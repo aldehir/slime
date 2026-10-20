@@ -291,23 +291,18 @@ pub fn paint(ui: *const Ui, p: *Painter, node: *const Node) void {
 fn paintUrl(ui: *const Ui, p: *Painter, r: Rect, b: BrowserPane, focused: bool) void {
     if (r.w < 1 or r.h < 1) return;
     const radius = ui.px(6);
-    var inner = r.inset(ui.px(url_pad), 0);
     if (b.field != null) {
         ui.fillBordered(p, r, radius, ui.theme.surface, ui.theme.accent);
     } else {
         p.fillRounded(r, radius, ui.theme.field);
     }
-    // The site's icon, where the bar has room for it and some url.
-    const size = ui.px(site_icon);
-    if (inner.w >= 4 * size) {
-        const icon: Rect = .{ .x = inner.x, .y = r.y + @round((r.h - size) / 2), .w = size, .h = size };
+    const inner = urlText(ui, r);
+    if (siteIcon(ui, r)) |icon| {
         if (b.favicon) |img| {
             p.image(img, icon, 0, 1);
         } else {
             ui.drawIcon(p, .globe, icon.inset(ui.px(1), ui.px(1)), if (focused) ui.theme.text_muted else ui.theme.text_inactive);
         }
-        const skip = size + ui.px(site_gap);
-        inner = .{ .x = inner.x + skip, .y = inner.y, .w = inner.w - skip, .h = inner.h };
     }
     if (b.field) |field| {
         ui.paintEditText(p, inner, field, .{ .caret = b.caret });
@@ -318,9 +313,34 @@ fn paintUrl(ui: *const Ui, p: *Painter, r: Rect, b: BrowserPane, focused: bool) 
     p.text(shownUrl(b.url), ui.fonts.get(.body), inner, if (focused) ui.theme.text else ui.theme.text_muted);
 }
 
+/// The site's icon in URL bar `r`, where the bar has room for it and
+/// some url.
+fn siteIcon(ui: *const Ui, r: Rect) ?Rect {
+    const inner = r.inset(ui.px(url_pad), 0);
+    const size = ui.px(site_icon);
+    if (inner.w < 4 * size) return null;
+    return .{ .x = inner.x, .y = r.y + @round((r.h - size) / 2), .w = size, .h = size };
+}
+
+/// Where URL bar `r` has its text: after the site's icon.
+fn urlText(ui: *const Ui, r: Rect) Rect {
+    const inner = r.inset(ui.px(url_pad), 0);
+    const icon = siteIcon(ui, r) orelse return inner;
+    const skip = icon.w + ui.px(site_gap);
+    return .{ .x = inner.x + skip, .y = inner.y, .w = inner.w - skip, .h = inner.h };
+}
+
+/// Where the field being edited in pane `node` has its text: the URL
+/// bar's (`url`) or the search card's.
+pub fn fieldText(ui: *const Ui, node: *const Node, url: bool) ?Rect {
+    if (url) return if (node.kind.pane.browser != null) urlText(ui, urlRect(ui, node)) else null;
+    const r = searchRects(ui, node) orelse return null;
+    return r.field;
+}
+
 /// A url as the bar shows it at rest: without `https://`, as browsers
 /// do, so a narrow bar starts with the host.
-fn shownUrl(url: []const u16) []const u16 {
+pub fn shownUrl(url: []const u16) []const u16 {
     const https = std.unicode.utf8ToUtf16LeStringLiteral("https://");
     return if (std.mem.startsWith(u16, url, https) and url.len > https.len) url[https.len..] else url;
 }
