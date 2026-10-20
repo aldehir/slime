@@ -72,6 +72,11 @@ pub const Binding = struct {
     /// The key goes to the child when the action can't run (copy with no
     /// selection), Ghostty's `performable:` prefix.
     performable: bool = false,
+    /// Once run, the sequence's earlier keys stay pressed, so its last
+    /// key again runs it again (tmux's `bind -r`), until the window's
+    /// timer runs out or a key that isn't a repeat ends it. Nothing
+    /// without a prefix: a key alone repeats as it's held.
+    repeat: bool = false,
     /// init.lua's, not a default: named ahead of the defaults.
     user: bool = false,
 
@@ -170,6 +175,7 @@ pub const Entry = struct {
     action: []const u8 = "",
     args: []const u8 = "",
     lua: u32 = 0,
+    repeat: bool = false,
 };
 
 /// The bindings in force: the defaults, with init.lua's over them; and
@@ -181,6 +187,9 @@ pub const Keymap = struct {
     /// The keys of a sequence pressed so far.
     pending_buf: [max_keys]Trigger = undefined,
     pending_len: usize = 0,
+    /// The pending keys are a repeatable binding's prefix, kept after it
+    /// ran: the window ends that when its timer runs out.
+    repeating: bool = false,
 
     /// The defaults alone.
     pub fn init(gpa: Allocator) Allocator.Error!Keymap {
@@ -203,7 +212,7 @@ pub const Keymap = struct {
     pub fn apply(self: *Keymap, entries: []const Entry) Allocator.Error!void {
         _ = self.arena.reset(.retain_capacity);
         self.bindings = .empty;
-        self.pending_len = 0;
+        self.cancel();
         const a = self.arena.allocator();
         try self.bindings.appendSlice(a, &defaults);
         for (entries) |e| {
@@ -233,6 +242,7 @@ pub const Keymap = struct {
                 .trigger = keys[keys.len - 1],
                 .prefix = try a.dupe(Trigger, keys[0 .. keys.len - 1]),
                 .action = action,
+                .repeat = e.repeat,
                 .user = true,
             });
         }
@@ -245,7 +255,7 @@ pub const Keymap = struct {
     pub fn press(self: *Keymap, vk: u32, mods: Mods) Press {
         const key: Trigger = .{ .vk = vk, .mods = mods.keys() };
         if (self.pending_len == max_keys) {
-            self.pending_len = 0;
+            self.cancel();
             return .cancelled;
         }
         self.pending_buf[self.pending_len] = key;
@@ -253,17 +263,26 @@ pub const Keymap = struct {
         var starts_one = false;
         for (self.bindings.items) |b| {
             if (b.matches(keys)) {
-                self.pending_len = 0;
+                // A repeatable binding's prefix stays pressed, so its key
+                // again runs it again.
+                self.repeating = b.repeat and b.prefix.len > 0;
+                self.pending_len = if (self.repeating) b.prefix.len else 0;
                 return .{ .binding = b };
             }
             if (b.startsWith(keys)) starts_one = true;
         }
         if (starts_one) {
             self.pending_len += 1;
+            self.repeating = false;
             return .pending;
         }
         if (self.pending_len == 0) return .none;
-        self.pending_len = 0;
+        // A key that's no repeat ends the repeat, and then does what it
+        // does on its own: only the keys of a sequence typed out are
+        // owed.
+        const was_repeating = self.repeating;
+        self.cancel();
+        if (was_repeating) return self.press(vk, mods);
         return .cancelled;
     }
 
@@ -272,9 +291,16 @@ pub const Keymap = struct {
         return self.pending_buf[0..self.pending_len];
     }
 
+    /// Whether the keys under way are a repeatable binding's, kept after
+    /// it ran.
+    pub fn isRepeating(self: *const Keymap) bool {
+        return self.repeating;
+    }
+
     /// End the sequence under way: Escape, or the focus going.
     pub fn cancel(self: *Keymap) void {
         self.pending_len = 0;
+        self.repeating = false;
     }
 
     pub fn find(self: *const Keymap, vk: u32, mods: Mods) ?Binding {
@@ -708,6 +734,59 @@ test "a sequence runs on its last key, and a key acts or starts one, never both"
     // A reload ends a sequence under way.
     try std.testing.expectEqual(Press.pending, km.press('B', ctrl_mods));
     try km.apply(&.{.{ .key = "ctrl+b>c", .action = "new_tab" }});
+    try std.testing.expectEqual(0, km.pending().len);
+}
+
+test "a repeatable binding keeps its prefix pressed, until a key that's no repeat of it" {
+    var km = try Keymap.init(std.testing.allocator);
+    defer km.deinit();
+    try km.apply(&.{
+        .{ .key = "ctrl+b>h", .action = "resize_split", .args = "{\"direction\":\"left\"}", .repeat = true },
+        .{ .key = "ctrl+b>l", .action = "resize_split", .args = "{\"direction\":\"right\"}", .repeat = true },
+        .{ .key = "ctrl+b>c", .action = "new_tab" },
+        .{ .key = "ctrl+b>ctrl+b>z", .action = "toggle_split_zoom" },
+        // Alone, a key repeats as it's held: the flag means nothing.
+        .{ .key = "ctrl+shift+r", .action = "reset_font_size", .repeat = true },
+    });
+    const ctrl_mods: Mods = .{ .ctrl = true };
+    const left: Action = .{ .resize_split = .{ .direction = .left, .amount = 1 } };
+    const right: Action = .{ .resize_split = .{ .direction = .right, .amount = 1 } };
+    try std.testing.expectEqual(Press.pending, km.press('B', ctrl_mods));
+    try std.testing.expect(!km.isRepeating());
+    try std.testing.expectEqual(left, km.press('H', .{}).binding.action);
+    try std.testing.expect(km.isRepeating());
+    try std.testing.expectEqual(1, km.pending().len);
+    try std.testing.expectEqual(left, km.press('H', .{}).binding.action);
+    // Another repeat of the prefix goes on repeating; a binding of the
+    // prefix that isn't one runs, and ends it.
+    try std.testing.expectEqual(right, km.press('L', .{}).binding.action);
+    try std.testing.expect(km.isRepeating());
+    try std.testing.expectEqual(Action.new_tab, km.press('C', .{}).binding.action);
+    try std.testing.expect(!km.isRepeating());
+    try std.testing.expectEqual(Press.none, km.press('H', .{}));
+    // A key that's nothing of the prefix's ends the repeat and goes on
+    // as itself: to the program, to its own binding, or into a sequence.
+    _ = km.press('B', ctrl_mods);
+    _ = km.press('H', .{});
+    try std.testing.expectEqual(Press.none, km.press('X', .{}));
+    try std.testing.expect(!km.isRepeating());
+    _ = km.press('B', ctrl_mods);
+    _ = km.press('H', .{});
+    try std.testing.expectEqual(Action.close_surface, km.press('W', .{ .ctrl = true, .shift = true }).binding.action);
+    _ = km.press('B', ctrl_mods);
+    _ = km.press('H', .{});
+    try std.testing.expectEqual(Press.pending, km.press('B', ctrl_mods));
+    try std.testing.expect(!km.isRepeating());
+    try std.testing.expectEqual(2, km.pending().len);
+    try std.testing.expectEqual(Action.toggle_split_zoom, km.press('Z', .{}).binding.action);
+    // The window's timer ends it through cancel.
+    _ = km.press('B', ctrl_mods);
+    _ = km.press('H', .{});
+    km.cancel();
+    try std.testing.expect(!km.isRepeating());
+    try std.testing.expectEqual(Press.none, km.press('H', .{}));
+    try std.testing.expectEqual(Action.reset_font_size, km.press('R', .{ .ctrl = true, .shift = true }).binding.action);
+    try std.testing.expect(!km.isRepeating());
     try std.testing.expectEqual(0, km.pending().len);
 }
 

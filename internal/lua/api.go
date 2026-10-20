@@ -168,7 +168,13 @@ which are for the top level only:
                              reaches the program; bind "ctrl+b>ctrl+b" to a
                              function that writes it). The window keeps the
                              keys of a sequence; Escape ends one, as does a key
-                             that's not in it, or a reload.
+                             that's not in it, or a reload. A sequence written
+                             "repeat:ctrl+b>h" keeps its earlier keys pressed
+                             once it runs, for half a second after each press,
+                             so its last key again runs it again (tmux's
+                             bind -r: resizing a pane by holding ctrl+b>shift+h
+                             then tapping shift+h); a key that's no repeat ends
+                             that and does what it does alone.
   slime.bind(key, fn)        key runs fn(ctx, args) in the daemon; a function
                              binding always consumes its key
   slime.unbind(key)          key does nothing, even if the window binds it;
