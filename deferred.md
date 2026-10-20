@@ -374,8 +374,8 @@ matches and a pill with the count.
 - **The needle isn't in frames**: another window's pill shows the count
   alone, and a window that reconnects loses the text it typed.
 - **The first match is the newest**, wherever the viewport is; the
-  window's own cursor isn't a position to search from. Enter steps down
-  (newer) and shift+Enter up, wrapping at the ends.
+  window's own cursor isn't a position to search from. Enter steps up
+  (older) and shift+Enter down, wrapping at the ends.
 - **The card covers the grid's top-right cells**; a row under the strip
   would resize the pty on every open. Scrolling to a match doesn't
   allow for it, so in a narrow pane a match can land under the card.

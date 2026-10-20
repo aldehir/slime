@@ -3661,7 +3661,7 @@ fn searchChanged(self: *App) void {
     const found = self.findSession(se.pane) orelse return;
     var buf: [TextField.max_len * 3]u8 = undefined;
     const n = std.unicode.utf16LeToUtf8(&buf, se.field.text()) catch 0;
-    found.s.search(.down, buf[0..n]);
+    found.s.search(.up, buf[0..n]);
     found.s.setSearchNeedle(se.field.text());
 }
 
@@ -4215,7 +4215,8 @@ fn widgetClick(self: *App, hit: Id) void {
         },
         .search => if (self.shownPane(hit.target)) |s| self.startSearch(s),
         .search_prev, .search_next => if (self.shownPane(hit.target)) |s| {
-            s.searchStep(if (hit.part == .search_prev) .previous else .next);
+            // The search runs up (searchChanged): the up chevron is next.
+            s.searchStep(if (hit.part == .search_prev) .next else .previous);
         },
         .search_close => if (self.shownPane(hit.target)) |s| {
             if (self.mode == .search and self.mode.search.pane == s.id) {
