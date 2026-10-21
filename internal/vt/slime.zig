@@ -453,16 +453,11 @@ fn handle(self: *View, t: *vt.Terminal, win32_input: bool, ev: Events.Event, res
                 return;
             }
             const opts: vt.input.KeyEncodeOptions = .fromTerminal(t);
-            vt.input.encodeKey(w, e, opts) catch return error.EncodeFailed;
-            // Following fixterms, the legacy encoder leaves ctrl+[, ctrl+i,
-            // and ctrl+m to CSI u, which it only emits with the key's
-            // plain text, so they encode to nothing. Send the C0 byte
-            // Windows produced (ESC, TAB, CR), as xterm and Windows
-            // Terminal do.
-            if (self.out.written().len == 0 and e.action != .release and
-                e.utf8.len == 1 and std.ascii.isControl(e.utf8[0]))
-            {
-                try w.writeByte(e.utf8[0]);
+            if (legacyC0(e, opts)) |c| {
+                if (e.mods.alt) try w.writeByte(0x1B);
+                try w.writeByte(c);
+            } else {
+                vt.input.encodeKey(w, e, opts) catch return error.EncodeFailed;
             }
             if (self.out.written().len > 0 and e.action != .release and !e.key.modifier()) typed(t, result);
         },
@@ -542,6 +537,25 @@ fn utf16Units(cp: u21, out: *[2]u16) usize {
     out[0] = @intCast(0xD800 + (v >> 10));
     out[1] = @intCast(0xDC00 + (v & 0x3FF));
     return 2;
+}
+
+/// The C0 byte for ctrl+[, ctrl+i, or ctrl+m (ESC, TAB, CR) when no
+/// keyboard protocol is on. Following fixterms, the legacy encoder sends
+/// those as CSI u, which shells and programs that never asked for it
+/// take as text; xterm and Windows Terminal send the C0 byte. Alt adds
+/// the ESC prefix, as it does for other control codes.
+fn legacyC0(e: vt.input.KeyEvent, opts: vt.input.KeyEncodeOptions) ?u8 {
+    if (e.action == .release or e.composing or e.utf8.len != 1) return null;
+    if (opts.modify_other_keys_state_2 or @as(u5, @bitCast(opts.kitty_flags)) != 0) return null;
+    var mods = e.mods.binding();
+    mods.alt = false;
+    if (!mods.equal(.{ .ctrl = true })) return null;
+    return switch (std.ascii.toLower(e.utf8[0])) {
+        '[' => 0x1B,
+        'i' => 0x09,
+        'm' => 0x0D,
+        else => null,
+    };
 }
 
 /// Drop the selection and bring the viewport back from scrollback, as

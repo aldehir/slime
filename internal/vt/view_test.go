@@ -329,6 +329,28 @@ func evKey(text string, win32 ...[]byte) []byte {
 	return b
 }
 
+// evCtrlKey is ctrl (with alt, if asked) and a key, with the text it
+// makes without ctrl, as the window sends it. key is libghostty-vt's
+// input.Key.
+func evCtrlKey(key uint16, char byte, alt bool) []byte {
+	b := evKey(string(char))
+	binary.LittleEndian.PutUint16(b[2:], key)
+	b[4] = 2 // mods: ctrl
+	if alt {
+		b[4] |= 4
+	}
+	binary.LittleEndian.PutUint32(b[9:], uint32(char))
+	return b
+}
+
+// input.Key values.
+const (
+	keyBracketLeft = 3
+	keyC           = 22
+	keyI           = 28
+	keyM           = 32
+)
+
 func win32Record(vk, scancode, char uint16, down bool) []byte {
 	b := binary.LittleEndian.AppendUint16(nil, vk)
 	b = binary.LittleEndian.AppendUint16(b, scancode)
@@ -356,6 +378,9 @@ func TestEventInput(t *testing.T) {
 	v := newView(t, term)
 	frame(t, v, term, true)
 
+	// Ctrl keys go under each keyboard protocol: none (legacy), xterm
+	// modifyOtherKeys 2, and kitty's.
+	const legacy, modifyOther, kitty = "\x1b[=0u\x1b[>4;0m", "\x1b[=0u\x1b[>4;2m", "\x1b[>4;0m\x1b[=1u"
 	cases := []struct {
 		name  string
 		setup string
@@ -371,7 +396,17 @@ func TestEventInput(t *testing.T) {
 		{"focus", "\x1b[?1004h", false, evFocus(false), "\x1b[O"},
 		{"key", "", false, evKey("a"), "a"},
 		{"key in win32-input-mode", "", true, evKey("a", win32Record(65, 30, 'a', true)), "\x1b[65;30;97;1;0;1_"},
-		{"ctrl+[ as ESC", "", false, evKey("\x1b"), "\x1b"},
+		{"ctrl+c", legacy, false, evCtrlKey(keyC, 'c', false), "\x03"},
+		{"ctrl+[", legacy, false, evCtrlKey(keyBracketLeft, '[', false), "\x1b"},
+		{"ctrl+i", legacy, false, evCtrlKey(keyI, 'i', false), "\t"},
+		{"ctrl+m", legacy, false, evCtrlKey(keyM, 'm', false), "\r"},
+		{"ctrl+alt+c", legacy, false, evCtrlKey(keyC, 'c', true), "\x1b\x03"},
+		{"ctrl+alt+[", legacy, false, evCtrlKey(keyBracketLeft, '[', true), "\x1b\x1b"},
+		{"ctrl+c modifyOtherKeys", modifyOther, false, evCtrlKey(keyC, 'c', false), "\x1b[27;5;99~"},
+		{"ctrl+[ modifyOtherKeys", modifyOther, false, evCtrlKey(keyBracketLeft, '[', false), "\x1b[27;5;91~"},
+		{"ctrl+c kitty", kitty, false, evCtrlKey(keyC, 'c', false), "\x1b[99;5u"},
+		{"ctrl+[ kitty", kitty, false, evCtrlKey(keyBracketLeft, '[', false), "\x1b[91;5u"},
+		{"ctrl+c back to legacy", legacy, false, evCtrlKey(keyC, 'c', false), "\x03"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

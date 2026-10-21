@@ -36,16 +36,42 @@ pub fn keyEvent(
         .unshifted_codepoint = unshiftedCodepoint(vk),
     };
 
-    // Windows applies ctrl to the text (ctrl+c gives 0x03). The encoder
-    // derives control codes from the key itself and skips that text, but
-    // slime sends it for the keys the encoder leaves empty (ctrl+[ is ESC).
-    event.utf8 = text;
+    // Callers pass text through ctrlFreeText, so this is control text
+    // only for keys like enter and tab, which the encoder derives itself.
     if (text.len > 0 and !(text.len == 1 and std.ascii.isControl(text[0]))) {
+        event.utf8 = text;
         // AltGr arrives as ctrl+alt; when it produced text, it's consumed.
         const altgr = mods.ctrl and mods.alt;
         event.consumed_mods = .{ .shift = mods.shift, .ctrl = altgr, .alt = altgr };
     }
     return event;
+}
+
+/// The text a key makes without ctrl, in place of the control code
+/// Windows made of it (ctrl+c gives 0x03). The encoder takes the plain
+/// character with ctrl in the mods, as Ghostty's other apprts give it:
+/// it derives the control code, the modifyOtherKeys sequence, or the
+/// CSI u from that. Other text comes back as it was, and control text
+/// with no plain character (ctrl+enter) as none.
+pub fn ctrlFreeText(wparam: win32.WPARAM, lparam: win32.LPARAM, text: []const u8, buf: *[4]u8) []const u8 {
+    if (!(text.len == 1 and std.ascii.isControl(text[0]))) return text;
+    var state: [256]u8 = undefined;
+    if (win32.GetKeyboardState(&state) == 0) return "";
+    for ([_]u8{ win32.VK_CONTROL, win32.VK_LCONTROL, win32.VK_RCONTROL }) |vk| state[vk] = 0;
+    const flags: usize = @bitCast(lparam);
+    var units: [4]u16 = undefined;
+    const n = win32.ToUnicodeEx(
+        @truncate(wparam),
+        @truncate((flags >> 16) & 0xFF),
+        &state,
+        &units,
+        units.len,
+        win32.TOUNICODE_NO_STATE_CHANGE,
+        win32.GetKeyboardLayout(0),
+    );
+    if (n != 1 or units[0] < 0x20 or units[0] == 0x7F) return "";
+    const len = std.unicode.utf8Encode(units[0], buf) catch return "";
+    return buf[0..len];
 }
 
 /// Whether a key message is for shift, ctrl, alt, or a Windows key.
@@ -348,11 +374,11 @@ test Win32Key {
 }
 
 test keyEvent {
-    // ctrl+[ keeps the ESC Windows produced: the legacy encoder sends
-    // nothing for it, and slime falls back to the text.
-    const lparam: win32.LPARAM = 0x1A << 16;
-    const ev = keyEvent(win32.WM_KEYDOWN, 0xDB, lparam, "\x1b", false);
-    try std.testing.expectEqualStrings("\x1b", ev.utf8);
+    // Control text is the encoder's to derive: given 0x03 for ctrl+c, it
+    // would send CSI 3;5u.
+    const lparam: win32.LPARAM = 0x2E << 16;
+    const ev = keyEvent(win32.WM_KEYDOWN, 'C', lparam, "\x03", false);
+    try std.testing.expectEqualStrings("", ev.utf8);
     try std.testing.expect(!ev.consumed_mods.ctrl);
 }
 

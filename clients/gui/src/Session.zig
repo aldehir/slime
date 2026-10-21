@@ -1094,7 +1094,9 @@ pub fn keyInput(self: *Session, msg: u32, wparam: win32.WPARAM, lparam: win32.LP
 
     var utf8: [64]u8 = undefined;
     const text_len = std.unicode.utf16LeToUtf8(&utf8, utf16[0..len]) catch 0;
-    const ev = input.keyEvent(msg, wparam, lparam, utf8[0..text_len], composing);
+    var plain: [4]u8 = undefined;
+    const text = input.ctrlFreeText(wparam, lparam, utf8[0..text_len], &plain);
+    const ev = input.keyEvent(msg, wparam, lparam, text, composing);
 
     // One win32 record per UTF-16 unit of text the key produced, or one
     // with none.
