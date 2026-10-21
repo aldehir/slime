@@ -156,6 +156,28 @@ cell and Unicode placeholders (`U=1`, `U+10EEEE` cells) are drawn.
 
 - **PSEUDOCONSOLE_INHERIT_CURSOR.** Skipped because the screen starts
   empty.
+- **Keyboard protocols under ConPTY.** ConPTY passes a program's kitty
+  push and query (`CSI >1u`, `CSI ?u`) and modifyOtherKeys (`CSI >4;2m`)
+  through, so the pane's terminal takes them up and answers `CSI ?1u`,
+  but the keys go as win32-input-mode records, which conhost encodes in
+  plain legacy whatever was asked (ConPTY 1.25: ctrl+i is TAB,
+  shift+enter is CR). WSL and `ssh.exe` programs in a local pane are
+  told kitty is on and never get it. While 9001 is on, the daemon should
+  neither apply nor answer them, which needs a hook in the fork.
+- **Win32-input-mode survives a reset.** The daemon tracks 9001 itself
+  (libghostty-vt leaves it unknown), so RIS doesn't clear it. Local
+  ConPTY sends `?9001l` as it closes; `ssh` to a Windows host from an SSH
+  pane that drops before then leaves the shell getting records.
+- **Kitty key codes past ASCII.** `unshiftedCodepoint` (`input.zig`)
+  lowercases only ASCII; if `MapVirtualKeyW` gives uppercase Cyrillic or
+  Latin-1 letters, kitty gets the uppercase code. Unchecked: only the US
+  layout was installed.
+- **Event meaning across versions.** A host's daemon encodes the keys
+  for its panes, and a newer `slime connect` attaches to an older daemon
+  still running there (one socket per user). The wire `Version` only
+  guards the layout, so a change to what an event's fields mean needs a
+  bump too: the GUI sending ctrl keys' plain character (0.3.7) gives
+  `CSI 91;5u` for ctrl+[ through an older host daemon.
 
 ## SSH
 

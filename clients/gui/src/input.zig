@@ -16,12 +16,14 @@ const Win32Key = @import("event").Win32Key;
 /// Build the event for a WM_(SYS)KEYDOWN or WM_(SYS)KEYUP. `text` is the
 /// UTF-8 the key produced (from the WM_(SYS)CHAR messages TranslateMessage
 /// posted for it) and `composing` is set if it produced a dead key.
+/// `plain` holds the text the event carries in place of a ctrl key's.
 pub fn keyEvent(
     msg: u32,
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
     text: []const u8,
     composing: bool,
+    plain: *[4]u8,
 ) KeyEvent {
     const flags: usize = @bitCast(lparam);
     const vk: u32 = @truncate(wparam);
@@ -36,9 +38,17 @@ pub fn keyEvent(
         .unshifted_codepoint = unshiftedCodepoint(vk),
     };
 
-    // Callers pass text through ctrlFreeText, so this is control text
-    // only for keys like enter and tab, which the encoder derives itself.
-    if (text.len > 0 and !(text.len == 1 and std.ascii.isControl(text[0]))) {
+    const control = text.len == 1 and std.ascii.isControl(text[0]);
+    if (mods.ctrl and (text.len == 0 or control)) {
+        // Windows applies ctrl to the text: ctrl+c gives 0x03, and ctrl+;
+        // or ctrl+alt+[ (AltGr, with nothing on it) give none. The encoder
+        // takes the plain character with ctrl in the mods, as Ghostty's
+        // other apprts give it, and derives the control code, the
+        // modifyOtherKeys sequence, or the CSI u from that. Nothing of
+        // it is consumed.
+        if (!composing) event.utf8 = plainText(wparam, lparam, plain);
+    } else if (text.len > 0 and !control) {
+        // Control text without ctrl (enter, tab) is the encoder's to derive.
         event.utf8 = text;
         // AltGr arrives as ctrl+alt; when it produced text, it's consumed.
         const altgr = mods.ctrl and mods.alt;
@@ -47,17 +57,15 @@ pub fn keyEvent(
     return event;
 }
 
-/// The text a key makes without ctrl, in place of the control code
-/// Windows made of it (ctrl+c gives 0x03). The encoder takes the plain
-/// character with ctrl in the mods, as Ghostty's other apprts give it:
-/// it derives the control code, the modifyOtherKeys sequence, or the
-/// CSI u from that. Other text comes back as it was, and control text
-/// with no plain character (ctrl+enter) as none.
-pub fn ctrlFreeText(wparam: win32.WPARAM, lparam: win32.LPARAM, text: []const u8, buf: *[4]u8) []const u8 {
-    if (!(text.len == 1 and std.ascii.isControl(text[0]))) return text;
+/// The text a key makes without ctrl and alt, into `buf`: none for a
+/// control code (ctrl+enter) or a dead key.
+fn plainText(wparam: win32.WPARAM, lparam: win32.LPARAM, buf: *[4]u8) []const u8 {
     var state: [256]u8 = undefined;
     if (win32.GetKeyboardState(&state) == 0) return "";
-    for ([_]u8{ win32.VK_CONTROL, win32.VK_LCONTROL, win32.VK_RCONTROL }) |vk| state[vk] = 0;
+    for ([_]u8{
+        win32.VK_CONTROL, win32.VK_LCONTROL, win32.VK_RCONTROL,
+        win32.VK_MENU,    win32.VK_LMENU,    win32.VK_RMENU,
+    }) |vk| state[vk] = 0;
     const flags: usize = @bitCast(lparam);
     var units: [4]u16 = undefined;
     const n = win32.ToUnicodeEx(
@@ -374,10 +382,11 @@ test Win32Key {
 }
 
 test keyEvent {
-    // Control text is the encoder's to derive: given 0x03 for ctrl+c, it
-    // would send CSI 3;5u.
-    const lparam: win32.LPARAM = 0x2E << 16;
-    const ev = keyEvent(win32.WM_KEYDOWN, 'C', lparam, "\x03", false);
+    // Control text without ctrl is the encoder's to derive: given enter's
+    // CR, it would send it as text.
+    const lparam: win32.LPARAM = 0x1C << 16;
+    var plain: [4]u8 = undefined;
+    const ev = keyEvent(win32.WM_KEYDOWN, win32.VK_RETURN, lparam, "\r", false, &plain);
     try std.testing.expectEqualStrings("", ev.utf8);
     try std.testing.expect(!ev.consumed_mods.ctrl);
 }

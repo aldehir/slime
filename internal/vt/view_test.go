@@ -329,26 +329,35 @@ func evKey(text string, win32 ...[]byte) []byte {
 	return b
 }
 
-// evCtrlKey is ctrl (with alt, if asked) and a key, with the text it
-// makes without ctrl, as the window sends it. key is libghostty-vt's
-// input.Key.
-func evCtrlKey(key uint16, char byte, alt bool) []byte {
-	b := evKey(string(char))
+// evCtrlKey is ctrl, with any other mods, and a key, with the text it
+// makes without ctrl and alt, as the window sends it (none for keys
+// like enter). key is libghostty-vt's input.Key; unshifted its
+// character on a US layout.
+func evCtrlKey(key uint16, unshifted rune, text string, mods byte) []byte {
+	b := evKey(text)
 	binary.LittleEndian.PutUint16(b[2:], key)
-	b[4] = 2 // mods: ctrl
-	if alt {
-		b[4] |= 4
-	}
-	binary.LittleEndian.PutUint32(b[9:], uint32(char))
+	b[4] = modCtrl | mods
+	binary.LittleEndian.PutUint32(b[9:], uint32(unshifted))
 	return b
 }
+
+// input.Mods bits.
+const (
+	modShift = 1
+	modCtrl  = 2
+	modAlt   = 4
+)
 
 // input.Key values.
 const (
 	keyBracketLeft = 3
+	keyDigit2      = 8
+	keyA           = 20
 	keyC           = 22
 	keyI           = 28
 	keyM           = 32
+	keySemicolon   = 49
+	keyEnter       = 58
 )
 
 func win32Record(vk, scancode, char uint16, down bool) []byte {
@@ -396,17 +405,27 @@ func TestEventInput(t *testing.T) {
 		{"focus", "\x1b[?1004h", false, evFocus(false), "\x1b[O"},
 		{"key", "", false, evKey("a"), "a"},
 		{"key in win32-input-mode", "", true, evKey("a", win32Record(65, 30, 'a', true)), "\x1b[65;30;97;1;0;1_"},
-		{"ctrl+c", legacy, false, evCtrlKey(keyC, 'c', false), "\x03"},
-		{"ctrl+[", legacy, false, evCtrlKey(keyBracketLeft, '[', false), "\x1b"},
-		{"ctrl+i", legacy, false, evCtrlKey(keyI, 'i', false), "\t"},
-		{"ctrl+m", legacy, false, evCtrlKey(keyM, 'm', false), "\r"},
-		{"ctrl+alt+c", legacy, false, evCtrlKey(keyC, 'c', true), "\x1b\x03"},
-		{"ctrl+alt+[", legacy, false, evCtrlKey(keyBracketLeft, '[', true), "\x1b\x1b"},
-		{"ctrl+c modifyOtherKeys", modifyOther, false, evCtrlKey(keyC, 'c', false), "\x1b[27;5;99~"},
-		{"ctrl+[ modifyOtherKeys", modifyOther, false, evCtrlKey(keyBracketLeft, '[', false), "\x1b[27;5;91~"},
-		{"ctrl+c kitty", kitty, false, evCtrlKey(keyC, 'c', false), "\x1b[99;5u"},
-		{"ctrl+[ kitty", kitty, false, evCtrlKey(keyBracketLeft, '[', false), "\x1b[91;5u"},
-		{"ctrl+c back to legacy", legacy, false, evCtrlKey(keyC, 'c', false), "\x03"},
+		{"ctrl+c", legacy, false, evCtrlKey(keyC, 'c', "c", 0), "\x03"},
+		{"ctrl+[", legacy, false, evCtrlKey(keyBracketLeft, '[', "[", 0), "\x1b"},
+		{"ctrl+i", legacy, false, evCtrlKey(keyI, 'i', "i", 0), "\t"},
+		{"ctrl+m", legacy, false, evCtrlKey(keyM, 'm', "m", 0), "\r"},
+		{"ctrl+shift+a", legacy, false, evCtrlKey(keyA, 'a', "A", modShift), "\x01"},
+		{"ctrl+@", legacy, false, evCtrlKey(keyDigit2, '2', "@", modShift), "\x00"},
+		{"ctrl+;", legacy, false, evCtrlKey(keySemicolon, ';', ";", 0), ";"},
+		{"ctrl+с, Russian", legacy, false, evCtrlKey(keyC, 'с', "с", 0), "\x03"},
+		{"ctrl+enter", legacy, false, evCtrlKey(keyEnter, 0, "", 0), "\x1b[27;5;13~"},
+		{"ctrl+alt+c", legacy, false, evCtrlKey(keyC, 'c', "c", modAlt), "\x1b\x03"},
+		{"ctrl+alt+[", legacy, false, evCtrlKey(keyBracketLeft, '[', "[", modAlt), "\x1b\x1b"},
+		{"ctrl+alt+i", legacy, false, evCtrlKey(keyI, 'i', "i", modAlt), "\x1b\t"},
+		{"ctrl+alt+;", legacy, false, evCtrlKey(keySemicolon, ';', ";", modAlt), "\x1b;"},
+		{"ctrl+c modifyOtherKeys", modifyOther, false, evCtrlKey(keyC, 'c', "c", 0), "\x1b[27;5;99~"},
+		{"ctrl+[ modifyOtherKeys", modifyOther, false, evCtrlKey(keyBracketLeft, '[', "[", 0), "\x1b[27;5;91~"},
+		{"ctrl+; modifyOtherKeys", modifyOther, false, evCtrlKey(keySemicolon, ';', ";", 0), "\x1b[27;5;59~"},
+		{"ctrl+shift+a modifyOtherKeys", modifyOther, false, evCtrlKey(keyA, 'a', "A", modShift), "\x1b[27;6;65~"},
+		{"ctrl+c kitty", kitty, false, evCtrlKey(keyC, 'c', "c", 0), "\x1b[99;5u"},
+		{"ctrl+[ kitty", kitty, false, evCtrlKey(keyBracketLeft, '[', "[", 0), "\x1b[91;5u"},
+		{"ctrl+shift+a kitty", kitty, false, evCtrlKey(keyA, 'a', "A", modShift), "\x1b[97;6u"},
+		{"ctrl+c back to legacy", legacy, false, evCtrlKey(keyC, 'c', "c", 0), "\x03"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

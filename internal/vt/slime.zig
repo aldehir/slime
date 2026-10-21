@@ -453,10 +453,7 @@ fn handle(self: *View, t: *vt.Terminal, win32_input: bool, ev: Events.Event, res
                 return;
             }
             const opts: vt.input.KeyEncodeOptions = .fromTerminal(t);
-            if (legacyC0(e, opts)) |c| {
-                if (e.mods.alt) try w.writeByte(0x1B);
-                try w.writeByte(c);
-            } else {
+            if (!try legacyCtrl(w, e, opts)) {
                 vt.input.encodeKey(w, e, opts) catch return error.EncodeFailed;
             }
             if (self.out.written().len > 0 and e.action != .release and !e.key.modifier()) typed(t, result);
@@ -539,21 +536,42 @@ fn utf16Units(cp: u21, out: *[2]u16) usize {
     return 2;
 }
 
-/// The C0 byte for ctrl+[, ctrl+i, or ctrl+m (ESC, TAB, CR) when no
-/// keyboard protocol is on. Following fixterms, the legacy encoder sends
-/// those as CSI u, which shells and programs that never asked for it
-/// take as text; xterm and Windows Terminal send the C0 byte. Alt adds
-/// the ESC prefix, as it does for other control codes.
-fn legacyC0(e: vt.input.KeyEvent, opts: vt.input.KeyEncodeOptions) ?u8 {
-    if (e.action == .release or e.composing or e.utf8.len != 1) return null;
-    if (opts.modify_other_keys_state_2 or @as(u5, @bitCast(opts.kitty_flags)) != 0) return null;
-    var mods = e.mods.binding();
-    mods.alt = false;
-    if (!mods.equal(.{ .ctrl = true })) return null;
-    return switch (std.ascii.toLower(e.utf8[0])) {
-        '[' => 0x1B,
-        'i' => 0x09,
-        'm' => 0x0D,
+/// Write ctrl and a character as xterm and the Windows console send them
+/// when no keyboard protocol is on: its C0 byte, shift or not (ctrl+[ is
+/// ESC, ctrl+shift+a is 0x01, ctrl+@ is NUL), or the character itself
+/// for one with none (ctrl+; is ;). Following fixterms, the legacy
+/// encoder sends CSI u for many of these, which shells and programs
+/// that never asked for it take as text. Alt adds the ESC prefix.
+/// Returns false for the encoder to take the key.
+fn legacyCtrl(w: *std.Io.Writer, e: vt.input.KeyEvent, opts: vt.input.KeyEncodeOptions) std.Io.Writer.Error!bool {
+    if (e.action == .release or e.composing or e.utf8.len == 0) return false;
+    if (opts.modify_other_keys_state_2 or @as(u5, @bitCast(opts.kitty_flags)) != 0) return false;
+    const mods = e.effectiveMods().binding();
+    if (!mods.ctrl or mods.super) return false;
+    // Text past ASCII takes its key's place on a US layout, as the
+    // encoder does: ctrl+с on a Russian layout is ctrl+c.
+    const char: u8 = if (e.utf8.len == 1) e.utf8[0] else std.math.cast(u8, e.key.codepoint() orelse 0) orelse 0;
+    if (char < 0x20 or char >= 0x7F) return false;
+    const c0 = ctrlByte(char);
+    if (mods.alt and (c0 != null or opts.alt_esc_prefix)) try w.writeByte(0x1B);
+    if (c0) |c| try w.writeByte(c) else try w.writeAll(e.utf8);
+    return true;
+}
+
+/// The C0 byte ctrl makes of an ASCII character, after xterm and
+/// Ghostty's table.
+fn ctrlByte(c: u8) ?u8 {
+    return switch (c) {
+        // A-Z and [ \ ] ^ _, and @ as NUL.
+        '@'...'_' => c - '@',
+        'a'...'z' => c - 'a' + 1,
+        ' ', '2' => 0,
+        '3' => 0x1B,
+        '4' => 0x1C,
+        '5' => 0x1D,
+        '6', '~' => 0x1E,
+        '7', '/' => 0x1F,
+        '8', '?' => 0x7F,
         else => null,
     };
 }
